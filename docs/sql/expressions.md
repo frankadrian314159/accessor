@@ -1,0 +1,106 @@
+# Expressions, operators and predicates
+
+## Literals
+
+| Literal | Type | Examples |
+| --- | --- | --- |
+| whole number | `INTEGER` (or `BIGNUM` when too big for 64 bits) | `42`, `-7`, `123456789012345678901234567890` |
+| number with a point | `DECIMAL` (exact) | `3.14`, `.5`, `10.00` |
+| number with an exponent | `DOUBLE` | `1e3`, `2.5E-4` |
+| text | `TEXT` | `'it''s'`, `"say ""hi"""` |
+| date and time | `DATETIME` | `#2024-03-05#`, `#2024-03-05 14:30:00#`, `#3/5/2024 2:30 PM#`, `DATE '2024-03-05'`, `TIMESTAMP '2024-03-05 14:30:00'` |
+| truth values | `YESNO` | `TRUE`, `FALSE`, `YES`, `NO` |
+| nothing | | `NULL` |
+
+Single quotes make text; a quote inside is doubled. Double quotes also make text (the Access habit), not identifiers: write `[Name]` for a name that needs quoting. A parameter is written `@name`.
+
+## Identifiers
+
+`Table.Column`, `Alias.Column` and plain `Column` are the forms of a column reference. Names are case-insensitive. A name containing a space or punctuation, or equal to a reserved word, goes in brackets: `[Order Details].[Unit Price]`. A plain name that matches columns in more than one source is an error ("ambiguous"); qualify it.
+
+## Operators
+
+From loosest to tightest binding:
+
+| Level | Operators |
+| --- | --- |
+| 1 | `OR` |
+| 2 | `AND` |
+| 3 | `NOT` |
+| 4 | comparisons and predicates: `= <> != < <= > >=`, `IS`, `LIKE`, `BETWEEN`, `IN` |
+| 5 | `&`, `\|\|` (join text) |
+| 6 | `+`, `-` |
+| 7 | `*`, `/`, `\` (whole-number division), `%` and `MOD` (remainder) |
+| 8 | unary `-`, `+` |
+| 9 | `^` (power) |
+
+Arithmetic on the [numeric types](../../README.md#numbers) is exact: the result type depends only on the operand types. `/` gives an exact `DECIMAL` when the quotient terminates and a 50-digit `DECIMAL` otherwise; `RATIONAL` stays exact; a whole-number overflow becomes `BIGNUM`. Dividing by zero is an error. Date arithmetic: a date plus or minus a number is a date that many days away; the difference of two dates is a number of days.
+
+`&` joins text and treats NULL as empty; `'a' & NULL & 'b'` is `'ab'`. Numbers and dates are converted to text. `||` is the same operator. `+` is only arithmetic.
+
+## NULL and three-valued logic
+
+NULL means "no value". Any comparison with NULL is *unknown* (neither true nor false), and arithmetic with NULL is NULL. `WHERE`, `HAVING`, `ON` and `WHEN` keep a row only when the condition is true. `AND`, `OR` and `NOT` follow the usual truth tables for unknown: `false AND unknown` is false, `true OR unknown` is true, and `NOT unknown` is unknown.
+
+## Comparison and predicates
+
+| Predicate | True when |
+| --- | --- |
+| `a = b`, `<>`, `<`, `<=`, `>`, `>=` | the comparison holds; numbers compare by value across all numeric types, text ignores case |
+| `a IS NULL`, `a IS NOT NULL` | `a` is / is not NULL |
+| `a IS [NOT] TRUE`, `IS [NOT] FALSE` | the test result is exactly that; never unknown |
+| `a IS [NOT] UNKNOWN` | the same as `IS [NOT] NULL` |
+| `a IS [NOT] DISTINCT FROM b` | like `<>` (`=`) but two NULLs count as equal, and the answer is never unknown |
+| `a [NOT] BETWEEN x AND y` | `x <= a AND a <= y` |
+| `a [NOT] BETWEEN SYMMETRIC x AND y` | between the two, whichever is smaller |
+| `a [NOT] IN (x, y, ...)` | equal to one of the list |
+| `a [NOT] IN (query)` | equal to one of the query's values |
+| `[NOT] EXISTS (query)` | the query returns a row |
+| `a op ANY / SOME / ALL (query)` | see [quantified comparisons](select.md#quantified-comparisons) |
+| `a [NOT] LIKE pattern [ESCAPE c]` | the text matches the pattern |
+
+### LIKE
+
+Both the Access and the standard wildcards work in the same pattern:
+
+| Wildcard | Matches |
+| --- | --- |
+| `*` or `%` | any run of characters, including none |
+| `?` or `_` | exactly one character |
+| `#` | exactly one digit |
+| `[abc]`, `[a-f]` | one character from the set or range |
+| `[!abc]` | one character not in the set |
+
+Matching ignores case. `ESCAPE` names a character that takes away the special meaning of the next one; the pattern and the escape character must be literals: `Code LIKE 'A!_%' ESCAPE '!'`. A literal `[` is written `[[]`.
+
+## CASE
+
+```sql
+CASE WHEN Sal > 100 THEN 'high' WHEN Sal > 50 THEN 'mid' ELSE 'low' END
+CASE Dept WHEN 'Eng' THEN 1 WHEN 'Ops' THEN 2 END
+```
+
+The first form tests conditions; the second compares one value with each `WHEN` value. Only the chosen branch is evaluated. Without a matching branch and without `ELSE` the result is NULL.
+
+## CAST
+
+`CAST(expr AS type)` converts a value to one of the [data types](ddl.md#data-types). Sizes are ignored except the scale of a decimal: `CAST(x AS DECIMAL(10, 2))` rounds to two places (halves go to the even digit). A value that cannot be converted is an error. A NULL stays NULL.
+
+## Other standard forms
+
+| Form | Same as |
+| --- | --- |
+| `EXTRACT(field FROM date)` | [`DatePart`](../functions/datetime.md#datepart) with the field name |
+| `POSITION(needle IN text)` | `InStr(text, needle)` |
+| `SUBSTRING(text FROM start [FOR length])` | `Mid(text, start, length)` |
+| `TRIM([LEADING \| TRAILING \| BOTH] [chars] FROM text)` | removes the characters (spaces by default) |
+| `CURRENT_DATE` | `Date()` |
+| `CURRENT_TIMESTAMP`, `CURRENT_TIME`, `LOCALTIMESTAMP`, `LOCALTIME` | `Now()` |
+
+## Sub-queries as values
+
+A parenthesised query used as a value is a scalar sub-query: it must return one column and at most one row; no row gives NULL. See [select.md](select.md#sub-queries).
+
+## Functions
+
+See the [function reference](../functions/README.md).

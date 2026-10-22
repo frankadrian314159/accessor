@@ -11,9 +11,14 @@ datasheets for working with records directly.
 
 ## What it can do
 
-- **SQL**: joins (including Access-style nested joins), grouping and `HAVING`,
-  subqueries, `TOP` / `LIMIT`, `CREATE` / `ALTER` / `DROP` for tables,
-  indexes and queries, and CSV import and export.
+- **SQL** (called ASQL): all the join types including `FULL`, `USING` and
+  `NATURAL` and Access-style nested joins; grouping, `ROLLUP` / `CUBE`;
+  subqueries including correlated ones; `UNION` / `INTERSECT` / `EXCEPT`;
+  `WITH` and `WITH RECURSIVE`; window functions; `MERGE`; `CHECK` constraints;
+  `CAST`, `Format` and about a hundred functions; `TOP` / `LIMIT` / `FETCH FIRST`;
+  `CREATE` / `ALTER` / `DROP` for tables, indexes and queries; and CSV import and
+  export. ASQL is a large subset of standard SQL, not all of the latest standard;
+  see [docs/sql/conformance.md](docs/sql/conformance.md).
 - **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints, covering schema
   changes as well as rows. Everything in a transaction becomes permanent together
   or not at all, including after a crash (see below).
@@ -31,6 +36,12 @@ datasheets for working with records directly.
 - **Durability**: a checksummed write-ahead log plus atomic snapshots. Committed
   work survives a crash; a torn write at the end of the log is discarded.
   Files written by every earlier version still open.
+
+## Documentation
+
+The [docs](docs/README.md) folder has an overview page ([index.html](docs/index.html)),
+a reference for the [SQL language](docs/sql/README.md) with its BNF grammar, the
+[functions](docs/functions/README.md), and the [column types](docs/types/README.md).
 
 ## Building and running
 
