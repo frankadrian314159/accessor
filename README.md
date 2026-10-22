@@ -43,8 +43,7 @@ datasheets for working with records directly.
 
 ## Documentation
 
-The [docs](docs/README.md) folder has an overview page ([index.html](docs/index.html)),
-a reference for the [SQL language](docs/sql/README.md) with its BNF grammar, the
+The [docs](docs/README.md) folder has an overview of Accessor, a reference for the [SQL language](docs/sql/README.md) with its BNF grammar, the
 [functions](docs/functions/README.md), the [column types](docs/types/README.md), and the
 [query optimizer](docs/optimizer/README.md).
 
