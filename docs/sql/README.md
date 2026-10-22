@@ -12,6 +12,7 @@ ASQL is the SQL dialect of Accessor. It is a subset of standard SQL with the hab
 | [ddl.md](ddl.md) | `CREATE`/`ALTER`/`DROP TABLE`, data types, constraints, indexes |
 | [queries-and-triggers.md](queries-and-triggers.md) | saved queries, parameters, `EXEC`, triggers |
 | [transactions.md](transactions.md) | `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints |
+| [optimizer.md](optimizer.md) | the query optimizer and `EXPLAIN` |
 | [expressions.md](expressions.md) | literals, operators, `NULL` logic, predicates, `LIKE`, `CASE`, `CAST` |
 | [conformance.md](conformance.md) | comparison with the SQL standard |
 | [../functions/README.md](../functions/README.md) | every built-in function |

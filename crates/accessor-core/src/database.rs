@@ -55,6 +55,10 @@ pub struct Database {
     pub(crate) calc_cache: crate::calc::CalcCache,
     /// Whether the batch being applied touches a table with calculated fields.
     pub(crate) calc_active: bool,
+    /// Collects the plan while an `EXPLAIN` runs.
+    pub(crate) plan_log: crate::exec::optimizer::PlanLog,
+    /// Whether the query optimiser is on (it is, by default).
+    pub(crate) optimizer_on: bool,
     persist: Option<Persistence>,
     tx: Option<Tx>,
 }
@@ -72,6 +76,8 @@ impl Database {
             triggers: BTreeMap::new(),
             calc_cache: Default::default(),
             calc_active: false,
+            plan_log: Default::default(),
+            optimizer_on: true,
             persist: None,
             tx: None,
         }
@@ -531,6 +537,17 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Turns the query optimiser on or off. Off, queries run exactly as written: joins
+    /// in the order given, conditions applied after the joins, no index-ordered reads.
+    /// Answers are the same either way; this exists to compare plans and for testing.
+    pub fn set_optimizer(&mut self, on: bool) {
+        self.optimizer_on = on;
+    }
+
+    pub fn optimizer_enabled(&self) -> bool {
+        self.optimizer_on
     }
 
     /// Number of changes made in the open transaction (0 when there is none).

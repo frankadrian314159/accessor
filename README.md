@@ -19,6 +19,10 @@ datasheets for working with records directly.
   `CREATE` / `ALTER` / `DROP` for tables, indexes and queries; and CSV import and
   export. ASQL is a large subset of standard SQL, not all of the latest standard;
   see [docs/sql/conformance.md](docs/sql/conformance.md).
+- **A query optimizer**: conditions are applied to each table before joining,
+  inner joins are put in the cheapest order, `ORDER BY ... LIMIT` reads an index
+  in order instead of sorting, and `EXPLAIN` shows the plan with estimated and
+  actual row counts (see [docs/sql/optimizer.md](docs/sql/optimizer.md)).
 - **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints, covering schema
   changes as well as rows. Everything in a transaction becomes permanent together
   or not at all, including after a crash (see below).

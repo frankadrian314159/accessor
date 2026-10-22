@@ -72,7 +72,7 @@ The joined column appears once in `SELECT *`, and can be written without a quali
 
 ### How a join runs
 
-The planner picks a method per join: an index lookup in the inner table when the join columns are indexed, otherwise a hash join for equality conditions, otherwise a nested loop. Joins are taken in the order written.
+The [optimizer](optimizer.md) filters each table by its own conditions first, puts inner joins in the cheapest order, and picks a method per join: an index lookup in the joined table when the join columns are indexed, otherwise a hash join for equality conditions, otherwise a nested loop. Outer joins are done in the order written. Use `EXPLAIN` to see what was chosen.
 
 ## WHERE
 

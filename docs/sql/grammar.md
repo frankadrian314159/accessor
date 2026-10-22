@@ -45,6 +45,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 
 ```bnf
 <statement> ::= <query>
+              | <explain>
               | <insert> | <update> | <delete> | <merge> | <truncate>
               | <create-table> | <create-index> | <create-view> | <create-trigger>
               | <drop> | <alter-table>
@@ -53,6 +54,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
               | <raise>
 
 <query>     ::= [ <with-clause> ] <query-body> [ <order-by> ] { <row-limit> }
+<explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
 ```
 
 ### Queries

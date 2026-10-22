@@ -140,6 +140,7 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 1.25rem 3rem; text-a
       <li>Exact numbers of any size</li>
       <li>Transactions that include schema changes</li>
       <li>Crash-safe write-ahead log</li>
+      <li>A query optimizer with EXPLAIN</li>
       <li>Relationships, triggers, calculated fields</li>
     </ul>
   </div>
@@ -204,6 +205,9 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 1.25rem 3rem; text-a
 
   <dt>Tables, keys and indexes</dt>
   <dd>Typed fields, <code>NOT NULL</code>, <code>DEFAULT</code>, <code>CHECK</code>, single and composite primary keys, unique constraints, AutoNumber (<code>COUNTER</code>, or standard identity) fields, generated columns and secondary indexes. Tables can be altered after they are created: fields can be added, dropped, renamed and retyped.</dd>
+
+  <dt>A query optimizer</dt>
+  <dd>Conditions are applied to each table before joining, inner joins are put in the cheapest order, <code>ORDER BY ... LIMIT</code> reads an index in order instead of sorting, and <code>COUNT(*)</code> costs nothing. <code>EXPLAIN</code> shows the plan with estimated and actual row counts. On a million-row table the right plan is often a thousand times faster than the wrong one, and there is nothing to tune.</dd>
 
   <dt>Relationships</dt>
   <dd>Foreign keys on one or several fields, with <code>RESTRICT</code>, <code>CASCADE</code> or <code>SET NULL</code> for deletes and for key changes. They are checked once per statement, after all of its rows are in place, so rows can arrive in any order.</dd>
@@ -412,6 +416,12 @@ WHERE T.Total &gt; 1;</code></pre>
 FROM Customers C
 WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total &gt; 100);</code></pre>
 <p>Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, <code>WHERE</code> and <code>ORDER BY</code> of a query without <code>GROUP BY</code>, and in the <code>WHERE</code> and <code>SET</code> of <code>UPDATE</code> and <code>DELETE</code>.</p>
+
+<h3>Seeing the plan</h3>
+<p><code>EXPLAIN</code> in front of a query runs it and returns the plan instead of the rows: the join order chosen, the index used for each table, the number of rows each step was expected to produce and did, and whether a sort was needed. See <a href="sql/optimizer.md">the optimizer reference</a>.</p>
+<pre><code>EXPLAIN SELECT C.Name, L.Item
+FROM Line L JOIN Ord O ON O.ID = L.OrdID JOIN Cust C ON C.ID = O.CustID
+WHERE C.Name = 'c77';</code></pre>
 
 <h3>Combining queries</h3>
 <p><code>UNION</code>, <code>INTERSECT</code> and <code>EXCEPT</code> (also spelt <code>MINUS</code>) combine the rows of two or more queries with the same number of columns. Each takes <code>ALL</code> to keep duplicates. <code>INTERSECT</code> binds more tightly than the others, which go left to right; parentheses group. An <code>ORDER BY</code> after the last query sorts the combined result, by result column name or position.</p>
@@ -749,6 +759,7 @@ SELECT Format(#2024-03-05#, 'dddd, mmmm d, yyyy');   -- Tuesday, March 5, 2024</
 <tr><td><code>.read FILE</code></td><td>run a SQL script</td></tr>
 <tr><td><code>.sync on|off</code></td><td>flush to disk on every commit (the default) or leave it to the operating system</td></tr>
 <tr><td><code>.timer on|off</code></td><td>show how long each statement takes</td></tr>
+<tr><td><code>.optimizer on|off</code></td><td>turn the query optimizer off to compare plans and timings (the answers are the same)</td></tr>
 <tr><td><code>.checkpoint</code>, <code>.compact</code></td><td>fold the log into the database file; rewrite the file compactly</td></tr>
 <tr><td><code>.help</code>, <code>.quit</code></td><td>help; leave</td></tr>
 </tbody>
@@ -864,6 +875,16 @@ fn main() -&gt; Result&lt;(), accessor_core::Error&gt; {
 
 <p>Values are a Rust enum with a variant for each type. Numbers carry the full numeric tower: <code>Int(i64)</code>, <code>Big(BigInt)</code>, <code>Dec(Decimal)</code> (a big integer mantissa and a scale), <code>Rational</code> (two big integers), and the two float types. Comparison, hashing and ordering are implemented once, across all of them, by exact value, and everything built on those (indexes, hash joins, <code>GROUP BY</code>, <code>DISTINCT</code>) inherits the same notion of equality.</p>
 
+<h3>The query optimizer</h3>
+<p>Between binding and execution, a <code>SELECT</code> passes through a small optimizer that changes how the query is run, never what it returns. It has no stored statistics to go stale. It reads what it needs from the tables as they are: the number of rows, and, for a condition an index can answer, the number of rows the index would visit, counted exactly up to a cap.</p>
+<ol>
+<li><strong>Pushdown.</strong> The <code>WHERE</code> and inner-join <code>ON</code> conditions are split into conjuncts and each is tagged with the set of tables it reads. A conjunct that reads one table moves into that table's scan, where it can pick an index and thin the rows before any join. Conjuncts that read several tables are applied at the first join where all of them are present. A conjunct is never pushed to the nullable side of an outer join, where doing so would turn a "no match" into a different answer.</li>
+<li><strong>Join order.</strong> When every join is inner or cross, the order is free. The optimizer estimates each table's size after its own conditions, starts from the smallest, and adds, one at a time, the table that gives the smallest intermediate result, ranking a unique-index lookup above an ordinary index above a hash above a cross product. The joined rows are built in that order and then rearranged to the column order of the query, so nothing downstream notices. Outer joins keep the order written.</li>
+<li><strong>Join method.</strong> An index on the joined table gives an index nested-loop join. Otherwise an equality join is hashed, and when an inner join's left side is much smaller than the right, the hash is built on the left and the right table is streamed through it.</li>
+<li><strong>Ordering and counting.</strong> An <code>ORDER BY ... LIMIT</code> whose columns an index holds in order, perhaps after an equality on its leading columns, reads that index in order and stops when it has enough rows; descending reads keep the tie order of a stable sort, so the answer is identical to sorting. A bare <code>COUNT(*)</code> is the table's row count.</li>
+</ol>
+<p><code>EXPLAIN</code> turns on a log that each of these decisions writes a line to, runs the query, and returns the log with the estimated and actual counts. The optimizer can be switched off (<code>.optimizer off</code>, <code>db.set_optimizer(false)</code>), which makes it easy to test: a differential test generates data, runs several dozen query shapes with and without it, and requires identical answers, including the order of rows with ties.</p>
+
 <h3>Execution</h3>
 <p>Rows are plain vectors of values and the executor works on whole result sets, a simple choice that suits an in-memory engine and keeps the code short. A few techniques carry most of the performance:</p>
 <ul>
@@ -922,6 +943,8 @@ fn main() -&gt; Result&lt;(), accessor_core::Error&gt; {
 </tbody>
 </table>
 
+<p>The optimizer matters more than any of these micro-costs. On a database with 1,000,000 rows in the largest of three joined tables, <code>SELECT Count(*) FROM Line L JOIN Ord O ON O.ID = L.OrdID JOIN Cust C ON C.ID = O.CustID WHERE C.Name = 'c77'</code> takes about 1.8 ms with the optimizer and 2.6 s without it, because the customer is found first and the other tables are reached through their indexes instead of being scanned. A bare <code>SELECT Count(*)</code> over the million rows takes 0.02 ms against 260 ms, and a top-5 <code>ORDER BY</code> on an indexed column 19 ms against 42 ms.</p>
+
 <p>Durability dominates writes. A committed single-row insert with <code>fsync</code> costs about 570 &micro;s, almost all of it the disk; with <code>OsBuffered</code> it costs 6.4 &micro;s. The way to make many inserts fast with full safety is to group them in one transaction, which pays the disk cost once. A checkpoint of a 200,000-row database takes a few milliseconds, and opening one (reading the snapshot) about 27 milliseconds.</p>
 </section>
 
@@ -937,6 +960,7 @@ fn main() -&gt; Result&lt;(), accessor_core::Error&gt; {
 <h2>Limits and what is missing <a class="anchor" href="#limits">#</a></h2>
 
 <ul>
+<li><strong>The optimizer is simple.</strong> Its estimates are table sizes, exact counts for indexed conditions and fixed fractions for the rest; there is no <code>ANALYZE</code> and no hints. Outer joins are not reordered.</li>
 <li><strong>The data must fit in memory.</strong> The whole database is loaded on open. The 200,000-row benchmarks above use a few tens of megabytes.</li>
 <li><strong>One process at a time.</strong> There is no file locking, no client/server mode, and no concurrent transactions.</li>
 <li><strong>No time zones, intervals or sub-second times.</strong> A <code>DATETIME</code> is whole seconds in a single zone.</li>

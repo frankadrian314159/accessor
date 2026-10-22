@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use super::agg::{AggFn, AggSpec, AggState};
 use super::bind::{contains_agg, Binder, CorrKind, CorrSpec, GroupCtx, Scope, ScopeCol};
+use super::optimizer::{choose_order, estimate, nullable, source_mask, Pred, MAX_SOURCES};
 use super::window::{self, MASK_COL, WIN_BASE};
 use super::QueryResult;
 use crate::database::Database;
@@ -23,13 +24,13 @@ const MAX_DEPTH: u32 = 16;
 // Sources
 // ---------------------------------------------------------------------------
 
-enum SourceData<'a> {
+pub(crate) enum SourceData<'a> {
     Table(&'a Table),
     Rows(Vec<Row>),
 }
 
 pub(crate) struct Source<'a> {
-    data: SourceData<'a>,
+    pub(crate) data: SourceData<'a>,
     pub(crate) alias: String,
     pub(crate) names: Vec<String>,
 }
@@ -121,6 +122,15 @@ impl Database {
         // 2. Expand the select list.
         let out_items = expand_items(sel, &scope)?;
         let n_vis = out_items.len();
+        self.note(depth, || {
+            format!("query over {}", if sources.is_empty() { "no tables".to_string() } else { sources.iter().map(|s| s.alias.as_str()).collect::<Vec<_>>().join(", ") })
+        });
+
+        // SELECT COUNT(*) FROM t needs no scan: the table knows its size.
+        if let Some(res) = self.count_shortcut(sel, &sources, &out_items) {
+            self.note(depth, || "COUNT(*) answered from the table's row count".to_string());
+            return Ok(res);
+        }
 
         // 3. Bind everything.
         let is_agg = !sel.group_by.is_empty()
@@ -193,7 +203,23 @@ impl Database {
         // Conjuncts that read a correlated sub-query's value wait until it is computed.
         let (filter, late_filter) = if corr.is_empty() { (filter, None) } else { split_late(filter, scope.cols.len()) };
 
-        let mut rows: Vec<Row> = match &sel.from {
+        let mut presorted = false;
+        let ordered = if !is_agg && wins.is_empty() && corr.is_empty() && !sel.distinct && !sel.order_by.is_empty() {
+            match (&sel.from, need) {
+                (Some(from), Some(need)) if from.joins.is_empty() => {
+                    self.index_ordered_rows(sel, &sources[0], &scope, &out_items, filter.as_ref(), need, depth)?
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut rows: Vec<Row> = match ordered {
+            Some(r) => {
+                presorted = true;
+                r
+            }
+            None => match &sel.from {
             None => {
                 let mut r = vec![Vec::new()];
                 if let Some(f) = &filter {
@@ -207,7 +233,7 @@ impl Database {
                 let conj: Vec<&BExpr> = filter.as_ref().map(split_and).unwrap_or_default();
                 self.produce_rows(&sources, from, &scope, &join_ons, filter.as_ref(), &conj, scan_limit, depth)?
             }
-        };
+        } };
         if !corr.is_empty() {
             rows = self.add_corr_columns(rows, &corr, depth)?;
             if let Some(f) = &late_filter {
@@ -223,6 +249,7 @@ impl Database {
 
         // 5. Grouping.
         if let Some(g) = group {
+            self.note(depth, || format!("group {} rows{}", rows.len(), if sel.group_sets.is_empty() { String::new() } else { format!(" into {} grouping set(s)", sel.group_sets.len()) }));
             rows = aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets)?;
             if let Some(h) = &having {
                 let mut kept = Vec::with_capacity(rows.len());
@@ -255,7 +282,13 @@ impl Database {
             let mut seen = HashSet::with_capacity(out.len());
             out.retain(|r| seen.insert(r[..n_vis].to_vec()));
         }
-        if !sort_keys.is_empty() {
+        if !sort_keys.is_empty() && !presorted {
+            self.note(depth, || {
+                match need {
+                    Some(k) if k > 0 && k.saturating_mul(2) < out.len() => format!("sort: top-{k} of {} rows", out.len()),
+                    _ => format!("sort: all {} rows", out.len()),
+                }
+            });
             let cmp = |a: &Row, b: &Row| -> Ordering {
                 for &(c, desc) in &sort_keys {
                     let o = a[c].cmp(&b[c]);
@@ -440,46 +473,189 @@ impl Database {
         limit: Option<usize>,
         depth: u32,
     ) -> Result<Vec<Row>> {
-        let base = &sources[0];
         let single = from.joins.is_empty();
-        let mut rows = match &base.data {
-            SourceData::Table(t) => scan_table(t, conj, if single { filter } else { None }, if single { limit } else { None })?,
-            SourceData::Rows(all) => {
-                let mut out = Vec::new();
-                for row in all {
-                    if single {
+        if single {
+            let base = &sources[0];
+            let rows = match &base.data {
+                SourceData::Table(t) => {
+                    self.note(depth, || scan_note(base, t, conj));
+                    scan_table(t, conj, filter, limit)?
+                }
+                SourceData::Rows(all) => {
+                    let mut out = Vec::new();
+                    for row in all {
                         if let Some(f) = filter {
                             if !f.eval_bool(row)? {
                                 continue;
                             }
                         }
+                        out.push(row.clone());
+                        if limit.is_some_and(|l| out.len() >= l) {
+                            break;
+                        }
                     }
-                    out.push(row.clone());
-                    if single && limit.is_some_and(|l| out.len() >= l) {
-                        break;
-                    }
+                    self.note(depth, || format!("scan {} (computed rows)", base.alias));
+                    out
                 }
-                out
-            }
-        };
-        if single {
+            };
+            self.note(depth, || format!("  -> {} rows", rows.len()));
             return Ok(rows);
         }
 
-        let mut width = base.ncols();
-        for (k, join) in from.joins.iter().enumerate() {
-            let right = &sources[k + 1];
-            let on = match &ons[k] {
+        let m = sources.len();
+        let optimize = m <= MAX_SOURCES && self.optimizer_on;
+        let mut offs = Vec::with_capacity(m);
+        let mut total = 0;
+        for s in sources {
+            offs.push(total);
+            total += s.ncols();
+        }
+        let kinds: Vec<JoinKind> = from.joins.iter().map(|j| j.kind).collect();
+
+        // Bind every ON condition against the columns it can see.
+        let mut on_b: Vec<Option<BExpr>> = Vec::with_capacity(kinds.len());
+        for (k, _) in kinds.iter().enumerate() {
+            on_b.push(match &ons[k] {
                 Some(on) => {
-                    let prefix = scope.prefix(width + right.ncols());
+                    let prefix = scope.prefix(offs[k + 1] + sources[k + 1].ncols());
                     Some(Binder::new(self, &prefix, depth).bind(on)?)
                 }
                 None => None,
+            });
+        }
+
+        // Inner and cross joins may be done in any order; outer joins keep theirs.
+        let reorder = optimize && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross));
+
+        // The conditions, each with the sources it reads.
+        let mut preds: Vec<Pred> = Vec::new();
+        if optimize {
+            for c in conj {
+                preds.push(Pred { expr: (*c).clone(), mask: source_mask(c, &offs), from_where: true, used: false });
+            }
+            if reorder {
+                for ob in on_b.iter().flatten() {
+                    for c in split_and(ob) {
+                        preds.push(Pred { expr: c.clone(), mask: source_mask(c, &offs), from_where: false, used: false });
+                    }
+                }
+            } else {
+                // A LEFT or INNER join's ON condition on the joined table alone can
+                // filter that table before the join.
+                for (k, ob) in on_b.iter().enumerate() {
+                    if let (Some(ob), true) = (ob, matches!(kinds[k], JoinKind::Inner | JoinKind::Left)) {
+                        for c in split_and(ob) {
+                            if source_mask(c, &offs) == 1 << (k + 1) {
+                                preds.push(Pred { expr: c.clone(), mask: 1 << (k + 1), from_where: false, used: false });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Conditions on one source alone move into its scan (bound to its own columns).
+        let mut pre: Vec<Vec<BExpr>> = vec![Vec::new(); m];
+        for p in preds.iter_mut() {
+            if p.mask.count_ones() == 1 {
+                let s = p.mask.trailing_zeros() as usize;
+                if !p.from_where || !nullable(&kinds, s) {
+                    let off = offs[s];
+                    pre[s].push(p.expr.map_cols(&move |i| i - off));
+                    p.used = true;
+                }
+            }
+        }
+
+        let est: Vec<f64> = (0..m).map(|s| if optimize { estimate(&sources[s], &pre[s]) } else { 0.0 }).collect();
+        let order: Vec<usize> = if reorder { choose_order(sources, &est, &preds, &offs) } else { (0..m).collect() };
+        let reordered = order.iter().enumerate().any(|(i, &s)| i != s);
+        self.note(depth, || {
+            let names: Vec<&str> = order.iter().map(|&s| sources[s].alias.as_str()).collect();
+            if reordered {
+                format!("join order: {} (reordered from the query's order)", names.join(" -> "))
+            } else {
+                format!("join order: {}", names.join(" -> "))
+            }
+        });
+
+        // Layout of the rows being built, which follows the join order.
+        let mut eoff = vec![0usize; m];
+        let mut pos = 0;
+        for &s in &order {
+            eoff[s] = pos;
+            pos += sources[s].ncols();
+        }
+        let owner = |c: usize| offs.partition_point(|&o| o <= c).saturating_sub(1);
+        let colmap = |c: usize| {
+            let s = owner(c);
+            eoff[s] + c - offs[s]
+        };
+        let and = |v: Vec<BExpr>| v.into_iter().reduce(|a, b| BExpr::Bin(BinOp::And, Box::new(a), Box::new(b)));
+
+        // First source.
+        let first = order[0];
+        let mut rows = self.scan_source(&sources[first], &pre[first], depth, est[first])?;
+        let mut placed: u64 = 1 << first;
+        let mut width = sources[first].ncols();
+        if reorder {
+            // Conditions that read no table at all.
+            let consts: Vec<BExpr> = preds.iter_mut().filter(|p| p.mask == 0 && !p.used).map(|p| {
+                p.used = true;
+                p.expr.clone()
+            }).collect();
+            if let Some(c) = and(consts) {
+                if !c.eval_bool(&[])? {
+                    rows.clear();
+                }
+            }
+        }
+
+        for (step, &s) in order.iter().enumerate().skip(1) {
+            let right = &sources[s];
+            placed |= 1 << s;
+            let (kind, on) = if reorder {
+                let ready: Vec<BExpr> = preds
+                    .iter_mut()
+                    .filter(|p| !p.used && p.mask != 0 && p.mask & !placed == 0)
+                    .map(|p| {
+                        p.used = true;
+                        p.expr.map_cols(&colmap)
+                    })
+                    .collect();
+                (if sources[s].ncols() == 0 { JoinKind::Cross } else { JoinKind::Inner }, and(ready))
+            } else {
+                (kinds[step - 1], on_b[step - 1].clone())
             };
-            rows = join_step(rows, width, right, join.kind, on.as_ref())?;
+            // Filtering the joined table first is safe unless it is preserved by the join.
+            let right_pre = if matches!(kind, JoinKind::Right | JoinKind::Full) { None } else { and(pre[s].clone()) };
+            let before = rows.len();
+            let (joined, how) = join_step(rows, width, right, kind, on.as_ref(), right_pre.as_ref(), self.optimizer_on)?;
+            rows = joined;
+            self.note(depth, || {
+                format!(
+                    "join {}: {how}; {before} rows in, {} out (the table has about {} rows after its own conditions)",
+                    right.alias,
+                    rows.len(),
+                    if optimize { format!("{:.0}", est[s]) } else { "?".into() },
+                )
+            });
             width += right.ncols();
         }
-        if let Some(f) = filter {
+
+        if reorder {
+            if reordered {
+                let mut out = Vec::with_capacity(rows.len());
+                for r in &rows {
+                    let mut row = Vec::with_capacity(total);
+                    for s in 0..m {
+                        row.extend_from_slice(&r[eoff[s]..eoff[s] + sources[s].ncols()]);
+                    }
+                    out.push(row);
+                }
+                rows = out;
+            }
+        } else if let Some(f) = filter {
             let mut kept = Vec::with_capacity(rows.len());
             for r in rows {
                 if f.eval_bool(&r)? {
@@ -490,6 +666,176 @@ impl Database {
         }
         Ok(rows)
     }
+
+    /// `SELECT COUNT(*), ... FROM t` with no condition, grouping or limit.
+    fn count_shortcut(&self, sel: &Select, sources: &[Source<'_>], out_items: &[(String, Expr)]) -> Option<QueryResult> {
+        if !self.optimizer_on {
+            return None;
+        }
+        let from = sel.from.as_ref()?;
+        if !from.joins.is_empty()
+            || sel.filter.is_some()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || sel.top.is_some()
+            || sel.limit.is_some()
+            || sel.offset.is_some()
+            || sel.distinct
+        {
+            return None;
+        }
+        let SourceData::Table(t) = &sources.first()?.data else { return None };
+        let all_counts = !out_items.is_empty()
+            && out_items.iter().all(|(_, e)| matches!(e, Expr::Function { name, star: true, distinct: false, .. } if name.eq_ignore_ascii_case("COUNT")));
+        all_counts.then(|| QueryResult {
+            columns: out_items.iter().map(|(n, _)| n.clone()).collect(),
+            rows: vec![vec![Value::Int(t.len() as i64); out_items.len()]],
+            affected: 0,
+        })
+    }
+
+    /// `ORDER BY` on columns that an index delivers in order, with a row limit:
+    /// read the index in order and stop as soon as enough rows qualify, instead
+    /// of finding every row and sorting. `None` when the plan does not apply.
+    #[allow(clippy::too_many_arguments)]
+    fn index_ordered_rows(
+        &self,
+        sel: &Select,
+        src: &Source<'_>,
+        scope: &Scope,
+        out_items: &[(String, Expr)],
+        filter: Option<&BExpr>,
+        need: usize,
+        depth: u32,
+    ) -> Result<Option<Vec<Row>>> {
+        let SourceData::Table(t) = &src.data else { return Ok(None) };
+        if !self.optimizer_on {
+            return Ok(None);
+        }
+        // The columns being sorted on, which must be plain columns of the table.
+        let mut cols = Vec::new();
+        for o in &sel.order_by {
+            let target = match &o.expr {
+                Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= out_items.len() => &out_items[*n as usize - 1].1,
+                Expr::Column { table: None, name } => out_items
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map_or(&o.expr, |(_, e)| e),
+                other => other,
+            };
+            let Expr::Column { table, name } = target else { return Ok(None) };
+            match scope.resolve(table.as_deref(), name) {
+                Ok(c) if c < t.schema().columns.len() => cols.push(c),
+                _ => return Ok(None),
+            }
+        }
+        let desc = sel.order_by[0].desc;
+        if sel.order_by.iter().any(|o| o.desc != desc) || need == 0 {
+            return Ok(None);
+        }
+        let k = cols.len();
+        let conj: Vec<&BExpr> = filter.map(split_and).unwrap_or_default();
+        let defs: Vec<_> = t.index_defs().collect();
+        // Which index and key prefix give the order?
+        let (idx, prefix): (usize, Vec<Value>) = match choose_access(t, &conj) {
+            Access::Prefix { idx, key }
+                if defs[idx].columns.len() >= key.len() + k && defs[idx].columns[key.len()..key.len() + k] == cols[..] =>
+            {
+                (idx, key)
+            }
+            Access::Prefix { idx, key } => {
+                // A selective lookup followed by a small sort beats walking an index.
+                if t.index_prefix(idx, &key).take(2048).count() < 2048 {
+                    return Ok(None);
+                }
+                match defs.iter().position(|d| d.columns.len() >= k && d.columns[..k] == cols[..]) {
+                    Some(i) => (i, Vec::new()),
+                    None => return Ok(None),
+                }
+            }
+            Access::Range { .. } => return Ok(None),
+            Access::Full => match defs.iter().position(|d| d.columns.len() >= k && d.columns[..k] == cols[..]) {
+                Some(i) => (i, Vec::new()),
+                None => return Ok(None),
+            },
+        };
+        self.note(depth, || {
+            format!(
+                "order by satisfied by index {} ({}), stopping after {need} rows: no sort",
+                defs[idx].name,
+                if desc { "descending" } else { "ascending" }
+            )
+        });
+        let mut out = Vec::new();
+        for id in t.index_ordered(idx, &prefix, prefix.len() + k, desc) {
+            let Some(row) = t.get(id) else { continue };
+            if let Some(f) = filter {
+                if !f.eval_bool(row)? {
+                    continue;
+                }
+            }
+            out.push(row.clone());
+            if out.len() >= need {
+                break;
+            }
+        }
+        self.note(depth, || format!("  -> {} rows read in index order", out.len()));
+        Ok(Some(out))
+    }
+
+    /// The rows of one source that satisfy `pre` (conditions bound to its own columns).
+    fn scan_source(&self, src: &Source<'_>, pre: &[BExpr], depth: u32, est: f64) -> Result<Vec<Row>> {
+        let filter = pre.iter().cloned().reduce(|a, b| BExpr::Bin(BinOp::And, Box::new(a), Box::new(b)));
+        let rows = match &src.data {
+            SourceData::Table(t) => {
+                let refs: Vec<&BExpr> = pre.iter().collect();
+                self.note(depth, || scan_note(src, t, &refs));
+                scan_table(t, &refs, filter.as_ref(), None)?
+            }
+            SourceData::Rows(all) => {
+                self.note(depth, || format!("scan {} (computed rows)", src.alias));
+                let mut out = Vec::new();
+                for row in all {
+                    if let Some(f) = &filter {
+                        if !f.eval_bool(row)? {
+                            continue;
+                        }
+                    }
+                    out.push(row.clone());
+                }
+                out
+            }
+        };
+        self.note(depth, || format!("  -> est {est:.0} rows, actual {}", rows.len()));
+        Ok(rows)
+    }
+}
+
+/// A plan line for scanning `src` under the conditions `conj`.
+fn scan_note(src: &Source<'_>, t: &Table, conj: &[&BExpr]) -> String {
+    let how = match choose_access(t, conj) {
+        Access::Full => "full scan".to_string(),
+        Access::Prefix { idx, key } => {
+            let def = t.index_defs().nth(idx);
+            format!(
+                "index {} on {} = ({})",
+                def.map_or("?", |d| d.name.as_str()),
+                def.map(|d| d.columns[..key.len()].iter().map(|&c| t.schema().columns[c].name.clone()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default(),
+                super::optimizer::describe_key(&key)
+            )
+        }
+        Access::Range { idx, .. } => {
+            let def = t.index_defs().nth(idx);
+            format!(
+                "index range scan {} on {}",
+                def.map_or("?", |d| d.name.as_str()),
+                def.map(|d| t.schema().columns[d.columns[0]].name.clone()).unwrap_or_default()
+            )
+        }
+    };
+    let filtered = if conj.is_empty() { String::new() } else { format!(" ({} condition(s) pushed down)", conj.len()) };
+    format!("scan {} [{} rows]: {how}{filtered}", src.alias, t.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +925,7 @@ pub(crate) fn split_late(filter: Option<BExpr>, width: usize) -> (Option<BExpr>,
     (join(early), join(late))
 }
 
-enum Access {
+pub(crate) enum Access {
     Full,
     Prefix { idx: usize, key: Vec<Value> },
     Range { idx: usize, lo: Bound<Value>, hi: Bound<Value> },
@@ -609,7 +955,7 @@ fn flip(op: BinOp) -> BinOp {
 /// Picks the cheapest index usable for the conjuncts that compare a column of
 /// `table` (positions `0..ncols`) with a literal. The caller still applies the
 /// full predicate, so the chosen access path only has to be a superset.
-fn choose_access(table: &Table, conj: &[&BExpr]) -> Access {
+pub(crate) fn choose_access(table: &Table, conj: &[&BExpr]) -> Access {
     let cols = &table.schema().columns;
     let n = cols.len();
     let mut eq: Vec<Option<&Value>> = vec![None; n];
@@ -681,7 +1027,7 @@ fn choose_access(table: &Table, conj: &[&BExpr]) -> Access {
     best.map_or(Access::Full, |(_, a)| a)
 }
 
-fn candidates<'t>(table: &'t Table, access: Access) -> Box<dyn Iterator<Item = (RowId, &'t Row)> + 't> {
+pub(crate) fn candidates<'t>(table: &'t Table, access: Access) -> Box<dyn Iterator<Item = (RowId, &'t Row)> + 't> {
     match access {
         Access::Full => Box::new(table.iter()),
         Access::Prefix { idx, key } => {
@@ -707,7 +1053,7 @@ pub(crate) fn matching_ids(table: &Table, conj: &[&BExpr], filter: Option<&BExpr
     Ok(ids)
 }
 
-fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>, limit: Option<usize>) -> Result<Vec<Row>> {
+pub(crate) fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>, limit: Option<usize>) -> Result<Vec<Row>> {
     let mut out = Vec::new();
     if limit == Some(0) {
         return Ok(out);
@@ -739,7 +1085,15 @@ enum Strategy {
     Scan,
 }
 
-fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: Option<&BExpr>) -> Result<Vec<Row>> {
+fn join_step(
+    left: Vec<Row>,
+    lw: usize,
+    right: &Source<'_>,
+    kind: JoinKind,
+    on: Option<&BExpr>,
+    right_pre: Option<&BExpr>,
+    allow_swap: bool,
+) -> Result<(Vec<Row>, String)> {
     let rw = right.ncols();
     let conj = on.map(split_and).unwrap_or_default();
 
@@ -802,11 +1156,20 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
         }
     };
 
+    // A hash join builds on the smaller input: with an inner join and far fewer
+    // rows on the left, hash the left and probe with the right.
+    let swap = allow_swap && matches!(&strategy, Strategy::Hash { .. }) && kind == JoinKind::Inner && left.len().saturating_mul(2) < right.slot_count();
+
     // Hash table over the right side, built once.
     let mut hash: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
-    if let Strategy::Hash { right: right_keys, .. } = &strategy {
+    if let (false, Strategy::Hash { right: right_keys, .. }) = (swap, &strategy) {
         for slot in 0..right.slot_count() {
             let Some(r) = right.get(slot) else { continue };
+            if let Some(p) = right_pre {
+                if !p.eval_bool(r)? {
+                    continue;
+                }
+            }
             let key = right_keys
                 .iter()
                 .map(|e| e.eval(r).map(|v| v.into_owned()))
@@ -826,6 +1189,57 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
         Strategy::Scan => false,
     };
     let residual = if only_equi && covers_all { None } else { on };
+    let how = match &strategy {
+        Strategy::Scan => "nested loop".to_string(),
+        Strategy::Hash { .. } if swap => format!("hash join, built on the {} left rows", left.len()),
+        Strategy::Hash { .. } => format!("hash join, built on the right table ({} slots)", right.slot_count()),
+        Strategy::Index { idx, left_cols } => match &right.data {
+            SourceData::Table(t) => format!(
+                "index nested-loop via {} ({} key column(s))",
+                t.index_defs().nth(*idx).map_or("?", |d| d.name.as_str()),
+                left_cols.len()
+            ),
+            _ => "index nested-loop".to_string(),
+        },
+    };
+    if swap {
+        let Strategy::Hash { left: left_keys, right: right_keys } = &strategy else { unreachable!("checked above") };
+        let mut table: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+        for (i, l) in left.iter().enumerate() {
+            let key = left_keys.iter().map(|e| e.eval(l).map(|v| v.into_owned())).collect::<Result<Vec<Value>>>()?;
+            if !key.iter().any(Value::is_null) {
+                table.entry(key).or_default().push(i);
+            }
+        }
+        let mut out: Vec<Row> = Vec::new();
+        let mut scratch: Row = Vec::with_capacity(lw + rw);
+        for slot in 0..right.slot_count() {
+            let Some(r) = right.get(slot) else { continue };
+            if let Some(p) = right_pre {
+                if !p.eval_bool(r)? {
+                    continue;
+                }
+            }
+            let key = right_keys.iter().map(|e| e.eval(r).map(|v| v.into_owned())).collect::<Result<Vec<Value>>>()?;
+            if key.iter().any(Value::is_null) {
+                continue;
+            }
+            if let Some(hits) = table.get(&key) {
+                for &i in hits {
+                    scratch.clear();
+                    scratch.extend_from_slice(&left[i]);
+                    scratch.extend_from_slice(r);
+                    if let Some(p) = residual {
+                        if !p.eval_bool(&scratch)? {
+                            continue;
+                        }
+                    }
+                    out.push(scratch.clone());
+                }
+            }
+        }
+        return Ok((out, how));
+    }
     let mut right_matched = matches!(kind, JoinKind::Right | JoinKind::Full).then(|| vec![false; right.slot_count()]);
     let mut out: Vec<Row> = Vec::new();
     let mut scratch: Row = Vec::with_capacity(lw + rw);
@@ -859,6 +1273,11 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
         let mut matched = false;
         for &slot in &cands {
             let Some(r) = right.get(slot) else { continue };
+            if let Some(p) = right_pre {
+                if !p.eval_bool(r)? {
+                    continue;
+                }
+            }
             scratch.clear();
             scratch.extend_from_slice(l);
             scratch.extend_from_slice(r);
@@ -892,7 +1311,7 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
             }
         }
     }
-    Ok(out)
+    Ok((out, how))
 }
 
 // ---------------------------------------------------------------------------

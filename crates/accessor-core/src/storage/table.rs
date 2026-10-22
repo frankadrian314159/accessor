@@ -475,6 +475,36 @@ impl Table {
             .map(|(_, id)| *id)
     }
 
+    /// Row ids in index order, for keys starting with `prefix` (all keys when it is
+    /// empty). Records whose first `tie_len` key values are equal keep ascending row-id
+    /// order even when `desc` reverses the rest, so the result matches a stable sort.
+    pub fn index_ordered(&self, idx: usize, prefix: &[Value], tie_len: usize, desc: bool) -> Box<dyn Iterator<Item = RowId> + '_> {
+        let p = prefix.to_vec();
+        let tree = &self.indexes[idx].tree;
+        let range = tree
+            .range((p.clone(), 0)..)
+            .take_while(move |(k, _)| k.len() >= p.len() && k[..p.len()] == p[..]);
+        if !desc {
+            return Box::new(range.map(|(_, id)| *id));
+        }
+        let entries: Vec<(&[Value], RowId)> = range.map(|(k, id)| (&k[..], *id)).collect();
+        let mut ids = Vec::with_capacity(entries.len());
+        let mut end = entries.len();
+        while end > 0 {
+            let tie = |e: &(&[Value], RowId)| e.0[..tie_len.min(e.0.len())].to_vec();
+            let key = tie(&entries[end - 1]);
+            let mut start = end - 1;
+            while start > 0 && tie(&entries[start - 1]) == key {
+                start -= 1;
+            }
+            let from = ids.len();
+            ids.extend(entries[start..end].iter().map(|e| e.1));
+            ids[from..].sort_unstable();
+            end = start;
+        }
+        Box::new(ids.into_iter())
+    }
+
     /// Row ids ordered by the first column of index `idx`, within bounds.
     /// `Null` keys never qualify.
     pub fn index_range(&self, idx: usize, lo: Bound<Value>, hi: Bound<Value>) -> impl Iterator<Item = RowId> + '_ {

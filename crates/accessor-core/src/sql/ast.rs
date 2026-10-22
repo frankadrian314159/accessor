@@ -284,6 +284,8 @@ pub enum Statement {
     DropTrigger(String),
     /// `TRUNCATE [TABLE] t`: delete every record.
     Truncate(String),
+    /// `EXPLAIN query`: run the query and report how it was planned.
+    Explain(Box<Select>),
     /// `DROP ... IF EXISTS` (`missing_ok`) or `CREATE ... IF NOT EXISTS`.
     Guarded { missing_ok: bool, stmt: Box<Statement> },
     Merge(Box<MergeDef>),

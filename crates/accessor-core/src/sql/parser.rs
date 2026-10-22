@@ -328,6 +328,13 @@ impl<'a> Parser<'a> {
         if self.eat_kw("MERGE") {
             return self.merge();
         }
+        if self.eat_kw("EXPLAIN") {
+            // `EXPLAIN QUERY PLAN` is accepted as a synonym.
+            if self.eat_kw("QUERY") {
+                self.expect_kw("PLAN")?;
+            }
+            return Ok(Statement::Explain(Box::new(self.select()?)));
+        }
         if self.eat_kw("TRUNCATE") {
             self.eat_kw("TABLE");
             return Ok(Statement::Truncate(self.ident()?));

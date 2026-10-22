@@ -1868,3 +1868,168 @@ fn ddl_dml_additions() {
     db.execute("DROP TABLE IF EXISTS Nope; DROP TABLE IF EXISTS T").unwrap();
     assert!(db.table("T").is_none());
 }
+
+// ----- the query optimizer -----------------------------------------------------------------
+
+/// A small deterministic generator, so the data is the same on every run.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) % n
+    }
+}
+
+fn opt_db() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE A (id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+         CREATE TABLE B (id INTEGER PRIMARY KEY, a_id INTEGER, w INTEGER);
+         CREATE TABLE C (id INTEGER PRIMARY KEY, b_id INTEGER, z INTEGER);
+         CREATE TABLE D (id INTEGER, tag TEXT);
+         CREATE INDEX ib ON B (a_id);
+         CREATE INDEX ic ON C (b_id);
+         CREATE INDEX ak ON A (k);
+         CREATE INDEX bw ON B (w, id);",
+    )
+    .unwrap();
+    let mut r = Lcg(12345);
+    let mut script = String::new();
+    for i in 1..=60 {
+        let k = if r.next(10) == 0 { "NULL".to_string() } else { r.next(8).to_string() };
+        script += &format!("INSERT INTO A VALUES ({i}, {k}, 'v{}');\n", r.next(5));
+    }
+    for i in 1..=300 {
+        let a = if r.next(12) == 0 { "NULL".to_string() } else { (r.next(70) + 1).to_string() };
+        let w = if r.next(15) == 0 { "NULL".to_string() } else { r.next(20).to_string() };
+        script += &format!("INSERT INTO B VALUES ({i}, {a}, {w});\n");
+    }
+    for i in 1..=900 {
+        let b = if r.next(12) == 0 { "NULL".to_string() } else { (r.next(320) + 1).to_string() };
+        script += &format!("INSERT INTO C VALUES ({i}, {b}, {});\n", r.next(10));
+    }
+    for i in 1..=6 {
+        script += &format!("INSERT INTO D VALUES ({i}, 't{i}');\n");
+    }
+    db.execute(&script).unwrap();
+    db
+}
+
+fn answers(db: &mut Database, sql: &str, on: bool) -> Vec<String> {
+    db.set_optimizer(on);
+    let r = db.query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("|")).collect()
+}
+
+#[test]
+fn the_optimizer_never_changes_an_answer() {
+    let mut db = opt_db();
+    // Queries whose rows have no defined order: compare as multisets.
+    let unordered = [
+        "SELECT A.id, B.id, C.id FROM A JOIN B ON B.a_id = A.id JOIN C ON C.b_id = B.id",
+        "SELECT A.id, C.id FROM C JOIN B ON B.id = C.b_id JOIN A ON A.id = B.a_id WHERE A.k = 3 AND C.z > 4",
+        "SELECT A.id, B.id FROM A, B WHERE B.a_id = A.id AND A.v = 'v1' AND B.w < 7",
+        "SELECT A.id, B.id, D.tag FROM A, B, D WHERE B.a_id = A.id AND D.id = B.w",
+        "SELECT * FROM A CROSS JOIN D WHERE A.k = D.id",
+        "SELECT A.id, B.id FROM A LEFT JOIN B ON B.a_id = A.id AND B.w > 10",
+        "SELECT A.id, B.id FROM A LEFT JOIN B ON B.a_id = A.id WHERE B.id IS NULL",
+        "SELECT A.id, B.id FROM A LEFT JOIN B ON B.a_id = A.id WHERE B.w > 10",
+        "SELECT A.id, B.id FROM A LEFT JOIN B ON B.a_id = A.id WHERE A.k = 2",
+        "SELECT A.id, B.id FROM A RIGHT JOIN B ON B.a_id = A.id WHERE B.w = 3",
+        "SELECT A.id, B.id FROM A RIGHT JOIN B ON B.a_id = A.id WHERE A.k = 3",
+        "SELECT A.id, B.id FROM A FULL JOIN B ON B.a_id = A.id WHERE B.w < 3 OR A.k = 1",
+        "SELECT A.id, B.id, C.id FROM A JOIN B ON B.a_id = A.id LEFT JOIN C ON C.b_id = B.id WHERE A.k > 4",
+        "SELECT A.id, B.id, C.id FROM A LEFT JOIN B ON B.a_id = A.id JOIN C ON C.b_id = B.id",
+        "SELECT X.id, Y.id FROM A X JOIN A Y ON X.k = Y.k WHERE X.id < Y.id AND X.v = 'v2'",
+        "SELECT B.id, C.id FROM B JOIN C ON C.z = B.w WHERE B.id < 20",
+        "SELECT A.k, Count(*), Sum(B.w) FROM A JOIN B ON B.a_id = A.id WHERE B.w IS NOT NULL GROUP BY A.k",
+        "SELECT A.id FROM A JOIN B ON B.a_id = A.id JOIN C ON C.b_id = B.id WHERE 1 = 0",
+        "SELECT A.id, B.id FROM A JOIN B ON B.a_id = A.id AND B.w = A.k",
+        "SELECT A.id FROM A WHERE A.id IN (SELECT a_id FROM B WHERE w = 5)",
+        "SELECT A.id, (SELECT Count(*) FROM B WHERE B.a_id = A.id) FROM A",
+        "SELECT Count(*) FROM B JOIN C ON C.b_id = B.id",
+        "SELECT COUNT(*), COUNT(*) FROM C",
+    ];
+    for sql in unordered {
+        let mut on = answers(&mut db, sql, true);
+        let mut off = answers(&mut db, sql, false);
+        on.sort();
+        off.sort();
+        assert_eq!(on, off, "different answers for {sql}");
+    }
+    // Queries with an ORDER BY: the sequence itself must match, ties included.
+    let ordered = [
+        "SELECT id, k FROM A ORDER BY k LIMIT 7",
+        "SELECT id, k FROM A ORDER BY k DESC LIMIT 7",
+        "SELECT id, k FROM A ORDER BY k DESC LIMIT 5 OFFSET 3",
+        "SELECT id, k FROM A WHERE v = 'v1' ORDER BY k LIMIT 4",
+        "SELECT id, w FROM B WHERE w IS NOT NULL ORDER BY w, id LIMIT 12",
+        "SELECT id, w FROM B ORDER BY w DESC, id DESC LIMIT 12",
+        "SELECT id, w FROM B ORDER BY w DESC LIMIT 12",
+        "SELECT id, w FROM B WHERE w = 4 ORDER BY id LIMIT 3",
+        "SELECT id, a_id FROM B WHERE a_id = 7 ORDER BY id DESC LIMIT 2",
+        "SELECT id, k AS kk FROM A ORDER BY kk LIMIT 5",
+        "SELECT id, k FROM A ORDER BY 2 DESC LIMIT 5",
+        "SELECT id, k FROM A ORDER BY k, id DESC LIMIT 5",
+        "SELECT TOP 6 id, k FROM A ORDER BY k",
+        "SELECT id FROM A WHERE k > 2 ORDER BY k LIMIT 3",
+        "SELECT A.id, B.id FROM A JOIN B ON B.a_id = A.id ORDER BY B.w, B.id LIMIT 10",
+    ];
+    for sql in ordered {
+        assert_eq!(answers(&mut db, sql, true), answers(&mut db, sql, false), "different order for {sql}");
+    }
+}
+
+#[test]
+fn explain_reports_the_plan() {
+    let mut db = opt_db();
+    let plan = |db: &Database, sql: &str| -> String {
+        db.query(&format!("EXPLAIN {sql}")).unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n")
+    };
+    // The selective table goes first and the others are reached through their indexes.
+    let p = plan(&db, "SELECT C.id FROM C JOIN B ON B.id = C.b_id JOIN A ON A.id = B.a_id WHERE A.id = 3");
+    assert!(p.contains("join order: A -> B -> C"), "{p}");
+    assert!(p.contains("reordered"), "{p}");
+    assert!(p.contains("index nested-loop via ib"), "{p}");
+    assert!(p.contains("row(s) returned"), "{p}");
+
+    // An ORDER BY answered by an index does not sort.
+    let p = plan(&db, "SELECT id FROM A ORDER BY k LIMIT 3");
+    assert!(p.contains("order by satisfied by index ak"), "{p}");
+    assert!(!p.contains("sort:"), "{p}");
+    let p = plan(&db, "SELECT id FROM A ORDER BY v LIMIT 3");
+    assert!(p.contains("sort: top-3"), "{p}");
+
+    // COUNT(*) is answered from the row count.
+    assert!(plan(&db, "SELECT COUNT(*) FROM C").contains("row count"));
+
+    // Outer joins keep the order written.
+    let p = plan(&db, "SELECT A.id FROM A LEFT JOIN B ON B.a_id = A.id");
+    assert!(p.contains("join order: A -> B"), "{p}");
+    assert!(!p.contains("reordered"), "{p}");
+
+    // The same query with the optimizer off reports no reordering.
+    db.set_optimizer(false);
+    let p = plan(&db, "SELECT C.id FROM C JOIN B ON B.id = C.b_id JOIN A ON A.id = B.a_id WHERE A.id = 3");
+    assert!(p.contains("join order: C -> B -> A") && !p.contains("reordered"), "{p}");
+    assert!(!plan(&db, "SELECT COUNT(*) FROM C").contains("row count"));
+}
+
+#[test]
+fn pushdown_keeps_outer_join_semantics() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE P (id INTEGER PRIMARY KEY, n TEXT);
+         CREATE TABLE Q (id INTEGER PRIMARY KEY, p_id INTEGER, flag INTEGER);
+         INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c');
+         INSERT INTO Q VALUES (1, 1, 1), (2, 1, 0), (3, 2, 0);",
+    )
+    .unwrap();
+    // A WHERE condition on the nullable side removes the padded rows, as written...
+    assert_eq!(rows(&db, "SELECT P.n FROM P LEFT JOIN Q ON Q.p_id = P.id WHERE Q.flag = 1"), vec![vec!["a"]]);
+    // ...but the same condition in ON keeps every P row.
+    let r = rows(&db, "SELECT P.n, Q.id FROM P LEFT JOIN Q ON Q.p_id = P.id AND Q.flag = 1 ORDER BY P.n");
+    assert_eq!(r, vec![vec!["a", "1"], vec!["b", ""], vec!["c", ""]]);
+    // IS NULL on the nullable side finds the unmatched rows.
+    assert_eq!(rows(&db, "SELECT P.n FROM P LEFT JOIN Q ON Q.p_id = P.id WHERE Q.id IS NULL"), vec![vec!["c"]]);
+}

@@ -25,6 +25,7 @@ Dot-commands:
   .export FILE SQL           write a query's result set as CSV
   .read FILE                 run a SQL script
   .sync on|off               fsync every commit (default on)
+  .optimizer on|off          turn the query optimizer on or off (for comparing plans)
   .timer on|off              show statement timings
   .checkpoint                fold the log into the database file
   .compact                   compact and repair
@@ -204,6 +205,10 @@ impl Shell {
                 }
                 None => eprintln!("no such table '{rest}'"),
             },
+            ".optimizer" => {
+                self.db.set_optimizer(!rest.eq_ignore_ascii_case("off"));
+                println!("optimizer {}", if self.db.optimizer_enabled() { "on" } else { "off" });
+            }
             ".timer" => self.timer = rest.eq_ignore_ascii_case("on"),
             ".sync" => self.db.set_durability(if rest.eq_ignore_ascii_case("off") {
                 Durability::OsBuffered
@@ -343,6 +348,13 @@ fn print_result(res: &QueryResult) {
     if res.columns.is_empty() {
         if res.affected > 0 {
             println!("{} row{} affected", res.affected, if res.affected == 1 { "" } else { "s" });
+        }
+        return;
+    }
+    // A query plan is read line by line, not as a grid, and is never shortened.
+    if res.columns.len() == 1 && res.columns[0] == "plan" {
+        for r in &res.rows {
+            println!("{}", r[0]);
         }
         return;
     }

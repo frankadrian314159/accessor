@@ -90,3 +90,4 @@ These parts of the standard are not available. Using one gives a syntax error or
 * Access-style syntax: `[bracketed names]`, `TOP n`, `&` concatenation, `#date#` literals, `IIf`, `Nz`, `\` and `MOD`, `First`/`Last`, `DateAdd`/`DateDiff`/`DateSerial`, `Format`, `DELETE *`.
 * A numeric tower with exact arithmetic: `BIGNUM`, `DECIMAL`, `CURRENCY` and `RATIONAL` ([see the README](../../README.md#numbers)).
 * `CALCULATED` columns, parameterised saved queries with `EXEC`, `RAISE` in triggers.
+* `EXPLAIN` and the [query optimizer](optimizer.md).

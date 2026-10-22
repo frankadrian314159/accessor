@@ -5,6 +5,7 @@ pub mod bind;
 mod check;
 mod ddl;
 mod merge;
+pub(crate) mod optimizer;
 mod proc;
 mod dml;
 pub(crate) mod select;
@@ -44,8 +45,21 @@ impl Database {
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         match parse_statement(sql)? {
             Statement::Select(s) => self.run_select(&s),
+            Statement::Explain(s) => self.run_explain(&s),
             _ => Err(Error::runtime("query() only accepts SELECT statements")),
         }
+    }
+
+    /// Runs a query and returns, instead of its rows, how it was planned.
+    fn run_explain(&self, sel: &crate::sql::ast::Select) -> Result<QueryResult> {
+        let (result, mut lines) = self.collect_plan(|| self.run_select(sel));
+        let result = result?;
+        lines.push(format!("{} row(s) returned", result.rows.len()));
+        Ok(QueryResult {
+            columns: vec!["plan".to_string()],
+            rows: lines.iter().map(|l| vec![crate::value::Value::text(l)]).collect(),
+            affected: 0,
+        })
     }
 
     pub fn execute_statement(&mut self, st: &Statement) -> Result<QueryResult> {
@@ -66,6 +80,7 @@ impl Database {
                 Ok(done)
             }
             Statement::Truncate(table) => self.exec_delete(table, None),
+            Statement::Explain(sel) => self.run_explain(sel),
             Statement::Guarded { missing_ok, stmt } => match self.execute_statement(stmt) {
                 Err(Error::Catalog(m))
                     if (*missing_ok && m.contains("does not exist")) || (!*missing_ok && m.contains("already exists")) =>
