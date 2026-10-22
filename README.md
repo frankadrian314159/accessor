@@ -22,7 +22,7 @@ datasheets for working with records directly.
 - **A query optimizer**: conditions are applied to each table before joining,
   inner joins are put in the cheapest order, `ORDER BY ... LIMIT` reads an index
   in order instead of sorting, and `EXPLAIN` shows the plan with estimated and
-  actual row counts (see [docs/sql/optimizer.md](docs/sql/optimizer.md)).
+  actual row counts (see [docs/optimizer](docs/optimizer/README.md)).
 - **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints, covering schema
   changes as well as rows. Everything in a transaction becomes permanent together
   or not at all, including after a crash (see below).
@@ -45,7 +45,8 @@ datasheets for working with records directly.
 
 The [docs](docs/README.md) folder has an overview page ([index.html](docs/index.html)),
 a reference for the [SQL language](docs/sql/README.md) with its BNF grammar, the
-[functions](docs/functions/README.md), and the [column types](docs/types/README.md).
+[functions](docs/functions/README.md), the [column types](docs/types/README.md), and the
+[query optimizer](docs/optimizer/README.md).
 
 ## Building and running
 
@@ -125,6 +126,52 @@ END;
 Text is joined with a single `&` (or the standard `||`). `RAISE 'message'` inside
 a trigger refuses the statement, and everything the trigger and any cascades did
 is undone with it.
+
+## The query optimizer
+
+A query says *what* rows you want; the optimizer decides *how* to get them, and
+never changes the answer. It is on by default, needs no statistics or hints, and
+makes its choices from the tables as they are when the query runs.
+
+- **Pushdown.** A `WHERE` or inner-join `ON` condition that reads one table is
+  applied while that table is read, before any join. Conditions are never
+  applied to the nullable side of an outer join, where that would change the answer.
+- **Join order.** Inner and cross joins are done in the cheapest order, not the
+  written one: start with the table that has the fewest rows after its own
+  conditions, then add the table that keeps the intermediate result smallest,
+  preferring index lookups. Outer joins keep the order written.
+- **Join method.** Index nested-loop when the joined table has an index on the
+  join columns, otherwise a hash join built on the smaller side.
+- **Access paths.** Each table uses the best index for its conditions. An
+  `ORDER BY ... LIMIT` that matches an index reads the index in order and stops
+  early instead of sorting, and a bare `SELECT COUNT(*)` is the table's row count.
+
+On a table of a million rows, a three-way join filtered to one customer takes
+about 1.8 ms instead of 2.6 s, and `SELECT COUNT(*)` takes 0.02 ms instead of 260 ms.
+
+`EXPLAIN` runs a query and shows its plan, with the optimizer's estimate next
+to the real row count at each step:
+
+```
+accessor> EXPLAIN SELECT C.Name, O.Total, L.Item
+     ...> FROM Line L JOIN Ord O ON O.ID = L.OrdID JOIN Cust C ON C.ID = O.CustID
+     ...> WHERE C.Name = 'c7';
+query over L, O, C
+join order: C -> O -> L (reordered from the query's order)
+scan C [50 rows]: full scan (1 condition(s) pushed down)
+  -> est 5 rows, actual 1
+join O: index nested-loop via ix_ord_cust (1 key column(s)); 1 rows in, 8 out (...)
+join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out (...)
+40 row(s) returned
+```
+
+`.optimizer off` in the shell (or `db.set_optimizer(false)`) runs queries exactly
+as written, which is how the optimizer is tested: the same queries must give the
+same answers, in the same order, with it on and off. When a query is slow, read
+its plan first; the usual fix is an index on a filtered or joined column. The
+estimates are simple (table sizes, exact counts for indexed conditions, fixed
+fractions otherwise), outer joins are not reordered, and plans are not cached.
+The full reference, with a tuning guide, is in [docs/optimizer](docs/optimizer/README.md).
 
 ## Transactions
 

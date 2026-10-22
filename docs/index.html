@@ -168,6 +168,7 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 1.25rem 3rem; text-a
       <li><a href="#shell">The shell</a></li>
       <li><a href="#library">Using the library</a></li>
       <li><a href="#architecture">Architecture</a></li>
+      <li><a href="#optimizer">The query optimizer</a></li>
       <li><a href="#performance">Performance</a></li>
       <li><a href="#standard">ASQL and standard SQL</a></li>
       <li><a href="#limits">Limits and what is missing</a></li>
@@ -207,7 +208,7 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 1.25rem 3rem; text-a
   <dd>Typed fields, <code>NOT NULL</code>, <code>DEFAULT</code>, <code>CHECK</code>, single and composite primary keys, unique constraints, AutoNumber (<code>COUNTER</code>, or standard identity) fields, generated columns and secondary indexes. Tables can be altered after they are created: fields can be added, dropped, renamed and retyped.</dd>
 
   <dt>A query optimizer</dt>
-  <dd>Conditions are applied to each table before joining, inner joins are put in the cheapest order, <code>ORDER BY ... LIMIT</code> reads an index in order instead of sorting, and <code>COUNT(*)</code> costs nothing. <code>EXPLAIN</code> shows the plan with estimated and actual row counts. On a million-row table the right plan is often a thousand times faster than the wrong one, and there is nothing to tune.</dd>
+  <dd>Conditions are applied to each table before joining, inner joins are put in the cheapest order, <code>ORDER BY ... LIMIT</code> reads an index in order instead of sorting, and <code>COUNT(*)</code> costs nothing. <code>EXPLAIN</code> shows the plan with estimated and actual row counts. On a million-row table the right plan is often a thousand times faster than the wrong one, and there is no statistics job to run. <a href="#optimizer">The optimizer section</a> and the <a href="optimizer/README.md">optimizer reference</a> explain how it decides.</dd>
 
   <dt>Relationships</dt>
   <dd>Foreign keys on one or several fields, with <code>RESTRICT</code>, <code>CASCADE</code> or <code>SET NULL</code> for deletes and for key changes. They are checked once per statement, after all of its rows are in place, so rows can arrive in any order.</dd>
@@ -418,7 +419,7 @@ WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total &gt; 100)
 <p>Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, <code>WHERE</code> and <code>ORDER BY</code> of a query without <code>GROUP BY</code>, and in the <code>WHERE</code> and <code>SET</code> of <code>UPDATE</code> and <code>DELETE</code>.</p>
 
 <h3>Seeing the plan</h3>
-<p><code>EXPLAIN</code> in front of a query runs it and returns the plan instead of the rows: the join order chosen, the index used for each table, the number of rows each step was expected to produce and did, and whether a sort was needed. See <a href="sql/optimizer.md">the optimizer reference</a>.</p>
+<p><code>EXPLAIN</code> in front of a query runs it and returns the plan instead of the rows: the join order chosen, the index used for each table, the number of rows each step was expected to produce and did, and whether a sort was needed. See <a href="#optimizer">the optimizer chapter</a> and the <a href="optimizer/explain.md">EXPLAIN reference</a>.</p>
 <pre><code>EXPLAIN SELECT C.Name, L.Item
 FROM Line L JOIN Ord O ON O.ID = L.OrdID JOIN Cust C ON C.ID = O.CustID
 WHERE C.Name = 'c77';</code></pre>
@@ -875,16 +876,6 @@ fn main() -&gt; Result&lt;(), accessor_core::Error&gt; {
 
 <p>Values are a Rust enum with a variant for each type. Numbers carry the full numeric tower: <code>Int(i64)</code>, <code>Big(BigInt)</code>, <code>Dec(Decimal)</code> (a big integer mantissa and a scale), <code>Rational</code> (two big integers), and the two float types. Comparison, hashing and ordering are implemented once, across all of them, by exact value, and everything built on those (indexes, hash joins, <code>GROUP BY</code>, <code>DISTINCT</code>) inherits the same notion of equality.</p>
 
-<h3>The query optimizer</h3>
-<p>Between binding and execution, a <code>SELECT</code> passes through a small optimizer that changes how the query is run, never what it returns. It has no stored statistics to go stale. It reads what it needs from the tables as they are: the number of rows, and, for a condition an index can answer, the number of rows the index would visit, counted exactly up to a cap.</p>
-<ol>
-<li><strong>Pushdown.</strong> The <code>WHERE</code> and inner-join <code>ON</code> conditions are split into conjuncts and each is tagged with the set of tables it reads. A conjunct that reads one table moves into that table's scan, where it can pick an index and thin the rows before any join. Conjuncts that read several tables are applied at the first join where all of them are present. A conjunct is never pushed to the nullable side of an outer join, where doing so would turn a "no match" into a different answer.</li>
-<li><strong>Join order.</strong> When every join is inner or cross, the order is free. The optimizer estimates each table's size after its own conditions, starts from the smallest, and adds, one at a time, the table that gives the smallest intermediate result, ranking a unique-index lookup above an ordinary index above a hash above a cross product. The joined rows are built in that order and then rearranged to the column order of the query, so nothing downstream notices. Outer joins keep the order written.</li>
-<li><strong>Join method.</strong> An index on the joined table gives an index nested-loop join. Otherwise an equality join is hashed, and when an inner join's left side is much smaller than the right, the hash is built on the left and the right table is streamed through it.</li>
-<li><strong>Ordering and counting.</strong> An <code>ORDER BY ... LIMIT</code> whose columns an index holds in order, perhaps after an equality on its leading columns, reads that index in order and stops when it has enough rows; descending reads keep the tie order of a stable sort, so the answer is identical to sorting. A bare <code>COUNT(*)</code> is the table's row count.</li>
-</ol>
-<p><code>EXPLAIN</code> turns on a log that each of these decisions writes a line to, runs the query, and returns the log with the estimated and actual counts. The optimizer can be switched off (<code>.optimizer off</code>, <code>db.set_optimizer(false)</code>), which makes it easy to test: a differential test generates data, runs several dozen query shapes with and without it, and requires identical answers, including the order of rows with ties.</p>
-
 <h3>Execution</h3>
 <p>Rows are plain vectors of values and the executor works on whole result sets, a simple choice that suits an in-memory engine and keeps the code short. A few techniques carry most of the performance:</p>
 <ul>
@@ -918,6 +909,48 @@ fn main() -&gt; Result&lt;(), accessor_core::Error&gt; {
 
 <h3>Testing</h3>
 <p>About 180 automated tests run in a few seconds: unit tests for the number types, the date calendar and the pattern matcher; around 80 SQL tests covering each feature through the public API; 25 persistence tests that close, reopen, truncate and corrupt files, and replay logs; and tests that drive the desktop application headlessly, feeding it pointer events and reading back what it drew, so that transaction dialogs and the datasheet are exercised without a screen.</p>
+</section>
+
+<section id="optimizer">
+<h2>The query optimizer <a class="anchor" href="#optimizer" aria-label="Link to this section">#</a></h2>
+
+<p>A query says <em>what</em> rows you want; the optimizer decides <em>how</em> to get them. It chooses which table to read first, which index to use, where to apply each condition and whether a sort can be skipped, and it never changes the answer, only the time. It is on by default and needs no set-up: there are no statistics to gather and no hints to write, because it reads what it needs from the tables as they are when the query runs.</p>
+
+<h3>A worked example</h3>
+<p>Take three tables, a million rows in the biggest, and a query that mentions the big table first:</p>
+<pre><code>SELECT Count(*)
+FROM Line L
+JOIN Ord  O ON O.ID = L.OrdID
+JOIN Cust C ON C.ID = O.CustID
+WHERE C.Name = 'c77';</code></pre>
+<p>Run exactly as written, this scans every line, looks up each line's order, and only then asks whether the customer is the right one: about 2.6 seconds. The optimizer sees that <code>C.Name = 'c77'</code> leaves a single customer, so it starts there, finds that customer's orders through an index on <code>Ord.CustID</code>, and the orders' lines through an index on <code>Line.OrdID</code>. The answer takes 1.8 milliseconds. <code>EXPLAIN</code> in front of the query shows the choice:</p>
+<pre><code>query over L, O, C
+join order: C -&gt; O -&gt; L (reordered from the query's order)
+scan C [50 rows]: full scan (1 condition(s) pushed down)
+  -&gt; est 5 rows, actual 1
+join O: index nested-loop via ix_ord_cust (1 key column(s)); 1 rows in, 8 out ...
+join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out ...
+40 row(s) returned</code></pre>
+
+<h3>What it does</h3>
+<ol>
+<li><strong>Pushdown.</strong> The <code>WHERE</code> and inner-join <code>ON</code> conditions are split at <code>AND</code> and each piece is labelled with the tables it reads. A piece that reads one table is applied while that table is scanned, where it can also choose an index, so the join sees only rows that can matter. A piece that reads several is applied at the first join where all its tables are present. A condition is never pushed to the nullable side of an outer join: <code>WHERE Q.id IS NULL</code>, the way to find unmatched rows, tests the padding the join adds, and applying it to <code>Q</code> first would return every row.</li>
+<li><strong>Join order.</strong> Inner and cross joins can be done in any order, so the optimizer chooses. It estimates each table's rows after its own conditions, starts with the smallest, and adds, one at a time, the table that leaves the smallest intermediate result, ranking a unique-index lookup above an ordinary index, above a hash, above a cross product. Tables with no join condition go last. The rows are built in that order and then rearranged to the column order you wrote, so <code>SELECT *</code> is unaffected. Joins with a <code>LEFT</code>, <code>RIGHT</code> or <code>FULL</code> keep the order written.</li>
+<li><strong>Join method.</strong> An index on the joined table's join columns gives an index nested-loop join, one lookup per row. Otherwise an equality is hashed, building on the smaller side; a join with no equality is a nested loop.</li>
+<li><strong>Access paths.</strong> Each table is read through the best index for its conditions: a unique key with every column equated beats a prefix equality beats a range beats a scan. All the conditions are still tested on every row, so an index can only speed a query up.</li>
+<li><strong>Ordered reads.</strong> <code>ORDER BY ... LIMIT n</code> on one table, on plain columns an index holds in that order (perhaps after an equality on its leading columns), reads the index and stops after <em>n</em> qualifying rows, with no sort. Descending reads preserve the tie order of a stable sort, so the answer is identical.</li>
+<li><strong>Free counts.</strong> <code>SELECT COUNT(*) FROM t</code> with no condition is the table's row count: 0.02 ms over a million rows against 260 ms when scanned.</li>
+</ol>
+
+<h3>Estimates without statistics</h3>
+<p>The optimizer's guesses are cheap and stateless. A table's size is known exactly. For a condition an index can answer, the estimate is the exact number of index entries it would visit, counted up to 4,096 (past that, a tenth of the table for an equality and a third for a range). A unique key is exactly one row. Conditions no index answers each keep a fixed fraction: 0.1 for an equality, 0.33 for a comparison, 0.25 for <code>BETWEEN</code> and <code>LIKE</code>, and so on. A join on an equality is guessed to return as many rows as the larger input unless a unique index limits it to one match per row. Nothing is stored, so there is nothing to go stale after a bulk load. The price is that estimates for unindexed conditions are crude; an index on the filtered column makes the estimate exact, and <code>EXPLAIN</code> prints the estimate beside the real count so that a poor guess is easy to see.</p>
+
+<h3>EXPLAIN</h3>
+<p><code>EXPLAIN</code> (or <code>EXPLAIN QUERY PLAN</code>) in front of a <code>SELECT</code> runs the query, read-only, and returns instead of its rows one line of text per step: the tables, the join order, each scan's access path and condition count, the estimated and actual rows, each join's method and the rows in and out, and any sort or shortcut. Sub-queries, derived tables and common table expressions appear indented. In the shell the lines are printed in full; in the desktop app they fill the result grid; from Rust, <code>db.query("EXPLAIN ...")</code> returns a one-column result.</p>
+
+<h3>Switching it off, and its limits</h3>
+<p><code>.optimizer off</code> in the shell, or <code>db.set_optimizer(false)</code>, runs queries exactly as written: joins in the written order, conditions applied after the joins, no ordered index reads or count shortcut. The answers are the same, only slower, which is how it is tested: a test builds data with NULLs, ties and several index shapes, runs nearly forty query shapes with the optimizer on and off, and requires identical answers and identical row order.</p>
+<p>It has limits. Outer joins are not reordered; more than 63 tables in a <code>FROM</code> are joined as written; sub-queries, views and common table expressions are planned on their own, so a condition on a derived table is not pushed inside it; the join search is greedy, not exhaustive; and plans are not cached. The usual cure for a slow query is an index on the filtered or joined column, then a look at the plan. The <a href="optimizer/tuning.md">tuning guide</a> lists the symptoms and remedies, and the rest of the <a href="optimizer/README.md">optimizer reference</a> goes into each decision in detail.</p>
 </section>
 
 <section id="performance">
@@ -981,6 +1014,7 @@ fn main() -&gt; Result&lt;(), accessor_core::Error&gt; {
 <li><a href="sql/README.md">sql/</a>: every statement, the complete BNF grammar, expressions, and the comparison with standard SQL.</li>
 <li><a href="functions/README.md">functions/</a>: every built-in function, with its arguments, result and examples.</li>
 <li><a href="types/README.md">types/</a>: each column type, how types convert, and how they combine in arithmetic.</li>
+<li><a href="optimizer/README.md">optimizer/</a>: pushdown, join order, access paths, row estimates, <code>EXPLAIN</code> and tuning.</li>
 </ul>
 
 <h3>Cheat sheet</h3>

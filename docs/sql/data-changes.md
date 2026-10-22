@@ -1,6 +1,6 @@
 # INSERT, UPDATE, DELETE, MERGE and TRUNCATE
 
-Every data statement is atomic: if it fails part-way, none of its changes remain. This holds with or without an explicit [transaction](transactions.md). Constraints (types, `NOT NULL`, keys, unique indexes, `CHECK`) are applied as rows are written; [foreign keys](ddl.md#foreign-keys) are checked once at the end of the statement against its final state, so rows may be inserted in any order within one statement. [Triggers](triggers.md) fire for each row.
+Every data statement is atomic: if it fails part-way, none of its changes remain. This holds with or without an explicit [transaction](transactions.md). Constraints (types, `NOT NULL`, keys, unique indexes, `CHECK`) are applied as rows are written; [foreign keys](ddl.md#foreign-keys) are checked once at the end of the statement against its final state, so rows may be inserted in any order within one statement. [Triggers](queries-and-triggers.md#triggers) fire for each row.
 
 A data statement returns the number of rows it changed.
 
