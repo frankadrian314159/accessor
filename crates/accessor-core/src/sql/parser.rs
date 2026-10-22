@@ -260,14 +260,29 @@ impl<'a> Parser<'a> {
             return Ok(Statement::Begin);
         }
         if self.eat_kw("COMMIT") {
-            self.eat_kw("TRANSACTION");
+            if !self.eat_kw("TRANSACTION") {
+                self.eat_kw("WORK");
+            }
             return Ok(Statement::Commit);
         }
         if self.eat_kw("ROLLBACK") {
-            self.eat_kw("TRANSACTION");
+            if !self.eat_kw("TRANSACTION") {
+                self.eat_kw("WORK");
+            }
+            if self.eat_kw("TO") {
+                self.eat_kw("SAVEPOINT");
+                return Ok(Statement::RollbackTo(self.ident()?));
+            }
             return Ok(Statement::Rollback);
         }
-        Err(self.unexpected("a statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, EXEC, BEGIN, COMMIT, ROLLBACK)"))
+        if self.eat_kw("SAVEPOINT") {
+            return Ok(Statement::Savepoint(self.ident()?));
+        }
+        if self.eat_kw("RELEASE") {
+            self.eat_kw("SAVEPOINT");
+            return Ok(Statement::ReleaseSavepoint(self.ident()?));
+        }
+        Err(self.unexpected("a statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, EXEC, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE)"))
     }
 
     fn insert(&mut self) -> Result<Statement> {

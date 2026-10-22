@@ -70,6 +70,9 @@ impl Database {
             Statement::Begin => self.begin().map(|_| QueryResult::default()),
             Statement::Commit => self.commit().map(|_| QueryResult::default()),
             Statement::Rollback => self.rollback().map(|_| QueryResult::default()),
+            Statement::Savepoint(name) => self.savepoint(name).map(|_| QueryResult::default()),
+            Statement::ReleaseSavepoint(name) => self.release(name).map(|_| QueryResult::default()),
+            Statement::RollbackTo(name) => self.rollback_to(name).map(|_| QueryResult::default()),
         }
     }
 }

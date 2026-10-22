@@ -219,9 +219,11 @@ fn transactions() {
 
     db.execute("BEGIN; INSERT INTO Customers (Name) VALUES ('T'); COMMIT").unwrap();
     assert_eq!(db.table("Customers").unwrap().len(), 5);
+    // Schema changes take part too.
     db.execute("BEGIN").unwrap();
-    assert!(db.execute("CREATE TABLE z (a INTEGER)").is_err());
+    db.execute("CREATE TABLE z (a INTEGER)").unwrap();
     db.execute("ROLLBACK").unwrap();
+    assert!(db.table("z").is_none());
 }
 
 #[test]
@@ -1359,4 +1361,228 @@ fn calculated_fields_have_typed_results() {
     db.execute("UPDATE T SET a = 6").unwrap();
     assert_eq!(typed(&db, "SELECT total FROM T"), "CURRENCY $119.94");
     assert_eq!(typed(&db, "SELECT share FROM T"), "RATIONAL 1/6");
+}
+
+// ----- transactions -----------------------------------------------------------------------
+
+/// Everything observable about the database: every table's schema and rows, saved
+/// queries and triggers. Two equal fingerprints mean nothing has changed.
+fn fingerprint(db: &Database) -> String {
+    let mut out = String::new();
+    for name in db.table_names() {
+        let t = db.table(name).unwrap();
+        out.push_str(&format!("{:?}\n", t.schema()));
+        let mut rows: Vec<String> = t.iter().map(|(id, r)| format!("{id}:{r:?}")).collect();
+        rows.sort();
+        out.push_str(&rows.join("\n"));
+        out.push('\n');
+    }
+    for v in db.view_names() {
+        out.push_str(&format!("view {v} = {}\n", db.view_sql(v).unwrap()));
+    }
+    for t in db.trigger_names() {
+        out.push_str(&format!("trigger {t} = {}\n", db.trigger_sql(t).unwrap()));
+    }
+    out
+}
+
+fn shop() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Customer (ID COUNTER PRIMARY KEY, Name TEXT NOT NULL);
+         CREATE TABLE Orders (ID COUNTER PRIMARY KEY, CustID INTEGER REFERENCES Customer (ID) ON DELETE CASCADE,
+                              Qty INTEGER, Price CURRENCY, Total CALCULATED AS (Qty * Price));
+         CREATE TABLE Log (Msg TEXT);
+         CREATE VIEW Big AS SELECT * FROM Orders WHERE Qty > 5;
+         CREATE TRIGGER order_added AFTER INSERT ON Orders BEGIN INSERT INTO Log VALUES ('order ' & NEW.ID); END;
+         INSERT INTO Customer (Name) VALUES ('Ada'), ('Grace');
+         INSERT INTO Orders (CustID, Qty, Price) VALUES (1, 3, 2.5), (1, 9, 1), (2, 7, 4)",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn rollback_undoes_row_changes_of_every_kind() {
+    let mut db = shop();
+    let before = fingerprint(&db);
+    db.begin().unwrap();
+    assert!(db.in_transaction());
+    db.execute("INSERT INTO Customer (Name) VALUES ('Linus')").unwrap(); // and the trigger's own insert
+    db.execute("INSERT INTO Orders (CustID, Qty, Price) VALUES (3, 1, 1)").unwrap();
+    db.execute("UPDATE Orders SET Qty = Qty + 1").unwrap(); // recomputes the calculated field
+    db.execute("DELETE FROM Customer WHERE ID = 1").unwrap(); // cascades into Orders
+    assert_eq!(count(&db, "SELECT Count(*) FROM Orders"), "2");
+    assert!(db.pending_changes() > 0);
+    db.rollback().unwrap();
+    assert!(!db.in_transaction());
+    assert_eq!(db.pending_changes(), 0);
+    assert_eq!(fingerprint(&db), before);
+}
+
+#[test]
+fn rollback_undoes_schema_changes_of_every_kind() {
+    let mut db = shop();
+    let before = fingerprint(&db);
+    db.begin().unwrap();
+    db.execute("CREATE TABLE Extra (a INTEGER PRIMARY KEY, b TEXT)").unwrap();
+    db.execute("INSERT INTO Extra VALUES (1, 'x')").unwrap();
+    db.execute("CREATE INDEX by_qty ON Orders (Qty)").unwrap();
+    db.execute("ALTER TABLE Orders ADD COLUMN Note TEXT").unwrap();
+    db.execute("ALTER TABLE Orders ADD COLUMN Tax CALCULATED AS (Total / 10)").unwrap();
+    db.execute("ALTER TABLE Orders ALTER COLUMN Note CALCULATED AS ('n' & Qty)").unwrap();
+    db.execute("ALTER TABLE Orders ALTER COLUMN Qty DECIMAL").unwrap_err(); // refused: Total uses it
+    db.execute("ALTER TABLE Orders RENAME COLUMN Price TO Cost").unwrap_err(); // refused: Total uses it
+    db.execute("ALTER TABLE Orders DROP COLUMN Tax").unwrap();
+    db.execute("ALTER TABLE Orders DROP CONSTRAINT fk_Orders_CustID").unwrap();
+    db.execute("ALTER TABLE Orders ADD FOREIGN KEY (Qty) REFERENCES Extra (a)").unwrap_err(); // 3, 9, 7 have no match
+    db.execute("CREATE VIEW Small AS SELECT * FROM Orders WHERE Qty < 5").unwrap();
+    db.execute("DROP VIEW Big").unwrap();
+    db.execute("CREATE TRIGGER extra_added AFTER INSERT ON Extra BEGIN INSERT INTO Log VALUES ('extra'); END").unwrap();
+    db.execute("DROP TRIGGER order_added").unwrap();
+    db.execute("DROP TABLE Log").unwrap();
+    db.execute("DROP TABLE Orders").unwrap();
+    db.execute("CREATE TABLE Orders (just_this INTEGER)").unwrap();
+    assert_ne!(fingerprint(&db), before);
+    db.rollback().unwrap();
+    assert_eq!(fingerprint(&db), before);
+    // The restored database works: triggers fire, calculated fields follow, relationships hold.
+    db.execute("INSERT INTO Orders (CustID, Qty, Price) VALUES (2, 2, 3)").unwrap();
+    assert_eq!(count(&db, "SELECT Msg FROM Log ORDER BY Msg DESC LIMIT 1"), "order 4");
+    assert_eq!(count(&db, "SELECT Total FROM Orders WHERE ID = 4"), "$6.00");
+    assert!(db.execute("INSERT INTO Orders (CustID) VALUES (99)").is_err());
+    assert_eq!(count(&db, "SELECT Count(*) FROM Big"), "2");
+}
+
+#[test]
+fn rows_and_schema_interleave_correctly_on_rollback() {
+    let mut db = shop();
+    let before = fingerprint(&db);
+    db.begin().unwrap();
+    db.execute("INSERT INTO Orders (CustID, Qty, Price) VALUES (1, 4, 1)").unwrap();
+    db.execute("ALTER TABLE Orders ADD COLUMN Flag YESNO").unwrap();
+    db.execute("INSERT INTO Orders (CustID, Qty, Price, Flag) VALUES (1, 5, 1, Yes)").unwrap();
+    db.execute("ALTER TABLE Orders DROP COLUMN Flag").unwrap();
+    db.execute("DELETE FROM Orders WHERE Qty = 4").unwrap();
+    db.rollback().unwrap();
+    assert_eq!(fingerprint(&db), before);
+
+    // And committed, the same sequence leaves the combined result.
+    db.begin().unwrap();
+    db.execute("INSERT INTO Orders (CustID, Qty, Price) VALUES (1, 4, 1)").unwrap();
+    db.execute("ALTER TABLE Orders ADD COLUMN Flag YESNO DEFAULT Yes").unwrap();
+    db.execute("INSERT INTO Orders (CustID, Qty, Price, Flag) VALUES (1, 5, 1, No)").unwrap();
+    db.commit().unwrap();
+    assert_eq!(count(&db, "SELECT Count(*) FROM Orders WHERE Flag"), "4"); // the 3 old rows and the one before the ALTER
+    assert_eq!(count(&db, "SELECT Count(*) FROM Orders"), "5");
+}
+
+#[test]
+fn a_failed_statement_leaves_the_transaction_open() {
+    let mut db = shop();
+    db.begin().unwrap();
+    db.execute("INSERT INTO Customer (Name) VALUES ('Linus')").unwrap();
+    assert!(db.execute("INSERT INTO Customer (Name) VALUES (NULL)").is_err()); // NOT NULL
+    assert!(db.execute("INSERT INTO Customer (Name) VALUES ('a'), (NULL)").is_err()); // second row fails the first too
+    assert!(db.execute("INSERT INTO Orders (CustID) VALUES (99)").is_err()); // no such customer
+    assert!(db.execute("ALTER TABLE Customer ADD COLUMN x INTEGER NOT NULL").is_err());
+    assert!(db.execute("CREATE TABLE Customer (a INTEGER)").is_err()); // exists
+    assert!(db.in_transaction());
+    assert_eq!(count(&db, "SELECT Count(*) FROM Customer"), "3"); // only the first insert is there
+    db.commit().unwrap();
+    assert_eq!(count(&db, "SELECT Count(*) FROM Customer"), "3");
+    assert!(db.commit().is_err());
+    assert!(db.rollback().is_err());
+}
+
+#[test]
+fn transactions_do_not_nest_and_block_file_maintenance() {
+    let mut db = shop();
+    db.execute("BEGIN").unwrap();
+    assert!(db.execute("BEGIN").is_err());
+    assert!(db.checkpoint().is_err());
+    assert!(db.compact().is_err());
+    db.execute("COMMIT TRANSACTION").unwrap();
+    db.execute("BEGIN TRANSACTION").unwrap();
+    db.execute("ROLLBACK WORK").unwrap();
+    assert!(db.execute("SAVEPOINT s").is_err(), "savepoints need a transaction");
+    assert!(db.execute("ROLLBACK TO s").is_err());
+    assert!(db.execute("RELEASE s").is_err());
+}
+
+#[test]
+fn savepoints_return_to_a_point_inside_a_transaction() {
+    let mut db = shop();
+    let at_start = fingerprint(&db);
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO Customer (Name) VALUES ('one')").unwrap();
+    db.execute("SAVEPOINT a").unwrap();
+    let at_a = fingerprint(&db);
+    db.execute("INSERT INTO Customer (Name) VALUES ('two')").unwrap();
+    db.execute("ALTER TABLE Customer ADD COLUMN Note TEXT").unwrap();
+    db.execute("SAVEPOINT b").unwrap();
+    db.execute("DELETE FROM Customer WHERE Name = 'one'").unwrap();
+    db.execute("DROP VIEW Big").unwrap();
+
+    db.execute("ROLLBACK TO b").unwrap();
+    assert_eq!(count(&db, "SELECT Count(*) FROM Customer"), "4");
+    assert_eq!(db.view_names().len(), 1);
+    db.execute("ROLLBACK TO SAVEPOINT a").unwrap(); // b is gone now
+    assert_eq!(fingerprint(&db), at_a);
+    assert!(db.execute("ROLLBACK TO b").is_err());
+    // The savepoint survives being returned to.
+    db.execute("INSERT INTO Customer (Name) VALUES ('three')").unwrap();
+    db.execute("ROLLBACK TO a").unwrap();
+    assert_eq!(fingerprint(&db), at_a);
+
+    // Releasing keeps the changes but forgets the point.
+    db.execute("INSERT INTO Customer (Name) VALUES ('four')").unwrap();
+    db.execute("RELEASE SAVEPOINT a").unwrap();
+    assert!(db.execute("ROLLBACK TO a").is_err());
+    assert_eq!(count(&db, "SELECT Count(*) FROM Customer"), "4");
+
+    // A reused name refers to the newest one; the whole transaction can still be abandoned.
+    db.execute("SAVEPOINT x").unwrap();
+    db.execute("INSERT INTO Customer (Name) VALUES ('five')").unwrap();
+    db.execute("SAVEPOINT x").unwrap();
+    db.execute("INSERT INTO Customer (Name) VALUES ('six')").unwrap();
+    db.execute("ROLLBACK TO x").unwrap();
+    assert_eq!(count(&db, "SELECT Count(*) FROM Customer"), "5"); // 'five' stays
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(fingerprint(&db), at_start);
+}
+
+#[test]
+fn the_transaction_helper_commits_or_rolls_back() {
+    let mut db = shop();
+    let before = fingerprint(&db);
+    // Ok: committed, and the value comes back.
+    let n = db
+        .transaction(|db| {
+            db.execute("INSERT INTO Customer (Name) VALUES ('Linus')")?;
+            Ok(db.table("Customer").unwrap().len())
+        })
+        .unwrap();
+    assert_eq!(n, 3);
+    assert!(!db.in_transaction());
+    assert_eq!(count(&db, "SELECT Count(*) FROM Customer"), "3");
+    // Err: everything it did is undone, and the error is returned.
+    let after_commit = fingerprint(&db);
+    let err = db
+        .transaction(|db| {
+            db.execute("INSERT INTO Customer (Name) VALUES ('Tim')")?;
+            db.execute("ALTER TABLE Customer ADD COLUMN x INTEGER")?;
+            db.execute("INSERT INTO Customer (Name) VALUES (NULL)")?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("Null"), "{err}");
+    assert!(!db.in_transaction());
+    assert_eq!(fingerprint(&db), after_commit);
+    assert_ne!(before, after_commit);
+    // It cannot be started inside another transaction.
+    db.begin().unwrap();
+    assert!(db.transaction(|_| Ok(())).is_err());
+    assert!(db.in_transaction(), "the outer transaction is untouched");
+    db.rollback().unwrap();
 }

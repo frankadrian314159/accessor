@@ -615,3 +615,143 @@ fn opens_files_from_the_number_build() {
     let amounts: Vec<String> = db.query("SELECT amount FROM t ORDER BY id").unwrap().rows.iter().map(|r| r[0].to_string()).collect();
     assert_eq!(amounts, ["42", "2.5"]);
 }
+
+// ----- transactions and durability --------------------------------------------------------
+
+fn tx_schema(db: &mut Database) {
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'base')").unwrap();
+    db.checkpoint().unwrap();
+}
+
+#[test]
+fn a_committed_transaction_survives_a_crash_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        tx_schema(&mut db);
+        db.begin().unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'in tx')").unwrap();
+        db.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 7").unwrap();
+        db.execute("CREATE TABLE made (a INTEGER)").unwrap();
+        db.execute("INSERT INTO made VALUES (1)").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        db.commit().unwrap();
+        std::mem::forget(db); // crash: the transaction exists only in the log
+    }
+    let db = Database::open(&path).unwrap();
+    let rows: Vec<String> = db.query("SELECT id, v, extra FROM t").unwrap().rows[0].iter().map(ToString::to_string).collect();
+    assert_eq!(rows, ["2", "in tx", "7"]);
+    assert_eq!(count(&db, "t"), 1);
+    assert_eq!(count(&db, "made"), 1);
+}
+
+#[test]
+fn an_uncommitted_or_rolled_back_transaction_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        tx_schema(&mut db);
+        db.begin().unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'rolled back')").unwrap();
+        db.execute("CREATE TABLE gone (a INTEGER)").unwrap();
+        db.rollback().unwrap();
+        db.begin().unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'never committed')").unwrap();
+        db.execute("DROP TABLE t").unwrap();
+        std::mem::forget(db); // crash with the transaction still open
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "t"), 1);
+    assert!(db.table("gone").is_none());
+    assert_eq!(db.query("SELECT v FROM t").unwrap().rows[0][0].to_string(), "base");
+}
+
+#[test]
+fn dropping_the_database_with_an_open_transaction_rolls_it_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        tx_schema(&mut db);
+        db.begin().unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'abandoned')").unwrap();
+        db.execute("ALTER TABLE t ADD COLUMN x INTEGER").unwrap();
+        assert_eq!(db.pending_changes(), 2);
+    } // dropped with the transaction open
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "t"), 1);
+    assert_eq!(db.table("t").unwrap().schema().columns.len(), 2);
+}
+
+#[test]
+fn savepoints_rolled_back_before_commit_never_reach_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        tx_schema(&mut db);
+        db.begin().unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'kept')").unwrap();
+        db.savepoint("sp").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'undone')").unwrap();
+        db.execute("CREATE TABLE undone (a INTEGER)").unwrap();
+        db.execute("UPDATE t SET v = 'changed' WHERE id = 1").unwrap();
+        db.rollback_to("sp").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'after')").unwrap();
+        db.release("sp").unwrap();
+        db.commit().unwrap();
+        std::mem::forget(db);
+    }
+    let db = Database::open(&path).unwrap();
+    let rows: Vec<String> = db.query("SELECT v FROM t ORDER BY id").unwrap().rows.iter().map(|r| r[0].to_string()).collect();
+    assert_eq!(rows, ["base", "kept", "after"]);
+    assert!(db.table("undone").is_none());
+}
+
+#[test]
+fn a_torn_commit_loses_the_whole_transaction_never_part_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.set_durability(Durability::OsBuffered);
+        tx_schema(&mut db);
+        db.execute("INSERT INTO t VALUES (2, 'before')").unwrap();
+        db.begin().unwrap();
+        for i in 10..20 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'tx')")).unwrap();
+        }
+        db.execute("CREATE TABLE late (a INTEGER)").unwrap();
+        db.commit().unwrap();
+        std::mem::forget(db);
+    }
+    // Power fails while the commit record is being written: its tail is lost.
+    let wal = wal_path(&path);
+    let len = std::fs::metadata(&wal).unwrap().len();
+    OpenOptions::new().write(true).open(&wal).unwrap().set_len(len - 5).unwrap();
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "t"), 2, "none of the ten rows, and the work before the transaction is intact");
+    assert!(db.table("late").is_none());
+}
+
+#[test]
+fn a_transaction_can_span_a_large_amount_of_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tx.adb");
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+    db.transaction(|db| {
+        for i in 0..5_000 {
+            db.execute(&format!("INSERT INTO big VALUES ({i}, {})", i * 2))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    std::mem::forget(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "big"), 5_000);
+    assert_eq!(db.query("SELECT Sum(n) FROM big").unwrap().rows[0][0].to_string(), "24995000");
+}

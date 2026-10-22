@@ -203,4 +203,7 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackTo(String),
 }

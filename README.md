@@ -12,8 +12,11 @@ datasheets for working with records directly.
 ## What it can do
 
 - **SQL**: joins (including Access-style nested joins), grouping and `HAVING`,
-  subqueries, `TOP` / `LIMIT`, transactions, `CREATE` / `ALTER` / `DROP`
-  for tables, indexes and queries, and `CSV` import and export.
+  subqueries, `TOP` / `LIMIT`, `CREATE` / `ALTER` / `DROP` for tables,
+  indexes and queries, and CSV import and export.
+- **Transactions**: `BEGIN`, `COMMIT`, `ROLLBACK` and savepoints, covering schema
+  changes as well as rows. Everything in a transaction becomes permanent together
+  or not at all, including after a crash (see below).
 - **Relationships**: foreign keys with `RESTRICT`, `CASCADE` or `SET NULL` on
   delete and on key change, checked as a whole statement so rows can arrive in
   any order.
@@ -56,6 +59,10 @@ Statements end with `;`. Dot-commands: `.tables`, `.queries`, `.schema [TABLE]`,
 `.indexes TABLE`, `.import FILE TABLE`, `.import --new FILE TABLE`,
 `.export FILE SQL`, `.read FILE`, `.sync on|off`, `.timer on|off`,
 `.checkpoint`, `.compact`, `.help`, `.quit`.
+
+The prompt shows `accessor*>` while a transaction is open. A transaction still open
+when the shell ends is rolled back, with a warning; a `-c` or `-f` script that ends
+that way exits with a failure status.
 
 ### As a library
 
@@ -103,6 +110,56 @@ END;
 Text is joined with a single `&` (or the standard `||`). `RAISE 'message'` inside
 a trigger refuses the statement, and everything the trigger and any cascades did
 is undone with it.
+
+## Transactions
+
+```sql
+BEGIN;
+INSERT INTO Artist (Name) VALUES ('Rush');
+SAVEPOINT before_albums;
+INSERT INTO Album (Name, Year, Artist_ID) VALUES ('Moving Pictures', 1981, 3);
+ALTER TABLE Album ADD COLUMN Label TEXT;
+ROLLBACK TO before_albums;      -- the album and the new column are gone; Rush stays
+COMMIT;                         -- ...and now Rush is permanent
+```
+
+- **All or nothing.** `BEGIN` starts a transaction. `COMMIT` makes every change since then
+  permanent as a single record in the write-ahead log, so after a crash you find either
+  all of it or none of it, never part. `ROLLBACK` takes everything back.
+- **Schema changes take part.** Creating, altering and dropping tables, fields,
+  indexes, relationships, saved queries and triggers can all be rolled back, along with
+  the cascades, triggers and calculated fields that rows set off. `DROP TABLE`
+  followed by `ROLLBACK` brings the table back with its data.
+- **A failed statement undoes only itself.** An error inside a transaction (a constraint,
+  a bad value) cancels that one statement; the transaction stays open and you can go on or
+  roll back.
+- **Savepoints.** `SAVEPOINT name`, `ROLLBACK TO [SAVEPOINT] name` (keeps the savepoint,
+  discards later ones) and `RELEASE [SAVEPOINT] name` (keeps the changes, forgets the
+  point). Reusing a name hides the earlier savepoint of that name.
+- **No nesting**: `BEGIN` inside a transaction is an error (use savepoints). `.checkpoint`
+  and "compact and repair" are refused while a transaction is open.
+- **Nothing is lost by accident.** A database closed or dropped with a transaction open
+  rolls it back. The desktop app shows an open transaction in its status bar (with
+  *Commit* and *Roll back* buttons, and a *Transaction* menu), and asks before you close the
+  window or open another database; the shell warns when it discards one.
+
+From Rust:
+
+```rust
+// Committed if the closure returns Ok, rolled back if it returns an error.
+db.transaction(|db| {
+    db.execute("INSERT INTO Customers (Name) VALUES ('Ada')")?;
+    db.execute("UPDATE Accounts SET Balance = Balance - 10 WHERE ID = 1")?;
+    Ok(())
+})?;
+
+// Or by hand:
+db.begin()?;
+db.savepoint("before_risky_part")?;
+// ...
+db.rollback_to("before_risky_part")?;   // also: db.release(..), db.commit()?, db.rollback()?
+db.commit()?;
+```
 
 ## Numbers
 

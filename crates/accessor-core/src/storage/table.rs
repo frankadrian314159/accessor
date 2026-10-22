@@ -10,7 +10,7 @@ use crate::value::{DataType, Row, Value};
 
 pub type RowId = u32;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Index {
     def: IndexDef,
     tree: BTreeSet<(Vec<Value>, RowId)>,
@@ -34,7 +34,7 @@ impl Index {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Table {
     schema: TableSchema,
     rows: Vec<Option<Row>>,

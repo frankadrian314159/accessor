@@ -64,6 +64,14 @@ enum Confirm {
     DropTable(String),
     DropQuery(String),
     DropTrigger(String),
+    /// A transaction is open and the user asked for something that would discard it.
+    Transaction(Deferred),
+}
+
+/// What to do once the open transaction has been committed or rolled back.
+enum Deferred {
+    Open(PathBuf),
+    Exit,
 }
 
 pub struct App {
@@ -80,11 +88,16 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<String>) -> Self {
+        Self::with_context(&cc.egui_ctx, path)
+    }
+
+    /// Builds the application for an egui context; split from `new` so tests need no window.
+    fn with_context(ctx: &egui::Context, path: Option<String>) -> Self {
         let mut visuals = egui::Visuals::light();
         visuals.selection.bg_fill = ACCENT;
         visuals.selection.stroke.color = Color32::WHITE;
         visuals.hyperlink_color = ACCENT;
-        cc.egui_ctx.set_visuals(visuals);
+        ctx.set_visuals(visuals);
 
         let mut app = App {
             db: Database::in_memory(),
@@ -101,6 +114,56 @@ impl App {
             app.open_db(PathBuf::from(p));
         }
         app
+    }
+
+    /// Opens `path`, first asking what to do with a transaction that is still open.
+    fn start_open(&mut self, path: PathBuf) {
+        if self.db.in_transaction() {
+            self.confirm = Some(Confirm::Transaction(Deferred::Open(path)));
+        } else {
+            self.open_db(path);
+        }
+    }
+
+    fn begin_tx(&mut self) {
+        match self.db.begin() {
+            Ok(()) => {
+                self.status = "Transaction started: nothing is permanent until you commit".into();
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+
+    fn commit_tx(&mut self) -> bool {
+        let n = self.db.pending_changes();
+        match self.db.commit() {
+            Ok(()) => {
+                self.status = format!("Transaction committed ({n} change(s) made permanent)");
+                self.error = None;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    fn rollback_tx(&mut self) -> bool {
+        let n = self.db.pending_changes();
+        match self.db.rollback() {
+            Ok(()) => {
+                self.status = format!("Transaction rolled back ({n} change(s) undone)");
+                self.error = None;
+                self.tabs.iter_mut().for_each(Tab::mark_dirty);
+                true
+            }
+            Err(e) => {
+                self.error = Some(e.to_string());
+                false
+            }
+        }
     }
 
     fn open_db(&mut self, path: PathBuf) {
@@ -206,13 +269,13 @@ impl App {
                             .set_file_name("Database1.adb")
                             .save_file()
                         {
-                            self.open_db(p);
+                            self.start_open(p);
                         }
                     }
                     if ui.button("Open...").clicked() {
                         ui.close();
                         if let Some(p) = rfd::FileDialog::new().add_filter("Accessor database", &["adb"]).pick_file() {
-                            self.open_db(p);
+                            self.start_open(p);
                         }
                     }
                     ui.separator();
@@ -267,6 +330,24 @@ BEGIN
 END";
                         self.open_tab(Tab::Query(QueryTab::new(None, sql.to_string())));
                     }
+                });
+                ui.menu_button("Transaction", |ui| {
+                    let open = self.db.in_transaction();
+                    if ui.add_enabled(!open, egui::Button::new("Begin")).clicked() {
+                        ui.close();
+                        self.begin_tx();
+                    }
+                    if ui.add_enabled(open, egui::Button::new("Commit")).clicked() {
+                        ui.close();
+                        self.commit_tx();
+                    }
+                    if ui.add_enabled(open, egui::Button::new("Roll back")).clicked() {
+                        ui.close();
+                        self.rollback_tx();
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Changes made while a transaction is open
+are kept or discarded together.").weak());
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("About").clicked() {
@@ -409,11 +490,53 @@ END";
             }
         }
 
-        if let Some(c) = &self.confirm {
+        if matches!(self.confirm, Some(Confirm::Transaction(_))) {
+            #[derive(Clone, Copy)]
+            enum Choice {
+                Commit,
+                RollBack,
+                Cancel,
+            }
+            let n = self.db.pending_changes();
+            let mut choice = None;
+            egui::Window::new("Transaction in progress").collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(format!("A transaction is open with {n} change(s) that are not permanent yet."));
+                ui.label("Commit keeps them; Roll back discards them.");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Commit").clicked() {
+                        choice = Some(Choice::Commit);
+                    }
+                    if ui.button("Roll back").clicked() {
+                        choice = Some(Choice::RollBack);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(Choice::Cancel);
+                    }
+                });
+            });
+            if let Some(choice) = choice {
+                let Some(Confirm::Transaction(next)) = self.confirm.take() else { return };
+                let finished = match choice {
+                    Choice::Commit => self.commit_tx(),
+                    Choice::RollBack => self.rollback_tx(),
+                    Choice::Cancel => false,
+                };
+                if finished {
+                    match next {
+                        Deferred::Open(path) => self.open_db(path),
+                        Deferred::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    }
+                }
+            }
+        }
+
+        if let Some(c) = self.confirm.as_ref().filter(|c| !matches!(c, Confirm::Transaction(_))) {
             let (what, name) = match c {
                 Confirm::DropTable(n) => ("table", n.clone()),
                 Confirm::DropQuery(n) => ("query", n.clone()),
                 Confirm::DropTrigger(n) => ("trigger", n.clone()),
+                Confirm::Transaction(_) => unreachable!("filtered out above"),
             };
             let mut decision: Option<bool> = None;
             egui::Window::new("Confirm delete").collapsible(false).resizable(false).show(ctx, |ui| {
@@ -433,7 +556,7 @@ END";
                         Some(Confirm::DropTable(n)) => format!("DROP TABLE {}", bracket(&n)),
                         Some(Confirm::DropQuery(n)) => format!("DROP VIEW {}", bracket(&n)),
                         Some(Confirm::DropTrigger(n)) => format!("DROP TRIGGER {}", bracket(&n)),
-                        None => String::new(),
+                        Some(Confirm::Transaction(_)) | None => String::new(),
                     };
                     self.tabs.retain(|t| !t.references(&name));
                     self.active = self.active.min(self.tabs.len().saturating_sub(1));
@@ -457,6 +580,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut ev: Vec<Event> = Vec::new();
 
+        // Closing the window must not silently throw a transaction away.
+        if ctx.input(|i| i.viewport().close_requested()) && self.db.in_transaction() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Transaction(Deferred::Exit));
+        }
+
         self.menu(ctx);
         self.nav_pane(ctx, &mut ev);
 
@@ -468,6 +597,21 @@ impl eframe::App for App {
                 };
                 ui.separator();
                 ui.label(&self.status);
+                // A transaction in progress is always visible, with a way to end it.
+                if self.db.in_transaction() {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("Transaction open: {} change(s)", self.db.pending_changes()))
+                            .strong()
+                            .color(ACCENT),
+                    );
+                    if ui.small_button("Commit").clicked() {
+                        self.commit_tx();
+                    }
+                    if ui.small_button("Roll back").clicked() {
+                        self.rollback_tx();
+                    }
+                }
             });
         });
 
@@ -525,5 +669,228 @@ impl eframe::App for App {
                 Event::OpenQuery { name, sql } => self.open_tab(Tab::Query(QueryTab::new(name, sql))),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App as _;
+
+    struct Harness {
+        ctx: egui::Context,
+        app: App,
+        frame: eframe::Frame,
+        time: f64,
+        texts: Vec<(egui::Pos2, String)>,
+        commands: Vec<egui::ViewportCommand>,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let app = App::with_context(&ctx, None);
+            let mut h = Harness {
+                ctx,
+                app,
+                frame: eframe::Frame::_new_kittest(),
+                time: 1.0,
+                texts: vec![],
+                commands: vec![],
+            };
+            h.settle();
+            h
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>, close_requested: bool) {
+            self.time += 0.016;
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 700.0))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            if close_requested {
+                let info = egui::ViewportInfo { events: vec![egui::ViewportEvent::Close], ..Default::default() };
+                input.viewports.insert(egui::ViewportId::ROOT, info);
+            }
+            let (app, frame) = (&mut self.app, &mut self.frame);
+            let out = self.ctx.run(input, |ctx| app.update(ctx, frame));
+            fn collect(s: &egui::epaint::Shape, out: &mut Vec<(egui::Pos2, String)>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => out.push((t.pos, t.galley.text().to_string())),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|x| collect(x, out)),
+                    _ => {}
+                }
+            }
+            self.texts.clear();
+            out.shapes.iter().for_each(|c| collect(&c.shape, &mut self.texts));
+            if let Some(v) = out.viewport_output.get(&egui::ViewportId::ROOT) {
+                self.commands.extend(v.commands.iter().cloned());
+            }
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..4 {
+                self.frame(vec![], false);
+            }
+        }
+
+        fn shows(&self, text: &str) -> bool {
+            self.texts.iter().any(|(_, t)| t.contains(text))
+        }
+
+        fn click(&mut self, label: &str) {
+            let at = self.texts.iter().find(|(_, t)| t == label).unwrap_or_else(|| panic!("no {label:?}: {:?}", self.texts)).0
+                + egui::vec2(4.0, 4.0);
+            let b = move |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            self.time += 1.0;
+            self.frame(vec![egui::Event::PointerMoved(at), b(true), b(false)], false);
+            self.settle();
+        }
+
+        fn wants_to_close(&self) -> bool {
+            self.commands.iter().any(|c| matches!(c, egui::ViewportCommand::Close))
+        }
+
+        fn cancels_close(&self) -> bool {
+            self.commands.iter().any(|c| matches!(c, egui::ViewportCommand::CancelClose))
+        }
+    }
+
+    fn with_open_transaction() -> Harness {
+        let mut h = Harness::new();
+        h.app.db.execute("CREATE TABLE t (a INTEGER)").unwrap();
+        h.app.db.execute("INSERT INTO t VALUES (1)").unwrap();
+        h.app.begin_tx();
+        h.app.db.execute("INSERT INTO t VALUES (2)").unwrap();
+        h.app.db.execute("CREATE TABLE made (a INTEGER)").unwrap();
+        h.settle();
+        h
+    }
+
+    #[test]
+    fn an_open_transaction_is_always_visible_and_can_be_ended_from_the_status_bar() {
+        let mut h = Harness::new();
+        assert!(!h.shows("Transaction open"), "nothing to show without a transaction");
+        let mut rolled = with_open_transaction();
+        assert!(rolled.shows("Transaction open: 2 change(s)"), "{:?}", rolled.texts);
+
+        rolled.click("Roll back");
+        assert!(!rolled.app.db.in_transaction());
+        assert_eq!(rolled.app.db.table("t").unwrap().len(), 1);
+        assert!(rolled.app.db.table("made").is_none());
+        assert!(!rolled.shows("Transaction open"));
+        assert!(rolled.shows("Transaction rolled back"), "{:?}", rolled.texts);
+
+        h.app.db.execute("CREATE TABLE t (a INTEGER)").unwrap();
+        h.app.begin_tx();
+        h.app.db.execute("INSERT INTO t VALUES (7)").unwrap();
+        h.settle();
+        h.click("Commit");
+        assert!(!h.app.db.in_transaction());
+        assert_eq!(h.app.db.table("t").unwrap().len(), 1);
+        assert!(h.shows("Transaction committed"), "{:?}", h.texts);
+    }
+
+    #[test]
+    fn closing_the_window_asks_before_discarding_a_transaction() {
+        // Without a transaction the window simply closes.
+        let mut plain = Harness::new();
+        plain.frame(vec![], true);
+        assert!(!plain.cancels_close());
+
+        for (button, committed) in [("Commit", true), ("Roll back", false)] {
+            let mut h = with_open_transaction();
+            h.frame(vec![], true);
+            assert!(h.cancels_close(), "the close is held back");
+            h.settle();
+            assert!(h.shows("Transaction in progress"), "{:?}", h.texts);
+            assert!(h.shows("2 change(s)"));
+            assert!(h.app.db.in_transaction(), "nothing decided yet");
+            // Two buttons are called "Commit" and "Roll back" (the status bar's and the dialog's): use the dialog's.
+            let dialog_y = h.texts.iter().find(|(_, t)| t == "Transaction in progress").unwrap().0.y;
+            let target = h
+                .texts
+                .iter()
+                .filter(|(p, t)| t == button && p.y > dialog_y && p.y < dialog_y + 120.0)
+                .map(|(p, _)| *p)
+                .next()
+                .expect("dialog button");
+            h.commands.clear();
+            let at = target + egui::vec2(4.0, 4.0);
+            let b = move |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            h.time += 1.0;
+            h.frame(vec![egui::Event::PointerMoved(at), b(true), b(false)], false);
+            h.settle();
+            assert!(!h.app.db.in_transaction());
+            assert_eq!(h.app.db.table("t").unwrap().len(), if committed { 2 } else { 1 });
+            assert_eq!(h.app.db.table("made").is_some(), committed);
+            assert!(h.wants_to_close(), "once decided, the window closes ({button}): {:?}", h.commands);
+        }
+
+        // Cancel keeps both the transaction and the window.
+        let mut h = with_open_transaction();
+        h.frame(vec![], true);
+        h.settle();
+        h.commands.clear();
+        h.click("Cancel");
+        assert!(h.app.db.in_transaction());
+        assert!(!h.wants_to_close());
+        assert!(!h.shows("Transaction in progress"));
+    }
+
+    #[test]
+    fn opening_another_database_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("other.adb");
+        let mut h = with_open_transaction();
+        h.app.start_open(path.clone());
+        h.settle();
+        assert!(h.shows("Transaction in progress"));
+        assert!(h.app.path.is_none(), "not opened yet");
+        let dialog_y = h.texts.iter().find(|(_, t)| t == "Transaction in progress").unwrap().0.y;
+        let target = h.texts.iter().filter(|(p, t)| t == "Roll back" && p.y > dialog_y && p.y < dialog_y + 120.0).map(|(p, _)| *p).next().unwrap();
+        let at = target + egui::vec2(4.0, 4.0);
+        let b = move |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        h.time += 1.0;
+        h.frame(vec![egui::Event::PointerMoved(at), b(true), b(false)], false);
+        h.settle();
+        assert_eq!(h.app.path.as_deref(), Some(path.as_path()), "opened after the answer");
+        assert!(!h.app.db.in_transaction());
+
+        // Cancel leaves everything as it was.
+        let mut h = with_open_transaction();
+        h.app.start_open(path);
+        h.settle();
+        h.click("Cancel");
+        assert!(h.app.path.is_none());
+        assert!(h.app.db.in_transaction());
+        assert_eq!(h.app.db.table("t").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rolling_back_refreshes_the_open_views() {
+        let mut h = with_open_transaction();
+        h.app.tabs.push(Tab::Datasheet(Datasheet::new("t".into())));
+        h.settle();
+        assert!(h.shows("2 of 2 records"), "{:?}", h.texts);
+        h.click("Roll back");
+        assert!(h.shows("1 of 1 records"), "the datasheet follows the rollback: {:?}", h.texts);
     }
 }

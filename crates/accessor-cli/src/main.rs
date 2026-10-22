@@ -13,7 +13,9 @@ use accessor_core::sql::lexer::lex;
 use accessor_core::{csv, Database, Durability, QueryResult, Value};
 
 const HELP: &str = "\
-Statements end with ';'. Dot-commands:
+Statements end with ';'. Transactions: BEGIN, COMMIT, ROLLBACK, SAVEPOINT name,
+ROLLBACK TO name, RELEASE name; the prompt shows * while one is open.
+Dot-commands:
   .tables                    list tables
   .queries                   list saved queries (views)
   .schema [TABLE]            show table definitions
@@ -75,6 +77,9 @@ fn main() -> ExitCode {
         for c in &commands {
             ok &= sh.run_script(c);
         }
+        // An unfinished transaction means the script's work was discarded: that is a failure.
+        ok &= !sh.db.in_transaction();
+        sh.warn_if_transaction_open();
         return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
 
@@ -106,7 +111,8 @@ impl Shell {
         let mut buf = String::new();
         loop {
             if interactive {
-                print!("{}", if buf.is_empty() { "accessor> " } else { "     ...> " });
+                let open = if self.db.in_transaction() { "*" } else { "" };
+                print!("{}", if buf.is_empty() { format!("accessor{open}> ") } else { "     ...> ".to_string() });
                 let _ = io::stdout().flush();
             }
             let mut line = String::new();
@@ -132,6 +138,17 @@ impl Shell {
         }
         if !buf.trim().is_empty() {
             self.run_script(&buf);
+        }
+        self.warn_if_transaction_open();
+    }
+
+    /// A transaction still open when the shell ends is rolled back; say so.
+    fn warn_if_transaction_open(&self) {
+        if self.db.in_transaction() {
+            eprintln!(
+                "warning: a transaction was still open ({} change(s)); it was rolled back, not committed",
+                self.db.pending_changes()
+            );
         }
     }
 

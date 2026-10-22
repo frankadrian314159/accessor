@@ -17,7 +17,32 @@ const CHECKPOINT_BYTES: u64 = 64 << 20;
 struct Tx {
     /// Committed to the log on COMMIT (only retained for persistent databases).
     ops: Vec<Op>,
-    undo: Vec<Op>,
+    /// How to take back everything done so far, oldest first.
+    undo: Vec<Undo>,
+    savepoints: Vec<Savepoint>,
+}
+
+/// A point in a transaction that can be returned to without abandoning the rest.
+struct Savepoint {
+    name: String,
+    undo_len: usize,
+    ops_len: usize,
+}
+
+/// One step of an undo log.
+pub(crate) enum Undo {
+    /// The inverse of a row operation.
+    Dml(Op),
+    /// What a schema change replaced.
+    Catalog(Box<CatalogUndo>),
+}
+
+/// The parts of the catalog a schema change touched, as they were before it.
+pub(crate) struct CatalogUndo {
+    /// Lowercase table name and the table as it was (`None`: it did not exist).
+    tables: Vec<(String, Option<Table>)>,
+    views: Option<BTreeMap<String, (String, String)>>,
+    triggers: Option<BTreeMap<String, Arc<TriggerDef>>>,
 }
 
 pub struct Database {
@@ -301,37 +326,129 @@ impl Database {
             .ok_or_else(|| Error::catalog(format!("the table '{name}' does not exist")))
     }
 
-    pub(crate) fn revert(&mut self, undo: Vec<Op>) {
-        for op in undo.into_iter().rev() {
-            // Inverses of operations that just succeeded cannot fail.
-            let _ = self.apply(&op);
+    /// Takes back a sequence of changes, newest first.
+    pub(crate) fn revert(&mut self, undo: Vec<Undo>) {
+        for step in undo.into_iter().rev() {
+            match step {
+                // Inverses of operations that just succeeded cannot fail.
+                Undo::Dml(op) => {
+                    let _ = self.apply(&op);
+                }
+                Undo::Catalog(c) => self.restore_catalog(*c),
+            }
         }
+    }
+
+    fn revert_rows(&mut self, undo: Vec<Op>) {
+        self.revert(undo.into_iter().map(Undo::Dml).collect());
+    }
+
+    /// Records what the schema change `op` is about to replace.
+    fn catalog_snapshot(&self, op: &Op) -> CatalogUndo {
+        let mut names: Vec<String> = Vec::new();
+        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None };
+        match op {
+            Op::CreateTable(schema) => names.push(key(&schema.name)),
+            Op::DropTable(table) => {
+                names.push(key(table));
+                undo.triggers = Some(self.triggers.clone()); // they go with their table
+            }
+            Op::CreateView { .. } | Op::DropView(_) => undo.views = Some(self.views.clone()),
+            Op::CreateTrigger { .. } | Op::DropTrigger(_) => undo.triggers = Some(self.triggers.clone()),
+            Op::DropColumn { table, .. } => {
+                names.push(key(table));
+                // Relationships in other tables that point at the later fields are renumbered.
+                for t in self.tables.values() {
+                    if t.schema().foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(table)) {
+                        names.push(key(t.name()));
+                    }
+                }
+            }
+            Op::CreateIndex { table, .. }
+            | Op::DropIndex { table, .. }
+            | Op::AddColumn { table, .. }
+            | Op::RenameColumn { table, .. }
+            | Op::AlterColumnType { table, .. }
+            | Op::AddForeignKey { table, .. }
+            | Op::DropForeignKey { table, .. }
+            | Op::SetExpression { table, .. } => names.push(key(table)),
+            Op::Insert { .. } | Op::Update { .. } | Op::Delete { .. } => {}
+        }
+        names.sort();
+        names.dedup();
+        undo.tables = names.into_iter().map(|n| (self.tables.get(&n).cloned(), n)).map(|(t, n)| (n, t)).collect();
+        undo
+    }
+
+    fn restore_catalog(&mut self, undo: CatalogUndo) {
+        for (name, table) in undo.tables {
+            match table {
+                Some(t) => {
+                    self.tables.insert(name, t);
+                }
+                None => {
+                    self.tables.remove(&name);
+                }
+            }
+        }
+        if let Some(views) = undo.views {
+            self.views = views;
+        }
+        if let Some(triggers) = undo.triggers {
+            self.triggers = triggers;
+        }
+        self.calc_cache.clear();
     }
 
     /// Atomically applies a batch: either every op takes effect (and is made
     /// durable, or queued in the open transaction) or none does.
+    ///
+    /// A batch holds either row operations or schema changes, never both.
     pub(crate) fn apply_all(&mut self, ops: Vec<Op>) -> Result<()> {
-        if self.tx.is_some() && ops.iter().any(Op::is_ddl) {
-            return Err(Error::runtime("schema changes are not allowed inside a transaction"));
+        let has_schema_change = ops.iter().any(Op::is_ddl);
+        if has_schema_change && ops.iter().any(Op::is_dml) {
+            return Err(Error::runtime("a schema change cannot share a batch with row changes"));
         }
         let mut ops = ops;
-        let mut undo = Vec::with_capacity(ops.len());
-        self.calc_active = ops.iter().any(Op::is_dml) && self.any_calculated();
-        let applied = if ops.iter().any(Op::is_dml) && (self.has_foreign_keys() || !self.triggers.is_empty()) {
-            // May append cascaded operations to `ops`.
-            self.apply_enforced(&mut ops, &mut undo)
-        } else {
-            ops.iter_mut().try_for_each(|op| {
-                if self.calc_active {
-                    self.finalize_op(op)?;
+        let undo: Vec<Undo> = if has_schema_change {
+            // Remember what each change replaces whenever it might have to be taken back:
+            // in a transaction, when the log may refuse it, or when a later part of the batch may fail.
+            let remember = self.tx.is_some() || self.persist.is_some() || ops.len() > 1;
+            let mut undo = Vec::new();
+            for op in &ops {
+                let snapshot = remember.then(|| self.catalog_snapshot(op));
+                match self.apply(op) {
+                    Ok(_) => undo.extend(snapshot.map(|s| Undo::Catalog(Box::new(s)))),
+                    Err(e) => {
+                        if let Some(s) = snapshot {
+                            self.restore_catalog(s);
+                        }
+                        self.revert(undo);
+                        return Err(e);
+                    }
                 }
-                self.apply(op).map(|inv| undo.extend(inv))
-            })
+            }
+            undo
+        } else {
+            let mut undo = Vec::with_capacity(ops.len());
+            self.calc_active = ops.iter().any(Op::is_dml) && self.any_calculated();
+            let applied = if ops.iter().any(Op::is_dml) && (self.has_foreign_keys() || !self.triggers.is_empty()) {
+                // May append cascaded operations to `ops`.
+                self.apply_enforced(&mut ops, &mut undo)
+            } else {
+                ops.iter_mut().try_for_each(|op| {
+                    if self.calc_active {
+                        self.finalize_op(op)?;
+                    }
+                    self.apply(op).map(|inv| undo.extend(inv))
+                })
+            };
+            if let Err(e) = applied {
+                self.revert_rows(undo);
+                return Err(e);
+            }
+            undo.into_iter().map(Undo::Dml).collect()
         };
-        if let Err(e) = applied {
-            self.revert(undo);
-            return Err(e);
-        }
         if let Some(tx) = &mut self.tx {
             if self.persist.is_some() {
                 tx.ops.extend(ops);
@@ -342,7 +459,7 @@ impl Database {
         self.log(&ops, undo)
     }
 
-    fn log(&mut self, ops: &[Op], undo: Vec<Op>) -> Result<()> {
+    fn log(&mut self, ops: &[Op], undo: Vec<Undo>) -> Result<()> {
         let Some(p) = &mut self.persist else { return Ok(()) };
         if ops.is_empty() {
             return Ok(());
@@ -358,7 +475,13 @@ impl Database {
     }
 
     // ----- transactions ----------------------------------------------------------
+    //
+    // Everything done after `begin` — rows and schema alike — either becomes
+    // permanent together at `commit` (one atomic record in the write-ahead log)
+    // or is taken back at `rollback`. A statement that fails inside a
+    // transaction undoes only itself; the transaction stays open.
 
+    /// Starts a transaction. Transactions do not nest; use savepoints inside one.
     pub fn begin(&mut self) -> Result<()> {
         if self.tx.is_some() {
             return Err(Error::runtime("a transaction is already in progress"));
@@ -367,14 +490,80 @@ impl Database {
         Ok(())
     }
 
+    /// Makes every change since `begin` permanent.
     pub fn commit(&mut self) -> Result<()> {
-        let tx = self.tx.take().ok_or_else(|| Error::runtime("no transaction is in progress"))?;
+        let tx = self.tx.take().ok_or_else(no_transaction)?;
         self.log(&tx.ops, tx.undo)
     }
 
+    /// Takes back every change since `begin`.
     pub fn rollback(&mut self) -> Result<()> {
-        let tx = self.tx.take().ok_or_else(|| Error::runtime("no transaction is in progress"))?;
+        let tx = self.tx.take().ok_or_else(no_transaction)?;
         self.revert(tx.undo);
+        Ok(())
+    }
+
+    /// Runs `f` in a transaction: committed if it returns `Ok`, rolled back if
+    /// it returns an error (which is then returned). `f` must not end the
+    /// transaction itself.
+    ///
+    /// ```
+    /// # use accessor_core::Database;
+    /// let mut db = Database::in_memory();
+    /// db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+    /// let failed = db.transaction(|db| {
+    ///     db.execute("INSERT INTO t VALUES (1)")?;
+    ///     db.execute("INSERT INTO t VALUES ('not a number')")?;
+    ///     Ok(())
+    /// });
+    /// assert!(failed.is_err());
+    /// assert_eq!(db.table("t").unwrap().len(), 0); // the first insert went with it
+    /// ```
+    pub fn transaction<T>(&mut self, f: impl FnOnce(&mut Database) -> Result<T>) -> Result<T> {
+        self.begin()?;
+        match f(self) {
+            Ok(value) => {
+                self.commit()?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = self.rollback();
+                Err(e)
+            }
+        }
+    }
+
+    /// Number of changes made in the open transaction (0 when there is none).
+    pub fn pending_changes(&self) -> usize {
+        self.tx.as_ref().map_or(0, |tx| tx.undo.len())
+    }
+
+    /// Marks a point in the open transaction to which [`rollback_to`](Self::rollback_to)
+    /// can return. Using a name again hides the earlier savepoint of that name.
+    pub fn savepoint(&mut self, name: &str) -> Result<()> {
+        let tx = self.tx.as_mut().ok_or_else(no_transaction)?;
+        tx.savepoints.push(Savepoint { name: key(name), undo_len: tx.undo.len(), ops_len: tx.ops.len() });
+        Ok(())
+    }
+
+    /// Takes back everything done since savepoint `name`, keeping the
+    /// transaction (and the savepoint itself) open. Later savepoints are discarded.
+    pub fn rollback_to(&mut self, name: &str) -> Result<()> {
+        let tx = self.tx.as_mut().ok_or_else(no_transaction)?;
+        let i = tx.savepoints.iter().rposition(|s| s.name == key(name)).ok_or_else(|| no_savepoint(name))?;
+        let (undo_len, ops_len) = (tx.savepoints[i].undo_len, tx.savepoints[i].ops_len);
+        tx.savepoints.truncate(i + 1);
+        tx.ops.truncate(ops_len);
+        let tail = tx.undo.split_off(undo_len);
+        self.revert(tail);
+        Ok(())
+    }
+
+    /// Forgets savepoint `name` and any made after it; the changes stay.
+    pub fn release(&mut self, name: &str) -> Result<()> {
+        let tx = self.tx.as_mut().ok_or_else(no_transaction)?;
+        let i = tx.savepoints.iter().rposition(|s| s.name == key(name)).ok_or_else(|| no_savepoint(name))?;
+        tx.savepoints.truncate(i);
         Ok(())
     }
 
@@ -425,4 +614,12 @@ fn parse_trigger(sql: &str) -> Result<TriggerDef> {
         Statement::CreateTrigger(def) => Ok(*def),
         _ => Err(Error::Corrupt("a stored trigger is not a CREATE TRIGGER statement".into())),
     }
+}
+
+fn no_transaction() -> Error {
+    Error::runtime("no transaction is in progress")
+}
+
+fn no_savepoint(name: &str) -> Error {
+    Error::runtime(format!("there is no savepoint named '{name}' in this transaction"))
 }

@@ -14,3 +14,6 @@ rfd = "0.17.2"
 [[bin]]
 name = "accessor-gui"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
