@@ -1586,3 +1586,24 @@ fn the_transaction_helper_commits_or_rolls_back() {
     assert!(db.in_transaction(), "the outer transaction is untouched");
     db.rollback().unwrap();
 }
+
+// ----- dates -----------------------------------------------------------------------------
+
+#[test]
+fn datediff_counts_calendar_boundaries() {
+    let db = Database::in_memory();
+    let diff = |unit: &str, a: &str, b: &str| q(&db, &format!("SELECT DateDiff('{unit}', #{a}#, #{b}#)"));
+    // Years and months count boundaries crossed, not elapsed time.
+    assert_eq!(diff("yyyy", "2020-12-31", "2021-01-01"), "1");
+    assert_eq!(diff("yyyy", "2020-01-01", "2020-12-31"), "0");
+    assert_eq!(diff("yyyy", "2019-06-15", "2024-01-02"), "5");
+    assert_eq!(diff("yyyy", "2021-01-01", "2020-12-31"), "-1");
+    assert_eq!(diff("m", "2024-01-31", "2024-03-01"), "2");
+    assert_eq!(diff("q", "2024-03-31", "2024-04-01"), "1");
+    assert_eq!(diff("q", "2024-01-01", "2024-03-31"), "0");
+    assert_eq!(diff("d", "2024-02-28", "2024-03-01"), "2");
+    // Hours, minutes and seconds are whole elapsed units.
+    assert_eq!(diff("h", "2024-01-01 10:30", "2024-01-01 12:29"), "1");
+    assert_eq!(diff("n", "2024-01-01 10:00:30", "2024-01-01 10:02:29"), "1");
+    assert_eq!(diff("s", "2024-01-01 10:00:00", "2024-01-01 10:00:07"), "7");
+}

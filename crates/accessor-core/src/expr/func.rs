@@ -407,7 +407,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 y * 12 + m as i64
             };
             Value::Int(match unit.as_str() {
-                "yyyy" | "y" => month_index(b).div_euclid(12) - month_index(a).div_euclid(12),
+                "yyyy" | "y" => (month_index(b) - 1).div_euclid(12) - (month_index(a) - 1).div_euclid(12),
                 "q" => (month_index(b) - 1).div_euclid(3) - (month_index(a) - 1).div_euclid(3),
                 "m" => month_index(b) - month_index(a),
                 "d" | "w" => b.div_euclid(86_400) - a.div_euclid(86_400),

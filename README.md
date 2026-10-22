@@ -197,6 +197,92 @@ SQL names from other databases (`INT`, `BIGINT`, `FLOAT`, `REAL`, `NUMERIC`,
 `Sqr`, `Exp`, `Log` and fractional powers are computed in floating point and are
 only as precise as a `DOUBLE`; everything else is exact.
 
+## Dates and times
+
+A `DATETIME` field holds a moment as a whole number of seconds since 1970-01-01 00:00:00,
+in UTC, so dates before 1970 work and there are no time zones or daylight-saving
+rules to think about. Fractions of a second are not kept. `DATE`, `TIME` and `TIMESTAMP`
+are accepted as other names for the type. The calendar is the proleptic Gregorian one.
+
+```sql
+CREATE TABLE Event (ID COUNTER PRIMARY KEY, Name TEXT, Starts DATETIME);
+INSERT INTO Event (Name, Starts) VALUES
+  ('launch', #2024-02-29 13:45:10#),    -- a date literal
+  ('retro',  '3/1/2024 9:30 AM'),       -- text is read as a date when stored
+  ('party',  '2024-03-15');
+SELECT Name, Starts FROM Event ORDER BY Starts;
+--  launch  2024-02-29 13:45:10
+--  retro   2024-03-01 09:30:00
+--  party   2024-03-15
+```
+
+**Writing dates.** A literal is written between `#` marks: `#2024-02-29#`,
+`#2024-02-29 13:45:10#`, `#3/1/2024 9:30 AM#`. Text stored into a `DATETIME` field or
+passed to `CDate` is read the same way. Two layouts are understood:
+
+- `YYYY-MM-DD`, optionally followed by a space or `T` and `HH:MM[:SS]`;
+- the US layout `M/D/YYYY`, optionally followed by `h:mm[:ss]` and `AM` or `PM`.
+
+A date that does not exist (`2023-02-29`) is refused, with an error naming the value.
+Years are taken literally, so write four digits.
+
+**Showing dates.** A date at midnight shows as `2024-03-15`; any other time as
+`2024-02-29 13:45:10`. `CStr` and CSV export use the same form.
+
+**Taking dates apart and building them**
+
+| Function | Result |
+|----------|--------|
+| `Year(d)`, `Month(d)`, `Day(d)` | the parts, as `INTEGER`s |
+| `Hour(d)`, `Minute(d)`, `Second(d)` | the time of day |
+| `Weekday(d)` | 1 for Sunday through 7 for Saturday |
+| `DateSerial(y, m, d)` | a date; months and days out of range roll over, so `DateSerial(2024, 14, 1)` is 2025-02-01 and `DateSerial(2024, 3, 0)` is 2024-02-29 |
+| `CDate(x)` | text or a number as a date |
+| `Now()` | the current moment (UTC) |
+| `Date()` (or `Today()`) | today's date at midnight (UTC) |
+
+**Adding and counting**
+
+`DateAdd(unit, n, d)` adds `n` units; `DateDiff(unit, a, b)` counts them from `a` to `b`
+(negative if `b` is earlier). The units are `'yyyy'` (years), `'q'` (quarters), `'m'` (months),
+`'d'` (days), `'ww'` (weeks), `'h'`, `'n'` (minutes) and `'s'`.
+
+```sql
+SELECT DateAdd('m', 1, #2024-01-31#);                 -- 2024-02-29 (the day is clamped to the month)
+SELECT DateAdd('h', 5, #2024-01-31#);                 -- 2024-01-31 05:00:00
+SELECT DateDiff('d', #2024-01-01#, #2024-03-01#);     -- 60
+SELECT DateDiff('yyyy', #2020-12-31#, #2021-01-01#);  -- 1
+```
+
+For `yyyy`, `q`, `m` and `d`, `DateDiff` counts the calendar boundaries crossed, not elapsed
+time, so the last example is 1 although it is one day. For `ww`, `h`, `n` and `s` it counts
+whole elapsed units (a week is 7 days).
+
+**Arithmetic.** Dates are counted in days, so a date plus a number is a later date and
+a fraction is part of a day:
+
+```sql
+SELECT #2024-03-15# + 1;       -- 2024-03-16
+SELECT #2024-03-15# + 0.5;     -- 2024-03-15 12:00:00
+SELECT #2024-03-15# - 7;       -- 2024-03-08
+SELECT #2024-03-15# - #2024-02-29#;   -- 15   (an INTEGER when it is a whole number of days, else a DECIMAL)
+```
+
+Any numeric type can be used for the number of days.
+
+**Comparing and sorting.** Dates compare as moments. Text on the other side of a
+comparison is read as a date, so `WHERE Starts >= '2024-03-01'` and `BETWEEN` work as
+you would hope (text that is not a date compares as greater than any date). Compared with
+a number, a date counts as the number of days since 1899-12-30, the convention
+Access and spreadsheets use: `CDate(45000)` is 2023-03-15 and `CDbl(#1899-12-31#)` is 1.
+In a sorted list, `Null` comes first, then Yes/No, numbers, dates, then text; `Min` and `Max`
+work on dates. An index on a `DATETIME` field speeds up searches that compare it with a date (`#...#`);
+comparing it with text works but reads the table.
+
+**Elsewhere.** `Now()` and `Date()` cannot be used in a calculated field, because the value
+would go stale (it is only recomputed when its record is saved). Importing CSV makes a column
+`DATETIME` when every non-empty value contains `-` or `/` and reads as a date.
+
 ## Project layout
 
 | Crate | |
