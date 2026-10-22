@@ -3,15 +3,15 @@
 //! Each statement is planned against an immutable view of the database into
 //! a list of [`Op`]s, which are then applied atomically.
 
-use super::bind::{Binder, Scope, ScopeCol};
-use super::select::{matching_ids, split_and};
+use super::bind::{Binder, CorrSpec, Scope, ScopeCol};
+use super::select::{matching_ids, split_and, split_late};
 use super::QueryResult;
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::expr::BExpr;
 use crate::schema::TableSchema;
 use crate::sql::ast::{Expr, InsertSource};
-use crate::storage::{Op, RowId};
+use crate::storage::{Op, RowId, Table};
 use crate::value::{Row, Value};
 
 /// Builds a full row from explicitly supplied values: defaults first, then
@@ -47,7 +47,7 @@ fn table_scope(schema: &TableSchema) -> Scope {
         cols: schema
             .columns
             .iter()
-            .map(|c| ScopeCol { table: schema.name.clone(), name: c.name.clone() })
+            .map(|c| ScopeCol { table: schema.name.clone(), name: c.name.clone(), hidden: false })
             .collect(),
     }
 }
@@ -100,6 +100,7 @@ impl Database {
             let t = self.table_checked(table)?;
             let schema = t.schema();
             let positions: Vec<usize> = match columns {
+                _ if matches!(source, InsertSource::DefaultValues) => Vec::new(),
                 Some(cols) => cols.iter().map(|c| column_pos(schema, c)).collect::<Result<_>>()?,
                 // Without a field list, the values are for the fields you can set.
                 None => (0..schema.columns.len()).filter(|&i| !schema.columns[i].is_calculated()).collect(),
@@ -125,6 +126,7 @@ impl Database {
                     }
                     out
                 }
+                InsertSource::DefaultValues => vec![Vec::new()],
                 InsertSource::Select(sel) => {
                     let res = self.run_select(sel)?;
                     if res.columns.len() != positions.len() {
@@ -155,48 +157,101 @@ impl Database {
         assignments: &[(String, Expr)],
         filter: Option<&Expr>,
     ) -> Result<Vec<Op>> {
-        let ops = {
-            let t = self.table_checked(table)?;
-            let schema = t.schema();
-            let scope = table_scope(schema);
-            let mut binder = Binder::new(self, &scope, 0);
-            let sets: Vec<(usize, BExpr)> = assignments
-                .iter()
-                .map(|(c, e)| Ok((column_pos(schema, c)?, binder.bind(e)?)))
-                .collect::<Result<_>>()?;
-            if let Some((p, _)) = sets.iter().find(|(p, _)| schema.columns[*p].is_calculated()) {
-                return Err(Database::calculated_write_error(&schema.name, &schema.columns[*p].name));
-            }
-            let f = filter.map(|f| binder.bind(f)).transpose()?;
-            let conj = f.as_ref().map(split_and).unwrap_or_default();
-            let mut ops = Vec::new();
-            for id in matching_ids(t, &conj, f.as_ref())? {
-                let old = t.get(id).expect("id from live scan");
-                let mut new = old.clone();
-                for (c, e) in &sets {
-                    new[*c] = e.eval(old)?.into_owned();
-                }
-                ops.push(Op::Update { table: schema.name.clone(), id, row: schema.coerce_row(new)? });
-            }
-            ops
-        };
-        Ok(ops)
+        let t = self.table_checked(table)?;
+        let schema = t.schema();
+        let scope = table_scope(schema);
+        let mut binder = Binder::new(self, &scope, 0);
+        binder.allow_corr = true;
+        let sets: Vec<(usize, BExpr)> = assignments
+            .iter()
+            .map(|(c, e)| Ok((column_pos(schema, c)?, binder.bind(e)?)))
+            .collect::<Result<_>>()?;
+        if let Some((p, _)) = sets.iter().find(|(p, _)| schema.columns[*p].is_calculated()) {
+            return Err(Database::calculated_write_error(&schema.name, &schema.columns[*p].name));
+        }
+        let f = filter.map(|f| binder.bind(f)).transpose()?;
+        let corr = std::mem::take(&mut binder.corr);
+        let hits = self.matching_with_corr(t, f, &corr, schema.columns.len())?;
+        update_ops(t, &sets, hits)
+    }
+
+    /// The update of exactly the records `ids` (used by MERGE).
+    pub(crate) fn plan_update_ids(&self, table: &str, assignments: &[(String, Expr)], ids: &[RowId]) -> Result<Vec<Op>> {
+        let t = self.table_checked(table)?;
+        let schema = t.schema();
+        let scope = table_scope(schema);
+        let mut binder = Binder::new(self, &scope, 0);
+        let sets: Vec<(usize, BExpr)> = assignments
+            .iter()
+            .map(|(c, e)| Ok((column_pos(schema, c)?, binder.bind(e)?)))
+            .collect::<Result<_>>()?;
+        if let Some((p, _)) = sets.iter().find(|(p, _)| schema.columns[*p].is_calculated()) {
+            return Err(Database::calculated_write_error(&schema.name, &schema.columns[*p].name));
+        }
+        update_ops(t, &sets, ids.iter().map(|&id| (id, None)).collect())
     }
 
     pub(crate) fn plan_delete(&self, table: &str, filter: Option<&Expr>) -> Result<Vec<Op>> {
-        let ops = {
-            let t = self.table_checked(table)?;
-            let schema = t.schema();
-            let scope = table_scope(schema);
-            let mut binder = Binder::new(self, &scope, 0);
-            let f = filter.map(|f| binder.bind(f)).transpose()?;
-            let conj = f.as_ref().map(split_and).unwrap_or_default();
-            matching_ids(t, &conj, f.as_ref())?
-                .into_iter()
-                .map(|id| Op::Delete { table: schema.name.clone(), id })
-                .collect::<Vec<_>>()
-        };
-        Ok(ops)
+        let t = self.table_checked(table)?;
+        let schema = t.schema();
+        let scope = table_scope(schema);
+        let mut binder = Binder::new(self, &scope, 0);
+        binder.allow_corr = true;
+        let f = filter.map(|f| binder.bind(f)).transpose()?;
+        let corr = std::mem::take(&mut binder.corr);
+        Ok(self
+            .matching_with_corr(t, f, &corr, schema.columns.len())?
+            .into_iter()
+            .map(|(id, _)| Op::Delete { table: schema.name.clone(), id })
+            .collect())
+    }
+
+    /// The records of `t` passing `filter`. A filter that reads correlated
+    /// sub-query values needs each record extended with them first; those
+    /// extended records come back alongside the ids.
+    fn matching_with_corr(
+        &self,
+        t: &Table,
+        filter: Option<BExpr>,
+        corr: &[CorrSpec],
+        width: usize,
+    ) -> Result<Vec<(RowId, Option<Row>)>> {
+        if corr.is_empty() {
+            let conj = filter.as_ref().map(split_and).unwrap_or_default();
+            return Ok(matching_ids(t, &conj, filter.as_ref())?.into_iter().map(|id| (id, None)).collect());
+        }
+        let (early, late) = split_late(filter, width);
+        let conj = early.as_ref().map(split_and).unwrap_or_default();
+        let ids = matching_ids(t, &conj, early.as_ref())?;
+        let rows: Vec<Row> = ids.iter().map(|&id| t.get(id).expect("id from live scan").clone()).collect();
+        let rows = self.add_corr_columns(rows, corr, 0)?;
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, row) in ids.into_iter().zip(rows) {
+            if late.as_ref().is_none_or(|f| f.eval_bool(&row).unwrap_or(false)) {
+                out.push((id, Some(row)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Ids of the records of `table` for which `cond` holds.
+    pub(crate) fn ids_matching(&self, table: &str, cond: &Expr) -> Result<Vec<RowId>> {
+        let t = self.table_checked(table)?;
+        let scope = table_scope(t.schema());
+        let f = Binder::new(self, &scope, 0).bind(cond)?;
+        let conj = split_and(&f);
+        matching_ids(t, &conj, Some(&f))
+    }
+
+    /// Whether `cond` holds for one record of `table`.
+    pub(crate) fn row_condition(&self, table: &str, id: RowId, cond: &Expr) -> Result<bool> {
+        let t = self.table_checked(table)?;
+        let scope = table_scope(t.schema());
+        let f = Binder::new(self, &scope, 0).bind(cond)?;
+        match t.get(id) {
+            Some(row) => f.eval_bool(row),
+            None => Ok(false),
+        }
     }
 
     // ----- cell-level API (datasheet editing) -----------------------------------
@@ -249,4 +304,24 @@ impl Database {
         let name = self.table_checked(table)?.name().to_string();
         self.apply_all(vec![Op::Delete { table: name, id }])
     }
+}
+
+/// Builds the `Update` ops for `hits`, evaluating the assignments on each
+/// record (extended with sub-query values where the statement needs them).
+fn update_ops(t: &Table, sets: &[(usize, BExpr)], hits: Vec<(RowId, Option<Row>)>) -> Result<Vec<Op>> {
+    let schema = t.schema();
+    let width = schema.columns.len();
+    let mut ops = Vec::with_capacity(hits.len());
+    for (id, extended) in hits {
+        let old: &Row = match &extended {
+            Some(r) => r,
+            None => t.get(id).expect("id from live scan"),
+        };
+        let mut new: Row = old[..width].to_vec();
+        for (c, e) in sets {
+            new[*c] = e.eval(old)?.into_owned();
+        }
+        ops.push(Op::Update { table: schema.name.clone(), id, row: schema.coerce_row(new)? });
+    }
+    Ok(ops)
 }

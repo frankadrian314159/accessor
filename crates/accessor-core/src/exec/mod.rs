@@ -2,10 +2,13 @@
 
 pub mod agg;
 pub mod bind;
+mod check;
 mod ddl;
+mod merge;
 mod proc;
 mod dml;
 pub(crate) mod select;
+pub(crate) mod window;
 
 use crate::database::Database;
 use crate::error::{Error, Result};
@@ -51,9 +54,27 @@ impl Database {
             Statement::Insert { table, columns, source } => self.exec_insert(table, columns, source),
             Statement::Update { table, assignments, filter } => self.exec_update(table, assignments, filter.as_ref()),
             Statement::Delete { table, filter } => self.exec_delete(table, filter.as_ref()),
-            Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys } => {
-                self.exec_create_table(name, columns, primary_key, uniques, foreign_keys)
+            Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks } => {
+                let done = self.exec_create_table(name, columns, primary_key, uniques, foreign_keys)?;
+                for (cname, text) in checks {
+                    if let Err(e) = self.add_check(name, cname.as_deref(), text) {
+                        // The table and any checks already added go together.
+                        let _ = self.exec_drop_table(name);
+                        return Err(e);
+                    }
+                }
+                Ok(done)
             }
+            Statement::Truncate(table) => self.exec_delete(table, None),
+            Statement::Guarded { missing_ok, stmt } => match self.execute_statement(stmt) {
+                Err(Error::Catalog(m))
+                    if (*missing_ok && m.contains("does not exist")) || (!*missing_ok && m.contains("already exists")) =>
+                {
+                    Ok(QueryResult::default())
+                }
+                other => other,
+            },
+            Statement::Merge(def) => self.exec_merge(def),
             Statement::DropTable(name) => self.exec_drop_table(name),
             Statement::AlterTable { table, action } => self.exec_alter_table(table, action),
             Statement::CreateIndex { name, table, columns, unique } => {

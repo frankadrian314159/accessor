@@ -225,6 +225,7 @@ impl Shell {
         true
     }
 
+    /// Prints table definitions as SQL that would recreate them (data excluded).
     fn schema(&self, only: &str) {
         let names: Vec<&str> = if only.is_empty() { self.db.table_names() } else { vec![only] };
         for n in names {
@@ -232,25 +233,62 @@ impl Shell {
                 eprintln!("no such table '{n}'");
                 continue;
             };
-            println!("CREATE TABLE {} (", t.name());
-            let cols = &t.schema().columns;
-            for (i, c) in cols.iter().enumerate() {
-                let mut line = format!("  [{}] {}", c.name, if c.autonumber { "COUNTER" } else { c.data_type.sql_name() });
-                if c.primary_key {
-                    line.push_str(" PRIMARY KEY");
-                } else if c.not_null {
-                    line.push_str(" NOT NULL");
-                }
-                if let Some(d) = &c.default {
-                    line.push_str(&format!(" DEFAULT {d}"));
-                }
-                println!("{line}{}", if i + 1 < cols.len() { "," } else { "" });
+            let s = t.schema();
+            let keys: Vec<&str> = s.columns.iter().filter(|c| c.primary_key).map(|c| c.name.as_str()).collect();
+            let mut lines: Vec<String> = Vec::new();
+            for c in &s.columns {
+                let line = if let Some(formula) = c.expression() {
+                    format!("  [{}] CALCULATED AS ({formula})", c.name)
+                } else {
+                    let mut line =
+                        format!("  [{}] {}", c.name, if c.autonumber { "COUNTER" } else { c.data_type.sql_name() });
+                    if c.primary_key && keys.len() == 1 {
+                        line.push_str(" PRIMARY KEY");
+                    } else if c.not_null && !c.primary_key {
+                        line.push_str(" NOT NULL");
+                    }
+                    if let Some(d) = &c.default {
+                        line.push_str(&format!(" DEFAULT {}", sql_literal(d)));
+                    }
+                    line
+                };
+                lines.push(line);
             }
-            println!(");");
+            if keys.len() > 1 {
+                let list: Vec<String> = keys.iter().map(|k| format!("[{k}]")).collect();
+                lines.push(format!("  PRIMARY KEY ({})", list.join(", ")));
+            }
+            for fk in &s.foreign_keys {
+                let own: Vec<String> = fk.columns.iter().map(|&c| format!("[{}]", s.columns[c].name)).collect();
+                let parent = self.db.table(&fk.ref_table);
+                let theirs: Vec<String> = fk
+                    .ref_columns
+                    .iter()
+                    .map(|&c| parent.map_or(c.to_string(), |p| format!("[{}]", p.schema().columns[c].name)))
+                    .collect();
+                let mut line = format!(
+                    "  CONSTRAINT [{}] FOREIGN KEY ({}) REFERENCES [{}] ({})",
+                    fk.name,
+                    own.join(", "),
+                    fk.ref_table,
+                    theirs.join(", ")
+                );
+                if fk.on_delete != accessor_core::RefAction::Restrict {
+                    line.push_str(&format!(" ON DELETE {}", fk.on_delete.sql()));
+                }
+                if fk.on_update != accessor_core::RefAction::Restrict {
+                    line.push_str(&format!(" ON UPDATE {}", fk.on_update.sql()));
+                }
+                lines.push(line);
+            }
+            println!("CREATE TABLE {} (\n{}\n);", t.name(), lines.join(",\n"));
         }
         if only.is_empty() {
             for v in self.db.view_names() {
                 println!("CREATE VIEW {v} AS {};", self.db.view_sql(v).unwrap_or(""));
+            }
+            for t in self.db.trigger_names() {
+                println!("{};", self.db.trigger_sql(t).unwrap_or(""));
             }
         }
     }
@@ -354,4 +392,15 @@ fn print_result(res: &QueryResult) {
         line(row);
     }
     println!("({} row{})", body.len(), if body.len() == 1 { "" } else { "s" });
+}
+
+/// A value written the way SQL would read it back.
+fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::DateTime(_) => format!("#{v}#"),
+        // Money prints with a `$`, which SQL numbers do not have.
+        Value::Currency(_) => v.to_string().replace('$', ""),
+        other => other.to_string(),
+    }
 }

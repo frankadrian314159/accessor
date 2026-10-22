@@ -44,6 +44,11 @@ pub fn walk_expr(e: &mut Expr, f: &mut Visitor) -> Result<()> {
         }
         Expr::Exists { query, .. } | Expr::Subquery(query) => walk_select(query, f)?,
         Expr::Function { args, .. } => args.iter_mut().try_for_each(|x| walk_expr(x, f))?,
+        Expr::Window { func, spec } => {
+            walk_expr(func, f)?;
+            spec.partition_by.iter_mut().try_for_each(|x| walk_expr(x, f))?;
+            spec.order_by.iter_mut().try_for_each(|o| walk_expr(&mut o.expr, f))?;
+        }
         Expr::Case { whens, else_expr } => {
             for (c, r) in whens {
                 walk_expr(c, f)?;
@@ -57,14 +62,62 @@ pub fn walk_expr(e: &mut Expr, f: &mut Visitor) -> Result<()> {
     Ok(())
 }
 
+/// Calls `f` on each expression directly inside `e`. Sub-queries are not entered:
+/// the caller decides how to treat their scope.
+pub fn each_child(e: &mut Expr, f: &mut Visitor) -> Result<()> {
+    match e {
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) | Expr::Exists { .. } | Expr::Subquery(_) => {}
+        Expr::Neg(a) | Expr::Not(a) => f(a)?,
+        Expr::Binary { left, right, .. } => {
+            f(left)?;
+            f(right)?;
+        }
+        Expr::IsNull { expr, .. } | Expr::InSelect { expr, .. } => f(expr)?,
+        Expr::Like { expr, pattern, .. } => {
+            f(expr)?;
+            f(pattern)?;
+        }
+        Expr::Between { expr, low, high, .. } => {
+            f(expr)?;
+            f(low)?;
+            f(high)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            f(expr)?;
+            list.iter_mut().try_for_each(|x| f(x))?;
+        }
+        Expr::Function { args, .. } => args.iter_mut().try_for_each(|x| f(x))?,
+        Expr::Window { func, spec } => {
+            f(func)?;
+            spec.partition_by.iter_mut().try_for_each(|x| f(x))?;
+            spec.order_by.iter_mut().try_for_each(|o| f(&mut o.expr))?;
+        }
+        Expr::Case { whens, else_expr } => {
+            for (c, r) in whens {
+                f(c)?;
+                f(r)?;
+            }
+            if let Some(x) = else_expr {
+                f(x)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn walk_factor(t: &mut TableFactor, f: &mut Visitor) -> Result<()> {
     match t {
-        TableFactor::Named { .. } => Ok(()),
+        TableFactor::Named { .. } | TableFactor::Materialized { .. } => Ok(()),
         TableFactor::Derived { query, .. } => walk_select(query, f),
     }
 }
 
 pub fn walk_select(s: &mut Select, f: &mut Visitor) -> Result<()> {
+    if let Some(with) = &mut s.with {
+        for cte in &mut with.ctes {
+            walk_select(&mut cte.query, f)?;
+        }
+    }
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
             walk_expr(expr, f)?;
@@ -83,7 +136,8 @@ pub fn walk_select(s: &mut Select, f: &mut Visitor) -> Result<()> {
         walk_expr(e, f)?;
     }
     s.group_by.iter_mut().try_for_each(|e| walk_expr(e, f))?;
-    s.order_by.iter_mut().try_for_each(|o| walk_expr(&mut o.expr, f))
+    s.order_by.iter_mut().try_for_each(|o| walk_expr(&mut o.expr, f))?;
+    s.unions.iter_mut().try_for_each(|u| walk_select(&mut u.select, f))
 }
 
 pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
@@ -91,6 +145,7 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
         Statement::Select(s) => walk_select(s, f),
         Statement::Insert { source, .. } => match source {
             InsertSource::Values(rows) => rows.iter_mut().flatten().try_for_each(|e| walk_expr(e, f)),
+            InsertSource::DefaultValues => Ok(()),
             InsertSource::Select(s) => walk_select(s, f),
         },
         Statement::Update { assignments, filter, .. } => {
@@ -100,6 +155,22 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
         Statement::Delete { filter, .. } => filter.iter_mut().try_for_each(|e| walk_expr(e, f)),
         Statement::Exec { args, .. } => args.iter_mut().try_for_each(|(_, e)| walk_expr(e, f)),
         Statement::Raise(e) => walk_expr(e, f),
+        Statement::Guarded { stmt, .. } => walk_statement(stmt, f),
+        Statement::Merge(m) => {
+            walk_factor(&mut m.source, f)?;
+            walk_expr(&mut m.on, f)?;
+            for w in &mut m.whens {
+                if let Some(c) = &mut w.condition {
+                    walk_expr(c, f)?;
+                }
+                match &mut w.action {
+                    MergeAction::Update(sets) => sets.iter_mut().try_for_each(|(_, e)| walk_expr(e, f))?,
+                    MergeAction::Insert { values, .. } => values.iter_mut().try_for_each(|e| walk_expr(e, f))?,
+                    MergeAction::Delete => {}
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

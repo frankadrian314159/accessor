@@ -4,9 +4,11 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
+use std::rc::Rc;
 
 use super::agg::{AggFn, AggSpec, AggState};
-use super::bind::{contains_agg, Binder, GroupCtx, Scope, ScopeCol};
+use super::bind::{contains_agg, Binder, CorrKind, CorrSpec, GroupCtx, Scope, ScopeCol};
+use super::window::{self, MASK_COL, WIN_BASE};
 use super::QueryResult;
 use crate::database::Database;
 use crate::error::{Error, Result};
@@ -26,10 +28,10 @@ enum SourceData<'a> {
     Rows(Vec<Row>),
 }
 
-struct Source<'a> {
+pub(crate) struct Source<'a> {
     data: SourceData<'a>,
-    alias: String,
-    names: Vec<String>,
+    pub(crate) alias: String,
+    pub(crate) names: Vec<String>,
 }
 
 impl Source<'_> {
@@ -51,7 +53,7 @@ impl Source<'_> {
 }
 
 impl Database {
-    fn resolve_factor(&self, f: &TableFactor, depth: u32) -> Result<Source<'_>> {
+    pub(crate) fn resolve_factor(&self, f: &TableFactor, depth: u32) -> Result<Source<'_>> {
         match f {
             TableFactor::Named { name, alias } => {
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
@@ -71,9 +73,13 @@ impl Database {
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
-            TableFactor::Derived { query, alias } => {
+            TableFactor::Derived { query, alias, columns } => {
                 let res = self.run_select_depth(query, depth + 1)?;
-                Ok(Source { data: SourceData::Rows(res.rows), alias: alias.clone(), names: res.columns })
+                let names = rename_columns(res.columns, columns, alias)?;
+                Ok(Source { data: SourceData::Rows(res.rows), alias: alias.clone(), names })
+            }
+            TableFactor::Materialized { rows, columns, alias } => {
+                Ok(Source { data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
             }
         }
     }
@@ -86,6 +92,12 @@ impl Database {
         if depth > MAX_DEPTH {
             return Err(Error::runtime("queries are nested too deeply (is a saved query referring to itself?)"));
         }
+        if sel.with.is_some() {
+            return self.run_with(sel, depth);
+        }
+        if !sel.unions.is_empty() {
+            return self.run_union(sel, depth);
+        }
 
         // 1. Resolve sources and build the name scope.
         let mut sources = Vec::new();
@@ -97,10 +109,14 @@ impl Database {
             }
             for s in &sources {
                 for n in &s.names {
-                    scope.cols.push(ScopeCol { table: s.alias.clone(), name: n.clone() });
+                    scope.cols.push(ScopeCol { table: s.alias.clone(), name: n.clone(), hidden: false });
                 }
             }
         }
+        let join_ons = match &sel.from {
+            Some(from) => join_conditions(from, &sources, &mut scope)?,
+            None => Vec::new(),
+        };
 
         // 2. Expand the select list.
         let out_items = expand_items(sel, &scope)?;
@@ -113,13 +129,17 @@ impl Database {
             || sel.order_by.iter().any(|o| contains_agg(&o.expr));
 
         let mut binder = Binder::new(self, &scope, depth);
+        binder.allow_corr = true;
         let filter = sel.filter.as_ref().map(|f| binder.bind(f)).transpose()?;
         if is_agg {
             let exprs = sel.group_by.iter().map(|g| binder.bind(g)).collect::<Result<Vec<_>>>()?;
             binder.group = Some(GroupCtx { exprs, aggs: Vec::new() });
         }
+        binder.allow_win = true;
         let out_b = out_items.iter().map(|(_, e)| binder.bind(e)).collect::<Result<Vec<_>>>()?;
+        binder.allow_win = false;
         let having = sel.having.as_ref().map(|h| binder.bind(h)).transpose()?;
+        binder.allow_win = true;
 
         // ORDER BY: ordinal, output alias, or arbitrary expression (hidden column).
         let mut hidden: Vec<BExpr> = Vec::new();
@@ -138,6 +158,30 @@ impl Database {
             sort_keys.push((col, o.desc));
         }
         let group = binder.group.take();
+        let corr = std::mem::take(&mut binder.corr);
+        let mut wins = std::mem::take(&mut binder.wins);
+
+        // Hidden columns follow the row: the grouping mask (grouped queries),
+        // sub-query values, then window function results.
+        let mask_pos = group.as_ref().map_or(0, |g| g.exprs.len() + g.aggs.len());
+        let has_mask = group.is_some() && !sel.group_sets.is_empty();
+        let extra_base = match &group {
+            Some(_) => mask_pos + usize::from(has_mask),
+            None => scope.cols.len() + corr.len(),
+        };
+        let remap = move |i: usize| {
+            if i == MASK_COL {
+                mask_pos
+            } else if i >= WIN_BASE {
+                extra_base + (i - WIN_BASE)
+            } else {
+                i
+            }
+        };
+        let out_b: Vec<BExpr> = out_b.iter().map(|e| e.map_cols(&remap)).collect();
+        let having = having.map(|h| h.map_cols(&remap));
+        let hidden: Vec<BExpr> = hidden.iter().map(|e| e.map_cols(&remap)).collect();
+        wins.iter_mut().for_each(|w| w.map_cols(&remap));
 
         // 4. Produce source rows.
         let limit_total = match (sel.top, sel.limit) {
@@ -145,7 +189,9 @@ impl Database {
             (a, b) => a.or(b),
         };
         let need = limit_total.map(|l| l.saturating_add(sel.offset.unwrap_or(0)));
-        let scan_limit = if !is_agg && !sel.distinct && sel.order_by.is_empty() { need } else { None };
+        let scan_limit = if !is_agg && !sel.distinct && sel.order_by.is_empty() && corr.is_empty() && wins.is_empty() { need } else { None };
+        // Conjuncts that read a correlated sub-query's value wait until it is computed.
+        let (filter, late_filter) = if corr.is_empty() { (filter, None) } else { split_late(filter, scope.cols.len()) };
 
         let mut rows: Vec<Row> = match &sel.from {
             None => {
@@ -159,13 +205,25 @@ impl Database {
             }
             Some(from) => {
                 let conj: Vec<&BExpr> = filter.as_ref().map(split_and).unwrap_or_default();
-                self.produce_rows(&sources, from, &scope, filter.as_ref(), &conj, scan_limit, depth)?
+                self.produce_rows(&sources, from, &scope, &join_ons, filter.as_ref(), &conj, scan_limit, depth)?
             }
         };
+        if !corr.is_empty() {
+            rows = self.add_corr_columns(rows, &corr, depth)?;
+            if let Some(f) = &late_filter {
+                let mut kept = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if f.eval_bool(&r)? {
+                        kept.push(r);
+                    }
+                }
+                rows = kept;
+            }
+        }
 
         // 5. Grouping.
         if let Some(g) = group {
-            rows = aggregate(rows, &g.exprs, &g.aggs)?;
+            rows = aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets)?;
             if let Some(h) = &having {
                 let mut kept = Vec::with_capacity(rows.len());
                 for r in rows {
@@ -175,6 +233,10 @@ impl Database {
                 }
                 rows = kept;
             }
+        }
+
+        if !wins.is_empty() {
+            rows = window::compute(rows, &wins)?;
         }
 
         // 6. Projection (plus hidden sort columns).
@@ -237,12 +299,142 @@ impl Database {
         })
     }
 
+    /// Appends, to every row, the value of each correlated sub-query for that
+    /// row. A sub-query runs once per distinct set of outer values it reads.
+    pub(crate) fn add_corr_columns(&self, mut rows: Vec<Row>, specs: &[CorrSpec], depth: u32) -> Result<Vec<Row>> {
+        const CACHE_LIMIT: usize = 4096;
+        let mut caches: Vec<HashMap<Vec<Value>, Rc<Vec<Row>>>> = specs.iter().map(|_| HashMap::new()).collect();
+        for row in &mut rows {
+            for (spec, cache) in specs.iter().zip(&mut caches) {
+                let key: Vec<Value> = spec.outer.iter().map(|(_, c)| row[*c].clone()).collect();
+                let result = match cache.get(&key) {
+                    Some(r) => Rc::clone(r),
+                    None => {
+                        let values: HashMap<String, Value> =
+                            spec.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
+                        let mut q = spec.query.clone();
+                        crate::sql::walk::bind_params_select(&mut q, &values)?;
+                        let res = self.run_select_depth(&q, depth + 1)?;
+                        if !matches!(spec.kind, CorrKind::Exists { .. }) && res.columns.len() != 1 {
+                            return Err(Error::runtime("a sub-query used as a value must return exactly one column"));
+                        }
+                        if cache.len() >= CACHE_LIMIT {
+                            cache.clear();
+                        }
+                        let rc = Rc::new(res.rows);
+                        cache.insert(key, Rc::clone(&rc));
+                        rc
+                    }
+                };
+                let v = match &spec.kind {
+                    CorrKind::Scalar => {
+                        if result.len() > 1 {
+                            return Err(Error::runtime("scalar subquery returned more than one row"));
+                        }
+                        result.first().map_or(Value::Null, |r| r[0].clone())
+                    }
+                    CorrKind::Exists { negated } => Value::Bool(result.is_empty() == *negated),
+                    CorrKind::In { expr, negated } => {
+                        let lhs = expr.eval(row)?;
+                        if lhs.is_null() {
+                            Value::Null
+                        } else {
+                            let found = result.iter().any(|r| lhs.sql_cmp(&r[0]) == Some(Ordering::Equal));
+                            let t = if found {
+                                Some(true)
+                            } else if result.iter().any(|r| r[0].is_null()) {
+                                None
+                            } else {
+                                Some(false)
+                            };
+                            t.map_or(Value::Null, |b| Value::Bool(b != *negated))
+                        }
+                    }
+                };
+                row.push(v);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// `SELECT ... UNION [ALL] SELECT ...`: the members run on their own, their
+    /// rows are concatenated (removing duplicates at each plain `UNION`), and the
+    /// trailing ORDER BY / LIMIT / OFFSET apply to the whole.
+    fn run_union(&self, sel: &Select, depth: u32) -> Result<QueryResult> {
+        let mut head = sel.clone();
+        head.unions.clear();
+        head.order_by.clear();
+        head.limit = None;
+        head.offset = None;
+        let first = self.run_select_depth(&head, depth)?;
+        let columns = first.columns;
+        // INTERSECT binds tighter than UNION and EXCEPT, which go left to right.
+        let mut terms: Vec<(SetOp, bool, Vec<Row>)> = vec![(SetOp::Union, true, first.rows)];
+        for part in &sel.unions {
+            let res = self.run_select_depth(&part.select, depth + 1)?;
+            if res.columns.len() != columns.len() {
+                return Err(Error::runtime(format!(
+                    "every SELECT in a set operation must return the same number of columns ({} and {} differ)",
+                    columns.len(),
+                    res.columns.len()
+                )));
+            }
+            if part.op == SetOp::Intersect {
+                let last = terms.last_mut().expect("never empty");
+                last.2 = combine(SetOp::Intersect, part.all, std::mem::take(&mut last.2), res.rows);
+            } else {
+                terms.push((part.op, part.all, res.rows));
+            }
+        }
+        let mut terms = terms.into_iter();
+        let mut rows = terms.next().expect("never empty").2;
+        for (op, all, next) in terms {
+            rows = combine(op, all, rows, next);
+        }
+
+        let mut keys: Vec<(usize, bool)> = Vec::new();
+        for o in &sel.order_by {
+            let col = match &o.expr {
+                Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= columns.len() => *n as usize - 1,
+                Expr::Column { name, .. } => columns.iter().position(|c| c.eq_ignore_ascii_case(name)).ok_or_else(|| {
+                    Error::catalog(format!("ORDER BY '{name}' is not a column of the UNION result"))
+                })?,
+                _ => {
+                    return Err(Error::runtime(
+                        "ORDER BY after a UNION must name a result column or give its position",
+                    ))
+                }
+            };
+            keys.push((col, o.desc));
+        }
+        if !keys.is_empty() {
+            rows.sort_by(|a, b| {
+                for &(c, desc) in &keys {
+                    let o = a[c].cmp(&b[c]);
+                    let o = if desc { o.reverse() } else { o };
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                Ordering::Equal
+            });
+        }
+        if let Some(off) = sel.offset {
+            rows.drain(..off.min(rows.len()));
+        }
+        if let Some(l) = sel.limit {
+            rows.truncate(l);
+        }
+        Ok(QueryResult { columns, rows, affected: 0 })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn produce_rows(
         &self,
         sources: &[Source<'_>],
         from: &From,
         scope: &Scope,
+        ons: &[Option<Expr>],
         filter: Option<&BExpr>,
         conj: &[&BExpr],
         limit: Option<usize>,
@@ -277,7 +469,7 @@ impl Database {
         let mut width = base.ncols();
         for (k, join) in from.joins.iter().enumerate() {
             let right = &sources[k + 1];
-            let on = match &join.on {
+            let on = match &ons[k] {
                 Some(on) => {
                     let prefix = scope.prefix(width + right.ncols());
                     Some(Binder::new(self, &prefix, depth).bind(on)?)
@@ -313,7 +505,7 @@ fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, Expr)>> {
                 if scope.cols.is_empty() {
                     return Err(Error::runtime("SELECT * requires a FROM clause"));
                 }
-                for c in &scope.cols {
+                for c in scope.cols.iter().filter(|c| !c.hidden) {
                     out.push((c.name.clone(), Expr::Column { table: Some(c.table.clone()), name: c.name.clone() }));
                 }
             }
@@ -370,6 +562,21 @@ pub(crate) fn split_and(e: &BExpr) -> Vec<&BExpr> {
         }
     }
     out
+}
+
+/// Splits a filter into the part that can run on source rows (reading only the
+/// first `width` columns) and the rest, which needs computed hidden columns.
+pub(crate) fn split_late(filter: Option<BExpr>, width: usize) -> (Option<BExpr>, Option<BExpr>) {
+    let Some(f) = filter else { return (None, None) };
+    let (mut early, mut late): (Vec<BExpr>, Vec<BExpr>) = (Vec::new(), Vec::new());
+    for c in split_and(&f) {
+        match c.col_bounds() {
+            Some((_, hi)) if hi >= width => late.push(c.clone()),
+            _ => early.push(c.clone()),
+        }
+    }
+    let join = |v: Vec<BExpr>| v.into_iter().reduce(|a, b| BExpr::Bin(BinOp::And, Box::new(a), Box::new(b)));
+    (join(early), join(late))
 }
 
 enum Access {
@@ -619,7 +826,7 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
         Strategy::Scan => false,
     };
     let residual = if only_equi && covers_all { None } else { on };
-    let mut right_matched = (kind == JoinKind::Right).then(|| vec![false; right.slot_count()]);
+    let mut right_matched = matches!(kind, JoinKind::Right | JoinKind::Full).then(|| vec![false; right.slot_count()]);
     let mut out: Vec<Row> = Vec::new();
     let mut scratch: Row = Vec::with_capacity(lw + rw);
     let mut cands: Vec<usize> = Vec::new();
@@ -666,7 +873,7 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
             }
             out.push(scratch.clone());
         }
-        if !matched && kind == JoinKind::Left {
+        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
             let mut row = l.clone();
             row.resize(lw + rw, Value::Null);
             out.push(row);
@@ -692,22 +899,50 @@ fn join_step(left: Vec<Row>, lw: usize, right: &Source<'_>, kind: JoinKind, on: 
 // Grouping
 // ---------------------------------------------------------------------------
 
-fn aggregate(rows: Vec<Row>, group_exprs: &[BExpr], aggs: &[AggSpec]) -> Result<Vec<Row>> {
+fn aggregate(rows: Vec<Row>, group_exprs: &[BExpr], aggs: &[AggSpec], sets: &[Vec<usize>]) -> Result<Vec<Row>> {
+    if sets.is_empty() {
+        return aggregate_set(&rows, group_exprs, aggs, None, None);
+    }
+    if group_exprs.len() > 62 {
+        return Err(Error::runtime("too many GROUP BY expressions for grouping sets"));
+    }
+    let mut out = Vec::new();
+    for set in sets {
+        // Bit i of the mask is set when group expression i is rolled up in this set.
+        let mask = (0..group_exprs.len()).filter(|i| !set.contains(i)).fold(0i64, |m, i| m | (1 << i));
+        out.extend(aggregate_set(&rows, group_exprs, aggs, Some(set), Some(mask))?);
+    }
+    Ok(out)
+}
+
+/// One grouping. With `active`, only those group expressions form the key; the
+/// others are NULL in the output, and `mask` is appended to every row.
+fn aggregate_set(
+    rows: &[Row],
+    group_exprs: &[BExpr],
+    aggs: &[AggSpec],
+    active: Option<&[usize]>,
+    mask: Option<i64>,
+) -> Result<Vec<Row>> {
     let new_states = || aggs.iter().map(AggState::new).collect::<Vec<_>>();
     let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
     let mut groups: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
-    if group_exprs.is_empty() {
+    let global = active.map_or(group_exprs.is_empty(), |s| s.is_empty());
+    let null_key = || vec![Value::Null; group_exprs.len()];
+    if global {
         // A global aggregate yields one row even over empty input.
-        groups.push((Vec::new(), new_states()));
+        groups.push((null_key(), new_states()));
     }
-    for row in &rows {
-        let gi = if group_exprs.is_empty() {
+    for row in rows {
+        let gi = if global {
             0
         } else {
-            let key = group_exprs
-                .iter()
-                .map(|e| e.eval(row).map(|v| v.into_owned()))
-                .collect::<Result<Vec<_>>>()?;
+            let mut key = null_key();
+            for (i, e) in group_exprs.iter().enumerate() {
+                if active.is_none_or(|s| s.contains(&i)) {
+                    key[i] = e.eval(row)?.into_owned();
+                }
+            }
             match index.get(&key) {
                 Some(&i) => i,
                 None => {
@@ -732,7 +967,264 @@ fn aggregate(rows: Vec<Row>, group_exprs: &[BExpr], aggs: &[AggSpec]) -> Result<
         .into_iter()
         .map(|(mut key, states)| {
             key.extend(states.into_iter().map(AggState::finish));
+            if let Some(m) = mask {
+                key.push(Value::Int(m));
+            }
             key
         })
         .collect())
+}
+
+/// `a UNION|INTERSECT|EXCEPT [ALL] b` over already computed rows.
+fn combine(op: SetOp, all: bool, a: Vec<Row>, b: Vec<Row>) -> Vec<Row> {
+    let dedupe = |rows: Vec<Row>| {
+        let mut seen = HashSet::with_capacity(rows.len());
+        rows.into_iter().filter(|r| seen.insert(r.clone())).collect::<Vec<_>>()
+    };
+    match op {
+        SetOp::Union => {
+            let mut rows = a;
+            rows.extend(b);
+            if all { rows } else { dedupe(rows) }
+        }
+        SetOp::Intersect | SetOp::Except => {
+            let keep_matches = op == SetOp::Intersect;
+            if all {
+                let mut counts: HashMap<Row, usize> = HashMap::new();
+                for r in b {
+                    *counts.entry(r).or_default() += 1;
+                }
+                a.into_iter()
+                    .filter(|r| match counts.get_mut(r) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            keep_matches
+                        }
+                        _ => !keep_matches,
+                    })
+                    .collect()
+            } else {
+                let set: HashSet<Row> = b.into_iter().collect();
+                dedupe(a.into_iter().filter(|r| set.contains(r) == keep_matches).collect())
+            }
+        }
+    }
+}
+
+/// Applies a column alias list (`AS t(a, b)`) to a source's column names.
+fn rename_columns(actual: Vec<String>, wanted: &[String], what: &str) -> Result<Vec<String>> {
+    if wanted.is_empty() {
+        return Ok(actual);
+    }
+    if wanted.len() != actual.len() {
+        return Err(Error::runtime(format!(
+            "'{what}' names {} columns but its query returns {}",
+            wanted.len(),
+            actual.len()
+        )));
+    }
+    Ok(wanted.to_vec())
+}
+
+/// The ON condition of each join. `USING` and `NATURAL` become equalities of
+/// the like-named columns, and hide the duplicate so the column shows once.
+fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Result<Vec<Option<Expr>>> {
+    let mut out = Vec::with_capacity(from.joins.len());
+    let mut left_width = sources[0].ncols();
+    for (k, join) in from.joins.iter().enumerate() {
+        let right = &sources[k + 1];
+        if join.using.is_empty() && !join.natural {
+            out.push(join.on.clone());
+            left_width += right.ncols();
+            continue;
+        }
+        if join.kind == JoinKind::Full {
+            return Err(Error::runtime("FULL JOIN with USING or NATURAL is not supported; write the ON condition"));
+        }
+        let names: Vec<String> = if join.natural {
+            let mut common: Vec<String> = Vec::new();
+            for n in &right.names {
+                let in_left = scope.cols[..left_width].iter().any(|c| !c.hidden && c.name.eq_ignore_ascii_case(n));
+                if in_left && !common.iter().any(|c| c.eq_ignore_ascii_case(n)) {
+                    common.push(n.clone());
+                }
+            }
+            common
+        } else {
+            join.using.clone()
+        };
+        let mut cond: Option<Expr> = None;
+        for name in &names {
+            let lefts: Vec<usize> = (0..left_width)
+                .filter(|&i| !scope.cols[i].hidden && scope.cols[i].name.eq_ignore_ascii_case(name))
+                .collect();
+            let rights: Vec<usize> =
+                (0..right.ncols()).filter(|&i| right.names[i].eq_ignore_ascii_case(name)).collect();
+            let (li, ri) = match (lefts.as_slice(), rights.as_slice()) {
+                ([l], [r]) => (*l, *r),
+                ([], _) => return Err(Error::catalog(format!("the column '{name}' of USING is not on the left side of the join"))),
+                (_, []) => return Err(Error::catalog(format!("the column '{name}' of USING is not on the right side of the join"))),
+                _ => return Err(Error::catalog(format!("the column '{name}' of USING is ambiguous"))),
+            };
+            let eq = Expr::Binary {
+                op: BinOp::Eq,
+                left: Box::new(Expr::Column { table: Some(scope.cols[li].table.clone()), name: scope.cols[li].name.clone() }),
+                right: Box::new(Expr::Column { table: Some(right.alias.clone()), name: right.names[ri].clone() }),
+            };
+            cond = Some(match cond {
+                None => eq,
+                Some(c) => Expr::Binary { op: BinOp::And, left: Box::new(c), right: Box::new(eq) },
+            });
+            if join.kind == JoinKind::Right {
+                scope.cols[li].hidden = true;
+            } else {
+                scope.cols[left_width + ri].hidden = true;
+            }
+        }
+        out.push(cond);
+        left_width += right.ncols();
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Common table expressions
+// ---------------------------------------------------------------------------
+
+/// Replaces references to the CTE `name` in `s` (sub-queries included) with its rows.
+fn subst_cte(s: &mut Select, name: &str, rows: &Rc<Vec<Row>>, cols: &[String]) {
+    fn factor(f: &mut TableFactor, name: &str, rows: &Rc<Vec<Row>>, cols: &[String]) {
+        match f {
+            TableFactor::Named { name: n, alias } if n.eq_ignore_ascii_case(name) => {
+                let alias = alias.clone().unwrap_or_else(|| n.clone());
+                *f = TableFactor::Materialized { rows: Rc::clone(rows), columns: cols.to_vec(), alias };
+            }
+            TableFactor::Derived { query, .. } => subst_cte(query, name, rows, cols),
+            _ => {}
+        }
+    }
+    if let Some(w) = &mut s.with {
+        for c in &mut w.ctes {
+            subst_cte(&mut c.query, name, rows, cols);
+        }
+    }
+    if let Some(from) = &mut s.from {
+        factor(&mut from.first, name, rows, cols);
+        for j in &mut from.joins {
+            factor(&mut j.factor, name, rows, cols);
+        }
+    }
+    for u in &mut s.unions {
+        subst_cte(&mut u.select, name, rows, cols);
+    }
+    let _ = crate::sql::walk::walk_select(s, &mut |e| {
+        if let Expr::Subquery(q) | Expr::Exists { query: q, .. } | Expr::InSelect { query: q, .. } = e {
+            subst_cte(q, name, rows, cols);
+        }
+        Ok(())
+    });
+}
+
+fn mentions_table(s: &Select, name: &str) -> bool {
+    let mut copy = s.clone();
+    subst_cte(&mut copy, name, &Rc::new(Vec::new()), &[]);
+    copy != *s
+}
+
+impl Database {
+    /// `WITH name AS (...) query`: each CTE runs once, in order, and its rows
+    /// stand in for the name wherever the rest of the statement uses it.
+    fn run_with(&self, sel: &Select, depth: u32) -> Result<QueryResult> {
+        let with = sel.with.as_ref().expect("checked by the caller");
+        let mut body = sel.clone();
+        body.with = None;
+        let mut done: Vec<(String, Rc<Vec<Row>>, Vec<String>)> = Vec::new();
+        for cte in &with.ctes {
+            let mut q = cte.query.clone();
+            for (n, rows, cols) in &done {
+                subst_cte(&mut q, n, rows, cols);
+            }
+            let (cols, rows) = if with.recursive && mentions_table(&q, &cte.name) {
+                self.run_recursive(cte, &q, depth)?
+            } else {
+                let res = self.run_select_depth(&q, depth + 1)?;
+                (rename_columns(res.columns, &cte.columns, &cte.name)?, res.rows)
+            };
+            done.push((cte.name.clone(), Rc::new(rows), cols));
+        }
+        for (n, rows, cols) in &done {
+            subst_cte(&mut body, n, rows, cols);
+        }
+        self.run_select_depth(&body, depth)
+    }
+
+    /// A recursive CTE: the non-recursive parts start it, then the recursive
+    /// parts run again and again on the rows the previous round produced,
+    /// until a round produces nothing.
+    fn run_recursive(&self, cte: &Cte, q: &Select, depth: u32) -> Result<(Vec<String>, Vec<Row>)> {
+        const MAX_ROUNDS: usize = 100_000;
+        const MAX_ROWS: usize = 10_000_000;
+        let name = &cte.name;
+        if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
+            return Err(Error::runtime(format!("the recursive query '{name}' cannot have ORDER BY or LIMIT")));
+        }
+        let mut head = q.clone();
+        head.unions.clear();
+        let mut members = vec![head];
+        for u in &q.unions {
+            if u.op != SetOp::Union {
+                return Err(Error::runtime(format!("the recursive query '{name}' may only combine its parts with UNION")));
+            }
+            members.push(u.select.clone());
+        }
+        let distinct = q.unions.iter().any(|u| !u.all);
+        let (recursive, anchors): (Vec<Select>, Vec<Select>) = members.into_iter().partition(|m| mentions_table(m, name));
+        if anchors.is_empty() {
+            return Err(Error::runtime(format!("the recursive query '{name}' has no starting part that avoids referring to itself")));
+        }
+        let mut names: Option<Vec<String>> = None;
+        let mut rows: Vec<Row> = Vec::new();
+        for m in &anchors {
+            let res = self.run_select_depth(m, depth + 1)?;
+            if names.as_ref().is_some_and(|n| n.len() != res.columns.len()) {
+                return Err(Error::runtime(format!("the parts of the recursive query '{name}' have different numbers of columns")));
+            }
+            names.get_or_insert(res.columns);
+            rows.extend(res.rows);
+        }
+        let names = rename_columns(names.expect("at least one anchor"), &cte.columns, name)?;
+        let mut seen: HashSet<Row> = HashSet::new();
+        if distinct {
+            rows.retain(|r| seen.insert(r.clone()));
+        }
+        let mut all = rows.clone();
+        let mut working = rows;
+        let mut rounds = 0;
+        while !working.is_empty() {
+            rounds += 1;
+            if rounds > MAX_ROUNDS {
+                return Err(Error::runtime(format!("the recursive query '{name}' did not stop after {MAX_ROUNDS} rounds")));
+            }
+            let current = Rc::new(std::mem::take(&mut working));
+            let mut next: Vec<Row> = Vec::new();
+            for m in &recursive {
+                let mut m = m.clone();
+                subst_cte(&mut m, name, &current, &names);
+                let res = self.run_select_depth(&m, depth + 1)?;
+                if res.columns.len() != names.len() {
+                    return Err(Error::runtime(format!("the parts of the recursive query '{name}' have different numbers of columns")));
+                }
+                next.extend(res.rows);
+            }
+            if distinct {
+                next.retain(|r| seen.insert(r.clone()));
+            }
+            if all.len() + next.len() > MAX_ROWS {
+                return Err(Error::runtime(format!("the recursive query '{name}' produced too many rows")));
+            }
+            all.extend(next.iter().cloned());
+            working = next;
+        }
+        Ok((names, all))
+    }
 }

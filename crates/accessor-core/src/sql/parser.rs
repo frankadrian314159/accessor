@@ -10,7 +10,8 @@ const RESERVED: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER",
     "CROSS", "ON", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN", "UNION", "LIMIT", "OFFSET", "SET",
     "VALUES", "INTO", "DISTINCT", "TOP", "ASC", "DESC", "CASE", "WHEN", "THEN", "ELSE", "END", "EXISTS", "INSERT",
-    "UPDATE", "DELETE", "CREATE", "DROP", "TABLE", "INDEX", "VIEW", "MOD", "ALL",
+    "UPDATE", "DELETE", "CREATE", "DROP", "TABLE", "INDEX", "VIEW", "MOD", "ALL", "NATURAL", "USING", "INTERSECT",
+    "EXCEPT", "FETCH",
 ];
 
 /// Parses a script of one or more `;`-separated statements.
@@ -104,6 +105,101 @@ fn negate_literal(v: &Value) -> Option<Value> {
         },
         other => other,
     })
+}
+
+/// Prefixes every identifier of `text` for which `is_column` holds with `prefix`
+/// (`age > 0` becomes `NEW.age > 0`), leaving function names and already
+/// qualified names alone.
+pub fn qualify_columns(text: &str, prefix: &str, is_column: &dyn Fn(&str) -> bool) -> Result<String> {
+    let toks = lex(text)?;
+    let mut out = String::new();
+    let mut last = 0;
+    for (i, t) in toks.iter().enumerate() {
+        let name = match &t.tok {
+            Tok::Ident(s) | Tok::Quoted(s) => s,
+            _ => continue,
+        };
+        let after_dot = i > 0 && matches!(toks[i - 1].tok, Tok::Sym("."));
+        let before_paren = matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Sym("(")));
+        if after_dot || before_paren || !is_column(name) {
+            continue;
+        }
+        out.push_str(&text[last..t.pos]);
+        out.push_str(prefix);
+        out.push('.');
+        last = t.pos;
+    }
+    out.push_str(&text[last..]);
+    Ok(out)
+}
+
+/// Rewrites `alias.col` to `table.col` in an UPDATE or DELETE that named its target with an alias.
+fn requalify(st: &mut Statement, alias: &str, table: &str) -> Result<()> {
+    crate::sql::walk::walk_statement(st, &mut |e| {
+        if let Expr::Column { table: Some(t), .. } = e {
+            if t.eq_ignore_ascii_case(alias) {
+                *t = table.to_string();
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `a IS [NOT] DISTINCT FROM b`: like `<>`/`=`, but NULLs compare as equal to each other.
+fn distinct_from(a: Expr, b: Expr, negated: bool) -> Expr {
+    let null = |e: &Expr| Expr::IsNull { expr: Box::new(e.clone()), negated: false };
+    let both_null = Expr::Binary { op: BinOp::And, left: Box::new(null(&a)), right: Box::new(null(&b)) };
+    let one_null = Expr::Binary { op: BinOp::Or, left: Box::new(null(&a)), right: Box::new(null(&b)) };
+    let differ = Expr::Binary { op: BinOp::Ne, left: Box::new(a), right: Box::new(b) };
+    let lit = |b: bool| Expr::Literal(Value::Bool(b));
+    Expr::Case {
+        whens: vec![(both_null, lit(negated)), (one_null, lit(!negated))],
+        else_expr: Some(Box::new(if negated { Expr::Not(Box::new(differ)) } else { differ })),
+    }
+}
+
+/// `x IS [NOT] TRUE|FALSE`: never unknown.
+fn truth_test(x: Expr, want: Option<bool>, negated: bool) -> Expr {
+    let lit = |b: bool| Expr::Literal(Value::Bool(b));
+    let is = match want {
+        Some(true) => Expr::Case { whens: vec![(x, lit(true))], else_expr: Some(Box::new(lit(false))) },
+        _ => Expr::Case {
+            whens: vec![(Expr::Not(Box::new(x)), lit(true))],
+            else_expr: Some(Box::new(lit(false))),
+        },
+    };
+    if negated { Expr::Not(Box::new(is)) } else { is }
+}
+
+/// `LIKE pattern ESCAPE e`: each escaped character becomes a one-character set,
+/// which matches that character literally.
+fn apply_escape(pattern: Expr, esc: Expr) -> Result<Expr> {
+    let (Expr::Literal(Value::Text(p)), Expr::Literal(Value::Text(e))) = (&pattern, &esc) else {
+        return Err(Error::syntax("LIKE ... ESCAPE needs a literal pattern and a literal escape character"));
+    };
+    let mut e_chars = e.chars();
+    let (Some(e), None) = (e_chars.next(), e_chars.next()) else {
+        return Err(Error::syntax("the ESCAPE value must be a single character"));
+    };
+    let mut out = String::new();
+    let mut chars = p.chars();
+    while let Some(c) = chars.next() {
+        if c == e {
+            match chars.next() {
+                Some(']') => out.push_str("]"),
+                Some('[') => out.push_str("[[]"),
+                Some(n) => {
+                    out.push('[');
+                    out.push(n);
+                    out.push(']');
+                }
+                None => return Err(Error::syntax("the pattern ends with the ESCAPE character")),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(Expr::Literal(Value::text(&out)))
 }
 
 struct Parser<'a> {
@@ -223,11 +319,18 @@ impl<'a> Parser<'a> {
     // ----- statements ------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
-        if self.peek_kw("SELECT") {
+        if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_sym("(") {
             return Ok(Statement::Select(self.select()?));
         }
         if self.eat_kw("INSERT") {
             return self.insert();
+        }
+        if self.eat_kw("MERGE") {
+            return self.merge();
+        }
+        if self.eat_kw("TRUNCATE") {
+            self.eat_kw("TABLE");
+            return Ok(Statement::Truncate(self.ident()?));
         }
         if self.eat_kw("UPDATE") {
             return self.update();
@@ -289,12 +392,16 @@ impl<'a> Parser<'a> {
         self.expect_kw("INTO")?;
         let table = self.ident()?;
         let mut columns = None;
-        if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") {
+        if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") && !self.peek_kw_at(1, "WITH") {
             self.advance();
             columns = Some(self.ident_list()?);
             self.expect_sym(")")?;
         }
-        let source = if self.eat_kw("VALUES") {
+        let source = if self.peek_kw("DEFAULT") && self.peek_kw_at(1, "VALUES") {
+            self.advance();
+            self.advance();
+            InsertSource::DefaultValues
+        } else if self.eat_kw("VALUES") {
             let mut rows = Vec::new();
             loop {
                 self.expect_sym("(")?;
@@ -309,7 +416,7 @@ impl<'a> Parser<'a> {
                 }
             }
             InsertSource::Values(rows)
-        } else if self.peek_kw("SELECT") {
+        } else if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_sym("(") {
             InsertSource::Select(Box::new(self.select()?))
         } else {
             return Err(self.unexpected("VALUES or SELECT"));
@@ -319,6 +426,7 @@ impl<'a> Parser<'a> {
 
     fn update(&mut self) -> Result<Statement> {
         let table = self.ident()?;
+        let alias = self.target_alias()?;
         self.expect_kw("SET")?;
         let mut assignments = Vec::new();
         loop {
@@ -330,7 +438,84 @@ impl<'a> Parser<'a> {
             }
         }
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
-        Ok(Statement::Update { table, assignments, filter })
+        let mut st = Statement::Update { table: table.clone(), assignments, filter };
+        if let Some(alias) = alias {
+            requalify(&mut st, &alias, &table)?;
+        }
+        Ok(st)
+    }
+
+    /// An optional `[AS] alias` after the target table of UPDATE, DELETE and MERGE.
+    fn target_alias(&mut self) -> Result<Option<String>> {
+        if self.eat_kw("AS") || self.peek_is_alias() {
+            return Ok(Some(self.ident()?));
+        }
+        Ok(None)
+    }
+
+    /// `MERGE INTO t [AS a] USING source ON cond WHEN [NOT] MATCHED [AND c] THEN action ...`.
+    fn merge(&mut self) -> Result<Statement> {
+        self.expect_kw("INTO")?;
+        let target = self.ident()?;
+        let target_alias = self.target_alias()?;
+        self.expect_kw("USING")?;
+        let source = self.table_factor()?;
+        self.expect_kw("ON")?;
+        let on = self.expr()?;
+        let mut whens = Vec::new();
+        while self.eat_kw("WHEN") {
+            let matched = !self.eat_kw("NOT");
+            self.expect_kw("MATCHED")?;
+            let condition = if self.eat_kw("AND") { Some(self.expr()?) } else { None };
+            self.expect_kw("THEN")?;
+            let action = if self.eat_kw("UPDATE") {
+                self.expect_kw("SET")?;
+                let mut sets = Vec::new();
+                loop {
+                    let col = self.column_name()?;
+                    self.expect_sym("=")?;
+                    sets.push((col, self.expr()?));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                MergeAction::Update(sets)
+            } else if self.eat_kw("DELETE") {
+                MergeAction::Delete
+            } else if self.eat_kw("INSERT") {
+                let columns = if self.eat_sym("(") {
+                    let c = self.ident_list()?;
+                    self.expect_sym(")")?;
+                    Some(c)
+                } else {
+                    None
+                };
+                self.expect_kw("VALUES")?;
+                self.expect_sym("(")?;
+                let mut values = vec![self.expr()?];
+                while self.eat_sym(",") {
+                    values.push(self.expr()?);
+                }
+                self.expect_sym(")")?;
+                MergeAction::Insert { columns, values }
+            } else {
+                return Err(self.unexpected("UPDATE, DELETE or INSERT"));
+            };
+            match (&action, matched) {
+                (MergeAction::Insert { .. }, true) => {
+                    return Err(Error::syntax("WHEN MATCHED cannot INSERT; use WHEN NOT MATCHED"))
+                }
+                (MergeAction::Update(_) | MergeAction::Delete, false) => {
+                    return Err(Error::syntax("WHEN NOT MATCHED can only INSERT"))
+                }
+                _ => {}
+            }
+            whens.push(MergeWhen { matched, condition, action });
+        }
+        if whens.is_empty() {
+            return Err(self.unexpected("WHEN"));
+        }
+        Ok(Statement::Merge(Box::new(MergeDef { target, target_alias, source, on, whens })))
     }
 
     /// A column name, optionally qualified (`t.col`); the qualifier is dropped.
@@ -346,8 +531,13 @@ impl<'a> Parser<'a> {
         self.eat_sym("*");
         self.expect_kw("FROM")?;
         let table = self.ident()?;
+        let alias = self.target_alias()?;
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
-        Ok(Statement::Delete { table, filter })
+        let mut st = Statement::Delete { table: table.clone(), filter };
+        if let Some(alias) = alias {
+            requalify(&mut st, &alias, &table)?;
+        }
+        Ok(st)
     }
 
     fn ident_list(&mut self) -> Result<Vec<String>> {
@@ -465,15 +655,35 @@ impl<'a> Parser<'a> {
     }
 
     fn create(&mut self) -> Result<Statement> {
+        let mut guarded = false;
+        let st = self.create_object(&mut guarded)?;
+        Ok(if guarded { Statement::Guarded { missing_ok: false, stmt: Box::new(st) } } else { st })
+    }
+
+    /// `IF NOT EXISTS` / `IF EXISTS` after the object keyword.
+    fn if_exists_clause(&mut self, negated: bool, guarded: &mut bool) -> Result<()> {
+        if self.eat_kw("IF") {
+            if negated {
+                self.expect_kw("NOT")?;
+            }
+            self.expect_kw("EXISTS")?;
+            *guarded = true;
+        }
+        Ok(())
+    }
+
+    fn create_object(&mut self, guarded: &mut bool) -> Result<Statement> {
         let create_pos = self.toks[self.pos - 1].pos;
         let unique = self.eat_kw("UNIQUE");
         if !unique && self.eat_kw("TRIGGER") {
             return self.trigger(create_pos);
         }
         if self.eat_kw("TABLE") {
+            self.if_exists_clause(true, guarded)?;
             return self.create_table();
         }
         if self.eat_kw("INDEX") {
+            self.if_exists_clause(true, guarded)?;
             let name = self.ident()?;
             self.expect_kw("ON")?;
             let table = self.ident()?;
@@ -483,6 +693,7 @@ impl<'a> Parser<'a> {
             return Ok(Statement::CreateIndex { name, table, columns, unique });
         }
         if !unique && (self.eat_kw("VIEW") || self.eat_kw("QUERY")) {
+            self.if_exists_clause(true, guarded)?;
             let name = self.ident()?;
             // Parameters come either as `name(@a, @b) AS ...` or as a leading
             // `PARAMETERS @a, @b;`; both are stored in the latter form.
@@ -536,8 +747,15 @@ impl<'a> Parser<'a> {
         let mut primary_key = Vec::new();
         let mut uniques = Vec::new();
         let mut foreign_keys = Vec::new();
+        let mut checks: Vec<(Option<String>, String)> = Vec::new();
         loop {
-            if self.peek_kw("FOREIGN") || self.peek_kw("CONSTRAINT") {
+            if self.peek_kw("CONSTRAINT") && self.peek_kw_at(2, "CHECK") {
+                self.advance();
+                let cname = self.ident()?;
+                checks.push((Some(cname), self.check_clause()?));
+            } else if self.peek_kw("CHECK") {
+                checks.push((None, self.check_clause()?));
+            } else if self.peek_kw("FOREIGN") || self.peek_kw("CONSTRAINT") {
                 foreign_keys.push(self.table_foreign_key()?);
             } else if self.peek_kw("PRIMARY") {
                 self.advance();
@@ -558,7 +776,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_sym(")")?;
-        Ok(Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys })
+        for c in &mut columns {
+            if let Some(text) = c.check.take() {
+                checks.push((None, text));
+            }
+        }
+        Ok(Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks })
     }
 
     /// `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES ...`
@@ -627,15 +850,20 @@ impl<'a> Parser<'a> {
         Ok(self.src[start..end].trim().to_string())
     }
 
+    /// `CHECK (expression)`; returns the expression text.
+    fn check_clause(&mut self) -> Result<String> {
+        self.expect_kw("CHECK")?;
+        self.expect_sym("(")?;
+        let start = self.toks[self.pos].pos;
+        self.expr()?;
+        let end = self.toks[self.pos].pos;
+        self.expect_sym(")")?;
+        Ok(self.src[start..end].trim().to_string())
+    }
+
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.ident()?;
-        let type_name = match self.advance() {
-            Tok::Ident(s) => s,
-            _ => {
-                self.pos = self.pos.saturating_sub(1);
-                return Err(self.unexpected("a data type"));
-            }
-        };
+        let type_name = self.type_name()?;
         let (data_type, autonumber) = DataType::from_sql_name(&type_name)
             .ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
         let mut expression = None;
@@ -658,9 +886,38 @@ impl<'a> Parser<'a> {
             default: None,
             references: None,
             expression,
+            check: None,
         };
         loop {
-            if self.eat_kw("NOT") {
+            if self.eat_kw("CONSTRAINT") {
+                // A name for the constraint that follows; only CHECK uses it.
+                self.ident()?;
+            } else if self.peek_kw("CHECK") {
+                def.check = Some(self.check_clause()?);
+            } else if self.eat_kw("GENERATED") {
+                if !self.eat_kw("ALWAYS") {
+                    self.expect_kw("BY")?;
+                    self.expect_kw("DEFAULT")?;
+                }
+                self.expect_kw("AS")?;
+                if self.eat_kw("IDENTITY") {
+                    def.autonumber = true;
+                    if self.eat_sym("(") {
+                        while !self.peek_sym(")") && !self.at_eof() {
+                            self.advance();
+                        }
+                        self.expect_sym(")")?;
+                    }
+                } else {
+                    // GENERATED ALWAYS AS (expression) [STORED|VIRTUAL]: a calculated field.
+                    self.pos -= 1;
+                    def.expression = Some(self.calculated_expression(&def.name)?);
+                    def.data_type = DataType::Calculated;
+                    if !self.eat_kw("STORED") {
+                        self.eat_kw("VIRTUAL");
+                    }
+                }
+            } else if self.eat_kw("NOT") {
                 self.expect_kw("NULL")?;
                 def.not_null = true;
             } else if self.eat_kw("NULL") {
@@ -697,7 +954,13 @@ impl<'a> Parser<'a> {
         self.expect_kw("TABLE")?;
         let table = self.ident()?;
         let action = if self.eat_kw("ADD") {
-            if self.peek_kw("FOREIGN") || self.peek_kw("CONSTRAINT") {
+            if self.peek_kw("CHECK") {
+                AlterAction::AddCheck { name: None, expr: self.check_clause()? }
+            } else if self.peek_kw("CONSTRAINT") && self.peek_kw_at(2, "CHECK") {
+                self.advance();
+                let name = self.ident()?;
+                AlterAction::AddCheck { name: Some(name), expr: self.check_clause()? }
+            } else if self.peek_kw("FOREIGN") || self.peek_kw("CONSTRAINT") {
                 AlterAction::AddForeignKey(self.table_foreign_key()?)
             } else {
                 self.eat_kw("COLUMN");
@@ -719,13 +982,7 @@ impl<'a> Parser<'a> {
             self.eat_kw("COLUMN");
             let name = self.ident()?;
             self.eat_kw("TYPE");
-            let type_name = match self.advance() {
-                Tok::Ident(s) => s,
-                _ => {
-                    self.pos = self.pos.saturating_sub(1);
-                    return Err(self.unexpected("a data type"));
-                }
-            };
+            let type_name = self.type_name()?;
             let (data_type, autonumber) = DataType::from_sql_name(&type_name)
                 .ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
             if data_type == DataType::Calculated {
@@ -749,16 +1006,29 @@ impl<'a> Parser<'a> {
     }
 
     fn drop_stmt(&mut self) -> Result<Statement> {
+        let mut guarded = false;
+        let st = self.drop_object(&mut guarded)?;
+        Ok(if guarded { Statement::Guarded { missing_ok: true, stmt: Box::new(st) } } else { st })
+    }
+
+    fn drop_object(&mut self, guarded: &mut bool) -> Result<Statement> {
         if self.eat_kw("TABLE") {
+            self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropTable(self.ident()?))
         } else if self.eat_kw("VIEW") || self.eat_kw("QUERY") {
+            self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropView(self.ident()?))
         } else if self.eat_kw("TRIGGER") {
+            self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropTrigger(self.ident()?))
         } else if self.eat_kw("INDEX") {
+            self.if_exists_clause(false, guarded)?;
             let name = self.ident()?;
-            self.expect_kw("ON")?;
-            Ok(Statement::DropIndex { name, table: self.ident()? })
+            if self.eat_kw("ON") {
+                Ok(Statement::DropIndex { name, table: self.ident()? })
+            } else {
+                Err(self.unexpected("ON"))
+            }
         } else {
             Err(self.unexpected("TABLE, VIEW, INDEX or TRIGGER"))
         }
@@ -767,6 +1037,114 @@ impl<'a> Parser<'a> {
     // ----- SELECT -----------------------------------------------------------
 
     fn select(&mut self) -> Result<Select> {
+        let with = if self.peek_kw("WITH") { Some(Box::new(self.with_clause()?)) } else { None };
+        let mut sel = self.select_core()?;
+        // Set operators combine left to right.
+        loop {
+            let op = if self.eat_kw("UNION") {
+                SetOp::Union
+            } else if self.eat_kw("INTERSECT") {
+                SetOp::Intersect
+            } else if self.eat_kw("EXCEPT") || self.eat_kw("MINUS") {
+                SetOp::Except
+            } else {
+                break;
+            };
+            let all = if self.eat_kw("ALL") {
+                true
+            } else {
+                self.eat_kw("DISTINCT");
+                false
+            };
+            let select = self.select_core()?;
+            sel.unions.push(SetPart { op, all, select });
+        }
+        self.select_tail(&mut sel)?;
+        sel.with = with;
+        Ok(sel)
+    }
+
+    /// `WITH [RECURSIVE] name [(columns)] AS (query) [, ...]`.
+    fn with_clause(&mut self) -> Result<With> {
+        self.expect_kw("WITH")?;
+        let recursive = self.eat_kw("RECURSIVE");
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident()?;
+            let columns = if self.eat_sym("(") {
+                let c = self.ident_list()?;
+                self.expect_sym(")")?;
+                c
+            } else {
+                Vec::new()
+            };
+            self.expect_kw("AS")?;
+            self.expect_sym("(")?;
+            let query = self.select()?;
+            self.expect_sym(")")?;
+            ctes.push(Cte { name, columns, query });
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        Ok(With { recursive, ctes })
+    }
+
+    /// `VALUES (a, b), (c, d)` as a query: the first row is the SELECT, the
+    /// rest are `UNION ALL` members.
+    fn values_select(&mut self) -> Result<Select> {
+        self.expect_kw("VALUES")?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect_sym("(")?;
+            let mut row = vec![self.expr()?];
+            while self.eat_sym(",") {
+                row.push(self.expr()?);
+            }
+            self.expect_sym(")")?;
+            rows.push(row);
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        let width = rows[0].len();
+        if rows.iter().any(|r| r.len() != width) {
+            return Err(Error::syntax("every row of VALUES must have the same number of values"));
+        }
+        let mut rows = rows.into_iter();
+        let first = rows.next().expect("at least one row");
+        let items = first
+            .into_iter()
+            .enumerate()
+            .map(|(i, expr)| SelectItem::Expr { expr, alias: Some(format!("column{}", i + 1)) })
+            .collect();
+        let mut sel = Select { items, ..Select::default() };
+        for r in rows {
+            let items = r.into_iter().map(|expr| SelectItem::Expr { expr, alias: None }).collect();
+            sel.unions.push(SetPart { op: SetOp::Union, all: true, select: Select { items, ..Select::default() } });
+        }
+        Ok(sel)
+    }
+
+    /// `SELECT ... [FROM ...] [WHERE ...] [GROUP BY ...] [HAVING ...]`.
+    fn select_core(&mut self) -> Result<Select> {
+        if self.peek_kw("VALUES") {
+            return self.values_select();
+        }
+        if self.peek_sym("(") {
+            // A parenthesised query used as a set-operation operand.
+            self.advance();
+            let inner = self.select()?;
+            self.expect_sym(")")?;
+            return Ok(Select {
+                items: vec![SelectItem::Wildcard],
+                from: Some(From {
+                    first: TableFactor::Derived { query: Box::new(inner), alias: "__paren".into(), columns: Vec::new() },
+                    joins: Vec::new(),
+                }),
+                ..Select::default()
+            });
+        }
         self.expect_kw("SELECT")?;
         let mut sel = Select::default();
         // DISTINCT / ALL and TOP n may come in either order.
@@ -794,14 +1172,16 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("GROUP") {
             self.expect_kw("BY")?;
-            sel.group_by.push(self.expr()?);
-            while self.eat_sym(",") {
-                sel.group_by.push(self.expr()?);
-            }
+            self.group_by(&mut sel)?;
         }
         if self.eat_kw("HAVING") {
             sel.having = Some(self.expr()?);
         }
+        Ok(sel)
+    }
+
+    /// `[ORDER BY ...] [LIMIT n [OFFSET m]]`, which close a whole query.
+    fn select_tail(&mut self, sel: &mut Select) -> Result<()> {
         if self.eat_kw("ORDER") {
             self.expect_kw("BY")?;
             loop {
@@ -818,13 +1198,131 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if self.eat_kw("LIMIT") {
-            sel.limit = Some(self.usize_literal()?);
-            if self.eat_kw("OFFSET") {
+        loop {
+            if self.eat_kw("LIMIT") {
+                sel.limit = Some(self.usize_literal()?);
+            } else if self.eat_kw("OFFSET") {
                 sel.offset = Some(self.usize_literal()?);
+                if !self.eat_kw("ROWS") {
+                    self.eat_kw("ROW");
+                }
+            } else if self.eat_kw("FETCH") {
+                if !self.eat_kw("FIRST") {
+                    self.expect_kw("NEXT")?;
+                }
+                let n = if matches!(self.peek(), Tok::Int(_)) { self.usize_literal()? } else { 1 };
+                if !self.eat_kw("ROWS") {
+                    self.expect_kw("ROW")?;
+                }
+                if self.eat_kw("WITH") {
+                    return Err(Error::syntax("FETCH ... WITH TIES is not supported"));
+                }
+                self.expect_kw("ONLY")?;
+                sel.limit = Some(n);
+            } else {
+                break;
             }
         }
-        Ok(sel)
+        Ok(())
+    }
+
+    /// The elements of a GROUP BY: plain expressions, `ROLLUP (...)`,
+    /// `CUBE (...)` and `GROUPING SETS (...)`, which combine by cross product.
+    fn group_by(&mut self, sel: &mut Select) -> Result<()> {
+        let index_of = |sel: &mut Select, e: Expr| -> usize {
+            match sel.group_by.iter().position(|x| *x == e) {
+                Some(i) => i,
+                None => {
+                    sel.group_by.push(e);
+                    sel.group_by.len() - 1
+                }
+            }
+        };
+        let mut sets: Vec<Vec<usize>> = vec![Vec::new()];
+        let mut special = false;
+        loop {
+            let alternatives: Vec<Vec<usize>> = if (self.peek_kw("ROLLUP") || self.peek_kw("CUBE"))
+                && matches!(self.peek_at(1), Tok::Sym("("))
+            {
+                special = true;
+                let cube = self.peek_kw("CUBE");
+                self.advance();
+                self.advance();
+                let mut idx = Vec::new();
+                loop {
+                    let e = self.expr()?;
+                    idx.push(index_of(sel, e));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                if cube {
+                    (0..1usize << idx.len())
+                        .rev()
+                        .map(|mask| (0..idx.len()).filter(|b| mask >> (idx.len() - 1 - b) & 1 == 1).map(|b| idx[b]).collect())
+                        .collect()
+                } else {
+                    (0..=idx.len()).rev().map(|n| idx[..n].to_vec()).collect()
+                }
+            } else if self.peek_kw("GROUPING") && self.peek_kw_at(1, "SETS") {
+                special = true;
+                self.advance();
+                self.advance();
+                self.expect_sym("(")?;
+                let mut alts = Vec::new();
+                loop {
+                    let mut set = Vec::new();
+                    if self.eat_sym("(") {
+                        if !self.peek_sym(")") {
+                            loop {
+                                let e = self.expr()?;
+                                set.push(index_of(sel, e));
+                                if !self.eat_sym(",") {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect_sym(")")?;
+                    } else {
+                        let e = self.expr()?;
+                        set.push(index_of(sel, e));
+                    }
+                    alts.push(set);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                alts
+            } else {
+                let e = self.expr()?;
+                vec![vec![index_of(sel, e)]]
+            };
+            let mut next = Vec::new();
+            for base in &sets {
+                for alt in &alternatives {
+                    let mut s = base.clone();
+                    for i in alt {
+                        if !s.contains(i) {
+                            s.push(*i);
+                        }
+                    }
+                    next.push(s);
+                }
+            }
+            sets = next;
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        if special {
+            for s in &mut sets {
+                s.sort_unstable();
+            }
+            sel.group_sets = sets;
+        }
+        Ok(())
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
@@ -854,6 +1352,7 @@ impl<'a> Parser<'a> {
     fn from_clause(&mut self) -> Result<From> {
         let mut from = self.from_source()?;
         loop {
+            let natural = self.eat_kw("NATURAL");
             let kind = if self.eat_kw("INNER") {
                 self.expect_kw("JOIN")?;
                 JoinKind::Inner
@@ -865,31 +1364,43 @@ impl<'a> Parser<'a> {
                 self.eat_kw("OUTER");
                 self.expect_kw("JOIN")?;
                 JoinKind::Right
+            } else if self.eat_kw("FULL") {
+                self.eat_kw("OUTER");
+                self.expect_kw("JOIN")?;
+                JoinKind::Full
             } else if self.eat_kw("CROSS") {
                 self.expect_kw("JOIN")?;
                 JoinKind::Cross
             } else if self.eat_kw("JOIN") {
                 JoinKind::Inner
+            } else if natural {
+                return Err(self.unexpected("JOIN"));
             } else if self.eat_sym(",") {
                 JoinKind::Cross
             } else {
                 break;
             };
             let factor = self.table_factor()?;
-            let on = if kind != JoinKind::Cross {
-                self.expect_kw("ON")?;
-                Some(self.expr()?)
-            } else {
-                None
-            };
-            from.joins.push(Join { kind, factor, on });
+            let mut on = None;
+            let mut using = Vec::new();
+            if kind != JoinKind::Cross && !natural {
+                if self.eat_kw("USING") {
+                    self.expect_sym("(")?;
+                    using = self.ident_list()?;
+                    self.expect_sym(")")?;
+                } else {
+                    self.expect_kw("ON")?;
+                    on = Some(self.expr()?);
+                }
+            }
+            from.joins.push(Join { kind, factor, on, using, natural });
         }
         Ok(from)
     }
 
     /// A table factor, or a parenthesised join list (Access nests joins).
     fn from_source(&mut self) -> Result<From> {
-        if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") {
+        if self.peek_sym("(") && !(self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH")) {
             self.advance();
             let inner = self.from_clause()?;
             self.expect_sym(")")?;
@@ -900,13 +1411,22 @@ impl<'a> Parser<'a> {
     }
 
     fn table_factor(&mut self) -> Result<TableFactor> {
-        if self.peek_sym("(") && self.peek_kw_at(1, "SELECT") {
+        if self.peek_sym("(")
+            && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH"))
+        {
             self.advance();
             let query = Box::new(self.select()?);
             self.expect_sym(")")?;
             self.eat_kw("AS");
             let alias = self.ident()?;
-            return Ok(TableFactor::Derived { query, alias });
+            let columns = if self.eat_sym("(") {
+                let c = self.ident_list()?;
+                self.expect_sym(")")?;
+                c
+            } else {
+                Vec::new()
+            };
+            return Ok(TableFactor::Derived { query, alias, columns });
         }
         let name = self.ident()?;
         let alias = if self.eat_kw("AS") || self.peek_is_alias() { Some(self.ident()?) } else { None };
@@ -959,14 +1479,30 @@ impl<'a> Parser<'a> {
             };
             if let Some(op) = op {
                 self.advance();
+                if (self.peek_kw("ANY") || self.peek_kw("SOME") || self.peek_kw("ALL")) && matches!(self.peek_at(1), Tok::Sym("(")) {
+                    left = self.quantified(left, op)?;
+                    continue;
+                }
                 let right = self.concat()?;
                 left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
                 continue;
             }
             if self.eat_kw("IS") {
                 let negated = self.eat_kw("NOT");
-                self.expect_kw("NULL")?;
-                left = Expr::IsNull { expr: Box::new(left), negated };
+                left = if self.eat_kw("DISTINCT") {
+                    self.expect_kw("FROM")?;
+                    let right = self.concat()?;
+                    distinct_from(left, right, negated)
+                } else if self.eat_kw("TRUE") {
+                    truth_test(left, Some(true), negated)
+                } else if self.eat_kw("FALSE") {
+                    truth_test(left, Some(false), negated)
+                } else if self.eat_kw("UNKNOWN") {
+                    Expr::IsNull { expr: Box::new(left), negated }
+                } else {
+                    self.expect_kw("NULL")?;
+                    Expr::IsNull { expr: Box::new(left), negated }
+                };
                 continue;
             }
             let negated = self.peek_kw("NOT")
@@ -975,16 +1511,36 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             if self.eat_kw("LIKE") {
-                let pattern = self.concat()?;
+                let mut pattern = self.concat()?;
+                if self.eat_kw("ESCAPE") {
+                    let esc = self.concat()?;
+                    pattern = apply_escape(pattern, esc)?;
+                }
                 left = Expr::Like { expr: Box::new(left), pattern: Box::new(pattern), negated };
             } else if self.eat_kw("BETWEEN") {
+                let symmetric = self.eat_kw("SYMMETRIC");
+                if !symmetric {
+                    self.eat_kw("ASYMMETRIC");
+                }
                 let low = self.concat()?;
                 self.expect_kw("AND")?;
                 let high = self.concat()?;
-                left = Expr::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated };
+                left = if symmetric {
+                    let fwd = Expr::Between {
+                        expr: Box::new(left.clone()),
+                        low: Box::new(low.clone()),
+                        high: Box::new(high.clone()),
+                        negated: false,
+                    };
+                    let rev = Expr::Between { expr: Box::new(left), low: Box::new(high), high: Box::new(low), negated: false };
+                    let either = Expr::Binary { op: BinOp::Or, left: Box::new(fwd), right: Box::new(rev) };
+                    if negated { Expr::Not(Box::new(either)) } else { either }
+                } else {
+                    Expr::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated }
+                };
             } else if self.eat_kw("IN") {
                 self.expect_sym("(")?;
-                if self.peek_kw("SELECT") {
+                if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
                     let q = self.select()?;
                     self.expect_sym(")")?;
                     left = Expr::InSelect { expr: Box::new(left), query: Box::new(q), negated };
@@ -1096,7 +1652,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Sym("(") => {
                 self.advance();
-                if self.peek_kw("SELECT") {
+                if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
                     let q = self.select()?;
                     self.expect_sym(")")?;
                     return Ok(Expr::Subquery(Box::new(q)));
@@ -1126,6 +1682,72 @@ impl<'a> Parser<'a> {
                         return Ok(Expr::Literal(Value::Bool(false)));
                     }
                     "CASE" => return self.case_expr(),
+                    // Typed literals: DATE '2024-03-05', TIMESTAMP '2024-03-05 10:30:00'.
+                    "DATE" | "TIMESTAMP" | "TIME" if matches!(self.peek_at(1), Tok::Str(_)) => {
+                        self.advance();
+                        let Tok::Str(text) = self.advance() else { unreachable!("checked") };
+                        let t = crate::datetime::parse(&text)
+                            .ok_or_else(|| Error::syntax(format!("'{text}' is not a valid {up} literal")))?;
+                        return Ok(Expr::Literal(Value::DateTime(t)));
+                    }
+                    "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
+                        if !matches!(self.peek_at(1), Tok::Sym("(")) =>
+                    {
+                        self.advance();
+                        let f = if up == "CURRENT_DATE" { "DATE" } else { "NOW" };
+                        return Ok(Expr::Function { name: f.into(), args: vec![], distinct: false, star: false });
+                    }
+                    "CAST" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        return self.cast_expr();
+                    }
+                    "EXTRACT" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        let field = self.ident_or_keyword()?;
+                        self.expect_kw("FROM")?;
+                        let e = self.expr()?;
+                        self.expect_sym(")")?;
+                        return Ok(Expr::Function {
+                            name: "DATEPART".into(),
+                            args: vec![Expr::Literal(Value::text(&field.to_ascii_lowercase())), e],
+                            distinct: false,
+                            star: false,
+                        });
+                    }
+                    "POSITION" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        let needle = self.additive()?;
+                        self.expect_kw("IN")?;
+                        let hay = self.expr()?;
+                        self.expect_sym(")")?;
+                        return Ok(Expr::Function { name: "INSTR".into(), args: vec![hay, needle], distinct: false, star: false });
+                    }
+                    "SUBSTRING" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        let s = self.expr()?;
+                        let mut args = vec![s];
+                        if self.eat_kw("FROM") {
+                            args.push(self.expr()?);
+                            if self.eat_kw("FOR") {
+                                args.push(self.expr()?);
+                            }
+                        } else {
+                            while self.eat_sym(",") {
+                                args.push(self.expr()?);
+                            }
+                        }
+                        self.expect_sym(")")?;
+                        return Ok(Expr::Function { name: "MID".into(), args, distinct: false, star: false });
+                    }
+                    "TRIM" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        return self.trim_expr();
+                    }
                     "EXISTS" => {
                         self.advance();
                         return self.exists(false);
@@ -1138,11 +1760,12 @@ impl<'a> Parser<'a> {
                     _ => {}
                 }
                 // LEFT and RIGHT are join keywords but also string functions.
-                let callable = !RESERVED.contains(&up.as_str()) || up == "LEFT" || up == "RIGHT";
+                let callable = !RESERVED.contains(&up.as_str()) || matches!(up.as_str(), "LEFT" | "RIGHT" | "MOD");
                 if matches!(self.peek_at(1), Tok::Sym("(")) && callable {
                     self.advance();
                     self.advance();
-                    return self.function_call(name);
+                    let call = self.function_call(name)?;
+                    return self.call_suffixes(call);
                 }
                 self.column_ref()
             }
@@ -1184,11 +1807,320 @@ impl<'a> Parser<'a> {
         Ok(Expr::Function { name: name.to_ascii_uppercase(), args, distinct, star })
     }
 
+    /// A keyword or identifier used as a plain word (field names of EXTRACT).
+    fn ident_or_keyword(&mut self) -> Result<String> {
+        match self.advance() {
+            Tok::Ident(s) => Ok(s),
+            _ => {
+                self.pos = self.pos.saturating_sub(1);
+                Err(self.unexpected("a name"))
+            }
+        }
+    }
+
+    /// The name of a data type, including the multi-word standard spellings.
+    fn type_name(&mut self) -> Result<String> {
+        let first = match self.advance() {
+            Tok::Ident(s) => s,
+            _ => {
+                self.pos = self.pos.saturating_sub(1);
+                return Err(self.unexpected("a data type"));
+            }
+        };
+        let up = first.to_ascii_uppercase();
+        match up.as_str() {
+            "DOUBLE" => {
+                self.eat_kw("PRECISION");
+            }
+            "NATIONAL" => {
+                if !self.eat_kw("CHARACTER") {
+                    self.eat_kw("CHAR");
+                }
+                self.eat_kw("VARYING");
+                return Ok("TEXT".into());
+            }
+            "CHARACTER" | "CHAR" | "VARCHAR" | "NCHAR" | "NVARCHAR" => {
+                if self.eat_kw("VARYING") {
+                    return Ok("TEXT".into());
+                }
+                if self.peek_kw("LARGE") {
+                    self.advance();
+                    self.expect_kw("OBJECT")?;
+                }
+            }
+            "BINARY" => {
+                self.eat_kw("LARGE");
+                self.eat_kw("VARYING");
+            }
+            "TIMESTAMP" | "TIME" => {
+                if self.eat_kw("WITH") || self.eat_kw("WITHOUT") {
+                    self.expect_kw("TIME")?;
+                    self.expect_kw("ZONE")?;
+                }
+            }
+            _ => {}
+        }
+        Ok(first)
+    }
+
+    /// `CAST(expr AS type)` after the opening parenthesis: the conversion
+    /// function for the type, and a ROUND for `DECIMAL(p, s)`.
+    fn cast_expr(&mut self) -> Result<Expr> {
+        let e = self.expr()?;
+        self.expect_kw("AS")?;
+        let tn = self.type_name()?;
+        let (ty, _) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+        let mut hints = Vec::new();
+        if self.eat_sym("(") {
+            while !self.peek_sym(")") && !self.at_eof() {
+                if let Tok::Int(i) = self.advance() {
+                    hints.push(i);
+                }
+            }
+            self.expect_sym(")")?;
+        }
+        self.expect_sym(")")?;
+        let name = match ty {
+            DataType::Integer => "CINT",
+            DataType::Bignum => "CBIG",
+            DataType::Float => "CSNG",
+            DataType::Double => "CDBL",
+            DataType::Decimal => "CDEC",
+            DataType::Currency => "CCUR",
+            DataType::Rational => "CRAT",
+            DataType::Text => "CSTR",
+            DataType::YesNo => "CBOOL",
+            DataType::DateTime => "CDATE",
+            DataType::Calculated => return Err(Error::syntax("cannot CAST to CALCULATED")),
+        };
+        let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };
+        Ok(match (ty, hints.get(1)) {
+            (DataType::Decimal | DataType::Currency, Some(scale)) => Expr::Function {
+                name: "ROUND".into(),
+                args: vec![call, Expr::Literal(Value::Int(*scale))],
+                distinct: false,
+                star: false,
+            },
+            _ => call,
+        })
+    }
+
+    /// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` after the parenthesis.
+    fn trim_expr(&mut self) -> Result<Expr> {
+        let mode = if self.eat_kw("LEADING") {
+            Some("leading")
+        } else if self.eat_kw("TRAILING") {
+            Some("trailing")
+        } else if self.eat_kw("BOTH") {
+            Some("both")
+        } else {
+            None
+        };
+        let call = |args: Vec<Expr>, name: &str| Expr::Function { name: name.into(), args, distinct: false, star: false };
+        let (chars, target) = if mode.is_some() && self.eat_kw("FROM") {
+            (None, self.expr()?)
+        } else {
+            let first = self.expr()?;
+            if self.eat_kw("FROM") {
+                (Some(first), self.expr()?)
+            } else if mode.is_none() {
+                self.expect_sym(")")?;
+                return Ok(call(vec![first], "TRIM"));
+            } else {
+                (None, first)
+            }
+        };
+        self.expect_sym(")")?;
+        Ok(call(
+            vec![
+                Expr::Literal(Value::text(mode.unwrap_or("both"))),
+                chars.unwrap_or(Expr::Literal(Value::text(" "))),
+                target,
+            ],
+            "TRIMOF",
+        ))
+    }
+
+    /// `x op ANY|SOME|ALL (query)`, rewritten into IN, MIN/MAX comparisons or EXISTS.
+    fn quantified(&mut self, x: Expr, op: BinOp) -> Result<Expr> {
+        let all = self.peek_kw("ALL");
+        self.advance();
+        self.expect_sym("(")?;
+        let mut q = self.select()?;
+        self.expect_sym(")")?;
+        if !all && op == BinOp::Eq {
+            return Ok(Expr::InSelect { expr: Box::new(x), query: Box::new(q), negated: false });
+        }
+        if all && op == BinOp::Ne {
+            return Ok(Expr::InSelect { expr: Box::new(x), query: Box::new(q), negated: true });
+        }
+        match q.items.as_mut_slice() {
+            [SelectItem::Expr { alias, .. }] => *alias = Some("__q".into()),
+            _ => return Err(Error::syntax("a quantified comparison needs a sub-query with exactly one column")),
+        }
+        let derived = |q: &Select| From {
+            first: TableFactor::Derived { query: Box::new(q.clone()), alias: "__t".into(), columns: Vec::new() },
+            joins: Vec::new(),
+        };
+        let col = Expr::Column { table: Some("__t".into()), name: "__q".into() };
+        let agg = |name: &str| {
+            Expr::Subquery(Box::new(Select {
+                items: vec![SelectItem::Expr {
+                    expr: Expr::Function { name: name.into(), args: vec![col.clone()], distinct: false, star: false },
+                    alias: None,
+                }],
+                from: Some(derived(&q)),
+                ..Select::default()
+            }))
+        };
+        let (min, max) = (agg("MIN"), agg("MAX"));
+        let cmp = |op: BinOp, r: Expr| Expr::Binary { op, left: Box::new(x.clone()), right: Box::new(r) };
+        let both = |a: Expr, b: Expr, op: BinOp| Expr::Binary { op, left: Box::new(a), right: Box::new(b) };
+        let body = match (all, op) {
+            (false, BinOp::Gt | BinOp::Ge) | (true, BinOp::Lt | BinOp::Le) => cmp(op, min),
+            (false, BinOp::Lt | BinOp::Le) | (true, BinOp::Gt | BinOp::Ge) => cmp(op, max),
+            (false, BinOp::Ne) => both(cmp(BinOp::Ne, min), cmp(BinOp::Ne, max), BinOp::Or),
+            (true, BinOp::Eq) => both(cmp(BinOp::Eq, min), cmp(BinOp::Eq, max), BinOp::And),
+            _ => return Err(Error::syntax("unsupported quantified comparison")),
+        };
+        if !all {
+            return Ok(body);
+        }
+        // ALL over an empty set is true.
+        let empty = Expr::Exists {
+            query: Box::new(Select {
+                items: vec![SelectItem::Expr { expr: Expr::Literal(Value::Int(1)), alias: None }],
+                from: Some(derived(&q)),
+                ..Select::default()
+            }),
+            negated: true,
+        };
+        Ok(Expr::Case { whens: vec![(empty, Expr::Literal(Value::Bool(true)))], else_expr: Some(Box::new(body)) })
+    }
+
+    /// What may follow a function call: `FILTER (WHERE ...)` and `OVER (...)`.
+    fn call_suffixes(&mut self, mut call: Expr) -> Result<Expr> {
+        if self.peek_kw("FILTER") && matches!(self.peek_at(1), Tok::Sym("(")) {
+            self.advance();
+            self.advance();
+            self.expect_kw("WHERE")?;
+            let cond = self.expr()?;
+            self.expect_sym(")")?;
+            if let Expr::Function { args, star, .. } = &mut call {
+                let guard = |v: Expr| Expr::Function {
+                    name: "IIF".into(),
+                    args: vec![cond.clone(), v, Expr::Literal(Value::Null)],
+                    distinct: false,
+                    star: false,
+                };
+                if *star {
+                    *star = false;
+                    args.push(guard(Expr::Literal(Value::Int(1))));
+                } else if let Some(a) = args.first_mut() {
+                    let inner = std::mem::replace(a, Expr::Literal(Value::Null));
+                    *a = guard(inner);
+                }
+            }
+        }
+        if self.peek_kw("WITHIN") {
+            return Err(Error::syntax("WITHIN GROUP is not supported"));
+        }
+        if self.eat_kw("OVER") {
+            let spec = self.window_spec()?;
+            return Ok(Expr::Window { func: Box::new(call), spec });
+        }
+        Ok(call)
+    }
+
+    fn window_spec(&mut self) -> Result<WindowSpec> {
+        if !self.peek_sym("(") {
+            return Err(Error::syntax("named windows are not supported; write OVER (...)"));
+        }
+        self.advance();
+        let mut spec = WindowSpec::default();
+        if self.eat_kw("PARTITION") {
+            self.expect_kw("BY")?;
+            loop {
+                spec.partition_by.push(self.expr()?);
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        if self.eat_kw("ORDER") {
+            self.expect_kw("BY")?;
+            loop {
+                let expr = self.expr()?;
+                let desc = if self.eat_kw("DESC") {
+                    true
+                } else {
+                    self.eat_kw("ASC");
+                    false
+                };
+                spec.order_by.push(OrderItem { expr, desc });
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        let units = if self.eat_kw("ROWS") {
+            Some(FrameUnits::Rows)
+        } else if self.eat_kw("RANGE") {
+            Some(FrameUnits::Range)
+        } else if self.peek_kw("GROUPS") {
+            return Err(Error::syntax("GROUPS frames are not supported"));
+        } else {
+            None
+        };
+        if let Some(units) = units {
+            let (start, end) = if self.eat_kw("BETWEEN") {
+                let s = self.frame_bound()?;
+                self.expect_kw("AND")?;
+                (s, self.frame_bound()?)
+            } else {
+                (self.frame_bound()?, FrameBound::CurrentRow)
+            };
+            if self.eat_kw("EXCLUDE") {
+                return Err(Error::syntax("frame EXCLUDE is not supported"));
+            }
+            spec.frame = Some(Frame { units, start, end });
+        }
+        self.expect_sym(")")?;
+        Ok(spec)
+    }
+
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_kw("UNBOUNDED") {
+            return Ok(if self.eat_kw("PRECEDING") {
+                FrameBound::UnboundedPreceding
+            } else {
+                self.expect_kw("FOLLOWING")?;
+                FrameBound::UnboundedFollowing
+            });
+        }
+        if self.eat_kw("CURRENT") {
+            self.expect_kw("ROW")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let n = self.usize_literal()?;
+        Ok(if self.eat_kw("PRECEDING") {
+            FrameBound::Preceding(n)
+        } else {
+            self.expect_kw("FOLLOWING")?;
+            FrameBound::Following(n)
+        })
+    }
+
     fn case_expr(&mut self) -> Result<Expr> {
         self.expect_kw("CASE")?;
+        // `CASE x WHEN a THEN ...` compares x with each WHEN value.
+        let operand = if self.peek_kw("WHEN") { None } else { Some(self.expr()?) };
         let mut whens = Vec::new();
         while self.eat_kw("WHEN") {
-            let cond = self.expr()?;
+            let mut cond = self.expr()?;
+            if let Some(x) = &operand {
+                cond = Expr::Binary { op: BinOp::Eq, left: Box::new(x.clone()), right: Box::new(cond) };
+            }
             self.expect_kw("THEN")?;
             whens.push((cond, self.expr()?));
         }

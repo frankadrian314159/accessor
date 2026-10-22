@@ -1,7 +1,9 @@
 //! Syntax tree for the supported SQL dialect.
 
+use std::rc::Rc;
+
 use crate::schema::RefAction;
-use crate::value::{DataType, Value};
+use crate::value::{DataType, Row, Value};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BinOp {
@@ -37,10 +39,41 @@ pub enum Expr {
     InSelect { expr: Box<Expr>, query: Box<Select>, negated: bool },
     Exists { query: Box<Select>, negated: bool },
     Subquery(Box<Select>),
+    /// A window function call: `func(...) OVER (...)`.
+    Window { func: Box<Expr>, spec: WindowSpec },
     Function { name: String, args: Vec<Expr>, distinct: bool, star: bool },
     Case { whens: Vec<(Expr, Expr)>, else_expr: Option<Box<Expr>> },
     /// `@name`, bound when a parameterised query runs.
     Param(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct WindowSpec {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderItem>,
+    pub frame: Option<Frame>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,7 +86,9 @@ pub enum SelectItem {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableFactor {
     Named { name: String, alias: Option<String> },
-    Derived { query: Box<Select>, alias: String },
+    Derived { query: Box<Select>, alias: String, columns: Vec<String> },
+    /// Rows already computed (the result of a common table expression).
+    Materialized { rows: Rc<Vec<Row>>, columns: Vec<String>, alias: String },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -61,6 +96,7 @@ pub enum JoinKind {
     Inner,
     Left,
     Right,
+    Full,
     Cross,
 }
 
@@ -69,6 +105,10 @@ pub struct Join {
     pub kind: JoinKind,
     pub factor: TableFactor,
     pub on: Option<Expr>,
+    /// `USING (a, b)`: join on the like-named columns, shown once.
+    pub using: Vec<String>,
+    /// `NATURAL JOIN`: `USING` all like-named columns.
+    pub natural: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +135,42 @@ pub struct Select {
     pub order_by: Vec<OrderItem>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// `UNION [ALL]` members after this one. When present, `order_by`, `limit`
+    /// and `offset` apply to the combined result, not to this member alone.
+    pub unions: Vec<SetPart>,
+    /// `GROUP BY ROLLUP/CUBE/GROUPING SETS`: the grouping sets, as indexes into
+    /// `group_by`. Empty for an ordinary GROUP BY.
+    pub group_sets: Vec<Vec<usize>>,
+    pub with: Option<Box<With>>,
+}
+
+/// A `WITH [RECURSIVE]` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct With {
+    pub recursive: bool,
+    pub ctes: Vec<Cte>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub query: Select,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// One `UNION [ALL] SELECT ...` member.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetPart {
+    pub op: SetOp,
+    pub all: bool,
+    pub select: Select,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,6 +185,8 @@ pub struct ColumnDef {
     pub references: Option<ForeignKeyDef>,
     /// Source text of the expression of a `CALCULATED` field.
     pub expression: Option<String>,
+    /// Source text of a column `CHECK (...)`.
+    pub check: Option<String>,
 }
 
 /// `FOREIGN KEY (columns) REFERENCES ref_table (ref_columns)`; an empty
@@ -129,6 +207,7 @@ pub enum AlterAction {
     DropColumn(String),
     RenameColumn { from: String, to: String },
     AddForeignKey(ForeignKeyDef),
+    AddCheck { name: Option<String>, expr: String },
     DropConstraint(String),
     AlterColumn { name: String, data_type: DataType },
     /// `ALTER COLUMN c CALCULATED AS (expr)`: change a calculated field's expression.
@@ -138,6 +217,7 @@ pub enum AlterAction {
 #[derive(Clone, Debug, PartialEq)]
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
+    DefaultValues,
     Select(Box<Select>),
 }
 
@@ -186,6 +266,8 @@ pub enum Statement {
         primary_key: Vec<String>,
         uniques: Vec<Vec<String>>,
         foreign_keys: Vec<ForeignKeyDef>,
+        /// `CHECK (...)` constraints (name, expression text), column and table level.
+        checks: Vec<(Option<String>, String)>,
     },
     DropTable(String),
     AlterTable { table: String, action: AlterAction },
@@ -200,10 +282,39 @@ pub enum Statement {
     Raise(Expr),
     CreateTrigger(Box<TriggerDef>),
     DropTrigger(String),
+    /// `TRUNCATE [TABLE] t`: delete every record.
+    Truncate(String),
+    /// `DROP ... IF EXISTS` (`missing_ok`) or `CREATE ... IF NOT EXISTS`.
+    Guarded { missing_ok: bool, stmt: Box<Statement> },
+    Merge(Box<MergeDef>),
     Begin,
     Commit,
     Rollback,
     Savepoint(String),
     ReleaseSavepoint(String),
     RollbackTo(String),
+}
+
+/// `MERGE INTO target USING source ON cond WHEN ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeDef {
+    pub target: String,
+    pub target_alias: Option<String>,
+    pub source: TableFactor,
+    pub on: Expr,
+    pub whens: Vec<MergeWhen>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeWhen {
+    pub matched: bool,
+    pub condition: Option<Expr>,
+    pub action: MergeAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MergeAction {
+    Update(Vec<(String, Expr)>),
+    Delete,
+    Insert { columns: Option<Vec<String>>, values: Vec<Expr> },
 }

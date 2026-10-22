@@ -64,6 +64,29 @@ pub enum ScalarFn {
     TypeName,
     CBool,
     CDate,
+    Format,
+    DatePart,
+    TrimOf,
+    NullIf,
+    Greatest,
+    Least,
+    Concat,
+    Ceil,
+    Power,
+    Mod,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    OctetLength,
+    /// `(mask, i1, i2, ...)`: bits of a GROUPING mask, as a number.
+    GroupingBit,
 }
 
 impl ScalarFn {
@@ -78,7 +101,7 @@ impl ScalarFn {
             "COALESCE" => (Coalesce, 1, usize::MAX),
             "UCASE" | "UPPER" => (UCase, 1, 1),
             "LCASE" | "LOWER" => (LCase, 1, 1),
-            "LEN" | "LENGTH" => (Len, 1, 1),
+            "LEN" | "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => (Len, 1, 1),
             "LEFT" => (Left, 2, 2),
             "RIGHT" => (Right, 2, 2),
             "MID" | "SUBSTR" | "SUBSTRING" => (Mid, 2, 3),
@@ -122,6 +145,28 @@ impl ScalarFn {
             "TYPENAME" => (TypeName, 1, 1),
             "CBOOL" => (CBool, 1, 1),
             "CDATE" => (CDate, 1, 1),
+            "FORMAT" => (Format, 1, 2),
+            "DATEPART" | "DATE_PART" => (DatePart, 2, 2),
+            "TRIMOF" => (TrimOf, 3, 3),
+            "NULLIF" => (NullIf, 2, 2),
+            "GREATEST" => (Greatest, 1, usize::MAX),
+            "LEAST" => (Least, 1, usize::MAX),
+            "CONCAT" => (Concat, 1, usize::MAX),
+            "CEIL" | "CEILING" => (Ceil, 1, 1),
+            "POWER" | "POW" => (Power, 2, 2),
+            "MOD" => (Mod, 2, 2),
+            "LOG10" => (Log10, 1, 1),
+            "SIN" => (Sin, 1, 1),
+            "COS" => (Cos, 1, 1),
+            "TAN" => (Tan, 1, 1),
+            "ASIN" => (Asin, 1, 1),
+            "ACOS" => (Acos, 1, 1),
+            "ATAN" => (Atan, 1, 1),
+            "SINH" => (Sinh, 1, 1),
+            "COSH" => (Cosh, 1, 1),
+            "TANH" => (Tanh, 1, 1),
+            "OCTET_LENGTH" => (OctetLength, 1, 1),
+            "GROUPINGBIT" => (GroupingBit, 2, usize::MAX),
             _ => return None,
         })
     }
@@ -129,7 +174,7 @@ impl ScalarFn {
     /// Functions that tolerate (and may transform) `Null` arguments; all
     /// others yield `Null` as soon as any argument is `Null`.
     fn handles_null(self) -> bool {
-        matches!(self, ScalarFn::Nz | ScalarFn::IsNull | ScalarFn::Coalesce | ScalarFn::Iif)
+        matches!(self, ScalarFn::Nz | ScalarFn::IsNull | ScalarFn::Coalesce | ScalarFn::Iif | ScalarFn::NullIf | ScalarFn::Concat)
     }
 }
 
@@ -461,6 +506,101 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         TypeName => Value::text(v0.unwrap().type_label()),
         CBool => v0.unwrap().coerce_to(DataType::YesNo)?,
         CDate => v0.unwrap().coerce_to(DataType::DateTime)?,
+        NullIf => {
+            if vals[0].is_null() || vals[1].is_null() {
+                vals[0].clone().into_owned()
+            } else if vals[0].sql_cmp(&vals[1]) == Some(std::cmp::Ordering::Equal) {
+                Value::Null
+            } else {
+                vals[0].clone().into_owned()
+            }
+        }
+        Greatest | Least => {
+            let mut best = vals[0].clone().into_owned();
+            for v in &vals[1..] {
+                let ord = v.sql_cmp(&best).ok_or_else(|| Error::type_err("cannot compare these values"))?;
+                if (f == Greatest && ord.is_gt()) || (f == Least && ord.is_lt()) {
+                    best = v.clone().into_owned();
+                }
+            }
+            best
+        }
+        Concat => {
+            let mut s = String::new();
+            for v in &vals {
+                if !v.is_null() {
+                    s.push_str(&text_of(v));
+                }
+            }
+            Value::text(&s)
+        }
+        Ceil => {
+            let negated = crate::numeric::negate(&*num_of(v0.unwrap())?)?;
+            crate::numeric::negate(&whole_part(&negated, true)?)?
+        }
+        Power => crate::numeric::arith(crate::sql::ast::BinOp::Pow, &vals[0], &vals[1])?,
+        Mod => crate::numeric::arith(crate::sql::ast::BinOp::Mod, &vals[0], &vals[1])?,
+        Log10 => {
+            if !sign_of(v0.unwrap())?.is_gt() {
+                return Err(Error::runtime("Log10: invalid argument"));
+            }
+            float_result(f64_of(v0.unwrap())?.log10(), v0.unwrap(), "Log10")?
+        }
+        Sin => float_result(f64_of(v0.unwrap())?.sin(), v0.unwrap(), "Sin")?,
+        Cos => float_result(f64_of(v0.unwrap())?.cos(), v0.unwrap(), "Cos")?,
+        Tan => float_result(f64_of(v0.unwrap())?.tan(), v0.unwrap(), "Tan")?,
+        Asin => float_result(f64_of(v0.unwrap())?.asin(), v0.unwrap(), "Asin")?,
+        Acos => float_result(f64_of(v0.unwrap())?.acos(), v0.unwrap(), "Acos")?,
+        Atan => float_result(f64_of(v0.unwrap())?.atan(), v0.unwrap(), "Atan")?,
+        Sinh => float_result(f64_of(v0.unwrap())?.sinh(), v0.unwrap(), "Sinh")?,
+        Cosh => float_result(f64_of(v0.unwrap())?.cosh(), v0.unwrap(), "Cosh")?,
+        Tanh => float_result(f64_of(v0.unwrap())?.tanh(), v0.unwrap(), "Tanh")?,
+        OctetLength => Value::Int(text_of(v0.unwrap()).len() as i64),
+        GroupingBit => {
+            let mask = int_of(&vals[0])?;
+            let n = vals.len() - 1;
+            let mut out = 0i64;
+            for (k, v) in vals[1..].iter().enumerate() {
+                let bit = (mask >> int_of(v)?) & 1;
+                out |= bit << (n - 1 - k);
+            }
+            Value::Int(out)
+        }
+        TrimOf => {
+            let (mode, chars, s) = (text_of(&vals[0]).to_string(), text_of(&vals[1]).to_string(), text_of(&vals[2]).to_string());
+            let set: Vec<char> = chars.chars().collect();
+            let hit = |c: char| set.contains(&c);
+            Value::text(match mode.as_str() {
+                "leading" => s.trim_start_matches(hit),
+                "trailing" => s.trim_end_matches(hit),
+                _ => s.trim_matches(hit),
+            })
+        }
+        DatePart => {
+            let unit = text_of(&vals[0]).to_ascii_lowercase();
+            let t = date_of(&vals[1])?;
+            let (y, mo, d, h, mi, s) = datetime::components(t);
+            let doy = datetime::days_from_civil(y, mo, d) - datetime::days_from_civil(y, 1, 1) + 1;
+            let jan1 = datetime::weekday(datetime::days_from_civil(y, 1, 1) * 86_400) - 1;
+            Value::Int(match unit.as_str() {
+                "yyyy" | "year" | "yy" => y,
+                "q" | "quarter" => ((mo - 1) / 3 + 1) as i64,
+                "m" | "month" => mo as i64,
+                "y" | "dayofyear" | "doy" => doy,
+                "d" | "day" => d as i64,
+                "w" | "weekday" | "dow" => datetime::weekday(t) - 1 + i64::from(unit == "w" || unit == "weekday"),
+                "ww" | "week" => (doy - 1 + jan1) / 7 + 1,
+                "h" | "hour" => h as i64,
+                "n" | "mi" | "minute" => mi as i64,
+                "s" | "second" => s as i64,
+                "epoch" => t,
+                u => return Err(Error::runtime(format!("DatePart: unknown field '{u}'"))),
+            })
+        }
+        Format => {
+            let pattern = vals.get(1).map(|p| text_of(p).into_owned()).unwrap_or_default();
+            Value::text(&super::format::format_value(v0.unwrap(), &pattern)?)
+        }
         Iif | Nz | IsNull | Coalesce | Now | Date => unreachable!("handled above"),
     })
 }

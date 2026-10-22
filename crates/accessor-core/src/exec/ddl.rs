@@ -178,7 +178,19 @@ impl Database {
                 ops.push(Op::AddForeignKey { table, fk });
                 ops
             }
-            AlterAction::DropConstraint(name) => vec![Op::DropForeignKey { table, name: name.clone() }],
+            AlterAction::AddCheck { name, expr } => {
+                self.add_check(&table, name.as_deref(), expr)?;
+                return Ok(QueryResult::default());
+            }
+            AlterAction::DropConstraint(name) => {
+                let is_fk = self.table_checked(&table)?.schema().foreign_keys.iter().any(|f| f.name.eq_ignore_ascii_case(name));
+                if !is_fk && self.trigger_sql(&format!("{name}_ins")).is_some() {
+                    // A CHECK constraint is a pair of triggers.
+                    self.execute(&format!("DROP TRIGGER [{name}_ins]; DROP TRIGGER [{name}_upd]"))?;
+                    return Ok(QueryResult::default());
+                }
+                vec![Op::DropForeignKey { table, name: name.clone() }]
+            }
         };
         self.apply_all(ops)?;
         Ok(QueryResult::default())

@@ -1,6 +1,7 @@
 //! Bound expressions: column references are resolved to row positions and
 //! function names to enum variants, so per-row evaluation does no lookups.
 
+pub mod format;
 pub mod func;
 pub mod like;
 

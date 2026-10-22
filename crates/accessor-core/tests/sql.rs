@@ -1607,3 +1607,264 @@ fn datediff_counts_calendar_boundaries() {
     assert_eq!(diff("n", "2024-01-01 10:00:30", "2024-01-01 10:02:29"), "1");
     assert_eq!(diff("s", "2024-01-01 10:00:00", "2024-01-01 10:00:07"), "7");
 }
+
+// ----- correlated sub-queries, UNION, FULL JOIN, Format ------------------------------------
+
+#[test]
+fn correlated_subqueries() {
+    let db = db();
+    let r = db
+        .query("SELECT Name FROM Customers c WHERE EXISTS (SELECT 1 FROM Orders o WHERE o.CustID = c.ID) ORDER BY Name")
+        .unwrap();
+    assert_eq!(col(&r, 0), vec!["Ada", "Grace", "Linus"]);
+    let r = db.query("SELECT Name FROM Customers c WHERE NOT EXISTS (SELECT 1 FROM Orders WHERE CustID = c.ID)").unwrap();
+    assert_eq!(col(&r, 0), vec!["Zed"]);
+    // A correlated scalar sub-query in the select list; no match gives NULL.
+    let r = db
+        .query("SELECT Name, (SELECT Sum(Total) FROM Orders WHERE CustID = Customers.ID) AS S FROM Customers ORDER BY ID")
+        .unwrap();
+    assert_eq!(col(&r, 1), vec!["$30.50", "$12.25", "$100.00", ""]);
+    // Correlated IN, a correlated comparison with an aggregate, and a mix with an ordinary predicate.
+    let r = db
+        .query("SELECT OrderID FROM Orders o WHERE o.Total = (SELECT Max(Total) FROM Orders WHERE CustID = o.CustID) AND o.OrderID > 1 ORDER BY 1")
+        .unwrap();
+    assert_eq!(col(&r, 0), vec!["2", "4", "5"]);
+    let r = db
+        .query("SELECT Name FROM Customers c WHERE c.ID IN (SELECT CustID FROM Orders o WHERE o.Total > 6 AND o.CustID = c.ID) ORDER BY 1")
+        .unwrap();
+    assert_eq!(col(&r, 0), vec!["Ada", "Grace", "Linus"]);
+    // Two levels deep: the innermost query reads the outermost row.
+    let r = db
+        .query("SELECT Name FROM Customers c WHERE EXISTS (SELECT 1 FROM Orders o WHERE o.CustID = c.ID AND EXISTS (SELECT 1 FROM Orders p WHERE p.CustID = c.ID AND p.Total > o.Total)) ORDER BY 1")
+        .unwrap();
+    assert_eq!(col(&r, 0), vec!["Ada", "Grace"]);
+    // Not allowed with GROUP BY, with a clear message.
+    let e = db
+        .query("SELECT City, Count(*) FROM Customers c GROUP BY City HAVING EXISTS (SELECT 1 FROM Orders o WHERE o.CustID = c.ID)")
+        .unwrap_err();
+    assert!(e.to_string().contains("outer query"), "{e}");
+}
+
+#[test]
+fn union_and_union_all() {
+    let db = db();
+    let r = db.query("SELECT City FROM Customers WHERE City IS NOT NULL UNION SELECT 'London' UNION SELECT 'Paris' ORDER BY 1").unwrap();
+    assert_eq!(col(&r, 0), vec!["Helsinki", "London", "NYC", "Paris"]);
+    let r = db.query("SELECT 1 AS n UNION ALL SELECT 1 UNION ALL SELECT 2").unwrap();
+    assert_eq!(col(&r, 0), vec!["1", "1", "2"]);
+    assert_eq!(r.columns, vec!["n"]);
+    let r = db.query("SELECT CustID FROM Orders UNION SELECT ID FROM Customers ORDER BY CustID DESC LIMIT 2 OFFSET 1").unwrap();
+    assert_eq!(col(&r, 0), vec!["3", "2"]);
+    let e = db.query("SELECT 1, 2 UNION SELECT 3").unwrap_err();
+    assert!(e.to_string().contains("same number of columns"), "{e}");
+    // Inside a derived table and an IN list.
+    let r = db.query("SELECT Count(*) FROM (SELECT ID FROM Customers UNION ALL SELECT CustID FROM Orders) AS u").unwrap();
+    assert_eq!(col(&r, 0), vec!["9"]);
+    let r = db.query("SELECT Name FROM Customers WHERE ID IN (SELECT 1 UNION SELECT 4) ORDER BY 1").unwrap();
+    assert_eq!(col(&r, 0), vec!["Ada", "Zed"]);
+}
+
+#[test]
+fn full_outer_join() {
+    let mut db = db();
+    db.execute("INSERT INTO Orders (CustID, Total) VALUES (99, 1)").unwrap();
+    let r = db
+        .query("SELECT c.Name, o.OrderID FROM Customers c FULL OUTER JOIN Orders o ON o.CustID = c.ID ORDER BY o.OrderID, c.Name")
+        .unwrap();
+    // Zed has no orders; order 6 has no customer; both survive.
+    assert_eq!(r.rows.len(), 7);
+    assert!(r.rows.iter().any(|row| row[0].to_string() == "Zed" && row[1].is_null()));
+    assert!(r.rows.iter().any(|row| row[0].is_null() && row[1].to_string() == "6"));
+    let r = db.query("SELECT Count(*) FROM Customers c FULL JOIN Orders o ON o.CustID = c.ID").unwrap();
+    assert_eq!(col(&r, 0), vec!["7"]);
+}
+
+#[test]
+fn format_function() {
+    let db = Database::in_memory();
+    let f = |v: &str, p: &str| q(&db, &format!("SELECT Format({v}, '{p}')"));
+    assert_eq!(f("1234567.891", "#,##0.00"), "1,234,567.89");
+    assert_eq!(f("0.125", "0.00"), "0.12"); // ties to even, exactly
+    assert_eq!(f("5", "000"), "005");
+    assert_eq!(f("0.256", "Percent"), "25.60%");
+    assert_eq!(f("-3.5", "Currency"), "($3.50)");
+    assert_eq!(f("1234.5", "Fixed"), "1234.50");
+    assert_eq!(f("1234.5", "Standard"), "1,234.50");
+    assert_eq!(f("1234.5", "0.00E+00"), "1.23E+03");
+    assert_eq!(f("0.5", "#.##"), ".5");
+    assert_eq!(f("-7", "0;(0)"), "(7)");
+    assert_eq!(f("0", "0;(0);\"zero\""), "zero");
+    assert_eq!(f("1", "Yes/No"), "Yes");
+    assert_eq!(f("12345678901234567890123", "#,##0"), "12,345,678,901,234,567,890,123");
+    assert_eq!(f("#2024-03-05 14:07:09#", "yyyy-mm-dd hh:nn:ss"), "2024-03-05 14:07:09");
+    assert_eq!(f("#2024-03-05 14:07:09#", "dddd, mmmm d, yyyy"), "Tuesday, March 5, 2024");
+    assert_eq!(f("#2024-03-05 14:07:09#", "h:mm AM/PM"), "2:07 PM");
+    assert_eq!(f("#2024-03-05 14:07:09#", "Short Date"), "3/5/2024");
+    assert_eq!(f("'abc'", ">"), "ABC");
+    assert!(db.query("SELECT Format(NULL, '0')").unwrap().rows[0][0].is_null());
+}
+
+// ----- standard SQL additions -------------------------------------------------------------
+
+fn emp() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Emp (ID INTEGER PRIMARY KEY, Name TEXT, Dept TEXT, Sal INTEGER);
+         INSERT INTO Emp VALUES (1,'Ann','Eng',100),(2,'Bob','Eng',120),(3,'Cy','Eng',120),(4,'Di','Ops',90),(5,'Ed','Ops',70),(6,'Flo','HR',80);",
+    )
+    .unwrap();
+    db
+}
+
+fn rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
+    db.query(sql).unwrap().rows.iter().map(|r| r.iter().map(|v| v.to_string()).collect()).collect()
+}
+
+#[test]
+fn window_functions() {
+    let db = emp();
+    let r = rows(&db, "SELECT Name, RANK() OVER (PARTITION BY Dept ORDER BY Sal DESC), ROW_NUMBER() OVER (PARTITION BY Dept ORDER BY Sal DESC, Name) FROM Emp WHERE Dept = 'Eng' ORDER BY 3");
+    assert_eq!(r, vec![vec!["Bob", "1", "1"], vec!["Cy", "1", "2"], vec!["Ann", "3", "3"]]);
+    let r = rows(&db, "SELECT SUM(Sal) OVER (ORDER BY ID), SUM(Sal) OVER (PARTITION BY Dept) FROM Emp ORDER BY ID");
+    assert_eq!(r[2], vec!["340", "340"]);
+    assert_eq!(r[5], vec!["580", "80"]);
+    let r = rows(&db, "SELECT LAG(Sal) OVER (ORDER BY ID), LEAD(Sal, 2, 0) OVER (ORDER BY ID) FROM Emp ORDER BY ID");
+    assert_eq!(r[0], vec!["", "120"]);
+    assert_eq!(r[5], vec!["70", "0"]);
+    let r = rows(&db, "SELECT Sal, SUM(Sal) OVER (ORDER BY ID ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM Emp ORDER BY ID");
+    assert_eq!(r[1][1], "220");
+    assert_eq!(r[2][1], "240");
+    // Over groups: rank the departments by their totals.
+    let r = rows(&db, "SELECT Dept, RANK() OVER (ORDER BY SUM(Sal) DESC) FROM Emp GROUP BY Dept ORDER BY 2");
+    assert_eq!(r, vec![vec!["Eng", "1"], vec!["Ops", "2"], vec!["HR", "3"]]);
+    // Not allowed in WHERE.
+    assert!(db.query("SELECT 1 FROM Emp WHERE ROW_NUMBER() OVER () = 1").is_err());
+}
+
+#[test]
+fn grouping_sets_and_aggregates() {
+    let db = emp();
+    let r = rows(&db, "SELECT Dept, SUM(Sal), GROUPING(Dept) FROM Emp GROUP BY ROLLUP (Dept) ORDER BY 3, 1");
+    assert_eq!(r.last().unwrap(), &vec!["", "580", "1"]);
+    assert_eq!(r.len(), 4);
+    let r = rows(&db, "SELECT Dept, Count(*) FROM Emp GROUP BY GROUPING SETS ((Dept), ()) ORDER BY 2 DESC LIMIT 1");
+    assert_eq!(r, vec![vec!["", "6"]]);
+    let r = rows(&db, "SELECT Dept, STRING_AGG(Name, '/'), Count(*) FILTER (WHERE Sal > 90) FROM Emp GROUP BY Dept ORDER BY Dept");
+    assert_eq!(r[0], vec!["Eng", "Ann/Bob/Cy", "3"]);
+    assert_eq!(r[2], vec!["Ops", "Di/Ed", "0"]);
+    let r = rows(&db, "SELECT STDDEV_POP(Sal), VAR_SAMP(Sal), EVERY(Sal > 60) FROM Emp WHERE Dept = 'Ops'");
+    assert_eq!(r, vec![vec!["10", "200", "Yes"]]);
+}
+
+#[test]
+fn common_table_expressions() {
+    let db = emp();
+    let r = rows(&db, "WITH hi AS (SELECT * FROM Emp WHERE Sal >= 100), d AS (SELECT Dept, Count(*) c FROM hi GROUP BY Dept) SELECT * FROM d");
+    assert_eq!(r, vec![vec!["Eng", "3"]]);
+    let r = rows(&db, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT SUM(i), Count(*) FROM n");
+    assert_eq!(r, vec![vec!["55", "10"]]);
+    let r = rows(&db, "WITH RECURSIVE fact(n, f) AS (VALUES (1, 1) UNION ALL SELECT n + 1, f * (n + 1) FROM fact WHERE n < 25) SELECT f FROM fact WHERE n = 25");
+    assert_eq!(r, vec![vec!["15511210043330985984000000"]]);
+}
+
+#[test]
+fn set_operations_and_values() {
+    let db = emp();
+    assert_eq!(rows(&db, "SELECT Dept FROM Emp INTERSECT SELECT 'Eng' UNION SELECT 'Zed' ORDER BY 1"), vec![vec!["Eng"], vec!["Zed"]]);
+    assert_eq!(rows(&db, "SELECT Dept FROM Emp EXCEPT SELECT 'Eng' ORDER BY 1"), vec![vec!["HR"], vec!["Ops"]]);
+    assert_eq!(rows(&db, "SELECT Dept FROM Emp EXCEPT ALL SELECT 'Eng' ORDER BY 1").len(), 5);
+    assert_eq!(rows(&db, "SELECT Dept FROM Emp INTERSECT ALL SELECT Dept FROM Emp WHERE ID < 3").len(), 2);
+    assert_eq!(rows(&db, "SELECT * FROM (VALUES (1,'a'),(2,'b')) AS v(n, s) ORDER BY n DESC"), vec![vec!["2", "b"], vec!["1", "a"]]);
+    assert_eq!(rows(&db, "SELECT Name FROM Emp ORDER BY ID OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY"), vec![vec!["Bob"], vec!["Cy"]]);
+}
+
+#[test]
+fn using_and_natural_joins() {
+    let db = emp();
+    let r = rows(&db, "SELECT e.Name, d.* FROM Emp e JOIN (VALUES ('Eng','X'),('Ops','Y')) AS d(Dept, Code) USING (Dept) ORDER BY e.ID");
+    assert_eq!(r.len(), 5);
+    assert_eq!(r[0], vec!["Ann", "Eng", "X"]);
+    let r = db.query("SELECT * FROM Emp NATURAL JOIN (SELECT Dept, 1 AS flag FROM Emp WHERE ID = 1) x").unwrap();
+    assert_eq!(r.columns, vec!["ID", "Name", "Dept", "Sal", "flag"]);
+    assert_eq!(r.rows.len(), 3);
+    // The merged column is usable unqualified.
+    assert_eq!(rows(&db, "SELECT Dept FROM Emp JOIN (SELECT Dept FROM Emp WHERE ID = 4) o USING (Dept)").len(), 2);
+}
+
+#[test]
+fn standard_expressions_and_functions() {
+    let db = Database::in_memory();
+    let one = |sql: &str| q(&db, sql);
+    assert_eq!(one("SELECT CAST('12' AS INTEGER) + 1"), "13");
+    assert_eq!(one("SELECT CAST(7 AS VARCHAR(5)) || 'x'"), "7x");
+    assert_eq!(one("SELECT EXTRACT(MONTH FROM TIMESTAMP '2024-03-05 10:20:30')"), "3");
+    assert_eq!(one("SELECT EXTRACT(QUARTER FROM DATE '2024-11-05')"), "4");
+    assert_eq!(one("SELECT POSITION('lo' IN 'hello')"), "4");
+    assert_eq!(one("SELECT SUBSTRING('hello' FROM 2 FOR 3)"), "ell");
+    assert_eq!(one("SELECT TRIM(LEADING 'x' FROM 'xxhixx')"), "hixx");
+    assert_eq!(one("SELECT CHAR_LENGTH('héllo')"), "5");
+    assert_eq!(one("SELECT COALESCE(NULLIF(3, 3), 9)"), "9");
+    assert_eq!(one("SELECT GREATEST(2, 9, 4) - LEAST(2, 9, 4)"), "7");
+    assert_eq!(one("SELECT CEILING(2.1) + FLOOR(-2.1)"), "0");
+    assert_eq!(one("SELECT POWER(2, 10) + MOD(7, 3)"), "1025");
+    assert_eq!(one("SELECT CASE 2 WHEN 1 THEN 'a' WHEN 2 THEN 'b' END"), "b");
+    assert_eq!(one("SELECT NULL IS NOT DISTINCT FROM NULL"), "Yes");
+    assert_eq!(one("SELECT 1 IS DISTINCT FROM NULL"), "Yes");
+    assert_eq!(one("SELECT (NULL = 1) IS NOT TRUE"), "Yes");
+    assert_eq!(one("SELECT 5 BETWEEN SYMMETRIC 9 AND 1"), "Yes");
+    assert_eq!(one("SELECT 'a_c' LIKE 'a!_c' ESCAPE '!'"), "Yes");
+    assert_eq!(one("SELECT 'abc' LIKE 'a!_c' ESCAPE '!'"), "No");
+    assert_eq!(one("SELECT 3 > ALL (SELECT 1 UNION SELECT 2)"), "Yes");
+    assert_eq!(one("SELECT 3 > ALL (SELECT 1 UNION SELECT 5)"), "No");
+    assert_eq!(one("SELECT 3 = ANY (SELECT 1 UNION SELECT 3)"), "Yes");
+    assert_eq!(one("SELECT 1 < ALL (SELECT 5 WHERE 1 = 0)"), "Yes");
+}
+
+#[test]
+fn ddl_dml_additions() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS P (ID INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, Name VARCHAR(20) NOT NULL,
+            Age INT CHECK (Age >= 0), Dbl INT GENERATED ALWAYS AS (Age * 2) STORED, CONSTRAINT young CHECK (Age < 150 OR Age IS NULL));
+         CREATE TABLE IF NOT EXISTS P (X INT);
+         INSERT INTO P (Name, Age) VALUES ('a', 5), ('b', 10);",
+    )
+    .unwrap();
+    assert_eq!(rows(&db, "SELECT ID, Dbl FROM P ORDER BY ID"), vec![vec!["1", "10"], vec!["2", "20"]]);
+    let e = db.execute("INSERT INTO P (Name, Age) VALUES ('c', -1)").unwrap_err();
+    assert!(e.to_string().contains("CHECK constraint failed"), "{e}");
+    assert!(db.execute("UPDATE P SET Age = 500 WHERE Name = 'a'").is_err());
+    assert!(db.execute("ALTER TABLE P ADD CONSTRAINT lim CHECK (Age < 8)").is_err()); // 10 violates it
+    db.execute("ALTER TABLE P DROP CONSTRAINT young").unwrap();
+    db.execute("UPDATE P SET Age = 500 WHERE Name = 'a'").unwrap();
+    assert!(db.execute("INSERT INTO P DEFAULT VALUES").is_err()); // Name is required
+
+    // Correlated sub-queries in UPDATE and DELETE.
+    db.execute("DELETE FROM P x WHERE EXISTS (SELECT 1 FROM P y WHERE y.Age > x.Age)").unwrap();
+    assert_eq!(rows(&db, "SELECT Name FROM P"), vec![vec!["a"]]);
+    db.execute("INSERT INTO P (Name, Age) VALUES ('d', 3)").unwrap();
+    db.execute("UPDATE P SET Age = (SELECT Count(*) FROM P q WHERE q.Age < P.Age) WHERE Name = 'a'").unwrap();
+    assert_eq!(rows(&db, "SELECT Age FROM P WHERE Name = 'a'"), vec![vec!["1"]]);
+
+    db.execute("CREATE TABLE T (K INT PRIMARY KEY, V TEXT); INSERT INTO T VALUES (1,'one'),(2,'two'),(3,'three');").unwrap();
+    let n = db
+        .execute(
+            "MERGE INTO T USING (VALUES (2,'TWO'),(3,'x'),(4,'four')) AS s(k, v) ON T.K = s.k
+             WHEN MATCHED AND s.v = 'x' THEN DELETE
+             WHEN MATCHED THEN UPDATE SET V = s.v
+             WHEN NOT MATCHED THEN INSERT (K, V) VALUES (s.k, s.v)",
+        )
+        .unwrap();
+    assert_eq!(n.affected, 3);
+    assert_eq!(rows(&db, "SELECT K, V FROM T ORDER BY K"), vec![vec!["1", "one"], vec!["2", "TWO"], vec!["4", "four"]]);
+    // A failing MERGE changes nothing.
+    assert!(db
+        .execute("MERGE INTO T USING (VALUES (9, 'n'), (8, 'm')) AS s(k, v) ON T.K = s.k WHEN NOT MATCHED THEN INSERT (K, V) VALUES (s.k, s.k / 0)")
+        .is_err());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM T"), vec![vec!["3"]]);
+
+    db.execute("TRUNCATE TABLE T").unwrap();
+    assert_eq!(rows(&db, "SELECT Count(*) FROM T"), vec![vec!["0"]]);
+    db.execute("DROP TABLE IF EXISTS Nope; DROP TABLE IF EXISTS T").unwrap();
+    assert!(db.table("T").is_none());
+}

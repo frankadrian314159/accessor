@@ -45,7 +45,7 @@ fn scope_of(schema: &TableSchema) -> Scope {
         cols: schema
             .columns
             .iter()
-            .map(|c| ScopeCol { table: schema.name.clone(), name: c.name.clone() })
+            .map(|c| ScopeCol { table: schema.name.clone(), name: c.name.clone(), hidden: false })
             .collect(),
     }
 }
