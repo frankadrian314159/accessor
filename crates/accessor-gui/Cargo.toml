@@ -1,0 +1,16 @@
+[package]
+name = "accessor-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+[dependencies]
+accessor-core = { path = "../accessor-core" }
+eframe = "0.32.3"
+egui = "0.32.3"
+egui_extras = "0.32.3"
+rfd = "0.17.2"
+
+[[bin]]
+name = "accessor-gui"
+path = "src/main.rs"

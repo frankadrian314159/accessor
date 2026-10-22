@@ -1,0 +1,8 @@
+/target
+*.adb
+*.adb-wal
+*.adb.tmp
+
+# Editor and language-server caches
+.clj-kondo/
+.lsp/
