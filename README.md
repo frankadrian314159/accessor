@@ -66,8 +66,10 @@ cargo build --release -p accessor-capi           # the C library and include/acc
 (cd jdbc && ./build.sh --jar)                    # the JDBC driver, with the library inside
 ```
 
-A database file is open in one connection at a time, in this or any other process
-(`name.adb-lock` beside it holds the lock); a second open fails with a message saying so.
+A database file is open in one process at a time (`name.adb-lock` beside it holds the lock);
+a second process's open fails with a message saying so. Threads of the one process share it
+with overlapping transactions: see [docs/concurrency.md](docs/concurrency.md) and
+[docs/extern/locking.md](docs/extern/locking.md).
 
 In the desktop app, **File > Load sample data** gives you something to explore.
 Right-click a table for its datasheet, form and design views. Saved queries,

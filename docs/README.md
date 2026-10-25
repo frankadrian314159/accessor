@@ -4,7 +4,7 @@
 | --- | --- |
 | [sql/](sql/README.md) | the ASQL language: statements, the BNF grammar, expressions, and how ASQL relates to standard SQL |
 | [concurrency.md](concurrency.md) | using one database from several threads: overlapping transactions with snapshot isolation, conflicts, deadlocks |
-| [extern/](extern/README.md) | using Accessor from C and from Java (JDBC), version numbers, locking and how the interface is tested |
+| [extern/](extern/README.md) | using Accessor from C and from Java (JDBC), version numbers, using the file from several processes, and how the interface is tested |
 | [functions/](functions/README.md) | every built-in function and table function, by group |
 | [optimizer/](optimizer/README.md) | the query optimizer: pushdown, join order, access paths, estimates, `EXPLAIN` and tuning |
 | [types/](types/README.md) | the column types, and how they convert and combine |
@@ -858,7 +858,7 @@ Accessor is a Cargo workspace of three crates, about twenty thousand lines of Ru
          v                  v                   v
   +-----------------------------------------------------------+
   | Database: execute, query, transaction, cell API           |
-  |           one entry point, one writer                     |
+  |  one writer; SharedDatabase: overlapping transactions     |
   +-----------------------------------------------------------+
         |                       |                        |
         v                       v                        v

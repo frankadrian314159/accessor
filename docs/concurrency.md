@@ -112,7 +112,7 @@ All connections to one `SharedDatabase` see the same **database settings**, beca
 
 ## Files, durability and processes
 
-A database file can be open once ([locking](extern/locking.md)). A `SharedDatabase` is one open, so its connections share the one lock, and other processes are kept out as before. Opening the same file twice in one process, with `Database::open` or `SharedDatabase::open`, fails with `Error::Locked`: connect to the one you have. There is no shared-read mode across processes; the answer to that is a server process owning the database.
+A database file can be open once ([locking](extern/locking.md)). A `SharedDatabase` is one open, so its connections share the one lock, and other processes are kept out as before. Opening the same file twice in one process, with `Database::open` or `SharedDatabase::open`, fails with `Error::Locked`: connect to the one you have. There is no shared mode across processes; to use one database from several programs, let one own it and serve the others, or take turns ([several processes](extern/locking.md#using-one-database-from-several-programs)).
 
 Each commit is one record in the write-ahead log, written when the transaction commits, in commit order. After a crash a database holds exactly the transactions that had committed, whatever order they began in, and none that had not. A checkpoint (`Connection::checkpoint`, or the automatic one) writes the committed state and leaves out changes still pending.
 

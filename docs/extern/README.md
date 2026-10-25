@@ -7,7 +7,7 @@ Accessor is a Rust library, but it can be used from any language that can call C
 | [c.md](c.md) | the C interface: `accessor.h`, the library, every function, error codes, threading and memory rules |
 | [jdbc.md](jdbc.md) | the JDBC driver: URLs, types, transactions, metadata, what is and is not supported |
 | [testing.md](testing.md) | how the C interface is checked: the C test suite, Valgrind, AddressSanitizer, fuzzing |
-| [locking.md](locking.md) | one connection per database file: how the lock works and what it protects |
+| [locking.md](locking.md) | several processes and one database file: the lock, patterns for sharing, crashes, backups |
 
 ```
  your program ──▶ accessor.h / libaccessor_capi ──▶ accessor-core (the engine, in Rust)

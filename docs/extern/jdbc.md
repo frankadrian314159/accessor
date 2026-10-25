@@ -40,7 +40,7 @@ A different native library can be named with `-Daccessor.library=/path/to/access
 | `optimizer` | `on` (default) or `off`; answers are the same |
 | `timezone` | an IANA zone, for showing `TIMESTAMPTZ` values |
 
-**A file can be open in one connection at a time**, in this or any other process; a second `getConnection` fails with SQL state `08001` and a message saying the database is in use ([locking.md](locking.md)).
+**A file can be open in one process at a time** (and, through this driver, by one connection); a second `getConnection` fails with SQL state `08001` and a message saying the database is in use ([locking.md](locking.md)).
 
 ## Types
 
