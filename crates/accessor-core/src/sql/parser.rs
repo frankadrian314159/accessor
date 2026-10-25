@@ -857,6 +857,19 @@ impl<'a> Parser<'a> {
         Ok(self.src[start..end].trim().to_string())
     }
 
+    /// `NULLS FIRST` or `NULLS LAST` after an ORDER BY item.
+    fn nulls_clause(&mut self) -> Result<Option<bool>> {
+        if !self.eat_kw("NULLS") {
+            return Ok(None);
+        }
+        if self.eat_kw("FIRST") {
+            Ok(Some(true))
+        } else {
+            self.expect_kw("LAST")?;
+            Ok(Some(false))
+        }
+    }
+
     /// `CHECK (expression)`; returns the expression text.
     fn check_clause(&mut self) -> Result<String> {
         self.expect_kw("CHECK")?;
@@ -1231,7 +1244,8 @@ impl<'a> Parser<'a> {
                     self.eat_kw("ASC");
                     false
                 };
-                sel.order_by.push(OrderItem { expr, desc });
+                let nulls_first = self.nulls_clause()?;
+                sel.order_by.push(OrderItem { expr, desc, nulls_first });
                 if !self.eat_sym(",") {
                     break;
                 }
@@ -2096,7 +2110,8 @@ impl<'a> Parser<'a> {
                     self.eat_kw("ASC");
                     false
                 };
-                spec.order_by.push(OrderItem { expr, desc });
+                let nulls_first = self.nulls_clause()?;
+                spec.order_by.push(OrderItem { expr, desc, nulls_first });
                 if !self.eat_sym(",") {
                     break;
                 }

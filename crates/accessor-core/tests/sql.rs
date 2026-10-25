@@ -2114,3 +2114,58 @@ fn the_crosstab_shortcut_gives_the_same_answers() {
         .join("\n");
     assert!(plan.contains("one grouped pass"), "{plan}");
 }
+
+// ----- NULLS FIRST / NULLS LAST --------------------------------------------------------------
+
+#[test]
+fn nulls_first_and_last() {
+    let db = Database::in_memory();
+    let mut db = db;
+    db.execute(
+        "CREATE TABLE N (id INTEGER PRIMARY KEY, x INTEGER, y TEXT);
+         CREATE INDEX nx ON N (x);
+         INSERT INTO N VALUES (1, 3, 'a'), (2, NULL, 'b'), (3, 1, 'c'), (4, NULL, 'd'), (5, 3, 'e'), (6, 2, NULL);",
+    )
+    .unwrap();
+    let ids = |db: &Database, sql: &str| -> Vec<String> { rows(db, sql).into_iter().map(|r| r[0].clone()).collect() };
+    // Defaults: NULLs first ascending, last descending.
+    assert_eq!(ids(&db, "SELECT id FROM N ORDER BY x, id"), ["2", "4", "3", "6", "1", "5"]);
+    assert_eq!(ids(&db, "SELECT id FROM N ORDER BY x DESC, id"), ["1", "5", "6", "3", "2", "4"]);
+    // Explicit placement.
+    assert_eq!(ids(&db, "SELECT id FROM N ORDER BY x NULLS LAST, id"), ["3", "6", "1", "5", "2", "4"]);
+    assert_eq!(ids(&db, "SELECT id FROM N ORDER BY x DESC NULLS FIRST, id"), ["2", "4", "1", "5", "6", "3"]);
+    assert_eq!(ids(&db, "SELECT id FROM N ORDER BY x ASC NULLS FIRST, id"), ["2", "4", "3", "6", "1", "5"]);
+    assert_eq!(ids(&db, "SELECT id FROM N ORDER BY y NULLS FIRST, id"), ["6", "1", "2", "3", "4", "5"]);
+    assert_eq!(ids(&db, "SELECT id, x FROM N ORDER BY 2 NULLS LAST, 1 DESC"), ["3", "6", "5", "1", "4", "2"]);
+    // In a window's ORDER BY, and after a set operator.
+    let r = rows(&db, "SELECT id, ROW_NUMBER() OVER (ORDER BY x NULLS LAST, id) FROM N ORDER BY 2");
+    assert_eq!(r[0], ["3", "1"]);
+    assert_eq!(r[5], ["4", "6"]);
+    assert_eq!(ids(&db, "SELECT x FROM N WHERE id < 4 UNION ALL SELECT 9 ORDER BY 1 DESC NULLS FIRST").len(), 4);
+
+    // The index serves every combination, with and without a limit, and gives the same rows.
+    for sql in [
+        "SELECT id, x FROM N ORDER BY x NULLS LAST LIMIT 4",
+        "SELECT id, x FROM N ORDER BY x NULLS FIRST LIMIT 4",
+        "SELECT id, x FROM N ORDER BY x DESC NULLS FIRST LIMIT 4",
+        "SELECT id, x FROM N ORDER BY x DESC NULLS LAST LIMIT 4",
+        "SELECT id, x FROM N ORDER BY x NULLS LAST LIMIT 3 OFFSET 2",
+        "SELECT id, x FROM N WHERE id > 1 ORDER BY x DESC NULLS FIRST LIMIT 5",
+        "SELECT id, x FROM N ORDER BY x NULLS LAST LIMIT 100",
+    ] {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        assert_eq!(on, rows(&db, sql), "{sql}");
+    }
+    db.set_optimizer(true);
+    let plan: String = db
+        .query("EXPLAIN SELECT id FROM N ORDER BY x NULLS LAST LIMIT 2")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("NULLs last") && plan.contains("no sort"), "{plan}");
+}

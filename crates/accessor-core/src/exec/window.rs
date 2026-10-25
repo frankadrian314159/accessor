@@ -73,7 +73,7 @@ pub struct WinSpecB {
     pub distinct: bool,
     pub sep: Option<String>,
     pub partition: Vec<BExpr>,
-    pub order: Vec<(BExpr, bool)>,
+    pub order: Vec<(BExpr, bool, Option<bool>)>,
     pub frame: Option<Frame>,
 }
 
@@ -82,7 +82,7 @@ impl WinSpecB {
         let m = |e: &BExpr| e.map_cols(f);
         self.args = self.args.iter().map(m).collect();
         self.partition = self.partition.iter().map(m).collect();
-        self.order = self.order.iter().map(|(e, d)| (e.map_cols(f), *d)).collect();
+        self.order = self.order.iter().map(|(e, d, n)| (e.map_cols(f), *d, *n)).collect();
     }
 }
 
@@ -103,10 +103,9 @@ fn eval_all(rows: &[Row], exprs: &[BExpr]) -> Result<Vec<Vec<Value>>> {
         .collect()
 }
 
-fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
-    for ((x, y), d) in a.iter().zip(b).zip(desc) {
-        let o = x.cmp(y);
-        let o = if *d { o.reverse() } else { o };
+fn cmp_keys(a: &[Value], b: &[Value], desc: &[(bool, Option<bool>)]) -> Ordering {
+    for ((x, y), (d, nulls_first)) in a.iter().zip(b).zip(desc) {
+        let o = super::select::cmp_nulls(x, y, *d, *nulls_first);
         if o != Ordering::Equal {
             return o;
         }
@@ -117,8 +116,8 @@ fn cmp_keys(a: &[Value], b: &[Value], desc: &[bool]) -> Ordering {
 fn compute_one(rows: &[Row], w: &WinSpecB) -> Result<Vec<Value>> {
     let n = rows.len();
     let pkeys = eval_all(rows, &w.partition)?;
-    let order_exprs: Vec<BExpr> = w.order.iter().map(|(e, _)| e.clone()).collect();
-    let desc: Vec<bool> = w.order.iter().map(|(_, d)| *d).collect();
+    let order_exprs: Vec<BExpr> = w.order.iter().map(|(e, _, _)| e.clone()).collect();
+    let desc: Vec<(bool, Option<bool>)> = w.order.iter().map(|(_, d, n)| (*d, *n)).collect();
     let okeys = eval_all(rows, &order_exprs)?;
     let args = w.args.iter().map(|a| rows.iter().map(|r| a.eval(r).map(|v| v.into_owned())).collect::<Result<Vec<_>>>());
     let argv: Vec<Vec<Value>> = args.collect::<Result<_>>()?;
@@ -139,7 +138,7 @@ fn compute_one(rows: &[Row], w: &WinSpecB) -> Result<Vec<Value>> {
     Ok(out)
 }
 
-fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Value>], desc: &[bool], out: &mut [Value]) -> Result<()> {
+fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Value>], desc: &[(bool, Option<bool>)], out: &mut [Value]) -> Result<()> {
     let m = part.len();
     // Peer groups: rows that tie on the ORDER BY keys (all rows, without one).
     let mut peer_start = vec![0usize; m];

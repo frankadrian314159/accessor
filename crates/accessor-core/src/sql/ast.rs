@@ -121,6 +121,9 @@ pub struct From {
 pub struct OrderItem {
     pub expr: Expr,
     pub desc: bool,
+    /// `NULLS FIRST` (`Some(true)`) or `NULLS LAST` (`Some(false)`); `None` leaves NULLs
+    /// where they sort naturally: first when ascending, last when descending.
+    pub nulls_first: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Default)]

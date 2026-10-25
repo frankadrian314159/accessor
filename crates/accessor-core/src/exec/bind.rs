@@ -456,7 +456,7 @@ impl<'a> Binder<'a> {
             let order = spec
                 .order_by
                 .iter()
-                .map(|o| Ok((self.bind(&o.expr)?, o.desc)))
+                .map(|o| Ok((self.bind(&o.expr)?, o.desc, o.nulls_first)))
                 .collect::<Result<Vec<_>>>()?;
             Ok(WinSpecB {
                 func: wf,

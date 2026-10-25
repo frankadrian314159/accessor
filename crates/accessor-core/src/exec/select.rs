@@ -156,7 +156,7 @@ impl Database {
 
         // ORDER BY: ordinal, output alias, or arbitrary expression (hidden column).
         let mut hidden: Vec<BExpr> = Vec::new();
-        let mut sort_keys: Vec<(usize, bool)> = Vec::new();
+        let mut sort_keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
         for o in &sel.order_by {
             let col = match &o.expr {
                 Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= n_vis => *n as usize - 1,
@@ -168,7 +168,7 @@ impl Database {
                     n_vis + hidden.len() - 1
                 }
             };
-            sort_keys.push((col, o.desc));
+            sort_keys.push((col, o.desc, o.nulls_first));
         }
         let group = binder.group.take();
         let corr = std::mem::take(&mut binder.corr);
@@ -293,9 +293,8 @@ impl Database {
                 }
             });
             let cmp = |a: &Row, b: &Row| -> Ordering {
-                for &(c, desc) in &sort_keys {
-                    let o = a[c].cmp(&b[c]);
-                    let o = if desc { o.reverse() } else { o };
+                for &(c, desc, nulls_first) in &sort_keys {
+                    let o = cmp_nulls(&a[c], &b[c], desc, nulls_first);
                     if o != Ordering::Equal {
                         return o;
                     }
@@ -428,7 +427,7 @@ impl Database {
             rows = combine(op, all, rows, next);
         }
 
-        let mut keys: Vec<(usize, bool)> = Vec::new();
+        let mut keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
         for o in &sel.order_by {
             let col = match &o.expr {
                 Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= columns.len() => *n as usize - 1,
@@ -441,13 +440,12 @@ impl Database {
                     ))
                 }
             };
-            keys.push((col, o.desc));
+            keys.push((col, o.desc, o.nulls_first));
         }
         if !keys.is_empty() {
             rows.sort_by(|a, b| {
-                for &(c, desc) in &keys {
-                    let o = a[c].cmp(&b[c]);
-                    let o = if desc { o.reverse() } else { o };
+                for &(c, desc, nulls_first) in &keys {
+                    let o = cmp_nulls(&a[c], &b[c], desc, nulls_first);
                     if o != Ordering::Equal {
                         return o;
                     }
@@ -896,6 +894,16 @@ impl Database {
             return Ok(None);
         }
         let k = cols.len();
+        // NULLs sit first in an index; where the query wants them elsewhere that is
+        // handled for a single sort column, and otherwise the index is not used.
+        let natural_first = !desc;
+        let nulls_first = sel.order_by[0].nulls_first.unwrap_or(natural_first);
+        if sel.order_by.iter().any(|o| o.nulls_first.unwrap_or(natural_first) != nulls_first) {
+            return Ok(None);
+        }
+        if k > 1 && nulls_first != natural_first {
+            return Ok(None);
+        }
         let conj: Vec<&BExpr> = filter.map(split_and).unwrap_or_default();
         let defs: Vec<_> = t.index_defs().collect();
         // Which index and key prefix give the order?
@@ -923,13 +931,30 @@ impl Database {
         };
         self.note(depth, || {
             format!(
-                "order by satisfied by index {} ({}), stopping after {need} rows: no sort",
+                "order by satisfied by index {} ({}{}), stopping after {need} rows: no sort",
                 defs[idx].name,
-                if desc { "descending" } else { "ascending" }
+                if desc { "descending" } else { "ascending" },
+                if nulls_first == natural_first { "" } else if nulls_first { ", NULLs first" } else { ", NULLs last" }
             )
         });
         let mut out = Vec::new();
-        for id in t.index_ordered(idx, &prefix, prefix.len() + k, desc) {
+        let null_at = |id: RowId| t.get(id).is_some_and(|r| r[cols[0]].is_null());
+        // Ids in the order wanted. The natural index order already puts NULLs where the
+        // query wants them unless it asked for the other end.
+        let ids: Box<dyn Iterator<Item = RowId> + '_> = if nulls_first == natural_first {
+            t.index_ordered(idx, &prefix, prefix.len() + k, desc)
+        } else if !desc {
+            // ascending, NULLs last: everything but the leading NULLs, then those
+            let rest = t.index_ordered(idx, &prefix, prefix.len() + k, false).skip_while(move |&id| null_at(id));
+            let nulls = t.index_ordered(idx, &prefix, prefix.len() + k, false).take_while(move |&id| null_at(id));
+            Box::new(rest.chain(nulls))
+        } else {
+            // descending, NULLs first: the NULLs (in storage order), then the rest descending
+            let nulls = t.index_ordered(idx, &prefix, prefix.len() + k, false).take_while(move |&id| null_at(id));
+            let rest = t.index_ordered(idx, &prefix, prefix.len() + k, true).filter(move |&id| !null_at(id));
+            Box::new(nulls.chain(rest))
+        };
+        for id in ids {
             let Some(row) = t.get(id) else { continue };
             if let Some(f) = filter {
                 if !f.eval_bool(row)? {
@@ -1554,6 +1579,21 @@ fn aggregate_set(
             key
         })
         .collect())
+}
+
+/// Compares two sort values, with NULLs placed by `nulls_first` (by default first when
+/// ascending and last when descending, which is where they sort naturally).
+pub(crate) fn cmp_nulls(a: &Value, b: &Value, desc: bool, nulls_first: Option<bool>) -> Ordering {
+    let first = nulls_first.unwrap_or(!desc);
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => if first { Ordering::Less } else { Ordering::Greater },
+        (false, true) => if first { Ordering::Greater } else { Ordering::Less },
+        _ => {
+            let o = a.cmp(b);
+            if desc { o.reverse() } else { o }
+        }
+    }
 }
 
 /// `a UNION|INTERSECT|EXCEPT [ALL] b` over already computed rows.
