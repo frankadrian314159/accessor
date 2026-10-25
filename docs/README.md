@@ -838,7 +838,7 @@ A user interface that edits a grid does not want to build SQL strings, so there 
 
 `db.set_durability(Durability::OsBuffered)` trades safety against power loss for speed (see [Durability and recovery](#architecture)). `db.checkpoint()` folds the log into the snapshot and `db.compact()` rewrites the file without gaps; both are refused while a transaction is open. When a `Database` is dropped with a transaction open, the transaction is rolled back.
 
-The library is synchronous and single-threaded: mutating calls take `&mut self`, so the borrow checker prevents two writers in one process. Several readers can share a `&Database`. Sharing one file between processes is refused by a file lock (see [locking](extern/locking.md)).
+The library is synchronous. `Database` is `Send` and `Sync` (a test keeps it so): a connection can be moved to another thread, and several threads can share a `&Database` to run `query` and `query_prepared` at the same time. Mutating calls take `&mut self`, so the borrow checker allows one writer at a time and no readers while it writes; to share a writable database between threads, wrap it in a `Mutex` or `RwLock`. Queries do not run in parallel *within* a statement, and there are no concurrent transactions. Sharing one file between processes is refused by a file lock (see [locking](extern/locking.md)).
 
 ### Architecture
 

@@ -15,7 +15,7 @@
 //! `(SELECT MAX(x) FROM t WHERE t.k = outer.k)`.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::agg::AggFn;
 use super::bind::{contains_agg, CorrKind, CorrSpec};
@@ -175,8 +175,8 @@ fn family(v: &Value) -> u8 {
 /// The answers of a decorrelated sub-query, by key.
 pub(crate) struct Hashed {
     outer: Vec<usize>,
-    map: HashMap<Vec<Value>, Rc<Vec<Row>>>,
-    empty: Rc<Vec<Row>>,
+    map: HashMap<Vec<Value>, Arc<Vec<Row>>>,
+    empty: Arc<Vec<Row>>,
     /// The kind of each key in the inner rows (`None`: no rows; `Some(0)`: mixed kinds).
     families: Vec<Option<u8>>,
     pub inner_rows: usize,
@@ -192,11 +192,11 @@ impl Hashed {
         key.iter().zip(&self.families).all(|(v, f)| v.is_null() || matches!(f, None) || *f == Some(family(v)))
     }
 
-    pub(crate) fn lookup(&self, key: &[Value]) -> Rc<Vec<Row>> {
+    pub(crate) fn lookup(&self, key: &[Value]) -> Arc<Vec<Row>> {
         if key.iter().any(Value::is_null) {
-            return Rc::clone(&self.empty);
+            return Arc::clone(&self.empty);
         }
-        self.map.get(key).map_or_else(|| Rc::clone(&self.empty), Rc::clone)
+        self.map.get(key).map_or_else(|| Arc::clone(&self.empty), Arc::clone)
     }
 }
 
@@ -246,8 +246,8 @@ impl Database {
             grouped.entry(row).or_default().push(tail);
         }
         let inner_rows = res.rows.len();
-        let map = grouped.into_iter().map(|(key, rows)| (key, Rc::new(rows))).collect();
-        let empty = Rc::new(if d.counts { vec![vec![Value::Int(0)]] } else { Vec::new() });
+        let map = grouped.into_iter().map(|(key, rows)| (key, Arc::new(rows))).collect();
+        let empty = Arc::new(if d.counts { vec![vec![Value::Int(0)]] } else { Vec::new() });
         Ok(Some(Hashed { outer: d.outer, map, empty, families, inner_rows }))
     }
 }

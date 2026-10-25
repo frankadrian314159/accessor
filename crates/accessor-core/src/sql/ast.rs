@@ -1,6 +1,6 @@
 //! Syntax tree for the supported SQL dialect.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::schema::RefAction;
 use crate::value::{DataType, Row, Value};
@@ -109,7 +109,7 @@ pub enum TableFactor {
     /// A table function such as `GENERATE_SERIES(1, 10)`; its arguments may read earlier tables.
     Function { name: String, args: Vec<Expr>, alias: String, columns: Vec<String> },
     /// Rows already computed (the result of a common table expression).
-    Materialized { rows: Rc<Vec<Row>>, columns: Vec<String>, alias: String },
+    Materialized { rows: Arc<Vec<Row>>, columns: Vec<String>, alias: String },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

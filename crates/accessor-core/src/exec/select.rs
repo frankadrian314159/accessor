@@ -4,7 +4,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::agg::{AggFn, AggSpec, AggState};
 use super::bind::{contains_agg, Binder, CorrKind, CorrSpec, GroupCtx, Scope, ScopeCol};
@@ -111,7 +111,7 @@ impl Database {
                 let heads: Vec<String> = inner.names.iter().filter(|n| !used.contains(&n.to_ascii_lowercase())).cloned().collect();
                 let from_factor = match inner.data {
                     SourceData::Rows(rows) => {
-                        TableFactor::Materialized { rows: Rc::new(rows), columns: inner.names.clone(), alias: inner.alias.clone() }
+                        TableFactor::Materialized { rows: Arc::new(rows), columns: inner.names.clone(), alias: inner.alias.clone() }
                     }
                     _ => (**source).clone(),
                 };
@@ -330,13 +330,13 @@ impl Database {
             return Err(Error::runtime("a LATERAL item cannot be the target of a RIGHT or FULL JOIN"));
         }
         let rw = right.ncols();
-        let mut cache: HashMap<Vec<Value>, Rc<Vec<Row>>> = HashMap::new();
+        let mut cache: HashMap<Vec<Value>, Arc<Vec<Row>>> = HashMap::new();
         let mut out: Vec<Row> = Vec::new();
         let mut runs = 0usize;
         for l in &left {
             let key: Vec<Value> = lat.outer.iter().map(|(_, c)| l[*c].clone()).collect();
             let produced = match cache.get(&key) {
-                Some(r) => Rc::clone(r),
+                Some(r) => Arc::clone(r),
                 None => {
                     let values: HashMap<String, Value> = lat.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
                     runs += 1;
@@ -357,8 +357,8 @@ impl Database {
                             self.table_function(name, &vals)?.1
                         }
                     };
-                    let rc = Rc::new(rows);
-                    cache.insert(key, Rc::clone(&rc));
+                    let rc = Arc::new(rows);
+                    cache.insert(key, Arc::clone(&rc));
                     rc
                 }
             };
@@ -664,7 +664,7 @@ impl Database {
         const CACHE_LIMIT: usize = 4096;
         let input_rows = rows.len();
         let runs = std::cell::Cell::new(0usize);
-        let mut caches: Vec<HashMap<Vec<Value>, Rc<Vec<Row>>>> = specs.iter().map(|_| HashMap::new()).collect();
+        let mut caches: Vec<HashMap<Vec<Value>, Arc<Vec<Row>>>> = specs.iter().map(|_| HashMap::new()).collect();
         // Sub-queries whose correlation is all equalities may be run once and looked up (a semi-join).
         let hashed: Vec<Option<super::decorrelate::Hashed>> =
             specs.iter().map(|s| self.hash_subquery(s, &rows, depth)).collect::<Result<_>>()?;
@@ -682,7 +682,7 @@ impl Database {
                         r
                     }
                     None => match cache.get(&key) {
-                        Some(r) => Rc::clone(r),
+                        Some(r) => Arc::clone(r),
                         None => {
                             let values: HashMap<String, Value> =
                                 spec.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
@@ -696,8 +696,8 @@ impl Database {
                             if cache.len() >= CACHE_LIMIT {
                                 cache.clear();
                             }
-                            let rc = Rc::new(res.rows);
-                            cache.insert(key, Rc::clone(&rc));
+                            let rc = Arc::new(res.rows);
+                            cache.insert(key, Arc::clone(&rc));
                             rc
                         }
                     },
@@ -2089,12 +2089,12 @@ fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Re
 // ---------------------------------------------------------------------------
 
 /// Replaces references to the CTE `name` in `s` (sub-queries included) with its rows.
-fn subst_cte(s: &mut Select, name: &str, rows: &Rc<Vec<Row>>, cols: &[String]) {
-    fn factor(f: &mut TableFactor, name: &str, rows: &Rc<Vec<Row>>, cols: &[String]) {
+fn subst_cte(s: &mut Select, name: &str, rows: &Arc<Vec<Row>>, cols: &[String]) {
+    fn factor(f: &mut TableFactor, name: &str, rows: &Arc<Vec<Row>>, cols: &[String]) {
         match f {
             TableFactor::Named { name: n, alias } if n.eq_ignore_ascii_case(name) => {
                 let alias = alias.clone().unwrap_or_else(|| n.clone());
-                *f = TableFactor::Materialized { rows: Rc::clone(rows), columns: cols.to_vec(), alias };
+                *f = TableFactor::Materialized { rows: Arc::clone(rows), columns: cols.to_vec(), alias };
             }
             TableFactor::Derived { query, .. } => subst_cte(query, name, rows, cols),
             TableFactor::Pivot { source, .. } | TableFactor::Unpivot { source, .. } => factor(source, name, rows, cols),
@@ -2125,7 +2125,7 @@ fn subst_cte(s: &mut Select, name: &str, rows: &Rc<Vec<Row>>, cols: &[String]) {
 
 fn mentions_table(s: &Select, name: &str) -> bool {
     let mut copy = s.clone();
-    subst_cte(&mut copy, name, &Rc::new(Vec::new()), &[]);
+    subst_cte(&mut copy, name, &Arc::new(Vec::new()), &[]);
     copy != *s
 }
 
@@ -2136,7 +2136,7 @@ impl Database {
         let with = sel.with.as_ref().expect("checked by the caller");
         let mut body = sel.clone();
         body.with = None;
-        let mut done: Vec<(String, Rc<Vec<Row>>, Vec<String>)> = Vec::new();
+        let mut done: Vec<(String, Arc<Vec<Row>>, Vec<String>)> = Vec::new();
         for cte in &with.ctes {
             let mut q = cte.query.clone();
             for (n, rows, cols) in &done {
@@ -2148,7 +2148,7 @@ impl Database {
                 let res = self.run_select_depth(&q, depth + 1)?;
                 (rename_columns(res.columns, &cte.columns, &cte.name)?, res.rows)
             };
-            done.push((cte.name.clone(), Rc::new(rows), cols));
+            done.push((cte.name.clone(), Arc::new(rows), cols));
         }
         for (n, rows, cols) in &done {
             subst_cte(&mut body, n, rows, cols);
@@ -2203,7 +2203,7 @@ impl Database {
             if rounds > MAX_ROUNDS {
                 return Err(Error::runtime(format!("the recursive query '{name}' did not stop after {MAX_ROUNDS} rounds")));
             }
-            let current = Rc::new(std::mem::take(&mut working));
+            let current = Arc::new(std::mem::take(&mut working));
             let mut next: Vec<Row> = Vec::new();
             for m in &recursive {
                 let mut m = m.clone();

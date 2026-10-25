@@ -9,6 +9,7 @@
 //! `EXEC`. It runs as one unit: if any statement fails, everything it did is undone.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::QueryResult;
@@ -176,7 +177,7 @@ impl Database {
             return Err(Error::catalog(format!("'{name}' is a function; use it in an expression")));
         }
         let RoutineBody::Block(body) = &def.body else { unreachable!("procedures have blocks") };
-        if self.call_depth.get() >= MAX_CALLS {
+        if self.call_depth.load(Ordering::Relaxed) >= MAX_CALLS {
             return Err(Error::runtime("procedures are nested too deeply (does one call itself?)"));
         }
         // Arguments, positionally or by name, then defaults.
@@ -226,9 +227,9 @@ impl Database {
             };
             frame.vars.insert(k, v);
         }
-        self.call_depth.set(self.call_depth.get() + 1);
+        self.call_depth.fetch_add(1, Ordering::Relaxed);
         let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| ()));
-        self.call_depth.set(self.call_depth.get() - 1);
+        self.call_depth.fetch_sub(1, Ordering::Relaxed);
         outcome?;
         Ok(Some(match (frame.returned, frame.last) {
             (Some(v), _) => QueryResult { columns: vec!["return".into()], rows: vec![vec![v]], affected: 0 },

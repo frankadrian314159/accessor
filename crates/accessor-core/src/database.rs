@@ -69,7 +69,7 @@ pub struct Database {
     /// The rows of one table changed so far by a statement with `RETURNING`.
     pub(crate) capture: Option<Capture>,
     /// How many procedures are running, one inside another.
-    pub(crate) call_depth: std::cell::Cell<u32>,
+    pub(crate) call_depth: std::sync::atomic::AtomicU32,
     /// SQL text recently read, with the statements it came to.
     pub(crate) parse_cache: Mutex<HashMap<String, Arc<Vec<Statement>>>>,
     /// `PREPARE`d statements of this session.
@@ -103,7 +103,7 @@ impl Database {
             routines: BTreeMap::new(),
             reports: BTreeMap::new(),
             capture: None,
-            call_depth: std::cell::Cell::new(0),
+            call_depth: std::sync::atomic::AtomicU32::new(0),
             parse_cache: Mutex::new(HashMap::new()),
             prepared: BTreeMap::new(),
             calc_cache: Default::default(),
