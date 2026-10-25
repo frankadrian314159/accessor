@@ -27,6 +27,19 @@ const MAX_DEPTH: u32 = 16;
 pub(crate) enum SourceData<'a> {
     Table(&'a Table),
     Rows(Vec<Row>),
+    /// A LATERAL sub-query or table function that reads earlier tables: rerun for each of their rows.
+    Lateral(Box<Lateral>),
+}
+
+pub(crate) struct Lateral {
+    kind: LateralKind,
+    /// Parameter names, with the position (in the rows joined so far) of the column each stands for.
+    outer: Vec<(String, usize)>,
+}
+
+enum LateralKind {
+    Query(Select),
+    Func(String, Vec<Expr>),
 }
 
 pub(crate) struct Source<'a> {
@@ -43,12 +56,14 @@ impl Source<'_> {
         match &self.data {
             SourceData::Table(t) => t.slot_count(),
             SourceData::Rows(r) => r.len(),
+            SourceData::Lateral(_) => 0,
         }
     }
     fn get(&self, slot: usize) -> Option<&Row> {
         match &self.data {
             SourceData::Table(t) => t.get(slot as RowId),
             SourceData::Rows(r) => r.get(slot),
+            SourceData::Lateral(_) => None,
         }
     }
 }
@@ -74,7 +89,17 @@ impl Database {
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
-            TableFactor::Derived { query, alias, columns } => {
+            TableFactor::Function { name, args, alias, columns } => {
+                let scope = Scope::default();
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(Binder::new(self, &scope, depth).bind(a)?.eval(&[])?.into_owned());
+                }
+                let (cols, rows) = self.table_function(name, &vals)?;
+                let names = rename_columns(cols, columns, alias)?;
+                Ok(Source { data: SourceData::Rows(rows), alias: alias.clone(), names })
+            }
+            TableFactor::Derived { query, alias, columns, .. } => {
                 let res = self.run_select_depth(query, depth + 1)?;
                 let names = rename_columns(res.columns, columns, alias)?;
                 Ok(Source { data: SourceData::Rows(res.rows), alias: alias.clone(), names })
@@ -83,6 +108,182 @@ impl Database {
                 Ok(Source { data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
             }
         }
+    }
+
+    /// A FROM item resolved with the columns of the items before it in view, which a
+    /// LATERAL sub-query or a table function may read.
+    fn resolve_source(&self, f: &TableFactor, scope: &Scope, depth: u32) -> Result<Source<'_>> {
+        match f {
+            TableFactor::Derived { query, alias, columns, lateral: true } => {
+                let mut q = (**query).clone();
+                let outer = super::bind::correlate_select(self, scope, &mut q, depth)?;
+                if outer.is_empty() {
+                    return self.resolve_factor(f, depth);
+                }
+                // Its columns are learned by running it once with NULL for every outer value.
+                let mut probe = q.clone();
+                let nulls: HashMap<String, Value> = outer.iter().map(|(n, _)| (n.clone(), Value::Null)).collect();
+                crate::sql::walk::bind_params_select(&mut probe, &nulls)?;
+                probe.limit = Some(0);
+                let probed = self.unlogged(|| self.run_select_depth(&probe, depth + 1))?;
+                let names = rename_columns(probed.columns, columns, alias)?;
+                Ok(Source { data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
+            }
+            TableFactor::Function { name, args, alias, columns } => {
+                let mut a = args.clone();
+                let outer = super::bind::correlate_exprs(self, scope, &mut a, depth)?;
+                if outer.is_empty() {
+                    return self.resolve_factor(f, depth);
+                }
+                let cols = self.table_function_columns(name)?;
+                let names = rename_columns(cols, columns, alias)?;
+                Ok(Source {
+                    data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Func(name.clone(), a), outer })),
+                    alias: alias.clone(),
+                    names,
+                })
+            }
+            _ => self.resolve_factor(f, depth),
+        }
+    }
+
+    /// The column names a table function produces.
+    pub(crate) fn table_function_columns(&self, name: &str) -> Result<Vec<String>> {
+        Ok(match name.to_ascii_uppercase().as_str() {
+            "GENERATE_SERIES" => vec!["generate_series".into()],
+            "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
+            other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES and SPLIT_STRING are available)"))),
+        })
+    }
+
+    /// Runs a table function on already evaluated arguments.
+    pub(crate) fn table_function(&self, name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Row>)> {
+        const MAX_ROWS: usize = 10_000_000;
+        let cols = self.table_function_columns(name)?;
+        let wrong = |n: &str| Error::runtime(format!("wrong number of arguments for {n}"));
+        match name.to_ascii_uppercase().as_str() {
+            "GENERATE_SERIES" => {
+                if !(2..=3).contains(&args.len()) {
+                    return Err(wrong("GENERATE_SERIES"));
+                }
+                if args.iter().any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let step = args.get(2).cloned().unwrap_or(Value::Int(1));
+                let forward = match step.sign() {
+                    Some(Ordering::Greater) => true,
+                    Some(Ordering::Less) => false,
+                    _ => return Err(Error::runtime("GENERATE_SERIES: the step must not be zero")),
+                };
+                let mut rows = Vec::new();
+                let mut cur = args[0].clone();
+                loop {
+                    match cur.sql_cmp(&args[1]) {
+                        Some(o) if (forward && o != Ordering::Greater) || (!forward && o != Ordering::Less) => {}
+                        _ => break,
+                    }
+                    if rows.len() >= MAX_ROWS {
+                        return Err(Error::runtime("GENERATE_SERIES would produce too many rows"));
+                    }
+                    rows.push(vec![cur.clone()]);
+                    cur = crate::numeric::arith(BinOp::Add, &cur, &step)?;
+                }
+                Ok((cols, rows))
+            }
+            "SPLIT_STRING" => {
+                if args.len() != 2 {
+                    return Err(wrong("SPLIT_STRING"));
+                }
+                if args.iter().any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let (text, sep) = (args[0].to_string(), args[1].to_string());
+                let parts: Vec<String> = if sep.is_empty() {
+                    text.chars().map(String::from).collect()
+                } else {
+                    text.split(&sep).map(str::to_string).collect()
+                };
+                let rows = parts.into_iter().enumerate().map(|(i, p)| vec![Value::text(&p), Value::Int(i as i64 + 1)]).collect();
+                Ok((cols, rows))
+            }
+            _ => unreachable!("checked by table_function_columns"),
+        }
+    }
+
+    /// Joins `left` to a LATERAL item, running the item once for each distinct set of outer values.
+    #[allow(clippy::too_many_arguments)]
+    fn lateral_step(
+        &self,
+        left: Vec<Row>,
+        right: &Source<'_>,
+        lat: &Lateral,
+        kind: JoinKind,
+        on: Option<&BExpr>,
+        right_pre: Option<&BExpr>,
+        depth: u32,
+    ) -> Result<(Vec<Row>, String)> {
+        if matches!(kind, JoinKind::Right | JoinKind::Full) {
+            return Err(Error::runtime("a LATERAL item cannot be the target of a RIGHT or FULL JOIN"));
+        }
+        let rw = right.ncols();
+        let mut cache: HashMap<Vec<Value>, Rc<Vec<Row>>> = HashMap::new();
+        let mut out: Vec<Row> = Vec::new();
+        let mut runs = 0usize;
+        for l in &left {
+            let key: Vec<Value> = lat.outer.iter().map(|(_, c)| l[*c].clone()).collect();
+            let produced = match cache.get(&key) {
+                Some(r) => Rc::clone(r),
+                None => {
+                    let values: HashMap<String, Value> = lat.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
+                    runs += 1;
+                    let rows = match &lat.kind {
+                        LateralKind::Query(q) => {
+                            let mut q = q.clone();
+                            crate::sql::walk::bind_params_select(&mut q, &values)?;
+                            self.run_select_depth(&q, depth + 1)?.rows
+                        }
+                        LateralKind::Func(name, args) => {
+                            let mut a = args.clone();
+                            crate::sql::walk::bind_params_exprs(&mut a, &values)?;
+                            let scope = Scope::default();
+                            let mut vals = Vec::with_capacity(a.len());
+                            for e in &a {
+                                vals.push(Binder::new(self, &scope, depth).bind(e)?.eval(&[])?.into_owned());
+                            }
+                            self.table_function(name, &vals)?.1
+                        }
+                    };
+                    let rc = Rc::new(rows);
+                    cache.insert(key, Rc::clone(&rc));
+                    rc
+                }
+            };
+            let mut matched = false;
+            for r in produced.iter() {
+                if let Some(p) = right_pre {
+                    if !p.eval_bool(r)? {
+                        continue;
+                    }
+                }
+                let mut row = Vec::with_capacity(l.len() + rw);
+                row.extend_from_slice(l);
+                row.extend_from_slice(r);
+                if let Some(c) = on {
+                    if !c.eval_bool(&row)? {
+                        continue;
+                    }
+                }
+                matched = true;
+                out.push(row);
+            }
+            if !matched && kind == JoinKind::Left {
+                let mut row = l.clone();
+                row.resize(l.len() + rw, Value::Null);
+                out.push(row);
+            }
+        }
+        let how = format!("LATERAL, run {runs} time(s) for {} left row(s) (answers remembered per distinct outer value)", left.len());
+        Ok((out, how))
     }
 
     pub fn run_select(&self, sel: &Select) -> Result<QueryResult> {
@@ -107,14 +308,12 @@ impl Database {
         let mut sources = Vec::new();
         let mut scope = Scope::default();
         if let Some(from) = &sel.from {
-            sources.push(self.resolve_factor(&from.first, depth)?);
-            for j in &from.joins {
-                sources.push(self.resolve_factor(&j.factor, depth)?);
-            }
-            for s in &sources {
-                for n in &s.names {
-                    scope.cols.push(ScopeCol { table: s.alias.clone(), name: n.clone(), hidden: false });
+            for f in std::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.factor)) {
+                let src = self.resolve_source(f, &scope, depth)?;
+                for n in &src.names {
+                    scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: false });
                 }
+                sources.push(src);
             }
         }
         let join_ons = match &sel.from {
@@ -478,6 +677,9 @@ impl Database {
         if single {
             let base = &sources[0];
             let rows = match &base.data {
+                SourceData::Lateral(_) => {
+                    return Err(Error::runtime("a LATERAL item needs another table before it in the FROM clause"))
+                }
                 SourceData::Table(t) => {
                     self.note(depth, || scan_note(base, t, conj));
                     scan_table(t, conj, filter, limit)?
@@ -526,7 +728,8 @@ impl Database {
         }
 
         // Inner and cross joins may be done in any order; outer joins keep theirs.
-        let reorder = optimize && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross));
+        let has_lateral = sources.iter().any(|s| matches!(s.data, SourceData::Lateral(_)));
+        let reorder = optimize && !has_lateral && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross));
 
         // The conditions, each with the sources it reads.
         let mut preds: Vec<Pred> = Vec::new();
@@ -631,7 +834,10 @@ impl Database {
             // Filtering the joined table first is safe unless it is preserved by the join.
             let right_pre = if matches!(kind, JoinKind::Right | JoinKind::Full) { None } else { and(pre[s].clone()) };
             let before = rows.len();
-            let (joined, how) = join_step(rows, width, right, kind, on.as_ref(), right_pre.as_ref(), self.optimizer_on)?;
+            let (joined, how) = match &right.data {
+                SourceData::Lateral(lat) => self.lateral_step(rows, right, lat, kind, on.as_ref(), right_pre.as_ref(), depth)?,
+                _ => join_step(rows, width, right, kind, on.as_ref(), right_pre.as_ref(), self.optimizer_on)?,
+            };
             rows = joined;
             self.note(depth, || {
                 format!(
@@ -974,6 +1180,9 @@ impl Database {
     fn scan_source(&self, src: &Source<'_>, pre: &[BExpr], depth: u32, est: f64) -> Result<Vec<Row>> {
         let filter = pre.iter().cloned().reduce(|a, b| BExpr::Bin(BinOp::And, Box::new(a), Box::new(b)));
         let rows = match &src.data {
+            SourceData::Lateral(_) => {
+                return Err(Error::runtime("a LATERAL item needs another table before it in the FROM clause"))
+            }
             SourceData::Table(t) => {
                 let refs: Vec<&BExpr> = pre.iter().collect();
                 self.note(depth, || scan_note(src, t, &refs));

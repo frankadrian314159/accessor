@@ -109,6 +109,7 @@ fn walk_factor(t: &mut TableFactor, f: &mut Visitor) -> Result<()> {
     match t {
         TableFactor::Named { .. } | TableFactor::Materialized { .. } => Ok(()),
         TableFactor::Derived { query, .. } => walk_select(query, f),
+        TableFactor::Function { args, .. } => args.iter_mut().try_for_each(|a| walk_expr(a, f)),
     }
 }
 
@@ -185,6 +186,11 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
 /// Replaces every `@name` using `values` (keys are lowercase).
 pub fn bind_params(st: &mut Statement, values: &HashMap<String, Value>) -> Result<()> {
     walk_statement(st, &mut |e| bind_param(e, values))
+}
+
+/// Replaces `@name` in a list of expressions.
+pub fn bind_params_exprs(exprs: &mut [Expr], values: &HashMap<String, Value>) -> Result<()> {
+    exprs.iter_mut().try_for_each(|e| walk_expr(e, &mut |x| bind_param(x, values)))
 }
 
 pub fn bind_params_select(s: &mut Select, values: &HashMap<String, Value>) -> Result<()> {

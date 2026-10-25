@@ -2169,3 +2169,106 @@ fn nulls_first_and_last() {
         .join("\n");
     assert!(plan.contains("NULLs last") && plan.contains("no sort"), "{plan}");
 }
+
+// ----- row values, LATERAL and table functions -------------------------------------------------
+
+fn cust_ord() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Cust (ID INTEGER PRIMARY KEY, Name TEXT);
+         CREATE TABLE Ord (ID INTEGER PRIMARY KEY, CustID INTEGER, Total INTEGER, D INTEGER);
+         CREATE INDEX oc ON Ord (CustID, Total);
+         INSERT INTO Cust VALUES (1,'Ada'),(2,'Bob'),(3,'Cy');
+         INSERT INTO Ord VALUES (1,1,50,1),(2,1,70,2),(3,1,20,3),(4,2,90,1),(5,2,10,2);",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn row_value_comparisons() {
+    let db = cust_ord();
+    let ids = |sql: &str| -> Vec<String> { rows(&db, sql).into_iter().map(|r| r[0].clone()).collect() };
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) = (1, 70)"), ["2"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) <> (1, 70) ORDER BY ID"), ["1", "3", "4", "5"]);
+    // Lexicographic ordering: the first differing part decides.
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) > (1, 50) ORDER BY ID"), ["2", "4", "5"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) >= (1, 50) ORDER BY ID"), ["1", "2", "4", "5"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) < (2, 10) ORDER BY ID"), ["1", "2", "3"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total, D) <= (1, 50, 1) ORDER BY ID"), ["1", "3"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE ROW(CustID, Total) = ROW(2, 90)"), ["4"]);
+    // IN and NOT IN with lists of rows and with a query.
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) IN ((1, 20), (2, 10)) ORDER BY ID"), ["3", "5"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, Total) NOT IN ((1, 20), (2, 10)) ORDER BY ID"), ["1", "2", "4"]);
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, D) IN (SELECT CustID, D FROM Ord WHERE Total >= 90) ORDER BY ID"), ["4"]);
+    // Keyset paging: the page after (1, 2) in (CustID, ID) order.
+    assert_eq!(ids("SELECT ID FROM Ord WHERE (CustID, ID) > (1, 2) ORDER BY CustID, ID LIMIT 2"), ["3", "4"]);
+    // NULL parts make the answer unknown, not false.
+    assert!(ids("SELECT 1 WHERE (1, NULL) = (1, 2)").is_empty());
+    assert!(ids("SELECT 1 WHERE NOT ((1, NULL) = (2, 2))").len() == 1); // the first parts already differ
+    // Misuse is reported.
+    assert!(db.query("SELECT (1, 2)").is_err());
+    assert!(db.query("SELECT 1 WHERE (1, 2) = (1, 2, 3)").is_err());
+    assert!(db.query("SELECT 1 WHERE (1, 2) = 1").is_err());
+}
+
+#[test]
+fn lateral_joins_and_table_functions() {
+    let mut db = cust_ord();
+    // Top 2 orders per customer.
+    let r = rows(
+        &db,
+        "SELECT C.Name, T.ID, T.Total FROM Cust C, LATERAL (SELECT O.ID, O.Total FROM Ord O WHERE O.CustID = C.ID ORDER BY O.Total DESC LIMIT 2) AS T ORDER BY C.Name, T.Total DESC",
+    );
+    assert_eq!(r, [["Ada", "2", "70"], ["Ada", "1", "50"], ["Bob", "4", "90"], ["Bob", "5", "10"]]);
+    // LEFT JOIN LATERAL keeps customers with no rows.
+    let r = rows(&db, "SELECT C.Name, T.ID FROM Cust C LEFT JOIN LATERAL (SELECT O.ID FROM Ord O WHERE O.CustID = C.ID AND O.Total > 60) AS T ON TRUE ORDER BY C.Name, T.ID");
+    assert_eq!(r, [["Ada", "2"], ["Bob", "4"], ["Cy", ""]]);
+    // An aggregate per row, with the item's column names given.
+    let r = rows(&db, "SELECT C.Name, S.n, S.total FROM Cust C CROSS JOIN LATERAL (SELECT Count(*), Sum(Total) FROM Ord WHERE CustID = C.ID) AS S (n, total) ORDER BY C.Name");
+    assert_eq!(r, [["Ada", "3", "140"], ["Bob", "2", "100"], ["Cy", "0", ""]]);
+    // A later item can use an earlier lateral one.
+    let r = rows(&db, "SELECT C.ID, A.n, B.m FROM Cust C, LATERAL (SELECT C.ID * 10 AS n) AS A, LATERAL (SELECT A.n + 1 AS m) AS B ORDER BY 1");
+    assert_eq!(r[1], ["2", "20", "21"]);
+    // Without any outer reference LATERAL is just a derived table.
+    assert_eq!(rows(&db, "SELECT * FROM LATERAL (SELECT 1 AS x) AS q"), [["1"]]);
+    // RIGHT and FULL joins cannot be lateral.
+    assert!(db.query("SELECT 1 FROM Cust C RIGHT JOIN LATERAL (SELECT 1 AS x WHERE C.ID > 0) AS T ON TRUE").is_err());
+
+    // Table functions.
+    assert_eq!(rows(&db, "SELECT * FROM GENERATE_SERIES(1, 10, 3)"), [["1"], ["4"], ["7"], ["10"]]);
+    assert_eq!(rows(&db, "SELECT x FROM GENERATE_SERIES(5, 1, -2) AS g (x)"), [["5"], ["3"], ["1"]]);
+    assert_eq!(rows(&db, "SELECT Sum(generate_series) FROM GENERATE_SERIES(1, 100)"), [["5050"]]);
+    assert_eq!(rows(&db, "SELECT generate_series FROM GENERATE_SERIES(1, 0)").len(), 0);
+    assert!(db.query("SELECT * FROM GENERATE_SERIES(1, 5, 0)").is_err());
+    assert_eq!(rows(&db, "SELECT * FROM SPLIT_STRING('a,b,c', ',') AS p (piece, n)"), [["a", "1"], ["b", "2"], ["c", "3"]]);
+    let r = rows(&db, "SELECT C.Name, S.generate_series FROM Cust C CROSS JOIN LATERAL GENERATE_SERIES(1, C.ID) AS S ORDER BY 1, 2");
+    assert_eq!(r.len(), 6);
+    assert!(db.query("SELECT * FROM NOSUCH(1)").is_err());
+
+    // The optimizer changes nothing about the answers.
+    for sql in [
+        "SELECT C.Name, T.ID FROM Cust C, LATERAL (SELECT O.ID FROM Ord O WHERE O.CustID = C.ID) AS T",
+        "SELECT C.Name, T.ID FROM Cust C JOIN Ord X ON X.CustID = C.ID, LATERAL (SELECT O.ID FROM Ord O WHERE O.CustID = X.CustID AND O.ID <> X.ID) AS T WHERE X.Total > 15",
+        "SELECT C.Name, T.ID FROM Cust C LEFT JOIN LATERAL (SELECT O.ID FROM Ord O WHERE O.CustID = C.ID) AS T ON T.ID > 1 WHERE C.ID < 3",
+    ] {
+        db.set_optimizer(true);
+        let mut on = rows(&db, sql);
+        db.set_optimizer(false);
+        let mut off = rows(&db, sql);
+        on.sort();
+        off.sort();
+        assert_eq!(on, off, "{sql}");
+    }
+    // Repeated outer values reuse the answer: Ord has two customers, so two runs for five rows.
+    db.set_optimizer(true);
+    let plan: String = db
+        .query("EXPLAIN SELECT X.ID, T.ID FROM Ord X, LATERAL (SELECT Count(*) AS ID FROM Ord O WHERE O.CustID = X.CustID) AS T")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("run 2 time(s) for 5 left row(s)"), "{plan}");
+}

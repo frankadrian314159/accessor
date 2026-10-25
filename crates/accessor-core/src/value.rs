@@ -421,6 +421,12 @@ impl Value {
         f.is_finite().then_some(Value::Float(f))
     }
 
+    /// How a number compares with zero (`None` for a value that is not a number).
+    pub(crate) fn sign(&self) -> Option<Ordering> {
+        let n = self.num()?;
+        Some(num_cmp(&n, &Value::Int(0)))
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }

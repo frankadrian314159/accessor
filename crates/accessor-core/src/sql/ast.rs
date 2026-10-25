@@ -86,7 +86,11 @@ pub enum SelectItem {
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableFactor {
     Named { name: String, alias: Option<String> },
-    Derived { query: Box<Select>, alias: String, columns: Vec<String> },
+    /// A parenthesised query. With `lateral`, it may read columns of the tables before it
+    /// in the FROM clause and is evaluated once for each of their rows.
+    Derived { query: Box<Select>, alias: String, columns: Vec<String>, lateral: bool },
+    /// A table function such as `GENERATE_SERIES(1, 10)`; its arguments may read earlier tables.
+    Function { name: String, args: Vec<Expr>, alias: String, columns: Vec<String> },
     /// Rows already computed (the result of a common table expression).
     Materialized { rows: Rc<Vec<Row>>, columns: Vec<String>, alias: String },
 }

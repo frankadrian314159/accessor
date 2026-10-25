@@ -55,7 +55,7 @@ impl Database {
         let src = self.run_select(&source)?;
         let src_alias = match &m.source {
             TableFactor::Named { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
-            TableFactor::Derived { alias, .. } | TableFactor::Materialized { alias, .. } => alias.clone(),
+            TableFactor::Derived { alias, .. } | TableFactor::Materialized { alias, .. } | TableFactor::Function { alias, .. } => alias.clone(),
         };
         let (target, target_cols) = {
             let t = self.table_checked(&m.target)?;

@@ -7,7 +7,7 @@ use super::window::{WinFn, WinSpecB, MASK_COL, WIN_BASE};
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::expr::{BExpr, LikePattern, ScalarFn};
-use crate::sql::ast::{Expr, Select, SelectItem};
+use crate::sql::ast::{Expr, Select, SelectItem, TableFactor};
 use crate::sql::walk::each_child;
 use crate::value::Value;
 
@@ -89,6 +89,23 @@ pub struct Binder<'a> {
     pub wins: Vec<WinSpecB>,
 }
 
+/// Rewrites the outer columns that `q` reads (those of `outer`) into parameters, and
+/// returns each parameter's name with the position of the outer column it stands for.
+pub(crate) fn correlate_select(db: &Database, outer: &Scope, q: &mut Select, depth: u32) -> Result<Vec<(String, usize)>> {
+    let mut c = Correlator { db, outer, depth: depth + 1, frames: Vec::new(), found: Vec::new() };
+    c.select(q)?;
+    Ok(c.found)
+}
+
+/// The same for a list of expressions (the arguments of a table function).
+pub(crate) fn correlate_exprs(db: &Database, outer: &Scope, exprs: &mut [Expr], depth: u32) -> Result<Vec<(String, usize)>> {
+    let mut c = Correlator { db, outer, depth: depth + 1, frames: Vec::new(), found: Vec::new() };
+    for e in exprs {
+        c.expr(e)?;
+    }
+    Ok(c.found)
+}
+
 /// Finds the outer columns a sub-query uses.
 struct Correlator<'a> {
     db: &'a Database,
@@ -104,8 +121,23 @@ impl Correlator<'_> {
         let mut frame = Vec::new();
         if let Some(from) = &s.from {
             for f in std::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.factor)) {
-                let src = self.db.resolve_factor(f, self.depth)?;
-                frame.push((src.alias, src.names));
+                // Table functions and LATERAL items may read other tables, so their column
+                // names are taken without running them.
+                let named = match f {
+                    TableFactor::Function { name, alias, columns, .. } => Some((
+                        alias.clone(),
+                        if columns.is_empty() { self.db.table_function_columns(name).unwrap_or_default() } else { columns.clone() },
+                    )),
+                    TableFactor::Derived { alias, columns, lateral: true, .. } => Some((alias.clone(), columns.clone())),
+                    _ => None,
+                };
+                match named {
+                    Some(n) => frame.push(n),
+                    None => {
+                        let src = self.db.resolve_factor(f, self.depth)?;
+                        frame.push((src.alias, src.names));
+                    }
+                }
             }
         }
         self.frames.push(frame);
@@ -133,9 +165,22 @@ impl Correlator<'_> {
             }
         }
         if let Some(from) = &mut s.from {
+            let mut factors: Vec<&mut TableFactor> = vec![&mut from.first];
             for j in &mut from.joins {
                 if let Some(on) = &mut j.on {
                     self.expr(on)?;
+                }
+                factors.push(&mut j.factor);
+            }
+            for f in factors {
+                match f {
+                    TableFactor::Function { args, .. } => {
+                        for a in args {
+                            self.expr(a)?;
+                        }
+                    }
+                    TableFactor::Derived { query, lateral: true, .. } => self.select(query)?,
+                    _ => {}
                 }
             }
         }
@@ -386,6 +431,9 @@ impl<'a> Binder<'a> {
                 BExpr::Lit(res.rows.pop().map_or(Value::Null, |mut r| r.swap_remove(0)))
             }
             Expr::Window { func, spec } => return self.bind_window(func, spec),
+            Expr::Function { name, .. } if name == "__ROW" => {
+                return Err(Error::runtime("a row value (a, b) can only be compared with another row value or used with IN"))
+            }
             Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("GROUPING") && self.group.is_some() => {
                 let saved = self.group.take();
                 let bound: Result<Vec<BExpr>> = args.iter().map(|a| self.bind(a)).collect();

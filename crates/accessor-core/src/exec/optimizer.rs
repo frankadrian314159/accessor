@@ -46,6 +46,15 @@ impl Database {
         }
     }
 
+    /// Runs `f` without adding to the plan, for internal probes such as learning the columns
+    /// of a LATERAL item.
+    pub(crate) fn unlogged<T>(&self, f: impl FnOnce() -> T) -> T {
+        let saved = self.plan_log.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let out = f();
+        *self.plan_log.0.lock().unwrap_or_else(|e| e.into_inner()) = saved;
+        out
+    }
+
     /// Runs `f` with plan collection on and returns what it collected.
     pub(crate) fn collect_plan<T>(&self, f: impl FnOnce() -> T) -> (T, Vec<String>) {
         *self.plan_log.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
@@ -130,6 +139,8 @@ pub(crate) fn estimate(source: &Source<'_>, conds: &[BExpr]) -> f64 {
             }
         }
         SourceData::Rows(r) => (r.len() as f64, r.len() as f64),
+        // Evaluated once per left row; a handful of rows each is the usual shape.
+        SourceData::Lateral(_) => (10.0, 10.0),
     };
     // Conditions the index did not answer thin the rows out further.
     let answered = match &source.data {
@@ -141,7 +152,7 @@ pub(crate) fn estimate(source: &Source<'_>, conds: &[BExpr]) -> f64 {
                 Access::Range { .. } => 1,
             }
         }
-        SourceData::Rows(_) => 0,
+        SourceData::Rows(_) | SourceData::Lateral(_) => 0,
     };
     for c in conds.iter().skip(answered.min(conds.len())) {
         rows *= selectivity(c);

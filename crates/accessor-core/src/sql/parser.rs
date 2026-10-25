@@ -145,6 +145,84 @@ fn requalify(st: &mut Statement, alias: &str, table: &str) -> Result<()> {
     })
 }
 
+/// The marker function that stands for a row value `(a, b)` until the comparison it is
+/// part of has been parsed; it never reaches the executor.
+const ROW_MARKER: &str = "__ROW";
+
+fn row_value(items: Vec<Expr>) -> Expr {
+    Expr::Function { name: ROW_MARKER.into(), args: items, distinct: false, star: false }
+}
+
+fn row_items(e: &Expr) -> Option<&[Expr]> {
+    match e {
+        Expr::Function { name, args, .. } if name == ROW_MARKER => Some(args),
+        _ => None,
+    }
+}
+
+/// `(a1, a2, ..) op (b1, b2, ..)`, written out as comparisons of the parts.
+fn row_compare(op: BinOp, a: &[Expr], b: &[Expr]) -> Result<Expr> {
+    if a.len() != b.len() {
+        return Err(Error::syntax(format!("the row values have {} and {} parts; they must be the same size", a.len(), b.len())));
+    }
+    let bin = |op: BinOp, l: Expr, r: Expr| Expr::Binary { op, left: Box::new(l), right: Box::new(r) };
+    let pair = |op: BinOp, i: usize| bin(op, a[i].clone(), b[i].clone());
+    let chain = |join: BinOp, op: BinOp| -> Expr {
+        (1..a.len()).fold(pair(op, 0), |acc, i| bin(join, acc, pair(op, i)))
+    };
+    Ok(match op {
+        BinOp::Eq => chain(BinOp::And, BinOp::Eq),
+        BinOp::Ne => chain(BinOp::Or, BinOp::Ne),
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+            // Lexicographic: the first differing part decides.
+            let strict = if matches!(op, BinOp::Lt | BinOp::Le) { BinOp::Lt } else { BinOp::Gt };
+            let mut result: Option<Expr> = None;
+            for i in 0..a.len() {
+                let last = if i + 1 == a.len() { op } else { strict };
+                let mut term = pair(last, i);
+                for j in (0..i).rev() {
+                    term = bin(BinOp::And, pair(BinOp::Eq, j), term);
+                }
+                result = Some(match result {
+                    None => term,
+                    Some(prev) => bin(BinOp::Or, prev, term),
+                });
+            }
+            result.expect("at least one part")
+        }
+        _ => return Err(Error::syntax("this operator cannot be used with row values")),
+    })
+}
+
+/// `(a, b) [NOT] IN (query)` as an EXISTS over the query with its columns compared in turn.
+fn row_in_query(items: &[Expr], q: Select, negated: bool) -> Expr {
+    let columns: Vec<String> = (0..items.len()).map(|i| format!("__c{i}")).collect();
+    let mut filter: Option<Expr> = None;
+    for (i, item) in items.iter().enumerate() {
+        let eq = Expr::Binary {
+            op: BinOp::Eq,
+            left: Box::new(item.clone()),
+            right: Box::new(Expr::Column { table: Some("__r".into()), name: columns[i].clone() }),
+        };
+        filter = Some(match filter {
+            None => eq,
+            Some(prev) => Expr::Binary { op: BinOp::And, left: Box::new(prev), right: Box::new(eq) },
+        });
+    }
+    Expr::Exists {
+        query: Box::new(Select {
+            items: vec![SelectItem::Expr { expr: Expr::Literal(Value::Int(1)), alias: None }],
+            from: Some(From {
+                first: TableFactor::Derived { query: Box::new(q), alias: "__r".into(), columns, lateral: false },
+                joins: Vec::new(),
+            }),
+            filter,
+            ..Select::default()
+        }),
+        negated,
+    }
+}
+
 /// `a IS [NOT] DISTINCT FROM b`: like `<>`/`=`, but NULLs compare as equal to each other.
 fn distinct_from(a: Expr, b: Expr, negated: bool) -> Expr {
     let null = |e: &Expr| Expr::IsNull { expr: Box::new(e.clone()), negated: false };
@@ -1191,7 +1269,7 @@ impl<'a> Parser<'a> {
             return Ok(Select {
                 items: vec![SelectItem::Wildcard],
                 from: Some(From {
-                    first: TableFactor::Derived { query: Box::new(inner), alias: "__paren".into(), columns: Vec::new() },
+                    first: TableFactor::Derived { query: Box::new(inner), alias: "__paren".into(), columns: Vec::new(), lateral: false },
                     joins: Vec::new(),
                 }),
                 ..Select::default()
@@ -1464,6 +1542,7 @@ impl<'a> Parser<'a> {
     }
 
     fn table_factor(&mut self) -> Result<TableFactor> {
+        let lateral = self.eat_kw("LATERAL");
         if self.peek_sym("(")
             && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH"))
         {
@@ -1479,7 +1558,32 @@ impl<'a> Parser<'a> {
             } else {
                 Vec::new()
             };
-            return Ok(TableFactor::Derived { query, alias, columns });
+            return Ok(TableFactor::Derived { query, alias, columns, lateral });
+        }
+        // A table function: name(arguments) [AS] alias [(columns)].
+        if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Sym("(")) {
+            let name = self.ident()?.to_ascii_uppercase();
+            self.expect_sym("(")?;
+            let mut args = Vec::new();
+            if !self.peek_sym(")") {
+                args.push(self.expr()?);
+                while self.eat_sym(",") {
+                    args.push(self.expr()?);
+                }
+            }
+            self.expect_sym(")")?;
+            let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { name.to_ascii_lowercase() };
+            let columns = if self.eat_sym("(") {
+                let c = self.ident_list()?;
+                self.expect_sym(")")?;
+                c
+            } else {
+                Vec::new()
+            };
+            return Ok(TableFactor::Function { name, args, alias, columns });
+        }
+        if lateral {
+            return Err(self.unexpected("a sub-query or function after LATERAL"));
         }
         let name = self.ident()?;
         let alias = if self.eat_kw("AS") || self.peek_is_alias() { Some(self.ident()?) } else { None };
@@ -1537,7 +1641,11 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 let right = self.concat()?;
-                left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+                left = match (row_items(&left), row_items(&right)) {
+                    (Some(a), Some(b)) => row_compare(op, a, b)?,
+                    (None, None) => Expr::Binary { op, left: Box::new(left), right: Box::new(right) },
+                    _ => return Err(Error::syntax("a row value (a, b) can only be compared with another row value of the same size")),
+                };
                 continue;
             }
             if self.eat_kw("IS") {
@@ -1596,14 +1704,34 @@ impl<'a> Parser<'a> {
                 if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
                     let q = self.select()?;
                     self.expect_sym(")")?;
-                    left = Expr::InSelect { expr: Box::new(left), query: Box::new(q), negated };
+                    left = match row_items(&left) {
+                        Some(items) => row_in_query(items, q, negated),
+                        None => Expr::InSelect { expr: Box::new(left), query: Box::new(q), negated },
+                    };
                 } else {
                     let mut list = vec![self.expr()?];
                     while self.eat_sym(",") {
                         list.push(self.expr()?);
                     }
                     self.expect_sym(")")?;
-                    left = Expr::InList { expr: Box::new(left), list, negated };
+                    left = match row_items(&left) {
+                        Some(items) => {
+                            let mut any: Option<Expr> = None;
+                            for item in &list {
+                                let Some(b) = row_items(item) else {
+                                    return Err(Error::syntax("a row value (a, b) must be compared with rows of the same size"));
+                                };
+                                let eq = row_compare(BinOp::Eq, items, b)?;
+                                any = Some(match any {
+                                    None => eq,
+                                    Some(prev) => Expr::Binary { op: BinOp::Or, left: Box::new(prev), right: Box::new(eq) },
+                                });
+                            }
+                            let any = any.expect("a non-empty list");
+                            if negated { Expr::Not(Box::new(any)) } else { any }
+                        }
+                        None => Expr::InList { expr: Box::new(left), list, negated },
+                    };
                 }
             } else {
                 break;
@@ -1711,6 +1839,14 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Subquery(Box::new(q)));
                 }
                 let e = self.expr()?;
+                if self.peek_sym(",") {
+                    let mut items = vec![e];
+                    while self.eat_sym(",") {
+                        items.push(self.expr()?);
+                    }
+                    self.expect_sym(")")?;
+                    return Ok(row_value(items));
+                }
                 self.expect_sym(")")?;
                 Ok(e)
             }
@@ -1735,6 +1871,16 @@ impl<'a> Parser<'a> {
                         return Ok(Expr::Literal(Value::Bool(false)));
                     }
                     "CASE" => return self.case_expr(),
+                    "ROW" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        let mut items = vec![self.expr()?];
+                        while self.eat_sym(",") {
+                            items.push(self.expr()?);
+                        }
+                        self.expect_sym(")")?;
+                        return Ok(row_value(items));
+                    }
                     // Typed literals: DATE '2024-03-05', TIMESTAMP '2024-03-05 10:30:00'.
                     "DATE" | "TIMESTAMP" | "TIME" if matches!(self.peek_at(1), Tok::Str(_)) => {
                         self.advance();
@@ -2012,7 +2158,7 @@ impl<'a> Parser<'a> {
             _ => return Err(Error::syntax("a quantified comparison needs a sub-query with exactly one column")),
         }
         let derived = |q: &Select| From {
-            first: TableFactor::Derived { query: Box::new(q.clone()), alias: "__t".into(), columns: Vec::new() },
+            first: TableFactor::Derived { query: Box::new(q.clone()), alias: "__t".into(), columns: Vec::new(), lateral: false },
             joins: Vec::new(),
         };
         let col = Expr::Column { table: Some("__t".into()), name: "__q".into() };
