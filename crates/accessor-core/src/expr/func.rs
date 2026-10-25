@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use super::BExpr;
 use crate::datetime;
+use crate::tz;
 use crate::error::{Error, Result};
 use crate::decimal::Decimal;
 use num_bigint::BigInt;
@@ -87,6 +88,16 @@ pub enum ScalarFn {
     OctetLength,
     /// `(mask, i1, i2, ...)`: bits of a GROUPING mask, as a number.
     GroupingBit,
+    NowTz,
+    LocalNow,
+    LocalDate,
+    SessionTimeZone,
+    AtTimeZone,
+    TimeZone,
+    CTimestampTz,
+    CInterval,
+    MakeInterval,
+    Age,
 }
 
 impl ScalarFn {
@@ -167,6 +178,16 @@ impl ScalarFn {
             "TANH" => (Tanh, 1, 1),
             "OCTET_LENGTH" => (OctetLength, 1, 1),
             "GROUPINGBIT" => (GroupingBit, 2, usize::MAX),
+            "NOWTZ" => (NowTz, 0, 0),
+            "LOCALNOW" => (LocalNow, 0, 0),
+            "LOCALDATE" => (LocalDate, 0, 0),
+            "SESSIONTIMEZONE" | "CURRENT_TIMEZONE" => (SessionTimeZone, 0, 0),
+            "ATTIMEZONE" => (AtTimeZone, 2, 2),
+            "TIMEZONE" => (TimeZone, 2, 2),
+            "CTIMESTAMPTZ" | "CTZ" => (CTimestampTz, 1, 1),
+            "CINTERVAL" => (CInterval, 1, 1),
+            "MAKEINTERVAL" | "MAKE_INTERVAL" => (MakeInterval, 1, 6),
+            "AGE" => (Age, 2, 2),
             _ => return None,
         })
     }
@@ -308,6 +329,10 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         IsNull => return Ok(Value::Bool(args[0].eval(row)?.is_null())),
         Now => return Ok(Value::DateTime(datetime::now())),
         Date => return Ok(Value::DateTime(datetime::now().div_euclid(86_400) * 86_400)),
+        NowTz => return Ok(Value::TimestampTz(datetime::now())),
+        LocalNow => return Ok(Value::DateTime(tz::session().to_local(datetime::now()))),
+        LocalDate => return Ok(Value::DateTime(tz::session().to_local(datetime::now()).div_euclid(86_400) * 86_400)),
+        SessionTimeZone => return Ok(Value::text(&tz::session().name())),
         _ => {}
     }
 
@@ -433,7 +458,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 }
                 datetime::from_components(ny, nm, day, h, mi, s).ok_or_else(|| Error::runtime("DateAdd: out of range"))
             };
-            Value::DateTime(match unit.as_str() {
+            let shifted = match unit.as_str() {
                 "yyyy" | "y" => months(n * 12)?,
                 "q" => months(n * 3)?,
                 "m" => months(n)?,
@@ -443,7 +468,13 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 "n" => t + n * 60,
                 "s" => t + n,
                 u => return Err(Error::runtime(format!("DateAdd: unknown interval '{u}'"))),
-            })
+            };
+            // A zoned timestamp stays zoned: the shift happened on its wall clock.
+            if matches!(&*vals[2], Value::TimestampTz(_)) {
+                Value::TimestampTz(tz::session().to_utc(shifted))
+            } else {
+                Value::DateTime(shifted)
+            }
         }
         DateDiff => {
             let (unit, a, b) = (text_of(&vals[0]).to_ascii_lowercase(), date_of(&vals[1])?, date_of(&vals[2])?);
@@ -578,6 +609,28 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         }
         DatePart => {
             let unit = text_of(&vals[0]).to_ascii_lowercase();
+            if let Value::Interval(iv) = &*vals[1] {
+                // The parts of an interval as written: 14 months is 1 year 2 months.
+                return Ok(Value::Int(match unit.as_str() {
+                    "yyyy" | "year" | "yy" => iv.months / 12,
+                    "m" | "month" | "mon" => iv.months % 12,
+                    "d" | "day" => iv.days,
+                    "h" | "hour" => iv.secs / 3600,
+                    "n" | "mi" | "minute" => iv.secs % 3600 / 60,
+                    "s" | "second" => iv.secs % 60,
+                    "epoch" => i64::try_from(iv.total_secs()).map_err(|_| Error::runtime("interval out of range"))?,
+                    u => return Err(Error::runtime(format!("DatePart: '{u}' is not a part of an interval"))),
+                }));
+            }
+            if let Value::TimestampTz(utc) = &*vals[1] {
+                let off = tz::session().offset_at(*utc);
+                match unit.as_str() {
+                    "timezone" => return Ok(Value::Int(off)),
+                    "timezone_hour" => return Ok(Value::Int(off / 3600)),
+                    "timezone_minute" => return Ok(Value::Int(off % 3600 / 60)),
+                    _ => {}
+                }
+            }
             let t = date_of(&vals[1])?;
             let (y, mo, d, h, mi, s) = datetime::components(t);
             let doy = datetime::days_from_civil(y, mo, d) - datetime::days_from_civil(y, 1, 1) + 1;
@@ -597,10 +650,53 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 u => return Err(Error::runtime(format!("DatePart: unknown field '{u}'"))),
             })
         }
+        AtTimeZone | TimeZone => {
+            let (value, zone) = if f == AtTimeZone { (&vals[0], &vals[1]) } else { (&vals[1], &vals[0]) };
+            let zone = match &**zone {
+                Value::Interval(iv) if iv.months == 0 => tz::Zone::Fixed(i32::try_from(iv.days * 86_400 + iv.secs).map_err(|_| Error::runtime("time zone offset out of range"))?),
+                other => {
+                    let name = text_of(other);
+                    tz::Zone::parse(&name).ok_or_else(|| Error::runtime(format!("unknown time zone '{name}'")))?
+                }
+            };
+            match value.coerce_to(DataType::TimestampTz).ok().filter(|_| matches!(&**value, Value::TimestampTz(_))) {
+                // An instant becomes the wall clock of the zone...
+                Some(Value::TimestampTz(utc)) => Value::DateTime(zone.to_local(utc)),
+                // ...and a wall clock is read as being in the zone.
+                _ => match &**value {
+                    Value::DateTime(local) => Value::TimestampTz(zone.to_utc(*local)),
+                    Value::TimestampTz(utc) => Value::DateTime(zone.to_local(*utc)),
+                    other => Value::TimestampTz(zone.to_utc(date_of(other)?)),
+                },
+            }
+        }
+        CTimestampTz => v0.unwrap().coerce_to(DataType::TimestampTz)?,
+        CInterval => v0.unwrap().coerce_to(DataType::Interval)?,
+        MakeInterval => {
+            let part = |i: usize| -> Result<Decimal> {
+                match vals.get(i) {
+                    Some(v) => v.as_decimal().ok_or_else(|| Error::type_err(format!("'{v}' is not a number"))),
+                    None => Ok(Decimal::from_i64(0)),
+                }
+            };
+            let total = [(12, 0), (1, 0), (0, 1)];
+            let _ = total;
+            let (years, months, days, hours, mins, secs) = (part(0)?, part(1)?, part(2)?, part(3)?, part(4)?, part(5)?);
+            let months_total = years.mul(&Decimal::from_i64(12)).add(&months);
+            let hms = hours.mul(&Decimal::from_i64(3600)).add(&mins.mul(&Decimal::from_i64(60))).add(&secs);
+            let iv = crate::interval::Interval::new(0, 1, 0)
+                .scale(&days)
+                .zip(crate::interval::Interval::new(1, 0, 0).scale(&months_total))
+                .zip(crate::interval::Interval::new(0, 0, 1).scale(&hms))
+                .and_then(|((d, m), s)| d.add(&m)?.add(&s))
+                .ok_or_else(|| Error::runtime("interval out of range"))?;
+            Value::Interval(iv)
+        }
+        Age => Value::Interval(crate::interval::Interval::age(date_of(&vals[0])?, date_of(&vals[1])?)),
         Format => {
             let pattern = vals.get(1).map(|p| text_of(p).into_owned()).unwrap_or_default();
             Value::text(&super::format::format_value(v0.unwrap(), &pattern)?)
         }
-        Iif | Nz | IsNull | Coalesce | Now | Date => unreachable!("handled above"),
+        Iif | Nz | IsNull | Coalesce | Now | Date | NowTz | LocalNow | LocalDate | SessionTimeZone => unreachable!("handled above"),
     })
 }

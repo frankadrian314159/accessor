@@ -20,6 +20,8 @@ use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::datetime;
+use crate::interval::Interval;
+use crate::tz;
 use crate::decimal::Decimal;
 use crate::error::{Error, Result};
 use crate::rational::Rational;
@@ -51,9 +53,13 @@ pub enum Value {
     Currency(Decimal),
     /// `RATIONAL`: an exact fraction of two `BIGNUM`s.
     Rational(Rational),
-    /// Seconds since the Unix epoch.
+    /// A wall-clock reading in whole seconds since 1970-01-01 00:00:00, with no zone.
     DateTime(i64),
     Text(Arc<str>),
+    /// `TIMESTAMPTZ`: an instant, as seconds since the Unix epoch in UTC.
+    TimestampTz(i64),
+    /// `INTERVAL`: months, days and seconds.
+    Interval(Interval),
 }
 
 // ----- on-disk form ---------------------------------------------------------
@@ -77,6 +83,8 @@ enum Wire {
     Float(f32),
     Rational(Rational),
     Currency(Decimal),
+    TimestampTz(i64),
+    Interval(Interval),
 }
 
 #[derive(Serialize)]
@@ -94,6 +102,8 @@ enum WireRef<'a> {
     Float(f32),
     Rational(&'a Rational),
     Currency(&'a Decimal),
+    TimestampTz(i64),
+    Interval(&'a Interval),
 }
 
 impl From<Wire> for Value {
@@ -112,6 +122,8 @@ impl From<Wire> for Value {
             Wire::Big(b) => Value::Big(b),
             Wire::Rational(r) => Value::Rational(r),
             Wire::Currency(d) => Value::Currency(d),
+            Wire::TimestampTz(t) => Value::TimestampTz(t),
+            Wire::Interval(i) => Value::Interval(i),
         }
     }
 }
@@ -130,6 +142,8 @@ impl Serialize for Value {
             Value::Rational(r) => WireRef::Rational(r),
             Value::DateTime(t) => WireRef::DateTime(*t),
             Value::Text(t) => WireRef::Text(t),
+            Value::TimestampTz(t) => WireRef::TimestampTz(*t),
+            Value::Interval(i) => WireRef::Interval(i),
         }
         .serialize(s)
     }
@@ -157,6 +171,10 @@ pub enum DataType {
     Text,
     YesNo,
     DateTime,
+    /// An instant, read on a wall clock through a time zone.
+    TimestampTz,
+    /// A length of time in months, days and seconds.
+    Interval,
     /// A field whose value is an expression over the other fields of the same
     /// record. The expression is kept in the column's `default`; see
     /// [`crate::schema::Column::expression`].
@@ -179,6 +197,8 @@ enum TypeWire {
     Float,
     Decimal,
     Rational,
+    TimestampTz,
+    Interval,
 }
 
 impl From<TypeWire> for DataType {
@@ -195,6 +215,8 @@ impl From<TypeWire> for DataType {
             TypeWire::Bignum => DataType::Bignum,
             TypeWire::Float => DataType::Float,
             TypeWire::Rational => DataType::Rational,
+            TypeWire::TimestampTz => DataType::TimestampTz,
+            TypeWire::Interval => DataType::Interval,
         }
     }
 }
@@ -213,6 +235,8 @@ impl From<DataType> for TypeWire {
             DataType::YesNo => TypeWire::YesNo,
             DataType::DateTime => TypeWire::DateTime,
             DataType::Calculated => TypeWire::Calculated,
+            DataType::TimestampTz => TypeWire::TimestampTz,
+            DataType::Interval => TypeWire::Interval,
         }
     }
 }
@@ -230,6 +254,8 @@ impl DataType {
             DataType::Text => "TEXT",
             DataType::YesNo => "YESNO",
             DataType::DateTime => "DATETIME",
+            DataType::TimestampTz => "TIMESTAMPTZ",
+            DataType::Interval => "INTERVAL",
             DataType::Calculated => "CALCULATED",
         }
     }
@@ -257,6 +283,8 @@ impl DataType {
             }
             "YESNO" | "BIT" | "BOOLEAN" | "BOOL" | "LOGICAL" => (DataType::YesNo, false),
             "DATETIME" | "DATE" | "TIME" | "TIMESTAMP" => (DataType::DateTime, false),
+            "TIMESTAMPTZ" => (DataType::TimestampTz, false),
+            "INTERVAL" => (DataType::Interval, false),
             "CALCULATED" => (DataType::Calculated, false),
             _ => return None,
         })
@@ -423,6 +451,9 @@ impl Value {
 
     /// How a number compares with zero (`None` for a value that is not a number).
     pub(crate) fn sign(&self) -> Option<Ordering> {
+        if let Value::Interval(i) = self {
+            return Some(i.total_secs().cmp(&0));
+        }
         let n = self.num()?;
         Some(num_cmp(&n, &Value::Int(0)))
     }
@@ -473,6 +504,8 @@ impl Value {
             Value::Currency(_) => DataType::Currency,
             Value::Rational(_) => DataType::Rational,
             Value::DateTime(_) => DataType::DateTime,
+            Value::TimestampTz(_) => DataType::TimestampTz,
+            Value::Interval(_) => DataType::Interval,
             Value::Text(_) => DataType::Text,
         })
     }
@@ -485,8 +518,9 @@ impl Value {
         match self {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::DateTime(_) => 3,
+            Value::DateTime(_) | Value::TimestampTz(_) => 3,
             Value::Text(_) => 4,
+            Value::Interval(_) => 5,
             _ => 2,
         }
     }
@@ -504,7 +538,7 @@ impl Value {
     pub(crate) fn num_lenient(&self) -> Option<Cow<'_, Value>> {
         match self {
             Value::Text(s) => parse_num(s).map(Cow::Owned),
-            Value::DateTime(t) => Some(Cow::Owned(ole_value(*t))),
+            Value::DateTime(t) | Value::TimestampTz(t) => Some(Cow::Owned(ole_value(*t))),
             other => other.num(),
         }
     }
@@ -619,6 +653,23 @@ impl Value {
                 Some(p) => d.cmp(&p),
                 None => Ordering::Less,
             },
+            (Value::Text(t), Value::TimestampTz(d)) => match tz::parse_timestamptz(t, tz::session()) {
+                Some(p) => p.cmp(d),
+                None => Ordering::Greater,
+            },
+            (Value::TimestampTz(d), Value::Text(t)) => match tz::parse_timestamptz(t, tz::session()) {
+                Some(p) => d.cmp(&p),
+                None => Ordering::Less,
+            },
+            (Value::Text(t), Value::Interval(i)) => match Interval::parse(t, None) {
+                Ok(p) => p.cmp(i),
+                Err(_) => Ordering::Greater,
+            },
+            (Value::Interval(i), Value::Text(t)) => match Interval::parse(t, None) {
+                Ok(p) => i.cmp(&p),
+                Err(_) => Ordering::Less,
+            },
+            (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
             (Value::Text(t), n) => match (parse_num(t), n.num()) {
                 (Some(x), Some(y)) => num_cmp(&x, &y),
                 _ => Ordering::Greater,
@@ -627,12 +678,12 @@ impl Value {
                 (Some(x), Some(y)) => num_cmp(&x, &y),
                 _ => Ordering::Less,
             },
-            (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
-            (Value::DateTime(a), n) => match n.num() {
+            (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) => a.cmp(b),
+            (Value::DateTime(a) | Value::TimestampTz(a), n) => match n.num() {
                 Some(y) => num_cmp(&ole_value(*a), &y),
                 None => self.cmp(other),
             },
-            (n, Value::DateTime(b)) => match n.num() {
+            (n, Value::DateTime(b) | Value::TimestampTz(b)) => match n.num() {
                 Some(x) => num_cmp(&x, &ole_value(*b)),
                 None => self.cmp(other),
             },
@@ -676,8 +727,27 @@ impl Value {
                     None => Err(bad()),
                 },
             },
+            DataType::TimestampTz => match self {
+                TimestampTz(_) => Ok(self.clone()),
+                DateTime(local) => Ok(TimestampTz(tz::session().to_utc(*local))),
+                Text(s) => Ok(TimestampTz(tz::parse_timestamptz(s, tz::session()).ok_or_else(bad)?)),
+                v => match v.num().and_then(|n| n.as_f64()) {
+                    Some(f) => Ok(TimestampTz(tz::session().to_utc(datetime::from_ole_days(f)))),
+                    None => Err(bad()),
+                },
+            },
+            DataType::Interval => match self {
+                Interval(_) => Ok(self.clone()),
+                Text(s) => crate::interval::Interval::parse(s, None).map(Interval).map_err(Error::type_err),
+                v => match v.num().and_then(|n| n.as_decimal()) {
+                    // A plain number is a number of days, as in date arithmetic.
+                    Some(d) => crate::interval::Interval::from_days(&d).map(Interval).ok_or_else(range),
+                    None => Err(bad()),
+                },
+            },
             DataType::DateTime => match self {
                 DateTime(_) => Ok(self.clone()),
+                TimestampTz(t) => Ok(DateTime(tz::session().to_local(*t))),
                 Text(s) => Ok(DateTime(datetime::parse(s).ok_or_else(bad)?)),
                 v => match v.num().and_then(|n| n.as_f64()) {
                     Some(f) => Ok(DateTime(datetime::from_ole_days(f))),
@@ -751,7 +821,8 @@ impl Ord for Value {
         }
         match (self, other) {
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-            (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
+            (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) => a.cmp(b),
+            (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
             (Value::Text(a), Value::Text(b)) => ci_cmp(a, b),
             (Value::Null, Value::Null) => Ordering::Equal,
             (a, b) if a.is_numeric() && b.is_numeric() => num_cmp(a, b),
@@ -811,9 +882,13 @@ impl Hash for Value {
                 1u8.hash(state);
                 b.hash(state);
             }
-            Value::DateTime(t) => {
+            Value::DateTime(t) | Value::TimestampTz(t) => {
                 3u8.hash(state);
                 t.hash(state);
+            }
+            Value::Interval(i) => {
+                5u8.hash(state);
+                i.hash(state);
             }
             Value::Text(s) => {
                 4u8.hash(state);
@@ -854,6 +929,8 @@ impl fmt::Display for Value {
             Value::Currency(d) => format_currency(d, f),
             Value::Rational(r) => write!(f, "{r}"),
             Value::DateTime(t) => f.write_str(&datetime::format(*t)),
+            Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
+            Value::Interval(i) => write!(f, "{i}"),
             Value::Text(s) => f.write_str(s),
         }
     }

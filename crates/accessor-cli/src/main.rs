@@ -25,6 +25,7 @@ Dot-commands:
   .export FILE SQL           write a query's result set as CSV
   .read FILE                 run a SQL script
   .sync on|off               fsync every commit (default on)
+  .timezone [NAME]           show or set the session time zone (UTC, +05:30, Europe/Paris)
   .optimizer on|off          turn the query optimizer on or off (for comparing plans)
   .timer on|off              show statement timings
   .checkpoint                fold the log into the database file
@@ -205,6 +206,15 @@ impl Shell {
                 }
                 None => eprintln!("no such table '{rest}'"),
             },
+            ".timezone" => {
+                if !rest.is_empty() {
+                    if let Err(e) = self.db.set_time_zone(rest) {
+                        eprintln!("Error: {e}");
+                        return true;
+                    }
+                }
+                println!("time zone {}", self.db.time_zone());
+            }
             ".optimizer" => {
                 self.db.set_optimizer(!rest.eq_ignore_ascii_case("off"));
                 println!("optimizer {}", if self.db.optimizer_enabled() { "on" } else { "off" });

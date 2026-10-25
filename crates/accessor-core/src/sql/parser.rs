@@ -413,6 +413,25 @@ impl<'a> Parser<'a> {
             }
             return Ok(Statement::Explain(Box::new(self.select()?)));
         }
+        if self.eat_kw("SET") {
+            // SET TIME ZONE 'x' | SET TIMEZONE TO 'x'
+            if !self.eat_kw("TIMEZONE") {
+                self.expect_kw("TIME")?;
+                self.expect_kw("ZONE")?;
+            }
+            if !self.eat_kw("TO") {
+                self.eat_sym("=");
+            }
+            let name = match self.advance() {
+                Tok::Str(s) => s,
+                Tok::Ident(s) => s,
+                _ => {
+                    self.pos = self.pos.saturating_sub(1);
+                    return Err(self.unexpected("a time zone name in quotes, or LOCAL"));
+                }
+            };
+            return Ok(Statement::SetTimeZone(name));
+        }
         if self.eat_kw("TRUNCATE") {
             self.eat_kw("TABLE");
             return Ok(Statement::Truncate(self.ident()?));
@@ -1797,7 +1816,15 @@ impl<'a> Parser<'a> {
     }
 
     fn power(&mut self) -> Result<Expr> {
-        let base = self.primary()?;
+        let mut base = self.primary()?;
+        // `x AT TIME ZONE 'Europe/Paris'`
+        while self.peek_kw("AT") && self.peek_kw_at(1, "TIME") && self.peek_kw_at(2, "ZONE") {
+            for _ in 0..3 {
+                self.advance();
+            }
+            let zone = self.primary()?;
+            base = Expr::Function { name: "ATTIMEZONE".into(), args: vec![base, zone], distinct: false, star: false };
+        }
         if self.eat_sym("^") {
             let exp = self.unary()?;
             return Ok(Expr::Binary { op: BinOp::Pow, left: Box::new(base), right: Box::new(exp) });
@@ -1881,6 +1908,52 @@ impl<'a> Parser<'a> {
                         self.expect_sym(")")?;
                         return Ok(row_value(items));
                     }
+                    // INTERVAL '3 days', INTERVAL '5' DAY, INTERVAL '1-6' YEAR TO MONTH.
+                    "INTERVAL" if matches!(self.peek_at(1), Tok::Str(_)) => {
+                        self.advance();
+                        let Tok::Str(text) = self.advance() else { unreachable!("checked") };
+                        let unit = |p: &Self| match p.peek() {
+                            Tok::Ident(w) => crate::interval::Unit::from_word(w).filter(|_| !w.eq_ignore_ascii_case("d") && !w.eq_ignore_ascii_case("s") && !w.eq_ignore_ascii_case("h") && !w.eq_ignore_ascii_case("y")),
+                            _ => None,
+                        };
+                        let qualifier = match unit(self) {
+                            Some(from) => {
+                                self.advance();
+                                if self.eat_sym("(") {
+                                    while !self.peek_sym(")") && !self.at_eof() {
+                                        self.advance();
+                                    }
+                                    self.expect_sym(")")?;
+                                }
+                                let to = if self.eat_kw("TO") {
+                                    let u = unit(self).ok_or_else(|| self.unexpected("YEAR, MONTH, DAY, HOUR, MINUTE or SECOND"))?;
+                                    self.advance();
+                                    Some(u)
+                                } else {
+                                    None
+                                };
+                                Some((from, to))
+                            }
+                            None => None,
+                        };
+                        let iv = crate::interval::Interval::parse(&text, qualifier).map_err(Error::syntax)?;
+                        return Ok(Expr::Literal(Value::Interval(iv)));
+                    }
+                    // TIMESTAMP WITH TIME ZONE '2024-03-05 10:30:00+01:00', read in the session zone when no offset is given.
+                    "TIMESTAMP" | "TIME"
+                        if self.peek_kw_at(1, "WITH") && self.peek_kw_at(2, "TIME") && self.peek_kw_at(3, "ZONE") && matches!(self.peek_at(4), Tok::Str(_)) =>
+                    {
+                        for _ in 0..4 {
+                            self.advance();
+                        }
+                        let Tok::Str(text) = self.advance() else { unreachable!("checked") };
+                        return Ok(Expr::Function {
+                            name: "CTIMESTAMPTZ".into(),
+                            args: vec![Expr::Literal(Value::text(&text))],
+                            distinct: false,
+                            star: false,
+                        });
+                    }
                     // Typed literals: DATE '2024-03-05', TIMESTAMP '2024-03-05 10:30:00'.
                     "DATE" | "TIMESTAMP" | "TIME" if matches!(self.peek_at(1), Tok::Str(_)) => {
                         self.advance();
@@ -1893,7 +1966,11 @@ impl<'a> Parser<'a> {
                         if !matches!(self.peek_at(1), Tok::Sym("(")) =>
                     {
                         self.advance();
-                        let f = if up == "CURRENT_DATE" { "DATE" } else { "NOW" };
+                        let f = match up.as_str() {
+                            "CURRENT_DATE" => "LOCALDATE",
+                            "CURRENT_TIMESTAMP" => "NOWTZ",
+                            _ => "LOCALNOW",
+                        };
                         return Ok(Expr::Function { name: f.into(), args: vec![], distinct: false, star: false });
                     }
                     "CAST" if matches!(self.peek_at(1), Tok::Sym("(")) => {
@@ -2052,9 +2129,13 @@ impl<'a> Parser<'a> {
                 self.eat_kw("VARYING");
             }
             "TIMESTAMP" | "TIME" => {
-                if self.eat_kw("WITH") || self.eat_kw("WITHOUT") {
+                let with = self.eat_kw("WITH");
+                if with || self.eat_kw("WITHOUT") {
                     self.expect_kw("TIME")?;
                     self.expect_kw("ZONE")?;
+                    if with {
+                        return Ok("TIMESTAMPTZ".into());
+                    }
                 }
             }
             _ => {}
@@ -2090,6 +2171,8 @@ impl<'a> Parser<'a> {
             DataType::Text => "CSTR",
             DataType::YesNo => "CBOOL",
             DataType::DateTime => "CDATE",
+            DataType::TimestampTz => "CTIMESTAMPTZ",
+            DataType::Interval => "CINTERVAL",
             DataType::Calculated => return Err(Error::syntax("cannot CAST to CALCULATED")),
         };
         let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };

@@ -43,6 +43,7 @@ impl Database {
 
     /// Runs a single read-only SELECT.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
+        self.enter_session();
         match parse_statement(sql)? {
             Statement::Select(s) => self.run_select(&s),
             Statement::Explain(s) => self.run_explain(&s),
@@ -63,7 +64,9 @@ impl Database {
     }
 
     pub fn execute_statement(&mut self, st: &Statement) -> Result<QueryResult> {
+        self.enter_session();
         match st {
+            Statement::SetTimeZone(name) => self.set_time_zone(name).map(|_| QueryResult::default()),
             Statement::Select(s) => self.run_select(s),
             Statement::Insert { table, columns, source } => self.exec_insert(table, columns, source),
             Statement::Update { table, assignments, filter } => self.exec_update(table, assignments, filter.as_ref()),

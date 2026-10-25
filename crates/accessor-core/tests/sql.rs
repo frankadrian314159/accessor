@@ -2272,3 +2272,109 @@ fn lateral_joins_and_table_functions() {
         .join("\n");
     assert!(plan.contains("run 2 time(s) for 5 left row(s)"), "{plan}");
 }
+
+// ----- INTERVAL and time zones ---------------------------------------------------------------
+
+#[test]
+fn intervals() {
+    let db = Database::in_memory();
+    let one = |sql: &str| q(&db, sql);
+    assert_eq!(one("SELECT INTERVAL '1 year 2 months 3 days 04:05:06'"), "1 year 2 months 3 days 04:05:06");
+    assert_eq!(one("SELECT INTERVAL '5' DAY"), "5 days");
+    assert_eq!(one("SELECT INTERVAL '1-6' YEAR TO MONTH"), "1 year 6 months");
+    assert_eq!(one("SELECT INTERVAL '2 03:04:05' DAY TO SECOND"), "2 days 03:04:05");
+    assert_eq!(one("SELECT INTERVAL '90' MINUTE"), "01:30:00");
+    assert_eq!(one("SELECT INTERVAL 'P1Y2M3DT4H5M6S'"), "1 year 2 months 3 days 04:05:06");
+    assert_eq!(one("SELECT TypeName(INTERVAL '1 day')"), "INTERVAL");
+    // Arithmetic.
+    assert_eq!(one("SELECT INTERVAL '1 day' * 3"), "3 days");
+    assert_eq!(one("SELECT 2 * INTERVAL '90 minutes'"), "03:00:00");
+    assert_eq!(one("SELECT INTERVAL '10 hours' / 4"), "02:30:00");
+    assert_eq!(one("SELECT INTERVAL '1 month' * 0.5"), "15 days");
+    assert_eq!(one("SELECT INTERVAL '1 day' + INTERVAL '2 hours' - INTERVAL '30 minutes'"), "1 day 01:30:00");
+    assert_eq!(one("SELECT -INTERVAL '1 day'"), "-1 day");
+    // Dates: months clamp to the end of a month, a day is a calendar day.
+    assert_eq!(one("SELECT #2024-01-31# + INTERVAL '1 month'"), "2024-02-29");
+    assert_eq!(one("SELECT #2024-03-05 10:00# - INTERVAL '2 hours 30 minutes'"), "2024-03-05 07:30:00");
+    assert_eq!(one("SELECT INTERVAL '1 year' + #2023-02-28#"), "2024-02-28");
+    // Comparison treats a month as 30 days and a day as 24 hours.
+    assert_eq!(one("SELECT INTERVAL '1 month' = INTERVAL '30 days'"), "Yes");
+    assert_eq!(one("SELECT INTERVAL '25 hours' > INTERVAL '1 day'"), "Yes");
+    assert_eq!(one("SELECT INTERVAL '1 day' IN (INTERVAL '24 hours', INTERVAL '2 days')"), "Yes");
+    // Parts, construction, age and text.
+    assert_eq!(one("SELECT EXTRACT(MONTH FROM INTERVAL '14 months 3 days')"), "2");
+    assert_eq!(one("SELECT EXTRACT(YEAR FROM INTERVAL '14 months')"), "1");
+    assert_eq!(one("SELECT EXTRACT(EPOCH FROM INTERVAL '1 hour')"), "3600");
+    assert_eq!(one("SELECT MakeInterval(1, 2, 3, 4, 5, 6)"), "1 year 2 months 3 days 04:05:06");
+    assert_eq!(one("SELECT AGE(#2024-03-05#, #2021-01-10#)"), "3 years 1 month 24 days");
+    assert_eq!(one("SELECT CAST('2 days' AS INTERVAL) + CAST('3 hours' AS INTERVAL)"), "2 days 03:00:00");
+    assert!(db.query("SELECT INTERVAL 'soon'").is_err());
+    assert!(db.query("SELECT INTERVAL '1 day' / 0").is_err());
+
+    // A column, aggregates and series.
+    let mut db = db;
+    db.execute("CREATE TABLE J (id INT, dur INTERVAL); INSERT INTO J VALUES (1, '2 hours'), (2, '90 minutes'), (3, NULL)").unwrap();
+    assert_eq!(rows(&db, "SELECT Sum(dur), Avg(dur), Max(dur), Min(dur) FROM J"), [["03:30:00", "01:45:00", "02:00:00", "01:30:00"]]);
+    assert_eq!(rows(&db, "SELECT id FROM J WHERE dur > INTERVAL '100 minutes'"), [["1"]]);
+    assert_eq!(rows(&db, "SELECT id FROM J ORDER BY dur DESC NULLS LAST LIMIT 2"), [["1"], ["2"]]);
+    let r = rows(&db, "SELECT * FROM GENERATE_SERIES(#2024-01-31#, #2024-04-30#, INTERVAL '1 month')");
+    assert_eq!(r, [["2024-01-31"], ["2024-02-29"], ["2024-03-29"], ["2024-04-29"]]);
+    assert_eq!(rows(&db, "SELECT * FROM GENERATE_SERIES(#2024-03-05 00:00#, #2024-03-05 06:00#, INTERVAL '3 hours')").len(), 3);
+}
+
+#[test]
+fn time_zones() {
+    let mut db = Database::in_memory();
+    // In UTC, the default session zone.
+    assert_eq!(q(&db, "SELECT SessionTimeZone()"), "UTC");
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-03-05 14:30:00+01:00'"), "2024-03-05 13:30:00+00:00");
+    assert_eq!(q(&db, "SELECT TypeName(TIMESTAMP WITH TIME ZONE '2024-03-05 14:30:00Z')"), "TIMESTAMPTZ");
+    // The session zone decides how an offset-less reading is taken and how an instant is shown.
+    db.execute("SET TIME ZONE 'America/New_York'").unwrap();
+    assert_eq!(db.time_zone(), "America/New_York");
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00'"), "2024-07-15 12:00:00-04:00");
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-01-15 12:00:00'"), "2024-01-15 12:00:00-05:00");
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00'"), "2024-07-15 08:00:00-04:00");
+    // AT TIME ZONE goes both ways.
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00' AT TIME ZONE 'Asia/Tokyo'"), "2024-07-15 21:00:00");
+    assert_eq!(q(&db, "SELECT #2024-07-15 12:00:00# AT TIME ZONE 'Europe/Paris'"), "2024-07-15 06:00:00-04:00");
+    assert_eq!(q(&db, "SELECT TIMEZONE('+05:30', TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00')"), "2024-07-15 17:30:00");
+    assert_eq!(q(&db, "SELECT #2024-07-15 12:00:00# AT TIME ZONE INTERVAL '2 hours'"), "2024-07-15 06:00:00-04:00");
+    // A day is a calendar day across the clock change; 24 hours are not.
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-03-09 12:00:00' + INTERVAL '1 day'"), "2024-03-10 12:00:00-04:00");
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-03-09 12:00:00' + INTERVAL '24 hours'"), "2024-03-10 13:00:00-04:00");
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-03-10 12:00:00' - TIMESTAMP WITH TIME ZONE '2024-03-09 12:00:00'"), "23:00:00");
+    // Parts are those of the session wall clock.
+    assert_eq!(q(&db, "SELECT EXTRACT(HOUR FROM TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00')"), "8");
+    assert_eq!(q(&db, "SELECT EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00')"), "-4");
+    assert_eq!(q(&db, "SELECT Format(TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00', 'yyyy-mm-dd hh:nn')"), "2024-07-15 08:00");
+    // Converting between the two timestamp types.
+    assert_eq!(q(&db, "SELECT CAST(#2024-07-15 12:00:00# AS TIMESTAMPTZ)"), "2024-07-15 12:00:00-04:00");
+    assert_eq!(q(&db, "SELECT CAST(TIMESTAMP WITH TIME ZONE '2024-07-15 12:00:00+00:00' AS DATETIME)"), "2024-07-15 08:00:00");
+    assert!(db.execute("SET TIME ZONE 'Nowhere/Land'").is_err());
+    assert!(db.query("SELECT #2024-07-15# AT TIME ZONE 'Nowhere/Land'").is_err());
+
+    // Columns: stored as instants, so a later change of session zone moves the display, not the value.
+    db.execute("CREATE TABLE Ev (id INT, at TIMESTAMPTZ); CREATE INDEX evat ON Ev (at)").unwrap();
+    db.execute("INSERT INTO Ev VALUES (1, '2024-03-05 10:00:00+01:00'), (2, '2024-03-05 09:30:00+00:00'), (3, '2024-03-05 12:00:00')").unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM Ev ORDER BY at"), [["1"], ["2"], ["3"]]);
+    assert_eq!(rows(&db, "SELECT id FROM Ev WHERE at = TIMESTAMP WITH TIME ZONE '2024-03-05 09:00:00+00:00'"), [["1"]]);
+    db.execute("SET TIME ZONE 'UTC'").unwrap();
+    assert_eq!(rows(&db, "SELECT at FROM Ev WHERE id = 1"), [["2024-03-05 09:00:00+00:00"]]);
+    // The datetime and the zoned type compare as UTC readings.
+    assert_eq!(q(&db, "SELECT TIMESTAMP WITH TIME ZONE '2024-03-05 09:00:00+00:00' = #2024-03-05 09:00:00#"), "Yes");
+
+    // The optimizer reads a range of instants through the index and sorts nothing.
+    db.set_optimizer(true);
+    let plan = db
+        .query("EXPLAIN SELECT id FROM Ev WHERE at >= TIMESTAMP WITH TIME ZONE '2024-03-05 00:00:00+00:00' AND at < TIMESTAMP WITH TIME ZONE '2024-03-05 00:00:00+00:00' + INTERVAL '1 day'")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("index range scan evat"), "{plan}");
+    let plan = db.query("EXPLAIN SELECT id FROM Ev ORDER BY at DESC LIMIT 1").unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n");
+    assert!(plan.contains("no sort"), "{plan}");
+}

@@ -126,6 +126,7 @@ pub fn negate(v: &Value) -> Result<Value> {
         Value::Currency(d) => Value::Currency(d.neg()),
         Value::Rational(r) => Value::Rational(r.neg()),
         Value::Bool(b) => Value::Bool(!b),
+        Value::Interval(i) => Value::Interval(i.neg().ok_or_else(overflow)?),
         other => match other.num_lenient() {
             Some(n) => negate(&n)?,
             None => return Err(Error::type_err(format!("cannot negate '{other}'"))),
@@ -317,6 +318,54 @@ fn day_seconds(n: &Value) -> Result<i64> {
     }
 }
 
+/// `a op b` where one side is an interval or a `TIMESTAMPTZ`; `None` for anything else.
+fn interval_arith(op: BinOp, a: &Value, b: &Value) -> Result<Option<Value>> {
+    use crate::interval::Interval;
+    use crate::tz;
+    let out_of_range = || Error::runtime("interval out of range");
+    // A zoned instant moved by months and days on its wall clock, and by seconds exactly.
+    let move_tz = |t: i64, iv: &Interval, sign: i64| -> Result<i64> {
+        let zone = tz::session();
+        let calendar = Interval::new(iv.months, iv.days, 0);
+        let local = calendar.add_to_local(zone.to_local(t), sign).ok_or_else(out_of_range)?;
+        zone.to_utc(local).checked_add(iv.secs.checked_mul(sign).ok_or_else(out_of_range)?).ok_or_else(out_of_range)
+    };
+    let scale = |iv: &Interval, k: &Decimal| iv.scale(k).map(Value::Interval).ok_or_else(out_of_range);
+    Ok(Some(match (op, a, b) {
+        (BinOp::Add, Value::Interval(x), Value::Interval(y)) => Value::Interval(x.add(y).ok_or_else(out_of_range)?),
+        (BinOp::Sub, Value::Interval(x), Value::Interval(y)) => Value::Interval(x.sub(y).ok_or_else(out_of_range)?),
+        (BinOp::Mul, Value::Interval(x), n) | (BinOp::Mul, n, Value::Interval(x)) if n.num().is_some() => {
+            scale(x, &n.num().and_then(|n| n.as_decimal()).ok_or_else(overflow)?)?
+        }
+        (BinOp::Div, Value::Interval(x), n) if n.num().is_some() => {
+            let d = n.num().and_then(|n| n.as_decimal()).ok_or_else(overflow)?;
+            let inverse = Decimal::from_i64(1).div(&d).ok_or_else(division_by_zero)?;
+            scale(x, &inverse)?
+        }
+        (BinOp::Add, Value::DateTime(t), Value::Interval(i)) | (BinOp::Add, Value::Interval(i), Value::DateTime(t)) => {
+            Value::DateTime(i.add_to_local(*t, 1).ok_or_else(out_of_range)?)
+        }
+        (BinOp::Sub, Value::DateTime(t), Value::Interval(i)) => Value::DateTime(i.add_to_local(*t, -1).ok_or_else(out_of_range)?),
+        (BinOp::Add, Value::TimestampTz(t), Value::Interval(i)) | (BinOp::Add, Value::Interval(i), Value::TimestampTz(t)) => {
+            Value::TimestampTz(move_tz(*t, i, 1)?)
+        }
+        (BinOp::Sub, Value::TimestampTz(t), Value::Interval(i)) => Value::TimestampTz(move_tz(*t, i, -1)?),
+        // The difference of two instants is an elapsed time.
+        (BinOp::Sub, Value::TimestampTz(t), Value::TimestampTz(u))
+        | (BinOp::Sub, Value::TimestampTz(t), Value::DateTime(u))
+        | (BinOp::Sub, Value::DateTime(t), Value::TimestampTz(u)) => Value::Interval(Interval::new(0, 0, t.checked_sub(*u).ok_or_else(out_of_range)?)),
+        (BinOp::Add, Value::TimestampTz(t), n) | (BinOp::Add, n, Value::TimestampTz(t)) if n.num().is_some() => {
+            let days = n.num().ok_or_else(overflow)?.into_owned();
+            Value::TimestampTz(t + day_seconds(&days)?)
+        }
+        (BinOp::Sub, Value::TimestampTz(t), n) if n.num().is_some() => {
+            let days = n.num().ok_or_else(overflow)?.into_owned();
+            Value::TimestampTz(t - day_seconds(&days)?)
+        }
+        _ => return Ok(None),
+    }))
+}
+
 fn operand(v: &Value) -> Result<Cow<'_, Value>> {
     v.num_lenient().ok_or_else(|| Error::type_err(format!("'{v}' is not a number")))
 }
@@ -325,6 +374,10 @@ fn operand(v: &Value) -> Result<Cow<'_, Value>> {
 pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
+    }
+    // Intervals and zoned timestamps.
+    if let Some(v) = interval_arith(op, a, b)? {
+        return Ok(v);
     }
     // Date arithmetic: dates are counted in days.
     match (op, a, b) {

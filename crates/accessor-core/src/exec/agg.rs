@@ -134,10 +134,13 @@ impl AggState {
             }
             AggFn::Avg => {
                 // Summed exactly; the division happens once, in `finish`.
-                let n = v
-                    .num_lenient()
-                    .ok_or_else(|| Error::type_err(format!("cannot average '{v}'")))?
-                    .into_owned();
+                let n = match v {
+                    Value::Interval(_) => v.clone(),
+                    _ => v
+                        .num_lenient()
+                        .ok_or_else(|| Error::type_err(format!("cannot average '{v}'")))?
+                        .into_owned(),
+                };
                 self.acc = Some(match self.acc.take() {
                     None => n,
                     Some(a) => arith(BinOp::Add, &a, &n)?,

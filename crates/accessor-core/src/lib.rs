@@ -24,6 +24,8 @@ pub mod decimal;
 pub mod rational;
 pub mod database;
 pub mod datetime;
+pub mod interval;
+pub mod tz;
 pub mod error;
 pub mod exec;
 pub mod expr;

@@ -36,7 +36,7 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-fn days_in_month(y: i64, m: u32) -> u32 {
+pub fn days_in_month(y: i64, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -56,6 +56,16 @@ pub fn components(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let rem = secs.rem_euclid(SECS_PER_DAY) as u32;
     let (y, m, d) = civil_from_days(days);
     (y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Adds `n` months to a reading, clamping the day to the end of a shorter month
+/// (31 January plus a month is 29 February in a leap year).
+pub fn add_months(secs: i64, n: i64) -> Option<i64> {
+    let (y, m, d, h, mi, s) = components(secs);
+    let total = y.checked_mul(12)?.checked_add(m as i64 - 1)?.checked_add(n)?;
+    let (ny, nm) = (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32);
+    let day = d.min(days_in_month(ny, nm));
+    from_components(ny, nm, day, h, mi, s)
 }
 
 pub fn from_components(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {

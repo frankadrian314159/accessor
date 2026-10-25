@@ -19,6 +19,9 @@ pub fn format_value(v: &Value, pattern: &str) -> Result<String> {
     let named = pattern.trim().to_ascii_lowercase();
     match v {
         Value::DateTime(t) => return format_date(*t, &date_pattern(&named, pattern)),
+        // A zoned instant is formatted on the wall clock of the session zone.
+        Value::TimestampTz(t) => return format_date(crate::tz::session().to_local(*t), &date_pattern(&named, pattern)),
+        Value::Interval(i) => return Ok(i.to_string()),
         Value::Bool(b) => {
             if let Some(s) = named_bool(&named, *b) {
                 return Ok(s);

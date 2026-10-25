@@ -59,6 +59,8 @@ pub struct Database {
     pub(crate) plan_log: crate::exec::optimizer::PlanLog,
     /// Whether the query optimiser is on (it is, by default).
     pub(crate) optimizer_on: bool,
+    /// The session time zone (`SET TIME ZONE`); not stored in the file.
+    pub(crate) time_zone: crate::tz::Zone,
     persist: Option<Persistence>,
     tx: Option<Tx>,
 }
@@ -78,6 +80,7 @@ impl Database {
             calc_active: false,
             plan_log: Default::default(),
             optimizer_on: true,
+            time_zone: crate::tz::Zone::UTC,
             persist: None,
             tx: None,
         }
@@ -544,6 +547,29 @@ impl Database {
     /// Answers are the same either way; this exists to compare plans and for testing.
     pub fn set_optimizer(&mut self, on: bool) {
         self.optimizer_on = on;
+    }
+
+    /// Sets the session time zone: how timestamps without an offset are read, and how
+    /// `TIMESTAMPTZ` values are shown. Accepts `UTC`, an offset (`+05:30`) or an IANA
+    /// name (`Europe/Paris`). It is a property of this `Database` value, not of the file.
+    pub fn set_time_zone(&mut self, name: &str) -> Result<()> {
+        let zone = if name.eq_ignore_ascii_case("local") || name.eq_ignore_ascii_case("default") {
+            crate::tz::Zone::UTC
+        } else {
+            crate::tz::Zone::parse(name).ok_or_else(|| Error::runtime(format!("unknown time zone '{name}'")))?
+        };
+        self.time_zone = zone;
+        crate::tz::set_session(zone);
+        Ok(())
+    }
+
+    pub fn time_zone(&self) -> String {
+        self.time_zone.name()
+    }
+
+    /// Makes this database's zone the one values are read and shown in.
+    pub(crate) fn enter_session(&self) {
+        crate::tz::set_session(self.time_zone);
     }
 
     pub fn optimizer_enabled(&self) -> bool {

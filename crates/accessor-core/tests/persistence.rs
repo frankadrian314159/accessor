@@ -755,3 +755,19 @@ fn a_transaction_can_span_a_large_amount_of_work() {
     assert_eq!(count(&db, "big"), 5_000);
     assert_eq!(db.query("SELECT Sum(n) FROM big").unwrap().rows[0][0].to_string(), "24995000");
 }
+
+#[test]
+fn intervals_and_zoned_timestamps_survive_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tz.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE e (at TIMESTAMPTZ, dur INTERVAL)").unwrap();
+        db.execute("INSERT INTO e VALUES ('2024-03-05 10:00:00+01:00', '1 month 2 days 03:04:05')").unwrap();
+    }
+    let db = Database::open(&path).unwrap();
+    let r = db.query("SELECT at, dur FROM e").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "2024-03-05 09:00:00+00:00");
+    assert_eq!(r.rows[0][1].to_string(), "1 month 2 days 03:04:05");
+    assert_eq!(db.query("SELECT TypeName(at), TypeName(dur) FROM e").unwrap().rows[0][1].to_string(), "INTERVAL");
+}

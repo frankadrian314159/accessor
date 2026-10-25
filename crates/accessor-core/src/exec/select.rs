@@ -287,6 +287,7 @@ impl Database {
     }
 
     pub fn run_select(&self, sel: &Select) -> Result<QueryResult> {
+        self.enter_session();
         self.run_select_depth(sel, 0)
     }
 
@@ -1334,7 +1335,10 @@ fn compatible(dt: DataType, v: &Value) -> bool {
     (dt.is_numeric() && v.is_numeric())
         || matches!(
             (dt, v),
-            (DataType::Text, Value::Text(_)) | (DataType::DateTime, Value::DateTime(_)) | (DataType::YesNo, Value::Bool(_))
+            (DataType::Text, Value::Text(_))
+                | (DataType::DateTime | DataType::TimestampTz, Value::DateTime(_) | Value::TimestampTz(_))
+                | (DataType::Interval, Value::Interval(_))
+                | (DataType::YesNo, Value::Bool(_))
         )
 }
 
