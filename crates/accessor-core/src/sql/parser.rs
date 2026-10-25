@@ -32,6 +32,26 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
     Ok(out)
 }
 
+/// The conversion function that `CAST(x AS ty)` stands for.
+pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
+    Some(match ty {
+        DataType::Integer => "CINT",
+        DataType::Bignum => "CBIG",
+        DataType::Float => "CSNG",
+        DataType::Double => "CDBL",
+        DataType::Decimal => "CDEC",
+        DataType::Currency => "CCUR",
+        DataType::Rational => "CRAT",
+        DataType::Text => "CSTR",
+        DataType::YesNo => "CBOOL",
+        DataType::DateTime => "CDATE",
+        DataType::TimestampTz => "CTIMESTAMPTZ",
+        DataType::Interval => "CINTERVAL",
+        DataType::Json => "JSON_PARSE",
+        DataType::Calculated => return None,
+    })
+}
+
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
     let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0 };
@@ -434,6 +454,19 @@ impl<'a> Parser<'a> {
     // ----- statements ------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
+        let st = self.statement_inner()?;
+        if self.peek_kw("RETURNING") && matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_)) {
+            self.advance();
+            let mut items = vec![self.select_item()?];
+            while self.eat_sym(",") {
+                items.push(self.select_item()?);
+            }
+            return Ok(Statement::Returning { stmt: Box::new(st), items });
+        }
+        Ok(st)
+    }
+
+    fn statement_inner(&mut self) -> Result<Statement> {
         if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_kw("TRANSFORM") || self.peek_sym("(") {
             return Ok(Statement::Select(self.select()?));
         }
@@ -505,6 +538,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("EXEC") || self.eat_kw("EXECUTE") || self.eat_kw("CALL") {
             return self.exec();
+        }
+        if self.peek_kw("RUN") && self.peek_kw_at(1, "REPORT") {
+            self.advance();
+            self.advance();
+            let name = self.ident()?;
+            let format = if self.eat_kw("AS") { self.ident()? } else { "text".to_string() };
+            return Ok(Statement::RunReport { name, format });
         }
         if self.eat_kw("PREPARE") {
             let name = self.ident()?;
@@ -764,6 +804,252 @@ impl<'a> Parser<'a> {
         Ok(Statement::Exec { name, args })
     }
 
+    /// After `CREATE REPORT`: `name [layout clauses] AS select`.
+    fn report(&mut self, start: usize) -> Result<Statement> {
+        let name = self.ident()?;
+        let mut layout = ReportLayout::default();
+        let text = |p: &mut Parser| -> Result<String> {
+            match p.advance() {
+                Tok::Str(s) => Ok(s),
+                _ => {
+                    p.pos -= 1;
+                    Err(p.unexpected("text in quotes"))
+                }
+            }
+        };
+        loop {
+            if self.eat_kw("TITLE") {
+                layout.title = Some(text(self)?);
+            } else if self.eat_kw("SUBTITLE") {
+                layout.subtitle = Some(text(self)?);
+            } else if self.eat_kw("BREAK") {
+                self.eat_kw("BY");
+                let column = self.ident()?;
+                let mut b = ReportBreak { column, header: None, footer: None, new_page: false };
+                loop {
+                    if self.eat_kw("HEADER") {
+                        b.header = Some(text(self)?);
+                    } else if self.eat_kw("FOOTER") {
+                        b.footer = Some(text(self)?);
+                    } else if self.peek_kw("NEW") && self.peek_kw_at(1, "PAGE") {
+                        self.advance();
+                        self.advance();
+                        b.new_page = true;
+                    } else {
+                        break;
+                    }
+                }
+                layout.breaks.push(b);
+            } else if self.eat_kw("COLUMN") {
+                let mut c = ReportColumn { name: self.ident()?, ..Default::default() };
+                loop {
+                    if self.eat_kw("HEADING") {
+                        c.heading = Some(text(self)?);
+                    } else if self.eat_kw("FORMAT") {
+                        c.format = Some(text(self)?);
+                    } else if self.eat_kw("ALIGN") {
+                        c.align = Some(if self.eat_kw("LEFT") {
+                            ReportAlign::Left
+                        } else if self.eat_kw("RIGHT") {
+                            ReportAlign::Right
+                        } else {
+                            self.expect_kw("CENTER")?;
+                            ReportAlign::Center
+                        });
+                    } else if self.eat_kw("WIDTH") {
+                        c.width = Some(usize::try_from(self.signed_int()?).map_err(|_| Error::syntax("WIDTH must be positive"))?);
+                    } else if self.eat_kw("SUM") {
+                        c.total = Some(ReportTotal::Sum);
+                    } else if self.eat_kw("AVG") {
+                        c.total = Some(ReportTotal::Avg);
+                    } else if self.eat_kw("COUNT") {
+                        c.total = Some(ReportTotal::Count);
+                    } else if self.eat_kw("MIN") {
+                        c.total = Some(ReportTotal::Min);
+                    } else if self.eat_kw("MAX") {
+                        c.total = Some(ReportTotal::Max);
+                    } else if self.eat_kw("HIDE") {
+                        c.hidden = true;
+                    } else {
+                        break;
+                    }
+                }
+                if layout.columns.iter().any(|x| x.name.eq_ignore_ascii_case(&c.name)) {
+                    return Err(Error::syntax(format!("the column '{}' is described twice", c.name)));
+                }
+                layout.columns.push(c);
+            } else if self.peek_kw("GRAND") {
+                self.advance();
+                self.expect_kw("TOTAL")?;
+                layout.grand_total = Some(if matches!(self.peek(), Tok::Str(_)) { text(self)? } else { "Grand total".to_string() });
+            } else if self.peek_kw("PAGE") {
+                self.advance();
+                self.expect_kw("SIZE")?;
+                layout.page_lines = Some(usize::try_from(self.signed_int()?).map_err(|_| Error::syntax("PAGE SIZE must be positive"))?);
+                self.eat_kw("LINES");
+            } else {
+                break;
+            }
+        }
+        self.expect_kw("AS")?;
+        let query = self.select()?;
+        let end = self.toks[self.pos].pos;
+        let sql = self.src[start..end].trim().to_string();
+        Ok(Statement::CreateReport(Box::new(ReportDef { name, layout, query, sql })))
+    }
+
+    /// After `CREATE FUNCTION` or `CREATE PROCEDURE`: `name (@p type [= default], ...) [RETURNS type] AS body`.
+    fn routine(&mut self, function: bool, start: usize) -> Result<Statement> {
+        let name = self.ident()?;
+        self.expect_sym("(")?;
+        let mut params = Vec::new();
+        if !self.peek_sym(")") {
+            loop {
+                let pname = match self.advance() {
+                    Tok::Param(n) => n,
+                    _ => {
+                        self.pos -= 1;
+                        return Err(self.unexpected("a parameter such as @name"));
+                    }
+                };
+                if params.iter().any(|p: &RoutineParam| p.name.eq_ignore_ascii_case(&pname)) {
+                    return Err(Error::syntax(format!("the parameter @{pname} is declared twice")));
+                }
+                let data_type = if matches!(self.peek(), Tok::Ident(_)) && !self.peek_kw("DEFAULT") { Some(self.data_type_name()?) } else { None };
+                let default = if self.eat_sym("=") || self.eat_kw("DEFAULT") { Some(self.expr()?) } else { None };
+                params.push(RoutineParam { name: pname, data_type, default });
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_sym(")")?;
+        let returns = if self.eat_kw("RETURNS") { Some(self.data_type_name()?) } else { None };
+        if !function && returns.is_some() {
+            return Err(Error::syntax("a procedure does not have RETURNS; use a function to return a value"));
+        }
+        self.expect_kw("AS")?;
+        let (body, end) = if function {
+            self.eat_kw("RETURN");
+            let e = self.expr()?;
+            (RoutineBody::Expr(e), self.toks[self.pos].pos)
+        } else {
+            self.expect_kw("BEGIN")?;
+            let b = self.proc_block(&["END"])?;
+            self.expect_kw("END")?;
+            (RoutineBody::Block(b), self.toks[self.pos - 1].pos + "END".len())
+        };
+        let sql = self.src[start..end].trim().to_string();
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, sql })))
+    }
+
+    /// A data type written as a name (`INTEGER`, `VARCHAR(20)`, `DOUBLE PRECISION`, ...).
+    fn data_type_name(&mut self) -> Result<DataType> {
+        let tn = self.type_name()?;
+        let (ty, auto) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+        if auto || ty == DataType::Calculated {
+            return Err(Error::syntax(format!("'{tn}' cannot be used as the type of a parameter")));
+        }
+        if self.eat_sym("(") {
+            while !self.peek_sym(")") && !self.at_eof() {
+                self.advance();
+            }
+            self.expect_sym(")")?;
+        }
+        Ok(ty)
+    }
+
+    /// Procedure statements up to (not including) one of the `stops` keywords.
+    fn proc_block(&mut self, stops: &[&str]) -> Result<Vec<ProcStmt>> {
+        let mut out = Vec::new();
+        loop {
+            while self.eat_sym(";") {}
+            if self.at_eof() {
+                return Err(self.unexpected(stops[0]));
+            }
+            if stops.iter().any(|s| self.peek_kw(s)) {
+                return Ok(out);
+            }
+            out.push(self.proc_stmt()?);
+            if !self.peek_sym(";") && !stops.iter().any(|s| self.peek_kw(s)) {
+                return Err(self.unexpected("';'"));
+            }
+        }
+    }
+
+    fn proc_stmt(&mut self) -> Result<ProcStmt> {
+        if self.eat_kw("DECLARE") {
+            let name = match self.advance() {
+                Tok::Param(n) => n,
+                _ => {
+                    self.pos -= 1;
+                    return Err(self.unexpected("a variable such as @name"));
+                }
+            };
+            let data_type = if matches!(self.peek(), Tok::Ident(_)) && !self.peek_kw("DEFAULT") { Some(self.data_type_name()?) } else { None };
+            let init = if self.eat_sym("=") || self.eat_kw("DEFAULT") { Some(self.expr()?) } else { None };
+            return Ok(ProcStmt::Declare { name, data_type, init });
+        }
+        if self.peek_kw("SET") && matches!(self.peek_at(1), Tok::Param(_)) {
+            self.advance();
+            let Tok::Param(name) = self.advance() else { unreachable!("checked") };
+            self.expect_sym("=")?;
+            return Ok(ProcStmt::Set { name, value: self.expr()? });
+        }
+        if self.eat_kw("IF") {
+            let mut branches = Vec::new();
+            let mut otherwise = Vec::new();
+            let cond = self.expr()?;
+            self.expect_kw("THEN")?;
+            branches.push((cond, self.proc_block(&["ELSEIF", "ELSIF", "ELSE", "END"])?));
+            loop {
+                if self.eat_kw("ELSEIF") || self.eat_kw("ELSIF") {
+                    let c = self.expr()?;
+                    self.expect_kw("THEN")?;
+                    branches.push((c, self.proc_block(&["ELSEIF", "ELSIF", "ELSE", "END"])?));
+                } else if self.eat_kw("ELSE") {
+                    otherwise = self.proc_block(&["END"])?;
+                } else {
+                    break;
+                }
+            }
+            self.expect_kw("END")?;
+            self.expect_kw("IF")?;
+            return Ok(ProcStmt::If { branches, otherwise });
+        }
+        if self.eat_kw("WHILE") {
+            let cond = self.expr()?;
+            self.expect_kw("DO")?;
+            let body = self.proc_block(&["END"])?;
+            self.expect_kw("END")?;
+            self.expect_kw("WHILE")?;
+            return Ok(ProcStmt::While { cond, body });
+        }
+        if self.eat_kw("LEAVE") {
+            return Ok(ProcStmt::Leave);
+        }
+        if self.eat_kw("RETURN") {
+            if self.peek_sym(";") || self.peek_kw("END") || self.at_eof() {
+                return Ok(ProcStmt::Return(None));
+            }
+            return Ok(ProcStmt::Return(Some(self.expr()?)));
+        }
+        let st = self.statement()?;
+        if matches!(
+            st,
+            Statement::Begin
+                | Statement::Commit
+                | Statement::Rollback
+                | Statement::Savepoint(_)
+                | Statement::ReleaseSavepoint(_)
+                | Statement::RollbackTo(_)
+                | Statement::Parameters(_)
+        ) {
+            return Err(Error::syntax("a procedure runs as one unit and cannot start or end a transaction"));
+        }
+        Ok(ProcStmt::Sql(st))
+    }
+
     /// `name BEFORE|AFTER INSERT|UPDATE|DELETE ON table [FOR EACH ROW]
     /// [WHEN cond] BEGIN stmt; ... END`; `start` is where `CREATE` began.
     fn trigger(&mut self, start: usize) -> Result<Statement> {
@@ -854,15 +1140,23 @@ impl<'a> Parser<'a> {
             self.advance();
             let mut guarded = false;
             let mut inner = self.create_object(&mut guarded, create_pos)?;
-            if let Statement::CreateTrigger(def) = &mut inner {
-                // The stored text is a plain CREATE TRIGGER, without the OR REPLACE.
-                if let Some(at) = def.sql.to_ascii_uppercase().find("REPLACE") {
-                    def.sql = format!("CREATE {}", def.sql[at + "REPLACE".len()..].trim_start());
+            // The stored text is a plain CREATE, without the OR REPLACE.
+            let strip = |sql: &mut String| {
+                if let Some(at) = sql.to_ascii_uppercase().find("REPLACE") {
+                    *sql = format!("CREATE {}", sql[at + "REPLACE".len()..].trim_start());
                 }
+            };
+            match &mut inner {
+                Statement::CreateTrigger(def) => strip(&mut def.sql),
+                Statement::CreateRoutine(def) => strip(&mut def.sql),
+                Statement::CreateReport(def) => strip(&mut def.sql),
+                _ => {}
             }
             return match inner {
-                Statement::CreateView { .. } | Statement::CreateTrigger(_) if !guarded => Ok(Statement::OrReplace(Box::new(inner))),
-                _ => Err(Error::syntax("CREATE OR REPLACE works for views, queries and triggers; a table cannot be replaced")),
+                Statement::CreateView { .. } | Statement::CreateTrigger(_) | Statement::CreateRoutine(_) | Statement::CreateReport(_) if !guarded => {
+                    Ok(Statement::OrReplace(Box::new(inner)))
+                }
+                _ => Err(Error::syntax("CREATE OR REPLACE works for views, queries, triggers, functions and procedures; a table cannot be replaced")),
             };
         }
         let mut guarded = false;
@@ -890,6 +1184,16 @@ impl<'a> Parser<'a> {
         if self.eat_kw("TABLE") {
             self.if_exists_clause(true, guarded)?;
             return self.create_table();
+        }
+        if !unique && self.eat_kw("REPORT") {
+            self.if_exists_clause(true, guarded)?;
+            return self.report(create_pos);
+        }
+        if !unique && (self.peek_kw("FUNCTION") || self.peek_kw("PROCEDURE")) {
+            let function = self.peek_kw("FUNCTION");
+            self.advance();
+            self.if_exists_clause(true, guarded)?;
+            return self.routine(function, create_pos);
         }
         if !unique && self.eat_kw("SEQUENCE") {
             self.if_exists_clause(true, guarded)?;
@@ -1404,6 +1708,14 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("VIEW") || self.eat_kw("QUERY") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropView(self.ident()?))
+        } else if self.eat_kw("REPORT") {
+            self.if_exists_clause(false, guarded)?;
+            Ok(Statement::DropReport(self.ident()?))
+        } else if self.peek_kw("FUNCTION") || self.peek_kw("PROCEDURE") {
+            let function = self.peek_kw("FUNCTION");
+            self.advance();
+            self.if_exists_clause(false, guarded)?;
+            Ok(Statement::DropRoutine { name: self.ident()?, function })
         } else if self.eat_kw("SEQUENCE") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropSequence(self.ident()?))
@@ -1419,7 +1731,7 @@ impl<'a> Parser<'a> {
                 Err(self.unexpected("ON"))
             }
         } else {
-            Err(self.unexpected("TABLE, VIEW, INDEX, SEQUENCE or TRIGGER"))
+            Err(self.unexpected("TABLE, VIEW, INDEX, SEQUENCE, FUNCTION, PROCEDURE, REPORT or TRIGGER"))
         }
     }
 
@@ -2570,22 +2882,7 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
         }
         self.expect_sym(")")?;
-        let name = match ty {
-            DataType::Integer => "CINT",
-            DataType::Bignum => "CBIG",
-            DataType::Float => "CSNG",
-            DataType::Double => "CDBL",
-            DataType::Decimal => "CDEC",
-            DataType::Currency => "CCUR",
-            DataType::Rational => "CRAT",
-            DataType::Text => "CSTR",
-            DataType::YesNo => "CBOOL",
-            DataType::DateTime => "CDATE",
-            DataType::TimestampTz => "CTIMESTAMPTZ",
-            DataType::Interval => "CINTERVAL",
-            DataType::Json => "JSON_PARSE",
-            DataType::Calculated => return Err(Error::syntax("cannot CAST to CALCULATED")),
-        };
+        let name = cast_function(ty).ok_or_else(|| Error::syntax("cannot CAST to CALCULATED"))?;
         let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };
         Ok(match (ty, hints.get(1)) {
             (DataType::Decimal | DataType::Currency, Some(scale)) => Expr::Function {

@@ -863,3 +863,47 @@ fn json_columns_survive_reopening() {
     assert_eq!(r.rows[1][0].to_string(), "[true]");
     assert_eq!(db.table("d").unwrap().schema().columns[1].data_type, accessor_core::DataType::Json);
 }
+
+#[test]
+fn stored_routines_survive_reopening_and_old_files_still_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("routines.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE t (n INTEGER); CREATE FUNCTION dbl(@a INTEGER) RETURNS INTEGER AS @a * 2;
+             CREATE PROCEDURE add_n(@k INTEGER) AS BEGIN INSERT INTO t VALUES (dbl(@k)); END",
+        )
+        .unwrap();
+        db.checkpoint().unwrap();
+        db.execute("CREATE FUNCTION trip(@a INTEGER) AS @a * 3").unwrap(); // only in the log
+        std::mem::forget(db);
+    }
+    let mut db = Database::open(&path).unwrap();
+    db.execute("CALL add_n(21)").unwrap();
+    assert_eq!(db.query("SELECT n, trip(n) FROM t").unwrap().rows[0], vec![Value::Int(42), Value::Int(126)]);
+    assert_eq!(db.routine_names().len(), 3);
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.routine_names().len(), 3);
+}
+
+#[test]
+fn reports_survive_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reports.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE s (g TEXT, n INTEGER); INSERT INTO s VALUES ('a', 1), ('a', 2), ('b', 5)").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("CREATE REPORT r TITLE 'T' BREAK BY g COLUMN n SUM GRAND TOTAL AS SELECT g, n FROM s").unwrap(); // only in the log
+        std::mem::forget(db);
+    }
+    let db = Database::open(&path).unwrap();
+    let text = String::from_utf8(db.render_report("r", accessor_core::ReportFormat::Text).unwrap()).unwrap();
+    assert!(text.starts_with("T\n"), "{text}");
+    assert!(text.contains("Grand total"), "{text}");
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.report_names(), ["r"]);
+}

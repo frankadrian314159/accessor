@@ -18,7 +18,8 @@ datasheets for working with records directly.
   (`TRANSFORM … PIVOT`); `CHECK` constraints;
   row value comparisons, `LATERAL` and table functions, `PIVOT` / `UNPIVOT`, named windows,
   `NULLS FIRST/LAST`, simple updatable views, `INTERVAL` and time-zone-aware timestamps;
-  sequences, a `JSON` type with path functions, deferrable foreign keys (`SET CONSTRAINTS`),
+  stored functions and procedures, `RETURNING`, reports (grouped, totalled, paged;
+  text, HTML, Markdown, CSV, PDF), sequences, a `JSON` type with path functions, deferrable foreign keys (`SET CONSTRAINTS`),
   and statement-level, multi-event, `UPDATE OF` and `INSTEAD OF` triggers;
   `CAST`, `Format` and about a hundred functions; `TOP` / `LIMIT` / `FETCH FIRST`;
   `CREATE` / `ALTER` / `DROP` for tables, indexes and queries; and CSV import and

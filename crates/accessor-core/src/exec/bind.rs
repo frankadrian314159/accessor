@@ -85,6 +85,8 @@ pub struct Binder<'a> {
     /// Whether correlated sub-queries may be bound here (only in the main
     /// expressions of a SELECT); they collect in `corr`.
     pub allow_corr: bool,
+    /// How many stored functions are being expanded, one inside another.
+    pub inlining: u32,
     pub corr: Vec<CorrSpec>,
     /// Correlated sub-queries in the select list, `HAVING` and `ORDER BY` of a grouped query:
     /// they read the group's columns and run once per group.
@@ -311,7 +313,7 @@ pub fn contains_agg(e: &Expr) -> bool {
 
 impl<'a> Binder<'a> {
     pub fn new(db: &'a Database, scope: &'a Scope, depth: u32) -> Self {
-        Binder { db, scope, group: None, depth, allow_corr: false, corr: Vec::new(), gcorr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new() }
+        Binder { db, scope, group: None, depth, allow_corr: false, inlining: 0, corr: Vec::new(), gcorr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new() }
     }
 
     pub fn bind(&mut self, e: &Expr) -> Result<BExpr> {
@@ -528,8 +530,18 @@ impl<'a> Binder<'a> {
                 if *distinct || *star {
                     return Err(Error::runtime(format!("{name} does not accept DISTINCT or *")));
                 }
-                let (f, min, max) =
-                    ScalarFn::lookup(name).ok_or_else(|| Error::catalog(format!("unknown function '{name}'")))?;
+                let Some((f, min, max)) = ScalarFn::lookup(name) else {
+                    // A stored function: its body, with the arguments in place of the parameters.
+                    let def = self.db.function_def(name).ok_or_else(|| Error::catalog(format!("unknown function '{name}'")))?;
+                    if self.inlining >= super::routine::MAX_INLINE {
+                        return Err(Error::runtime(format!("the function '{name}' calls itself (or functions nest too deeply)")));
+                    }
+                    let body = super::routine::inline_call(&def, args)?;
+                    self.inlining += 1;
+                    let bound = self.bind(&body);
+                    self.inlining -= 1;
+                    return bound;
+                };
                 if args.len() < min || args.len() > max {
                     return Err(Error::runtime(format!("wrong number of arguments for {name}")));
                 }

@@ -261,6 +261,104 @@ pub enum AlterAction {
     SetNotNull { name: String, not_null: bool },
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReportTotal {
+    Sum,
+    Avg,
+    Count,
+    Min,
+    Max,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReportAlign {
+    Left,
+    Right,
+    Center,
+}
+
+/// `BREAK BY column`: a new group whenever the column's value changes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportBreak {
+    pub column: String,
+    /// Text for the group's heading; `{column}` is replaced by that column's value.
+    pub header: Option<String>,
+    /// Text for the line of totals closing the group; `{count}` is the number of rows.
+    pub footer: Option<String>,
+    pub new_page: bool,
+}
+
+/// `COLUMN name ...`: how one column of the query is shown.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ReportColumn {
+    pub name: String,
+    pub heading: Option<String>,
+    pub format: Option<String>,
+    pub align: Option<ReportAlign>,
+    pub total: Option<ReportTotal>,
+    pub width: Option<usize>,
+    pub hidden: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ReportLayout {
+    pub title: Option<String>,
+    pub subtitle: Option<String>,
+    pub breaks: Vec<ReportBreak>,
+    pub columns: Vec<ReportColumn>,
+    pub grand_total: Option<String>,
+    pub page_lines: Option<usize>,
+}
+
+/// A stored report. `sql` is the original `CREATE REPORT` text, which is what gets stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReportDef {
+    pub name: String,
+    pub layout: ReportLayout,
+    pub query: Select,
+    pub sql: String,
+}
+
+/// A parameter of a stored function or procedure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutineParam {
+    pub name: String,
+    pub data_type: Option<DataType>,
+    pub default: Option<Expr>,
+}
+
+/// One statement of a stored procedure.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProcStmt {
+    Declare { name: String, data_type: Option<DataType>, init: Option<Expr> },
+    Set { name: String, value: Expr },
+    If { branches: Vec<(Expr, Vec<ProcStmt>)>, otherwise: Vec<ProcStmt> },
+    While { cond: Expr, body: Vec<ProcStmt> },
+    /// Leaves the innermost `WHILE`.
+    Leave,
+    Return(Option<Expr>),
+    Sql(Statement),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RoutineBody {
+    /// A function: one expression, in which the parameters are `@name`.
+    Expr(Expr),
+    /// A procedure: statements with variables and control flow.
+    Block(Vec<ProcStmt>),
+}
+
+/// A stored function or procedure. `sql` is the original `CREATE` text, which is what gets stored.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoutineDef {
+    pub name: String,
+    pub function: bool,
+    pub params: Vec<RoutineParam>,
+    pub returns: Option<DataType>,
+    pub body: RoutineBody,
+    pub sql: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
@@ -335,6 +433,14 @@ pub enum Statement {
     Raise(Expr),
     CreateTrigger(Box<TriggerDef>),
     DropTrigger(String),
+    /// `INSERT | UPDATE | DELETE | MERGE ... RETURNING items`.
+    Returning { stmt: Box<Statement>, items: Vec<SelectItem> },
+    CreateReport(Box<ReportDef>),
+    DropReport(String),
+    /// `RUN REPORT name [AS format]`.
+    RunReport { name: String, format: String },
+    CreateRoutine(Box<RoutineDef>),
+    DropRoutine { name: String, function: bool },
     CreateSequence { name: String, options: crate::sequence::SequenceOptions },
     AlterSequence { name: String, options: crate::sequence::SequenceOptions },
     DropSequence(String),

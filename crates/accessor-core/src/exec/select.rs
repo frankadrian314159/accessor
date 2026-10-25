@@ -1398,7 +1398,7 @@ fn scan_note(src: &Source<'_>, t: &Table, conj: &[&BExpr]) -> String {
 // Select list
 // ---------------------------------------------------------------------------
 
-fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, Expr)>> {
+pub(crate) fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, Expr)>> {
     let mut out = Vec::new();
     let mut anon = 1000;
     for item in &sel.items {

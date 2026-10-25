@@ -20,6 +20,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | Definition | `CREATE`/`ALTER`/`DROP TABLE` (including `RENAME TO`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`); `CREATE OR REPLACE VIEW`/`TRIGGER`; `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`/`SET NULL`; identity columns (`GENERATED ... AS IDENTITY`); generated columns (`GENERATED ALWAYS AS (expr)`); `IF [NOT] EXISTS`; `CREATE`/`DROP INDEX`; `CREATE`/`DROP VIEW`; `CREATE`/`DROP TRIGGER`; `CREATE`/`ALTER`/`DROP SEQUENCE` with `NEXT VALUE FOR`; `DEFERRABLE` foreign keys with `SET CONSTRAINTS`; `SET DEFAULT` and `NO ACTION` referential actions |
 | Triggers | `BEFORE`, `AFTER` and `INSTEAD OF`; `FOR EACH ROW` and `FOR EACH STATEMENT`; several events in one trigger; `UPDATE OF column`; `WHEN` |
 | JSON | a `JSON` type; `->`, `->>`; value, query, set, remove, merge-patch, contains, object/array construction, `JSON_ARRAYAGG`, `JSON_EACH` (a simplified form of SQL/JSON, with a limited path language) |
+| Routines | `CREATE FUNCTION` with an expression body, `CREATE PROCEDURE` with `DECLARE`, `SET`, `IF`, `WHILE`, `LEAVE`, `RETURN`; `CALL` |
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`; transactional DDL |
 | Types | exact and approximate numerics, character strings, booleans, date-times, `TIMESTAMP WITH TIME ZONE`, `INTERVAL`, with the standard's spellings (`VARCHAR`, `NUMERIC`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, ...) |
 
@@ -78,11 +79,12 @@ These parts of the standard are not available. Using one gives a syntax error or
 * `ALTER TABLE` actions `ADD PRIMARY KEY` and `ADD UNIQUE` (use `CREATE UNIQUE INDEX`).
 * Deferrable `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints (only foreign keys can be deferred); `MATCH FULL/PARTIAL`; sequence options `AS type` and `CACHE` are accepted and ignored; `OWNED BY`.
 * Temporal tables (`PERIOD FOR`, `WITH SYSTEM VERSIONING`).
-* `INSERT ... OVERRIDING`.
+* `INSERT ... OVERRIDING`. `RETURNING` (a common extension, not in the standard) is available; the standard's data-change delta tables (`SELECT ... FROM FINAL TABLE (INSERT ...)`) are not.
+* Report writers are outside the standard; `CREATE REPORT` is an extension (see below).
 
 ### Routines, triggers and administration
 
-* `CREATE FUNCTION`, `CREATE PROCEDURE` and the procedural language (SQL/PSM): variables, `IF`, loops, handlers. The substitutes are parameterised saved queries (`CREATE QUERY`, `EXEC`) and triggers.
+* The rest of SQL/PSM: functions with statement bodies (a function is one expression; use a procedure for statements), `LOOP`, `REPEAT`, `FOR`, `CASE` statements, `ITERATE`, cursors, condition handlers (`DECLARE ... HANDLER`), `OUT`/`INOUT` parameters, table functions (`RETURNS TABLE`), overloading, `SIGNAL`/`RESIGNAL`, external routines. `RAISE` stops a procedure.
 * Triggers: `REFERENCING OLD/NEW TABLE` transition tables, `INSTEAD OF` on tables, statement triggers that fire when no row changed, `SET NEW.col = ...` in `BEFORE` triggers, procedural trigger bodies.
 * Privileges and roles (`GRANT`, `REVOKE`, `CREATE ROLE`), `SET TRANSACTION` isolation levels, `SET SESSION` statements.
 * The other parts of the standard: client interface (SQL/CLI), foreign data (SQL/MED), Java routines (SQL/JRT), XML (SQL/XML), multidimensional arrays (SQL/MDA), property graphs (SQL/PGQ).
@@ -92,4 +94,5 @@ These parts of the standard are not available. Using one gives a syntax error or
 * Access-style syntax: `[bracketed names]`, `TOP n`, `&` concatenation, `#date#` literals, `IIf`, `Nz`, `\` and `MOD`, `First`/`Last`, `DateAdd`/`DateDiff`/`DateSerial`, `Format`, `DELETE *`, and crosstab queries (`TRANSFORM … PIVOT`; standard SQL has no pivot clause).
 * A numeric tower with exact arithmetic: `BIGNUM`, `DECIMAL`, `CURRENCY` and `RATIONAL` ([see the README](../../README.md#numbers)).
 * `CALCULATED` columns, parameterised saved queries with `EXEC`, `RAISE` in triggers, `SELECT` in trigger bodies, `LASTVAL`/`SETVAL`.
+* `RETURNING` on `INSERT`, `UPDATE`, `DELETE` and `MERGE`, `PREPARE`/`EXEC`, [reports](reports.md) (`CREATE REPORT`), `LASTVAL`/`SETVAL`.
 * `EXPLAIN` and the [query optimizer](../optimizer/README.md).

@@ -106,6 +106,9 @@ impl Database {
             if let Some(done) = self.exec_prepared_by_name(name, args)? {
                 return Ok(done);
             }
+            if let Some(done) = self.call_procedure(name, args)? {
+                return Ok(done);
+            }
         }
         let select = self.bind_call(name, args, 0)?;
         self.run_select(&select)

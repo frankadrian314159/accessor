@@ -339,6 +339,18 @@ WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total > 100);
 
 Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY` (in a grouped query they read the group, so only its grouping columns), and in the `WHERE` and `SET` of `UPDATE` and `DELETE`. When the correlation is through equalities, as in `EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID)`, the optimizer runs the sub-query once and looks the answers up instead (a semi-join): over 5,000 customers and 30,000 orders with no index that is 8 ms instead of 12 s.
 
+#### Stored functions and procedures
+
+`CREATE FUNCTION tax(@amount CURRENCY, @rate DECIMAL = 0.2) AS @amount * @rate` defines an expression you can use anywhere (it is expanded in place, so indexes and the optimizer see through it). `CREATE PROCEDURE` takes a block with `DECLARE`, `SET`, `IF`, `WHILE`, `RETURN` and ordinary SQL statements, run by `CALL` as one all-or-nothing unit. See [routines](sql/routines.md).
+
+#### RETURNING
+
+`INSERT INTO t (name) VALUES ('Ada') RETURNING id` hands back the AutoNumber (or any column, or an expression) of each row changed, for `INSERT`, `UPDATE`, `DELETE` and `MERGE`, as the row ended up. See [data changes](sql/data-changes.md#returning).
+
+#### Reports
+
+`CREATE REPORT` stores a layout and a query: `BREAK BY Region` groups the rows under headings, `COLUMN Amount FORMAT '#,##0.00' SUM` totals and formats a column, `GRAND TOTAL` closes the report, and `PAGE SIZE` pages it. `RUN REPORT name AS HTML` (or text, Markdown, CSV) returns the document; `db.render_report(name, ReportFormat::Pdf)` and the shell's `.report name file.pdf` write a PDF. See [reports](sql/reports.md).
+
 #### Sequences
 
 `CREATE SEQUENCE invoice_no START WITH 1000` makes a counter of its own; `NEXT VALUE FOR invoice_no` (or `NEXTVAL('invoice_no')`) takes the next number, and `DEFAULT NEXT VALUE FOR invoice_no` fills a column. Numbers taken are never given back, even by a rollback, and survive a restart. See [sequences](sql/sequences.md).

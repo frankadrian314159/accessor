@@ -2,6 +2,8 @@
 
 Function names are not case-sensitive: `Upper`, `UPPER` and `upper` are the same function. Many functions have two or three names, the Access name and the standard one; all are listed.
 
+Functions you define yourself with [`CREATE FUNCTION`](../sql/routines.md) are called the same way.
+
 ## NULL handling
 
 Unless a function's page says otherwise, a function returns NULL when any of its arguments is NULL. The exceptions are the functions made to deal with NULLs: `IIf`, `Nz`, `IsNull`, `Coalesce`, `NullIf`, `Concat`, the `&` operator, and the aggregates (which skip NULLs).

@@ -80,7 +80,15 @@ A condition on something *inside* a document, such as `WHERE JSON_VALUE(Body, '$
 
 `NEXTVAL`, `Now()` and the other functions whose answer changes from call to call are never folded into a constant, so a condition that contains one is not used to pick an index. Take the value first (`SELECT NEXTVAL('s')` in its own statement, or a parameter) when you want to look it up by index.
 
-## 11. Switch it off to check
+## 11. Stored functions
+
+A call of a stored function is expanded in place, so it costs what its body costs, and a function of a column hides the column from an index just as the same expression written out would: `WHERE tax(Total) > 5` scans, `WHERE Total > 25` can use an index on `Total`. A function whose body is a sub-query on a column argument (`spent(ID)`) is a correlated sub-query; index the column it searches by, and it may be run once as a semi-join.
+
+## 12. Reports
+
+A report's query is planned like any other. When it has no `ORDER BY`, the report adds one on its break columns, which an index on them can answer. Index the break columns of a large report.
+
+## 13. Switch it off to check
 
 If a result looks wrong, or you want to compare timings, turn the optimizer off:
 

@@ -29,6 +29,9 @@ Dot-commands:
   .optimizer on|off          turn the query optimizer on or off (for comparing plans)
   .stats TABLE               column statistics the optimizer uses (distinct values, common values, range)
   .sequences                 list the sequences and the last number each handed out
+  .reports                   list the stored reports
+  .report NAME [FILE]        run a report: print it, or write FILE (.txt .html .md .csv .pdf by extension)
+  .routines                  list the stored functions and procedures
   .timer on|off              show statement timings
   .checkpoint                fold the log into the database file
   .compact                   compact and repair
@@ -243,6 +246,35 @@ impl Shell {
                     }
                 }
             },
+            ".reports" => self.db.report_names().iter().for_each(|n| println!("{n}")),
+            ".routines" => {
+                for (n, function) in self.db.routine_names() {
+                    println!("{n}  ({})", if function { "function" } else { "procedure" });
+                }
+            }
+            ".report" => {
+                let mut parts = rest.split_whitespace();
+                let Some(name) = parts.next() else {
+                    eprintln!("usage: .report NAME [FILE]");
+                    return true;
+                };
+                match parts.next() {
+                    None => match self.db.render_report(name, accessor_core::ReportFormat::Text) {
+                        Ok(bytes) => println!("{}", String::from_utf8_lossy(&bytes)),
+                        Err(e) => eprintln!("error: {e}"),
+                    },
+                    Some(file) => {
+                        let Some(format) = accessor_core::ReportFormat::from_path(file) else {
+                            eprintln!("cannot tell the format from '{file}' (use .txt, .html, .md, .csv or .pdf)");
+                            return true;
+                        };
+                        match self.db.render_report(name, format).map_err(|e| e.to_string()).and_then(|b| std::fs::write(file, b).map_err(|e| e.to_string())) {
+                            Ok(()) => println!("wrote {file}"),
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                    }
+                }
+            }
             ".sequences" => {
                 for d in self.db.sequences() {
                     let last = d.last.map_or("-".to_string(), |n| n.to_string());

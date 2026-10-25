@@ -51,7 +51,8 @@ join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out .
 7. **View and derived-table merging.** A view or derived table that is a plain selection of columns of one table is read as that table, with its condition applied during the scan. See [views.md](views.md) and [subqueries.md](subqueries.md#derived-tables-and-views-read-as-their-table).
 8. **Semi-joins.** A correlated `EXISTS`, `IN` or aggregate sub-query whose correlation is an equality is run once and looked up in a hash table, instead of once per outer key. See [subqueries.md](subqueries.md).
 9. **Statistics.** Distinct counts, common values and histograms of unindexed columns, worked out on demand, sharpen the estimates behind the choices above. See [estimates.md](estimates.md).
-10. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
+10. **Stored functions are expanded.** A call of a `CREATE FUNCTION` function is replaced by its body, so it can be folded to a constant, use an index, or become a semi-join. See [../sql/routines.md](../sql/routines.md).
+11. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
 
 And what it deliberately does not do, so that you are not surprised:
 

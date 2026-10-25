@@ -7,6 +7,9 @@ mod check;
 mod ddl;
 mod merge;
 mod seq;
+mod routine;
+mod reports;
+mod returning;
 mod prepared;
 mod decorrelate;
 mod viewdml;
@@ -129,6 +132,27 @@ impl Database {
                             db.execute_statement(&inner)
                         })
                     }
+                    Statement::CreateReport(def) => {
+                        let name = def.name.clone();
+                        self.atomically(|db| {
+                            if db.reports.contains_key(&crate::database::key(&name)) {
+                                db.exec_drop_report(&name)?;
+                            }
+                            db.execute_statement(&inner)
+                        })
+                    }
+                    Statement::CreateRoutine(def) => {
+                        let name = def.name.clone();
+                        self.atomically(|db| {
+                            if let Some(old) = db.routines.get(&crate::database::key(&name)).cloned() {
+                                if old.function != def.function {
+                                    return Err(Error::catalog(format!("'{name}' exists as a {}; drop it first", if old.function { "function" } else { "procedure" })));
+                                }
+                                db.exec_drop_routine(&name, old.function)?;
+                            }
+                            db.execute_statement(&inner)
+                        })
+                    }
                     Statement::CreateTrigger(def) => {
                         let name = def.name.clone();
                         self.atomically(|db| {
@@ -165,6 +189,12 @@ impl Database {
             Statement::Raise(_) => Err(Error::runtime("RAISE can only be used inside a trigger")),
             Statement::CreateTrigger(def) => self.exec_create_trigger(def),
             Statement::DropTrigger(name) => self.exec_drop_trigger(name),
+            Statement::CreateReport(def) => self.exec_create_report(def),
+            Statement::DropReport(name) => self.exec_drop_report(name),
+            Statement::RunReport { name, format } => self.exec_run_report(name, format),
+            Statement::Returning { stmt, items } => self.exec_returning(stmt, items),
+            Statement::CreateRoutine(def) => self.exec_create_routine(def),
+            Statement::DropRoutine { name, function } => self.exec_drop_routine(name, *function),
             Statement::Prepare { name, statement } => self.exec_prepare(name, statement),
             Statement::Deallocate(name) => self.exec_deallocate(name),
             Statement::CreateSequence { name, options } => self.exec_create_sequence(name, options),

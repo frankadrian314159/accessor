@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::sequence::SequenceDef;
-use crate::sql::ast::{Statement, TriggerDef};
+use crate::sql::ast::{ReportDef, RoutineDef, Statement, TriggerDef};
 use crate::sql::parse_statement;
 use crate::storage::persist::{Durability, Persistence};
 use crate::storage::{Op, Table};
@@ -50,6 +50,8 @@ pub(crate) struct CatalogUndo {
     triggers: Option<BTreeMap<String, Arc<TriggerDef>>>,
     /// Lowercase sequence name and its definition before the change (`None`: it did not exist).
     sequence: Option<(String, Option<SequenceDef>)>,
+    routines: Option<BTreeMap<String, Arc<RoutineDef>>>,
+    reports: Option<BTreeMap<String, Arc<ReportDef>>>,
 }
 
 pub struct Database {
@@ -60,6 +62,14 @@ pub struct Database {
     pub(crate) triggers: BTreeMap<String, Arc<TriggerDef>>,
     /// Sequences; shared with the expression evaluator (`NEXTVAL`).
     pub(crate) seqs: crate::sequence::Shared,
+    /// Stored functions and procedures by lowercase name.
+    pub(crate) routines: BTreeMap<String, Arc<RoutineDef>>,
+    /// Stored reports by lowercase name.
+    pub(crate) reports: BTreeMap<String, Arc<ReportDef>>,
+    /// The rows of one table changed so far by a statement with `RETURNING`.
+    pub(crate) capture: Option<Capture>,
+    /// How many procedures are running, one inside another.
+    pub(crate) call_depth: std::cell::Cell<u32>,
     /// SQL text recently read, with the statements it came to.
     pub(crate) parse_cache: Mutex<HashMap<String, Arc<Vec<Statement>>>>,
     /// `PREPARE`d statements of this session.
@@ -90,6 +100,10 @@ impl Database {
             views: BTreeMap::new(),
             triggers: BTreeMap::new(),
             seqs: Default::default(),
+            routines: BTreeMap::new(),
+            reports: BTreeMap::new(),
+            capture: None,
+            call_depth: std::cell::Cell::new(0),
             parse_cache: Mutex::new(HashMap::new()),
             prepared: BTreeMap::new(),
             calc_cache: Default::default(),
@@ -125,6 +139,14 @@ impl Database {
                 if let Some(t) = db.tables.get_mut(&key(&table)) {
                     let _ = t.set_foreign_key_timing(&name, deferrable, initially_deferred);
                 }
+            }
+            for (_, sql) in l.reports {
+                let def = parse_report(&sql)?;
+                db.reports.insert(key(&def.name), Arc::new(def));
+            }
+            for (_, sql) in l.routines {
+                let def = parse_routine(&sql)?;
+                db.routines.insert(key(&def.name), Arc::new(def));
             }
             for (_, sql) in l.triggers {
                 let def = parse_trigger(&sql)?;
@@ -196,6 +218,16 @@ impl Database {
         self.views.get(&key(name)).map(|(_, s)| s.as_str())
     }
 
+    /// The stored functions and procedures: name, and whether it is a function.
+    pub fn routine_names(&self) -> Vec<(&str, bool)> {
+        self.routines.values().map(|r| (r.name.as_str(), r.function)).collect()
+    }
+
+    /// The stored reports.
+    pub fn report_names(&self) -> Vec<&str> {
+        self.reports.values().map(|r| r.name.as_str()).collect()
+    }
+
     pub fn trigger_names(&self) -> Vec<&str> {
         self.triggers.values().map(|t| t.name.as_str()).collect()
     }
@@ -215,6 +247,14 @@ impl Database {
 
     /// Applies one operation, returning its inverse for DML.
     pub(crate) fn apply(&mut self, op: &Op) -> Result<Option<Op>> {
+        let inverse = self.apply_op(op)?;
+        if let Some(c) = &mut self.capture {
+            c.record(op, inverse.as_ref());
+        }
+        Ok(inverse)
+    }
+
+    fn apply_op(&mut self, op: &Op) -> Result<Option<Op>> {
         if op.is_ddl() {
             self.calc_cache.clear();
         }
@@ -392,6 +432,36 @@ impl Database {
                 }
                 Ok(None)
             }
+            Op::CreateReport { name, sql } => {
+                let def = parse_report(sql)?;
+                let k = key(name);
+                if self.reports.contains_key(&k) {
+                    return Err(Error::catalog(format!("the report '{name}' already exists")));
+                }
+                self.reports.insert(k, Arc::new(def));
+                Ok(None)
+            }
+            Op::DropReport(name) => {
+                self.reports
+                    .remove(&key(name))
+                    .ok_or_else(|| Error::catalog(format!("the report '{name}' does not exist")))?;
+                Ok(None)
+            }
+            Op::CreateRoutine { name, sql } => {
+                let def = parse_routine(sql)?;
+                let k = key(name);
+                if self.routines.contains_key(&k) {
+                    return Err(Error::catalog(format!("the function or procedure '{name}' already exists")));
+                }
+                self.routines.insert(k, Arc::new(def));
+                Ok(None)
+            }
+            Op::DropRoutine(name) => {
+                self.routines
+                    .remove(&key(name))
+                    .ok_or_else(|| Error::catalog(format!("the function or procedure '{name}' does not exist")))?;
+                Ok(None)
+            }
             Op::CreateTrigger { name, sql } => {
                 let def = parse_trigger(sql)?;
                 if def.timing == crate::sql::ast::TriggerTiming::InsteadOf {
@@ -458,7 +528,7 @@ impl Database {
     /// Records what the schema change `op` is about to replace.
     fn catalog_snapshot(&self, op: &Op) -> CatalogUndo {
         let mut names: Vec<String> = Vec::new();
-        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None, sequence: None };
+        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None, sequence: None, routines: None, reports: None };
         match op {
             Op::CreateTable(schema) => names.push(key(&schema.name)),
             Op::DropTable(table) => {
@@ -487,6 +557,8 @@ impl Database {
                 undo.sequence = Some((k, old));
             }
             Op::SequenceValue { .. } => {}
+            Op::CreateRoutine { .. } | Op::DropRoutine(_) => undo.routines = Some(self.routines.clone()),
+            Op::CreateReport { .. } | Op::DropReport(_) => undo.reports = Some(self.reports.clone()),
             Op::CreateTrigger { .. } | Op::DropTrigger(_) => undo.triggers = Some(self.triggers.clone()),
             Op::DropColumn { table, .. } => {
                 names.push(key(table));
@@ -532,6 +604,12 @@ impl Database {
         }
         if let Some(triggers) = undo.triggers {
             self.triggers = triggers;
+        }
+        if let Some(routines) = undo.routines {
+            self.routines = routines;
+        }
+        if let Some(reports) = undo.reports {
+            self.reports = reports;
         }
         if let Some((k, old)) = undo.sequence {
             let mut s = self.seqs.lock().expect("sequences lock");
@@ -815,6 +893,8 @@ impl Database {
                 self.triggers.values().map(|t| (t.name.as_str(), t.sql.as_str())),
                 sequences,
                 fk_timing,
+                self.routines.values().map(|r| (r.name.as_str(), r.sql.as_str())),
+                self.reports.values().map(|r| (r.name.as_str(), r.sql.as_str())),
             )?;
         }
         self.seqs.lock().expect("sequences lock").dirty.clear();
@@ -968,6 +1048,48 @@ impl Drop for Database {
         if self.persist.as_ref().is_some_and(Persistence::is_dirty) {
             let _ = self.checkpoint();
         }
+    }
+}
+
+/// What a statement with `RETURNING` has done to the rows of its table: for each row, how it was
+/// before and how it is now (an inserted row has no earlier state, a deleted one no later).
+pub(crate) struct Capture {
+    pub table: String,
+    pub changes: BTreeMap<crate::storage::RowId, (Option<crate::value::Row>, Option<crate::value::Row>)>,
+}
+
+impl Capture {
+    fn record(&mut self, op: &Op, inverse: Option<&Op>) {
+        match (op, inverse) {
+            (Op::Insert { table, id, row }, _) if key(table) == self.table => {
+                self.changes.entry(*id).or_insert((None, None)).1 = Some(row.clone());
+            }
+            (Op::Update { table, id, row }, Some(Op::Update { row: old, .. })) if key(table) == self.table => {
+                let e = self.changes.entry(*id).or_insert((Some(old.clone()), None));
+                e.1 = Some(row.clone());
+            }
+            (Op::Delete { table, id }, Some(Op::Insert { row: old, .. })) if key(table) == self.table => {
+                let e = self.changes.entry(*id).or_insert((Some(old.clone()), None));
+                e.1 = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parses the stored text of a report.
+fn parse_report(sql: &str) -> Result<ReportDef> {
+    match parse_statement(sql)? {
+        Statement::CreateReport(def) => Ok(*def),
+        _ => Err(Error::Corrupt("a stored report is not a CREATE REPORT statement".into())),
+    }
+}
+
+/// Parses the stored text of a function or procedure.
+fn parse_routine(sql: &str) -> Result<RoutineDef> {
+    match parse_statement(sql)? {
+        Statement::CreateRoutine(def) => Ok(*def),
+        _ => Err(Error::Corrupt("a stored routine is not a CREATE FUNCTION or CREATE PROCEDURE statement".into())),
     }
 }
 

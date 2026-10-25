@@ -46,9 +46,11 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 
 ```bnf
 <statement> ::= <query>
+              | <returning>
               | <explain> | <set-time-zone> | <set-constraints>
               | <create-sequence> | <alter-sequence> | <drop-sequence>
               | <prepare> | <deallocate>
+              | <create-routine> | <drop-routine> | <create-report> | <drop-report> | <run-report>
               | <insert> | <update> | <delete> | <merge> | <truncate>
               | <create-table> | <create-index> | <create-view> | <create-trigger>
               | <drop> | <alter-table>
@@ -62,7 +64,32 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                 <select-core> [ <order-by> ] { <row-limit> }
                 PIVOT <concat> [ IN '(' <expr-list> ')' ]
 <explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
+<returning>   ::= ( <insert> | <update> | <delete> | <merge> ) RETURNING <select-item> { ',' <select-item> }
 <set-time-zone> ::= SET ( TIME ZONE | TIMEZONE TO ) ( <string> | LOCAL | UTC )
+<create-routine> ::= CREATE [ OR REPLACE ] FUNCTION <identifier> '(' [ <routine-param> { ',' <routine-param> } ] ')'
+                       [ RETURNS <data-type> ] AS [ RETURN ] <expr>
+                   | CREATE [ OR REPLACE ] PROCEDURE <identifier> '(' [ <routine-param> { ',' <routine-param> } ] ')'
+                       AS BEGIN <proc-statement> ';' { <proc-statement> ';' } END
+<routine-param>  ::= <parameter> [ <data-type> ] [ ( '=' | DEFAULT ) <expr> ]
+<proc-statement> ::= DECLARE <parameter> [ <data-type> ] [ ( '=' | DEFAULT ) <expr> ]
+                   | SET <parameter> '=' <expr>
+                   | IF <expr> THEN <proc-block> { ( ELSEIF | ELSIF ) <expr> THEN <proc-block> } [ ELSE <proc-block> ] END IF
+                   | WHILE <expr> DO <proc-block> END WHILE
+                   | LEAVE | RETURN [ <expr> ] | RAISE <expr>
+                   | <statement>                       (* not BEGIN, COMMIT, ROLLBACK or SAVEPOINT *)
+<proc-block>     ::= <proc-statement> ';' { <proc-statement> ';' }
+<drop-routine>   ::= DROP ( FUNCTION | PROCEDURE ) [ IF EXISTS ] <identifier>
+
+<create-report>  ::= CREATE [ OR REPLACE ] REPORT <identifier> { <report-clause> } AS <query>
+<report-clause>  ::= TITLE <string> | SUBTITLE <string>
+                   | BREAK [ BY ] <identifier> { HEADER <string> | FOOTER <string> | NEW PAGE }
+                   | COLUMN <identifier> { HEADING <string> | FORMAT <string> | ALIGN ( LEFT | RIGHT | CENTER )
+                                           | WIDTH <integer> | SUM | AVG | COUNT | MIN | MAX | HIDE }
+                   | GRAND TOTAL [ <string> ]
+                   | PAGE SIZE <integer> [ LINES ]
+<drop-report>    ::= DROP REPORT [ IF EXISTS ] <identifier>
+<run-report>     ::= RUN REPORT <identifier> [ AS <identifier> ]
+
 <prepare>     ::= PREPARE <identifier> AS <statement>
 <deallocate>  ::= DEALLOCATE [ PREPARE ] ( <identifier> | ALL )     (* run with EXEC <identifier> [ '(' <exec-arg> { ',' <exec-arg> } ')' ] *)
 <set-constraints> ::= SET CONSTRAINTS ( ALL | <identifier-list> ) ( DEFERRED | IMMEDIATE )

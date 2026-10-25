@@ -88,3 +88,18 @@ WHEN NOT MATCHED THEN INSERT (ID, Qty) VALUES (D.ID, D.Qty);
 ```
 
 Expressions can use the source's columns (qualified by its alias, or unqualified when the target has no column of that name) and the target's. A target row matched by more than one source row is an error. The whole statement is atomic; an error leaves the target as it was. The statement returns the number of rows inserted, updated and deleted together.
+
+## RETURNING
+
+`INSERT`, `UPDATE`, `DELETE` and `MERGE` can hand back the rows they changed, so the generated values need no second query:
+
+```sql
+INSERT INTO Customers (Name) VALUES ('Ada'), ('Grace') RETURNING ID, Name;
+UPDATE Orders SET Total = Total * 1.1 WHERE CustID = 7 RETURNING OrderID, Total;
+DELETE FROM Log WHERE At < #2024-01-01# RETURNING *;
+MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (v) VALUES (s.v) RETURNING id, v;
+```
+
+The list after `RETURNING` is a select list: columns, `*`, expressions, aliases. It is evaluated on each changed row of the target table **as the row ended up**: with its AutoNumber, defaults and calculated fields filled in and after any `BEFORE`/`AFTER` trigger changed it, for an insert or an update; and as it was, for a delete. The result has one row for each row changed, in the order of their storage. Rows that a cascade or a trigger changed in the *same table* are included; rows of other tables are not. The expressions are checked before anything is changed, so a mistake in them changes nothing. `RETURNING` works on tables (not on a view), may not contain aggregates or sub-queries that read the row, and works with parameters, prepared statements and `EXEC`.
+
+The number of rows is also in the result's `affected` count.

@@ -26,10 +26,11 @@ const SNAP_MAGIC: &[u8; 4] = b"ACDB";
 const WAL_MAGIC: &[u8; 4] = b"ACWL";
 /// Current file format. Version 1 predates foreign keys; it is still read and
 /// is rewritten as version 2 on open.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const V1: u32 = 1;
 const V2: u32 = 2;
 const V3: u32 = 3;
+const V4: u32 = 4;
 const WAL_HEADER_LEN: u64 = 16;
 const SNAP_HEADER_LEN: usize = 28;
 /// Frames larger than this are treated as corruption rather than allocated.
@@ -60,6 +61,8 @@ pub(crate) struct SnapshotOut<'a> {
     pub sequences: Vec<SequenceDef>,
     /// `(table, constraint, deferrable, initially deferred)` of the relationships that can be deferred.
     pub fk_timing: Vec<(String, String, bool, bool)>,
+    pub routines: Vec<(&'a str, &'a str)>,
+    pub reports: Vec<(&'a str, &'a str)>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +79,8 @@ pub(crate) struct SnapshotIn {
     pub triggers: Vec<(String, String)>,
     pub sequences: Vec<SequenceDef>,
     pub fk_timing: Vec<(String, String, bool, bool)>,
+    pub routines: Vec<(String, String)>,
+    pub reports: Vec<(String, String)>,
 }
 
 pub(crate) struct Loaded {
@@ -84,6 +89,8 @@ pub(crate) struct Loaded {
     pub triggers: Vec<(String, String)>,
     pub sequences: Vec<SequenceDef>,
     pub fk_timing: Vec<(String, String, bool, bool)>,
+    pub routines: Vec<(String, String)>,
+    pub reports: Vec<(String, String)>,
     pub epoch: u64,
     /// The file was written in an older format.
     pub legacy: bool,
@@ -129,7 +136,7 @@ impl Persistence {
             let bytes = fs::read(&wal_path)?;
             if bytes.len() >= WAL_HEADER_LEN as usize && &bytes[..4] == WAL_MAGIC {
                 let version = u32_at(&bytes, 4);
-                if !matches!(version, V1 | V2 | V3 | VERSION) {
+                if !matches!(version, V1 | V2 | V3 | V4 | VERSION) {
                     return Err(Error::Corrupt("unsupported WAL version".into()));
                 }
                 let wal_legacy = version == V1;
@@ -200,6 +207,8 @@ impl Persistence {
         triggers: impl Iterator<Item = (&'a str, &'a str)>,
         sequences: Vec<SequenceDef>,
         fk_timing: Vec<(String, String, bool, bool)>,
+        routines: impl Iterator<Item = (&'a str, &'a str)>,
+        reports: impl Iterator<Item = (&'a str, &'a str)>,
     ) -> Result<()> {
         let out = SnapshotOut {
             tables: tables
@@ -209,6 +218,8 @@ impl Persistence {
             triggers: triggers.collect(),
             sequences,
             fk_timing,
+            routines: routines.collect(),
+            reports: reports.collect(),
         };
         let payload = postcard::to_allocvec(&out).map_err(|e| Error::runtime(format!("encode failed: {e}")))?;
         let epoch = self.epoch + 1;
@@ -290,7 +301,7 @@ fn read_snapshot(path: &Path) -> Result<Loaded> {
         return Err(Error::Corrupt("not an Accessor database file".into()));
     }
     let version = u32_at(&bytes, 4);
-    if !matches!(version, V1 | V2 | V3 | VERSION) {
+    if !matches!(version, V1 | V2 | V3 | V4 | VERSION) {
         return Err(Error::Corrupt("unsupported database version".into()));
     }
     let epoch = u64_at(&bytes, 8);
@@ -307,6 +318,7 @@ fn read_snapshot(path: &Path) -> Result<Loaded> {
         V1 => postcard::from_bytes::<v1::SnapshotIn>(payload).map_err(decode_err)?.into(),
         V2 => postcard::from_bytes::<v2::SnapshotIn>(payload).map_err(decode_err)?.into(),
         V3 => postcard::from_bytes::<v3::SnapshotIn>(payload).map_err(decode_err)?.into(),
+        V4 => postcard::from_bytes::<v4::SnapshotIn>(payload).map_err(decode_err)?.into(),
         _ => postcard::from_bytes(payload).map_err(decode_err)?,
     };
     let tables = snap
@@ -320,6 +332,8 @@ fn read_snapshot(path: &Path) -> Result<Loaded> {
         triggers: snap.triggers,
         sequences: snap.sequences,
         fk_timing: snap.fk_timing,
+        routines: snap.routines,
+        reports: snap.reports,
         epoch,
         legacy: version != VERSION,
     })
@@ -372,6 +386,8 @@ mod v1 {
                 triggers: Vec::new(),
                 sequences: Vec::new(),
                 fk_timing: Vec::new(),
+                routines: Vec::new(),
+                reports: Vec::new(),
             }
         }
     }
@@ -429,7 +445,7 @@ mod v2 {
 
     impl From<SnapshotIn> for New {
         fn from(s: SnapshotIn) -> Self {
-            New { tables: s.tables, views: s.views, triggers: Vec::new(), sequences: Vec::new(), fk_timing: Vec::new() }
+            New { tables: s.tables, views: s.views, triggers: Vec::new(), sequences: Vec::new(), fk_timing: Vec::new(), routines: Vec::new(), reports: Vec::new() }
         }
     }
 }
@@ -449,7 +465,123 @@ mod v3 {
 
     impl From<SnapshotIn> for New {
         fn from(s: SnapshotIn) -> Self {
-            New { tables: s.tables, views: s.views, triggers: s.triggers, sequences: Vec::new(), fk_timing: Vec::new() }
+            New {
+                tables: s.tables,
+                views: s.views,
+                triggers: s.triggers,
+                sequences: Vec::new(),
+                fk_timing: Vec::new(),
+                routines: Vec::new(),
+                reports: Vec::new(),
+            }
         }
+    }
+}
+
+/// Version 4 snapshots: no stored functions or procedures.
+mod v4 {
+    use serde::Deserialize;
+
+    use super::{SnapshotIn as New, TableIn};
+    use crate::sequence::SequenceDef;
+
+    #[derive(Deserialize)]
+    pub struct SnapshotIn {
+        tables: Vec<TableIn>,
+        views: Vec<(String, String)>,
+        triggers: Vec<(String, String)>,
+        sequences: Vec<SequenceDef>,
+        fk_timing: Vec<(String, String, bool, bool)>,
+    }
+
+    impl From<SnapshotIn> for New {
+        fn from(s: SnapshotIn) -> Self {
+            New {
+                tables: s.tables,
+                views: s.views,
+                triggers: s.triggers,
+                sequences: s.sequences,
+                fk_timing: s.fk_timing,
+                routines: Vec::new(),
+                reports: Vec::new(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{Column, TableSchema};
+    use crate::value::DataType;
+
+    fn snapshot_bytes(version: u32, payload: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(SNAP_MAGIC);
+        b.extend_from_slice(&version.to_le_bytes());
+        b.extend_from_slice(&7u64.to_le_bytes());
+        b.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+        b.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    fn one_table() -> Vec<(TableSchema, Vec<Option<Row>>, i64)> {
+        let schema = TableSchema {
+            name: "t".into(),
+            columns: vec![Column::new("n", DataType::Integer)],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        vec![(schema, vec![Some(vec![crate::value::Value::Int(5)])], 1)]
+    }
+
+    #[derive(Serialize)]
+    struct OldTable<'a> {
+        schema: &'a TableSchema,
+        rows: &'a [Option<Row>],
+        next_auto: i64,
+    }
+
+    #[derive(Serialize)]
+    struct V3Out<'a> {
+        tables: Vec<OldTable<'a>>,
+        views: Vec<(&'a str, &'a str)>,
+        triggers: Vec<(&'a str, &'a str)>,
+    }
+
+    #[derive(Serialize)]
+    struct V4Out<'a> {
+        tables: Vec<OldTable<'a>>,
+        views: Vec<(&'a str, &'a str)>,
+        triggers: Vec<(&'a str, &'a str)>,
+        sequences: Vec<SequenceDef>,
+        fk_timing: Vec<(String, String, bool, bool)>,
+    }
+
+    #[test]
+    fn snapshots_of_versions_3_and_4_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.adb");
+        let tables = one_table();
+        let old: Vec<OldTable> = tables.iter().map(|(s, r, n)| OldTable { schema: s, rows: r, next_auto: *n }).collect();
+        let v3 = postcard::to_allocvec(&V3Out { tables: old, views: vec![("v", "SELECT 1")], triggers: vec![] }).unwrap();
+        std::fs::write(&path, snapshot_bytes(3, &v3)).unwrap();
+        let l = read_snapshot(&path).unwrap();
+        assert_eq!((l.tables.len(), l.views.len(), l.routines.len(), l.reports.len(), l.epoch, l.legacy), (1, 1, 0, 0, 7, true));
+
+        let old: Vec<OldTable> = tables.iter().map(|(s, r, n)| OldTable { schema: s, rows: r, next_auto: *n }).collect();
+        let seq = SequenceDef { name: "s".into(), start: 1, increment: 1, min: 1, max: 9, cycle: false, last: Some(4) };
+        let v4 = postcard::to_allocvec(&V4Out {
+            tables: old,
+            views: vec![],
+            triggers: vec![],
+            sequences: vec![seq.clone()],
+            fk_timing: vec![("t".into(), "fk".into(), true, false)],
+        })
+        .unwrap();
+        std::fs::write(&path, snapshot_bytes(4, &v4)).unwrap();
+        let l = read_snapshot(&path).unwrap();
+        assert_eq!((l.tables.len(), l.sequences, l.fk_timing.len(), l.routines.len(), l.legacy), (1, vec![seq], 1, 0, true));
     }
 }

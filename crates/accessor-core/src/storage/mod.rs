@@ -41,6 +41,12 @@ pub enum Op {
     SetNotNull { table: String, name: String, not_null: bool },
     /// Whether a relationship may be (and starts out) deferred; the table's stored form does not carry it.
     SetForeignKeyTiming { table: String, name: String, deferrable: bool, initially_deferred: bool },
+    /// A stored function or procedure, as its `CREATE` text.
+    CreateRoutine { name: String, sql: String },
+    /// A stored report, as its `CREATE REPORT` text.
+    CreateReport { name: String, sql: String },
+    DropReport(String),
+    DropRoutine(String),
     CreateSequence(SequenceDef),
     DropSequence(String),
     /// `ALTER SEQUENCE`: replaces the definition.

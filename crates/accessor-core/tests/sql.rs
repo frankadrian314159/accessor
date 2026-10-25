@@ -3275,3 +3275,295 @@ fn repeated_text_is_read_once_and_still_correct() {
     assert!(db.query("").is_err());
     assert!(db.query("DELETE FROM t").is_err());
 }
+
+#[test]
+fn stored_functions() {
+    let mut db = db();
+    db.execute(
+        "CREATE FUNCTION tax(@amount CURRENCY, @rate DECIMAL = 0.2) RETURNS CURRENCY AS @amount * @rate;
+         CREATE FUNCTION gross(@amount CURRENCY) AS @amount + tax(@amount);
+         CREATE FUNCTION spent(@id INTEGER) RETURNS CURRENCY AS (SELECT COALESCE(SUM(Total), 0) FROM Orders WHERE CustID = @id);
+         CREATE FUNCTION label(@n INTEGER) AS CASE WHEN @n > 1 THEN 'many' WHEN @n = 1 THEN 'one' ELSE 'none' END",
+    )
+    .unwrap();
+    assert_eq!(rows(&db, "SELECT tax(100), tax(100, 0.1), gross(10)"), [["$20.00", "$10.00", "$12.00"]]);
+    assert_eq!(rows(&db, "SELECT Name, spent(ID), label(ID - 2) FROM Customers ORDER BY ID"), [["Ada", "$30.50", "none"], ["Grace", "$12.25", "none"], ["Linus", "$100.00", "one"], ["Zed", "$0.00", "many"]]);
+    // A function reads like any other expression: in WHERE, ORDER BY, GROUP BY, aggregates.
+    assert_eq!(rows(&db, "SELECT Name FROM Customers WHERE spent(ID) > 20 ORDER BY spent(ID) DESC"), [["Linus"], ["Ada"]]);
+    assert_eq!(rows(&db, "SELECT Sum(tax(Total)) FROM Orders"), [["$28.55"]]);
+    // The parameter's type converts the argument.
+    assert_eq!(rows(&db, "SELECT label('3')"), [["many"]]);
+    // With constant arguments the call is a constant, so an index can answer it.
+    let plan = plan_text(&db, "SELECT Name FROM Customers WHERE ID = gross(0) + 2");
+    assert!(plan.contains("index") || plan.contains("PrimaryKey"), "{plan}");
+    // Errors.
+    assert!(db.query("SELECT tax()").is_err());
+    assert!(db.query("SELECT tax(1, 2, 3)").is_err());
+    assert!(db.query("SELECT nosuch(1)").is_err());
+    assert!(db.execute("CREATE FUNCTION tax(@a INTEGER) AS @a").is_err()); // exists
+    assert!(db.execute("CREATE FUNCTION upper(@a TEXT) AS @a").is_err()); // built in
+    assert!(db.execute("CREATE FUNCTION bad(@a INTEGER) AS @b").is_err()); // unknown parameter
+    assert!(db.execute("CREATE FUNCTION bad2(@a INTEGER) AS nothing_like_it(@a)").is_err());
+    assert!(db.execute("CREATE FUNCTION bad3(@a INTEGER, @a INTEGER) AS @a").is_err());
+    // A function that calls itself is stopped.
+    db.execute("CREATE FUNCTION loop_(@a INTEGER) AS 1").unwrap();
+    db.execute("CREATE OR REPLACE FUNCTION loop_(@a INTEGER) AS loop_(@a)").unwrap_err(); // refused when it is made
+    // An argument that gives a new value each time cannot be used twice.
+    db.execute("CREATE SEQUENCE s; CREATE FUNCTION twice(@a INTEGER) AS @a + @a; CREATE FUNCTION once(@a INTEGER) AS @a * 10").unwrap();
+    assert!(db.query("SELECT twice(NEXTVAL('s'))").is_err());
+    assert_eq!(rows(&db, "SELECT once(NEXTVAL('s'))"), [["10"]]);
+    // Replace and drop.
+    db.execute("CREATE OR REPLACE FUNCTION once(@a INTEGER) AS @a * 100").unwrap();
+    assert_eq!(rows(&db, "SELECT once(2)"), [["200"]]);
+    db.execute("DROP FUNCTION once").unwrap();
+    assert!(db.query("SELECT once(2)").is_err());
+    db.execute("DROP FUNCTION IF EXISTS once").unwrap();
+    assert!(db.execute("DROP FUNCTION once").is_err());
+    assert!(db.execute("DROP PROCEDURE tax").is_err());
+    // Rolled back with a transaction.
+    db.execute("BEGIN; CREATE FUNCTION temp_(@a INTEGER) AS @a; ROLLBACK").unwrap();
+    assert!(db.query("SELECT temp_(1)").is_err());
+    assert!(db.routine_names().iter().any(|(n, f)| *n == "tax" && *f));
+    // The optimizer on or off gives the same answers.
+    let sql = "SELECT Name, spent(ID) FROM Customers WHERE spent(ID) > 5 ORDER BY ID";
+    let on = rows(&db, sql);
+    db.set_optimizer(false);
+    assert_eq!(on, rows(&db, sql));
+}
+
+#[test]
+fn stored_procedures() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE item (id INTEGER PRIMARY KEY, stock INTEGER);
+         CREATE TABLE log (msg TEXT);
+         INSERT INTO item VALUES (1, 10), (2, 95);
+         CREATE PROCEDURE restock(@id INTEGER, @qty INTEGER = 10) AS BEGIN
+             DECLARE @cur INTEGER = (SELECT stock FROM item WHERE id = @id);
+             IF @cur IS NULL THEN
+                 RAISE 'no such item';
+             ELSEIF @cur + @qty > 100 THEN
+                 SET @qty = 100 - @cur;
+             END IF;
+             UPDATE item SET stock = stock + @qty WHERE id = @id;
+             INSERT INTO log VALUES ('restocked ' & @id & ' by ' & @qty);
+             RETURN @qty;
+         END",
+    )
+    .unwrap();
+    assert_eq!(rows_of(&mut db, "CALL restock(1, 5)"), [["5"]]);
+    assert_eq!(rows_of(&mut db, "EXEC restock(2)"), [["5"]]); // capped: 95 + 10 > 100
+    assert_eq!(rows_of(&mut db, "CALL restock(@qty = 1, @id = 1)"), [["1"]]);
+    assert_eq!(rows(&db, "SELECT id, stock FROM item ORDER BY id"), [["1", "16"], ["2", "100"]]);
+    assert_eq!(rows(&db, "SELECT msg FROM log ORDER BY msg"), [["restocked 1 by 1"], ["restocked 1 by 5"], ["restocked 2 by 5"]]);
+    // A failure undoes everything the procedure did.
+    let n = rows(&db, "SELECT Count(*) FROM log");
+    assert!(db.execute("CALL restock(99)").is_err());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM log"), n);
+
+    // Loops, LEAVE, variables, and the result of the last SELECT.
+    db.execute(
+        "CREATE PROCEDURE fill(@n INTEGER) AS BEGIN
+             DECLARE @i INTEGER = 0;
+             WHILE TRUE DO
+                 SET @i = @i + 1;
+                 IF @i > @n THEN LEAVE; END IF;
+                 INSERT INTO item VALUES (1000 + @i, @i * @i);
+             END WHILE;
+             SELECT Count(*), Sum(stock) FROM item WHERE id > 1000;
+         END",
+    )
+    .unwrap();
+    assert_eq!(rows_of(&mut db, "CALL fill(4)"), [["4", "30"]]);
+    // Procedures call procedures; a procedure that calls itself is stopped.
+    db.execute("CREATE PROCEDURE outer_(@n INTEGER) AS BEGIN CALL fill(@n); END").unwrap();
+    assert!(db.execute("CALL outer_(2)").is_err()); // ids 1001.. already exist: refused, whole call undone
+    db.execute("CREATE PROCEDURE again() AS BEGIN CALL again(); END").unwrap();
+    assert!(db.execute("CALL again()").unwrap_err().to_string().contains("nested too deeply"));
+    db.execute("CREATE PROCEDURE forever() AS BEGIN DECLARE @x INTEGER = 0; WHILE TRUE DO SET @x = @x + 1; END WHILE; END").unwrap();
+    assert!(db.execute("CALL forever()").unwrap_err().to_string().contains("million"));
+    // Rules.
+    assert!(db.execute("CALL restock()").is_err());
+    assert!(db.execute("CALL restock(1, 2, 3)").is_err());
+    assert!(db.execute("CALL restock(@nope = 1)").is_err());
+    assert!(db.execute("CREATE PROCEDURE p() AS BEGIN COMMIT; END").is_err());
+    assert!(db.execute("CREATE PROCEDURE p() AS BEGIN SET @undeclared = 1; END").is_ok());
+    assert!(db.execute("CALL p()").is_err());
+    assert!(db.execute("CREATE PROCEDURE q() RETURNS INTEGER AS BEGIN RETURN 1; END").is_err());
+    assert!(db.query("SELECT restock(1)").is_err());
+    db.execute("CREATE FUNCTION f(@a INTEGER) AS @a").unwrap();
+    assert!(db.execute("CALL f(1)").is_err());
+    db.execute("DROP PROCEDURE restock").unwrap();
+    assert!(db.execute("CALL restock(1)").is_err());
+}
+
+#[test]
+fn returning_gives_back_the_changed_rows() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE t (id COUNTER PRIMARY KEY, name TEXT, qty INTEGER DEFAULT 1, twice CALCULATED AS (qty * 2));
+         CREATE TABLE log (msg TEXT);",
+    )
+    .unwrap();
+    // Generated values come back: the AutoNumber, defaults and calculated fields.
+    let r = db.execute("INSERT INTO t (name) VALUES ('a'), ('b') RETURNING id, name, qty, twice").unwrap();
+    assert_eq!(r.columns, ["id", "name", "qty", "twice"]);
+    assert_eq!(r.rows.iter().map(|r| r.iter().map(|v| v.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>(), [["1", "a", "1", "2"], ["2", "b", "1", "2"]]);
+    assert_eq!(r.affected, 2);
+    // Expressions, aliases and *.
+    let r = db.execute("INSERT INTO t (name, qty) VALUES ('c', 5) RETURNING id * 10 AS ten, Upper(name), *").unwrap();
+    assert_eq!(r.columns, ["ten", "Expr1000", "id", "name", "qty", "twice"]); // an unnamed expression, as in SELECT
+    assert_eq!(r.rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), ["30", "C", "3", "c", "5", "10"]);
+    // INSERT ... SELECT and DEFAULT VALUES.
+    let r = db.execute("INSERT INTO t (name, qty) SELECT name & '2', qty FROM t WHERE id < 3 RETURNING id").unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(db.execute("INSERT INTO t DEFAULT VALUES RETURNING id, qty").unwrap().rows.len(), 1);
+
+    // UPDATE returns the rows as they are now; DELETE the rows as they were.
+    let r = db.execute("UPDATE t SET qty = qty + 100 WHERE id <= 2 RETURNING id, qty, twice").unwrap();
+    assert_eq!(r.rows.iter().map(|r| r.iter().map(|v| v.to_string()).collect::<Vec<_>>()).collect::<Vec<_>>(), [["1", "101", "202"], ["2", "101", "202"]]);
+    let r = db.execute("DELETE FROM t WHERE id >= 3 RETURNING id, name").unwrap();
+    assert_eq!(r.rows.len(), 4);
+    assert_eq!(r.rows[0][1].to_string(), "c");
+    assert_eq!(rows(&db, "SELECT Count(*) FROM t"), [["2"]]);
+    // Nothing matched: nothing returned.
+    assert!(db.execute("DELETE FROM t WHERE id = 999 RETURNING id").unwrap().rows.is_empty());
+
+    // What a trigger did to the row is what comes back.
+    db.execute("CREATE TRIGGER bump AFTER INSERT ON t BEGIN UPDATE t SET qty = qty + 1000 WHERE id = NEW.id; END").unwrap();
+    let r = db.execute("INSERT INTO t (name) VALUES ('d') RETURNING qty").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "1001");
+
+    // MERGE.
+    db.execute("CREATE TABLE src (id INTEGER, name TEXT)").unwrap();
+    db.execute("INSERT INTO src VALUES (1, 'one'), (77, 'new')").unwrap();
+    let r = db
+        .execute("MERGE INTO t USING src ON t.id = src.id WHEN MATCHED THEN UPDATE SET name = src.name WHEN NOT MATCHED THEN INSERT (name) VALUES (src.name) RETURNING id, name")
+        .unwrap();
+    let mut got: Vec<String> = r.rows.iter().map(|r| r[1].to_string()).collect();
+    got.sort();
+    assert_eq!(got, ["new", "one"]);
+
+    // Checked before anything changes; only tables; with parameters; in a prepared statement.
+    let before = rows(&db, "SELECT Count(*) FROM t");
+    assert!(db.execute("INSERT INTO t (name) VALUES ('x') RETURNING nosuch").is_err());
+    assert!(db.execute("INSERT INTO t (name) VALUES ('x') RETURNING Count(*)").is_err());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM t"), before);
+    db.execute("CREATE VIEW v AS SELECT id, name FROM t").unwrap();
+    assert!(db.execute("INSERT INTO v (name) VALUES ('x') RETURNING id").is_err());
+    let r = db.execute_with_params("INSERT INTO log VALUES (@m) RETURNING msg", &[("m", Value::text("hello"))]).unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "hello");
+    let p = db.prepare("DELETE FROM log WHERE msg = @m RETURNING msg").unwrap();
+    assert_eq!(db.execute_prepared(&p, &[("m", Value::text("hello"))]).unwrap().rows.len(), 1);
+    // Failure leaves nothing.
+    assert!(db.execute("INSERT INTO t (id, name) VALUES (1, 'dup') RETURNING id").is_err());
+}
+
+fn sales_db() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Sales (Region TEXT, City TEXT, Rep TEXT, Amount CURRENCY, Units INTEGER);
+         INSERT INTO Sales VALUES
+            ('North', 'Oslo', 'Ada', 1200.50, 3), ('North', 'Oslo', 'Bo', 300, 1), ('North', 'Bergen', 'Cy', 99.99, 2),
+            ('South', 'Rome', 'Di', 4000, 10), ('South', 'Rome', 'Ed', 250.25, 5), ('South', 'Milan', 'Flo', 75, 1);
+         CREATE REPORT by_region
+            TITLE 'Sales by region' SUBTITLE 'All figures in dollars'
+            BREAK BY Region HEADER 'Region {Region}' FOOTER 'Total {Region} ({count} sales)'
+            BREAK BY City
+            COLUMN Rep HEADING 'Representative'
+            COLUMN Amount FORMAT '#,##0.00' SUM
+            COLUMN Units SUM
+            GRAND TOTAL 'All regions'
+         AS SELECT Region, City, Rep, Amount, Units FROM Sales",
+    )
+    .unwrap();
+    db
+}
+
+fn report(db: &Database, fmt: accessor_core::ReportFormat) -> String {
+    String::from_utf8(db.render_report("by_region", fmt).unwrap()).unwrap()
+}
+
+#[test]
+fn reports_group_total_and_render() {
+    let db = sales_db();
+    let text = report(&db, accessor_core::ReportFormat::Text);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "Sales by region");
+    assert_eq!(lines[1], "All figures in dollars");
+    assert!(text.contains("Representative"), "{text}");
+    // Groups, in order, with their subtotals and the grand total.
+    let pos = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle} missing in\n{text}"));
+    assert!(pos("Region North") < pos("City: Bergen"));
+    assert!(pos("City: Bergen") < pos("City: Oslo"));
+    assert!(pos("Total North (3 sales)") < pos("Region South"));
+    assert!(pos("Total South (3 sales)") < pos("All regions"));
+    // Totals are exact and use the column's pattern: 1,200.50 + 300 + 99.99 = 1,600.49 for the north.
+    assert!(text.contains("1,600.49"), "{text}");
+    assert!(text.contains("4,325.25"), "{text}"); // the south
+    assert!(text.contains("5,925.74"), "{text}"); // everything
+    assert!(text.contains("Page 1 of 1"));
+
+    let html = report(&db, accessor_core::ReportFormat::Html);
+    assert!(html.starts_with("<!DOCTYPE html>"));
+    assert!(html.contains("<tr class=\"group g0\"><td colspan=\"3\">Region North</td></tr>"), "{html}");
+    assert!(html.contains("<td class=\"r\">1,600.49</td>"), "{html}");
+    assert!(html.contains("tr.grand"));
+    let md = report(&db, accessor_core::ReportFormat::Markdown);
+    assert!(md.starts_with("# Sales by region\n"));
+    assert!(md.contains("| **Region South** |"), "{md}");
+    let csv = report(&db, accessor_core::ReportFormat::Csv);
+    assert_eq!(csv.lines().next().unwrap(), "Representative,Amount,Units");
+    assert!(csv.contains("Ada,\"1,200.50\",3"), "{csv}");
+    assert!(csv.lines().last().unwrap().starts_with("All regions"), "{csv}");
+}
+
+#[test]
+fn reports_in_sql_and_as_documents() {
+    let mut db = sales_db();
+    let r = db.execute("RUN REPORT by_region AS markdown").unwrap();
+    assert_eq!(r.columns, ["report"]);
+    assert!(r.rows[0][0].to_string().starts_with("# Sales by region"));
+    assert!(db.execute("RUN REPORT by_region AS pdf").is_err());
+    assert!(db.execute("RUN REPORT by_region AS docx").is_err());
+    assert!(db.execute("RUN REPORT nosuch").is_err());
+    let pdf = db.render_report("by_region", accessor_core::ReportFormat::Pdf).unwrap();
+    assert!(pdf.starts_with(b"%PDF-1.4"));
+    assert!(String::from_utf8_lossy(&pdf).contains("Sales by region"));
+    // Definition rules: the query must run and the layout must name its columns.
+    assert!(db.execute("CREATE REPORT bad BREAK BY Nope AS SELECT Region FROM Sales").is_err());
+    assert!(db.execute("CREATE REPORT bad COLUMN Nope SUM AS SELECT Region FROM Sales").is_err());
+    assert!(db.execute("CREATE REPORT bad BREAK BY Region HEADER '{Nope}' AS SELECT Region FROM Sales").is_err());
+    assert!(db.execute("CREATE REPORT bad AS SELECT Nope FROM Sales").is_err());
+    assert!(db.execute("CREATE REPORT by_region AS SELECT 1").is_err());
+    db.execute("CREATE OR REPLACE REPORT by_region TITLE 'Again' AS SELECT Region, Amount FROM Sales").unwrap();
+    assert!(String::from_utf8(db.render_report("by_region", accessor_core::ReportFormat::Text).unwrap()).unwrap().starts_with("Again"));
+    assert_eq!(db.report_names(), ["by_region"]);
+    db.execute("DROP REPORT by_region").unwrap();
+    assert!(db.render_report("by_region", accessor_core::ReportFormat::Text).is_err());
+    db.execute("DROP REPORT IF EXISTS by_region").unwrap();
+}
+
+#[test]
+fn long_reports_are_paged_and_new_page_breaks_work() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE r (grp INTEGER, n INTEGER)").unwrap();
+    let mut script = String::new();
+    for i in 0..100 {
+        script += &format!("INSERT INTO r VALUES ({}, {i});\n", i / 50);
+    }
+    db.execute(&script).unwrap();
+    db.execute("CREATE REPORT paged TITLE 'Long' BREAK BY grp NEW PAGE COLUMN n SUM PAGE SIZE 30 LINES AS SELECT grp, n FROM r").unwrap();
+    let text = String::from_utf8(db.render_report("paged", accessor_core::ReportFormat::Text).unwrap()).unwrap();
+    let pages: Vec<&str> = text.split("\n\u{c}\n").collect();
+    assert!(pages.len() >= 4, "{} pages", pages.len());
+    for (i, p) in pages.iter().enumerate() {
+        assert!(p.lines().count() <= 30, "page {} has {} lines", i + 1, p.lines().count());
+        assert!(p.starts_with("Long"), "every page has the title");
+        assert!(p.contains(&format!("Page {} of {}", i + 1, pages.len())));
+    }
+    // The second group starts on a page of its own.
+    let second = pages.iter().position(|p| p.contains("grp: 1")).unwrap();
+    assert!(!pages[second].contains("grp: 0"));
+    assert!(text.contains("1225") && text.contains("3725"), "sums of 0..49 and 50..99"); // 49*50/2, 99*100/2-1225
+}
