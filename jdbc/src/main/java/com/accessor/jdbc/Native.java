@@ -37,6 +37,7 @@ final class Native {
     static final int ERR_MISUSE = 9;
     static final int ERR_ENCODING = 10;
     static final int ERR_INTERNAL = 11;
+    static final int ERR_CONFLICT = 12;
 
     // Value type tags (ACC_TYPE_*).
     static final int T_NULL = 0;
@@ -513,6 +514,7 @@ final class Native {
             case ERR_IO -> "58030";
             case ERR_CORRUPT -> "XX001";
             case ERR_LOCKED -> "08001";
+            case ERR_CONFLICT -> "40001";
             case ERR_MISUSE -> "HY010";
             case ERR_ENCODING -> "22021";
             default -> "XX000";

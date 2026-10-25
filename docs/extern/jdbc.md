@@ -84,6 +84,7 @@ Auto-commit is on by default: each statement is its own transaction. `setAutoCom
 | `23000` | a constraint refused the change |
 | `22018`, `22021`, `22003` | wrong type, bad text encoding, number out of range |
 | `08001` | the database could not be opened, such as when it is in use |
+| `40001` | two transactions changed the same row and this one must be run again (reserved: one connection per database file cannot raise it today) |
 | `08003` | the connection is closed |
 | `07001`, `07009` | a parameter has no value / a parameter or column index is out of range |
 | `25000`, `3B001` | a transaction or savepoint call in the wrong state |

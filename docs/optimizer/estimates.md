@@ -86,3 +86,7 @@ When the estimates still mislead the optimizer, the usual cure is an index on th
 ## What it costs
 
 Computing a column's statistics reads (a sample of) its rows once, about as much as one scan, and only for a column used in a condition the indexes do not answer, only after the table has changed since the last time. A table that is changed between every two queries, and queried on unindexed columns each time, pays that scan each time, a cost of the same order as the scan that query was about to do anyway. Statistics are copied with the table when a transaction takes a snapshot of it, and recomputed lazily.
+
+## When transactions overlap
+
+In a database shared between threads ([concurrency](../concurrency.md)) a table can hold, besides the current rows, older versions that an open transaction still needs, and rows not yet committed. The estimates use the number of current rows (`Table::estimated_len`) and count index entries without checking each against the reader's snapshot, so they can be a little high while such versions exist. This changes only which plan is chosen, never an answer: the rows a query returns are always those its transaction can see.

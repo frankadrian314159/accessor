@@ -51,7 +51,7 @@ pub enum Durability {
 #[derive(Serialize)]
 pub(crate) struct TableOut<'a> {
     pub schema: &'a TableSchema,
-    pub rows: &'a [Option<Row>],
+    pub rows: Vec<Option<&'a Row>>,
     pub next_auto: i64,
 }
 
@@ -237,7 +237,7 @@ impl Persistence {
     ) -> Result<()> {
         let out = SnapshotOut {
             tables: tables
-                .map(|t| TableOut { schema: t.schema(), rows: t.raw_slots(), next_auto: t.next_auto() })
+                .map(|t| TableOut { schema: t.schema(), rows: t.committed_slots(), next_auto: t.next_auto() })
                 .collect(),
             views: views.collect(),
             triggers: triggers.collect(),

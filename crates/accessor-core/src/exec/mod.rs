@@ -59,6 +59,7 @@ impl Database {
     /// Runs statements that [`is_pure_read`](Database::is_pure_read) has accepted (or any one SELECT).
     pub(crate) fn run_read(&self, parsed: &[Statement]) -> Result<QueryResult> {
         self.enter_session();
+        self.admit()?;
         match parsed {
             [] => Err(Error::syntax("empty statement")),
             [Statement::Select(s)] => self.run_select(s),
@@ -89,6 +90,9 @@ impl Database {
 
     fn run_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         self.enter_session();
+        if !matches!(st, Statement::Begin | Statement::Commit | Statement::Rollback) {
+            self.admit()?;
+        }
         match st {
             Statement::SetConstraints { names, deferred } => {
                 self.set_constraints(names.as_deref(), *deferred).map(|_| QueryResult::default())

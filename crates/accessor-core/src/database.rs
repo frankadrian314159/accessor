@@ -9,13 +9,14 @@ use crate::sequence::SequenceDef;
 use crate::sql::ast::{ReportDef, RoutineDef, Statement, TriggerDef};
 use crate::sql::parse_statement;
 use crate::storage::persist::{Durability, Persistence};
-use crate::storage::{Op, Table};
+use crate::storage::mvcc::{self, View};
+use crate::storage::{Op, RowId, Table};
 
 /// Log size that triggers an automatic checkpoint.
 const CHECKPOINT_BYTES: u64 = 64 << 20;
 
 #[derive(Default)]
-struct Tx {
+pub(crate) struct Tx {
     /// Committed to the log on COMMIT (only retained for persistent databases).
     ops: Vec<Op>,
     /// How to take back everything done so far, oldest first.
@@ -25,6 +26,14 @@ struct Tx {
     modes: Vec<(Option<String>, bool)>,
     /// Deferred relationships (child table, constraint) to verify when the transaction ends.
     pending: std::collections::BTreeSet<(String, String)>,
+    /// The id of the transaction, and the commit timestamp its snapshot was taken at (databases that
+    /// are shared; see `mvcc`).
+    pub(crate) id: u64,
+    pub(crate) snapshot: u64,
+    /// Opened by the engine around one statement, not by the user.
+    auto: bool,
+    /// Has changed the schema, so no other transaction may run until it ends.
+    ddl: bool,
 }
 
 /// A point in a transaction that can be returned to without abandoning the rest.
@@ -85,7 +94,20 @@ pub struct Database {
     /// The session time zone (`SET TIME ZONE`); not stored in the file.
     pub(crate) time_zone: crate::tz::Zone,
     persist: Option<Persistence>,
-    tx: Option<Tx>,
+    pub(crate) tx: Option<Tx>,
+    /// Whether rows are kept as versions, so that transactions can overlap (see `SharedDatabase`).
+    pub(crate) mvcc: bool,
+    /// The commit timestamp of the latest commit.
+    clock: u64,
+    next_txn: u64,
+    /// Snapshots of the open transactions, with how many have each: versions older than the oldest are garbage.
+    active: BTreeMap<u64, usize>,
+    /// Rows with versions waiting to be cleaned away (table, row).
+    gc_queue: std::collections::BTreeSet<(String, RowId)>,
+    /// The oldest snapshot as of the last full sweep of the queue.
+    gc_floor: u64,
+    /// The transaction that has changed the schema and is still open.
+    ddl_owner: Option<u64>,
 }
 
 pub(crate) fn key(name: &str) -> String {
@@ -113,7 +135,24 @@ impl Database {
             time_zone: crate::tz::Zone::UTC,
             persist: None,
             tx: None,
+            mvcc: std::env::var_os("ACCESSOR_FORCE_MVCC").is_some(),
+            clock: 0,
+            next_txn: 0,
+            active: BTreeMap::new(),
+            gc_queue: Default::default(),
+            gc_floor: 0,
+            ddl_owner: None,
         }
+    }
+
+    /// Makes the database ready to be shared by several transactions at once: from now on rows are
+    /// kept as versions. Done by [`SharedDatabase`](crate::SharedDatabase).
+    pub(crate) fn share(&mut self) -> Result<()> {
+        if self.tx.is_some() {
+            return Err(Error::runtime("a database cannot be shared inside a transaction"));
+        }
+        self.mvcc = true;
+        Ok(())
     }
 
     /// Opens (creating if necessary) a database file. Committed changes made
@@ -504,10 +543,7 @@ impl Database {
                 Ok(Some(Op::Update { table: table.clone(), id: *id, row: old }))
             }
             Op::Delete { table, id } => {
-                let old = self
-                    .table_mut(table)?
-                    .remove(*id)
-                    .ok_or_else(|| Error::runtime(format!("row {id} does not exist in '{table}'")))?;
+                let old = self.table_mut(table)?.remove(*id)?;
                 Ok(Some(Op::Insert { table: table.clone(), id: *id, row: old }))
             }
         }
@@ -524,11 +560,24 @@ impl Database {
         for step in undo.into_iter().rev() {
             match step {
                 // Inverses of operations that just succeeded cannot fail.
+                Undo::Dml(op) if self.mvcc => match &op {
+                    // What each inverse takes back, in the version chain of the row.
+                    Op::Delete { table, id } => self.unwind(table, |t| t.unwind_insert(*id)),
+                    Op::Update { table, id, .. } => self.unwind(table, |t| t.unwind_update(*id)),
+                    Op::Insert { table, id, .. } => self.unwind(table, |t| t.unwind_delete(*id)),
+                    _ => {}
+                },
                 Undo::Dml(op) => {
                     let _ = self.apply(&op);
                 }
                 Undo::Catalog(c) => self.restore_catalog(*c),
             }
+        }
+    }
+
+    fn unwind(&mut self, table: &str, f: impl FnOnce(&mut Table)) {
+        if let Some(t) = self.tables.get_mut(&key(table)) {
+            f(t);
         }
     }
 
@@ -641,7 +690,21 @@ impl Database {
     ///
     /// A batch holds either row operations or schema changes, never both.
     pub(crate) fn apply_all(&mut self, ops: Vec<Op>) -> Result<()> {
+        if self.mvcc && self.tx.is_none() {
+            // Rows are versions: even a lone statement is a transaction, committed at its end.
+            self.start_tx(true);
+            return match self.apply_all(ops) {
+                Ok(()) => self.commit(),
+                Err(e) => {
+                    let _ = self.rollback();
+                    Err(e)
+                }
+            };
+        }
         let has_schema_change = ops.iter().any(Op::is_ddl);
+        if has_schema_change && self.mvcc {
+            self.claim_schema()?;
+        }
         if has_schema_change && ops.iter().any(Op::is_dml) {
             return Err(Error::runtime("a schema change cannot share a batch with row changes"));
         }
@@ -722,15 +785,78 @@ impl Database {
         if self.tx.is_some() {
             return Err(Error::runtime("a transaction is already in progress"));
         }
-        self.tx = Some(Tx::default());
+        self.start_tx(false);
         Ok(())
+    }
+
+    fn start_tx(&mut self, auto: bool) {
+        let mut tx = Tx { auto, ..Tx::default() };
+        if self.mvcc {
+            self.next_txn += 1;
+            tx.id = self.next_txn;
+            tx.snapshot = self.clock;
+            *self.active.entry(tx.snapshot).or_insert(0) += 1;
+        }
+        self.tx = Some(tx);
+        mvcc::set_view(self.view_of());
+    }
+
+    /// The transaction is over, however it ended: it no longer holds a snapshot or the schema.
+    fn finish_tx(&mut self, id: u64, snapshot: u64) {
+        self.release_tx(id, snapshot);
+        // The oldest snapshot may have moved on: versions kept for it can go.
+        if self.mvcc && !self.gc_queue.is_empty() {
+            self.sweep(Default::default());
+        }
+        mvcc::set_view(self.view_of());
+    }
+
+    fn release_tx(&mut self, id: u64, snapshot: u64) {
+        if self.mvcc {
+            if let Some(n) = self.active.get_mut(&snapshot) {
+                *n -= 1;
+                if *n == 0 {
+                    self.active.remove(&snapshot);
+                }
+            }
+            if self.ddl_owner == Some(id) {
+                self.ddl_owner = None;
+            }
+        }
+    }
+
+    /// A transaction that changes the schema must be the only one open, and keeps everyone else out
+    /// until it ends: the catalog has no versions.
+    fn claim_schema(&mut self) -> Result<()> {
+        let open: usize = self.active.values().sum();
+        if open > 1 {
+            return Err(Error::busy("a schema change must wait for the other open transactions to end"));
+        }
+        if let Some(tx) = &mut self.tx {
+            tx.ddl = true;
+            self.ddl_owner = Some(tx.id);
+        }
+        Ok(())
+    }
+
+    /// The rows (table, id) the open transaction has changed.
+    fn written(tx: &Tx) -> std::collections::BTreeSet<(String, RowId)> {
+        tx.undo
+            .iter()
+            .filter_map(|u| match u {
+                Undo::Dml(Op::Insert { table, id, .. } | Op::Update { table, id, .. } | Op::Delete { table, id }) => Some((key(table), *id)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Makes every change since `begin` permanent.
     pub fn commit(&mut self) -> Result<()> {
         let tx = self.tx.take().ok_or_else(no_transaction)?;
+        mvcc::set_view(if self.mvcc { View { snapshot: tx.snapshot, txn: tx.id } } else { View::LATEST });
         if let Err(e) = self.verify_deferred(&tx.pending) {
             self.revert(tx.undo);
+            self.finish_tx(tx.id, tx.snapshot);
             return Err(e);
         }
         // A sequence made in the transaction is logged as it was made; bring its value up to date.
@@ -745,18 +871,87 @@ impl Database {
                 .map(|d| Op::SequenceValue { name: d.name.clone(), last: d.last })
                 .collect()
         };
-        self.log(&tx.ops, tx.undo)?;
+        let (id, snapshot, ddl) = (tx.id, tx.snapshot, tx.ddl);
+        let slots = if self.mvcc { Self::written(&tx) } else { Default::default() };
+        if let Err(e) = self.log(&tx.ops, tx.undo) {
+            self.finish_tx(id, snapshot);
+            return Err(e);
+        }
+        self.release_tx(id, snapshot);
+        if self.mvcc {
+            self.stamp_commit(id, ddl, slots);
+        }
+        mvcc::set_view(self.view_of());
         if let (Some(p), false) = (&mut self.persist, made.is_empty()) {
             p.append(&made)?;
         }
         Ok(())
     }
 
+    /// Gives the transaction's changes a commit timestamp, and cleans up what is no longer needed.
+    fn stamp_commit(&mut self, id: u64, ddl: bool, slots: std::collections::BTreeSet<(String, RowId)>) {
+        if ddl || !slots.is_empty() {
+            let ts = self.clock + 1;
+            if ddl {
+                for t in self.tables.values_mut() {
+                    t.commit_all(id, ts);
+                }
+            } else {
+                for (table, row) in &slots {
+                    if let Some(t) = self.tables.get_mut(table) {
+                        t.commit_slot(*row, id, ts);
+                    }
+                }
+            }
+            self.clock = ts;
+        }
+        let fresh = if ddl {
+            // The tables were replaced: find again what needs cleaning.
+            self.gc_queue.clear();
+            self.tables.iter().flat_map(|(name, t)| t.unsettled().into_iter().map(|row| (name.clone(), row))).collect()
+        } else {
+            slots
+        };
+        self.sweep(fresh);
+    }
+
+    /// Cleans away the versions nobody from `oldest` on can see.
+    fn sweep(&mut self, fresh: std::collections::BTreeSet<(String, RowId)>) {
+        let mut snapshots: Vec<u64> = self.active.keys().copied().collect();
+        snapshots.push(self.clock);
+        let oldest = snapshots[0];
+        // Rows just changed are cleaned at once; the rest of the queue when the oldest snapshot has moved on.
+        let work = if oldest > self.gc_floor {
+            self.gc_floor = oldest;
+            let mut all = std::mem::take(&mut self.gc_queue);
+            all.extend(fresh);
+            all
+        } else {
+            fresh
+        };
+        for (table, row) in work {
+            let Some(t) = self.tables.get_mut(&table) else { continue };
+            if t.clean_slot(row, &snapshots) {
+                self.gc_queue.remove(&(table, row));
+            } else {
+                self.gc_queue.insert((table, row));
+            }
+        }
+    }
+
     /// Takes back every change since `begin`.
     pub fn rollback(&mut self) -> Result<()> {
         let tx = self.tx.take().ok_or_else(no_transaction)?;
         self.revert(tx.undo);
+        self.finish_tx(tx.id, tx.snapshot);
         Ok(())
+    }
+
+    /// Runs the open transaction `tx` (if any) in place of the database's own, for a connection that
+    /// keeps its transaction between calls.
+    pub(crate) fn swap_tx(&mut self, other: &mut Option<Tx>) {
+        std::mem::swap(&mut self.tx, other);
+        mvcc::set_view(self.view_of());
     }
 
     /// Runs `f` in a transaction: committed if it returns `Ok`, rolled back if
@@ -818,6 +1013,37 @@ impl Database {
     pub(crate) fn enter_session(&self) {
         crate::tz::set_session(self.time_zone);
         crate::sequence::set_current(&self.seqs);
+        // A connection reading for a transaction that is not the one the database has open says so.
+        mvcc::set_view(mvcc::override_view().unwrap_or_else(|| self.view_of()));
+    }
+
+    /// What the open transaction sees; outside one, everything committed so far.
+    pub(crate) fn view_of(&self) -> View {
+        if !self.mvcc {
+            return View::LATEST;
+        }
+        match &self.tx {
+            Some(tx) => View { snapshot: tx.snapshot, txn: tx.id },
+            None => View { snapshot: self.clock, txn: 0 },
+        }
+    }
+
+    /// Rows of `t` whose `cols` equal `key`, for a foreign key to respect: in a shared database, the
+    /// newest state of the table rather than what the caller's snapshot shows.
+    pub(crate) fn rows_with(&self, t: &Table, cols: &[usize], key: &[crate::value::Value]) -> Result<Vec<RowId>> {
+        if self.mvcc {
+            t.lookup_latest(cols, key)
+        } else {
+            Ok(t.lookup(cols, key))
+        }
+    }
+
+    /// Fails while another transaction has changed the schema and not yet finished.
+    pub(crate) fn admit(&self) -> Result<()> {
+        match self.ddl_owner {
+            Some(owner) if owner != mvcc::view().txn => Err(Error::busy("another transaction is changing the schema")),
+            _ => Ok(()),
+        }
     }
 
     pub fn optimizer_enabled(&self) -> bool {
@@ -947,7 +1173,7 @@ impl Database {
     /// being refused at the end of the statement.
     pub(crate) fn fk_deferred(&self, fk: &crate::schema::ForeignKey) -> bool {
         let Some(tx) = &self.tx else { return false };
-        if !fk.deferrable {
+        if tx.auto || !fk.deferrable {
             return false;
         }
         tx.modes
@@ -975,7 +1201,7 @@ impl Database {
                 if k.iter().any(crate::value::Value::is_null) {
                     continue;
                 }
-                if parent.lookup(&fk.ref_columns, &k).is_empty() {
+                if self.rows_with(parent, &fk.ref_columns, &k)?.is_empty() {
                     let fields: Vec<&str> = fk.columns.iter().map(|&c| t.schema().columns[c].name.as_str()).collect();
                     return Err(Error::constraint(format!(
                         "cannot commit: '{}' ({}) requires a matching record in '{}' (relationship '{}')",
@@ -1040,7 +1266,7 @@ impl Database {
     /// "Compact and Repair": drops deleted-row slots, rebuilds every index,
     /// and rewrites the file. Row ids are renumbered.
     pub fn compact(&mut self) -> Result<()> {
-        if self.tx.is_some() {
+        if self.tx.is_some() || !self.active.is_empty() {
             return Err(Error::runtime("cannot compact inside a transaction"));
         }
         for t in self.tables.values_mut() {

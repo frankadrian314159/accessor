@@ -216,7 +216,7 @@ pub(crate) fn cond_selectivity(table: Option<&Table>, c: &BExpr) -> f64 {
 pub(crate) fn estimate(source: &Source<'_>, conds: &[BExpr]) -> f64 {
     let (total, mut rows) = match &source.data {
         SourceData::Table(t) => {
-            let n = t.len() as f64;
+            let n = t.estimated_len() as f64;
             if conds.is_empty() {
                 return n.max(1.0);
             }

@@ -158,7 +158,7 @@ impl Database {
                 continue;
             }
             let t = self.table_checked(&a.table)?;
-            if self.table_checked(&fk.ref_table)?.lookup(&fk.ref_columns, &k).is_empty() {
+            if self.rows_with(self.table_checked(&fk.ref_table)?, &fk.ref_columns, &k)?.is_empty() {
                 let fields: Vec<&str> = fk.columns.iter().map(|&c| t.schema().columns[c].name.as_str()).collect();
                 return Err(Error::constraint(format!(
                     "cannot save the record: '{}' ({}) requires a matching record in '{}'",
@@ -192,11 +192,11 @@ impl Database {
                 continue;
             }
             let parent = self.table_checked(&a.table)?;
-            if !parent.lookup(&fk.ref_columns, &old_key).is_empty() {
+            if !self.rows_with(parent, &fk.ref_columns, &old_key)?.is_empty() {
                 continue; // another row still provides the key
             }
             let child = self.table_checked(child_name)?;
-            let ids = child.lookup(&fk.columns, &old_key);
+            let ids = self.rows_with(child, &fk.columns, &old_key)?;
             if ids.is_empty() {
                 continue;
             }
@@ -217,7 +217,7 @@ impl Database {
             let mut follow_ups = Vec::with_capacity(ids.len());
             for id in ids {
                 let table = child.name().to_string();
-                let mut row = child.get(id).expect("id from lookup").clone();
+                let mut row = child.get_latest(id).expect("id from lookup").clone();
                 follow_ups.push(match (action, &new_key) {
                     (RefAction::Cascade, None) => Op::Delete { table, id },
                     (RefAction::Cascade, Some(nk)) => {

@@ -1,9 +1,8 @@
-//! Many readers or one writer: `SharedDatabase` and `Connection`.
+//! Several threads on one `SharedDatabase`: the basics. Overlapping transactions are in `mvcc.rs`.
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use accessor_core::{Connection, Database, Error, SharedDatabase, Value};
 
@@ -80,62 +79,6 @@ fn writers_take_turns() {
 }
 
 #[test]
-fn transactions_do_not_interleave() {
-    let db = counter_db();
-    // Read, then write what was read plus one, inside a transaction: only correct if transactions are serial.
-    thread::scope(|s| {
-        for _ in 0..6 {
-            let c = db.connect();
-            s.spawn(move || {
-                for _ in 0..40 {
-                    c.execute("BEGIN").unwrap();
-                    assert!(c.in_transaction());
-                    let seen = n(&c);
-                    c.execute(&format!("UPDATE c SET n = {} WHERE id = 1", seen + 1)).unwrap();
-                    c.execute("COMMIT").unwrap();
-                    assert!(!c.in_transaction());
-                }
-            });
-        }
-    });
-    assert_eq!(n(&db.connect()), 240);
-}
-
-#[test]
-fn an_open_transaction_holds_everyone_else_up_and_is_not_seen_until_commit() {
-    let db = counter_db();
-    db.set_busy_timeout(Some(Duration::from_millis(100)));
-    let a = db.connect();
-    let b = db.connect();
-    a.execute("BEGIN").unwrap();
-    a.execute("UPDATE c SET n = 5 WHERE id = 1").unwrap();
-    assert_eq!(n(&a), 5, "the writer sees its own changes");
-    // The others can neither read the uncommitted 5 nor write.
-    assert!(matches!(b.execute("SELECT n FROM c"), Err(Error::Locked(_))));
-    assert!(matches!(b.execute("UPDATE c SET n = 9"), Err(Error::Locked(_))));
-    a.execute("COMMIT").unwrap();
-    assert_eq!(n(&b), 5);
-    b.execute("UPDATE c SET n = 6").unwrap();
-    assert_eq!(n(&a), 6);
-}
-
-#[test]
-fn a_waiting_connection_goes_ahead_when_the_transaction_ends() {
-    let db = counter_db();
-    let a = db.connect();
-    a.execute("BEGIN").unwrap();
-    a.execute("UPDATE c SET n = 7").unwrap();
-    let b = db.connect();
-    let seen = thread::scope(|s| {
-        let h = s.spawn(move || n(&b));
-        thread::sleep(Duration::from_millis(100));
-        a.execute("COMMIT").unwrap();
-        h.join().unwrap()
-    });
-    assert_eq!(seen, 7);
-}
-
-#[test]
 fn rollback_and_dropping_a_connection_undo_the_transaction() {
     let db = counter_db();
     let a = db.connect();
@@ -164,22 +107,6 @@ fn a_failed_statement_in_a_transaction_leaves_it_open() {
     assert!(a.in_transaction());
     a.execute("COMMIT").unwrap();
     assert!(!a.in_transaction());
-}
-
-#[test]
-fn a_busy_timeout_gives_up_instead_of_waiting_forever() {
-    let db = counter_db();
-    db.set_busy_timeout(Some(Duration::from_millis(50)));
-    let a = db.connect();
-    let b = db.connect();
-    a.execute("BEGIN").unwrap();
-    let started = std::time::Instant::now();
-    let err = b.execute("INSERT INTO c VALUES (2, 0)").unwrap_err();
-    assert!(matches!(err, Error::Locked(_)));
-    assert!(started.elapsed() < Duration::from_secs(5));
-    // The failed wait left nothing behind: once the transaction ends everyone proceeds.
-    a.execute("ROLLBACK").unwrap();
-    b.execute("INSERT INTO c VALUES (2, 0)").unwrap();
 }
 
 #[test]

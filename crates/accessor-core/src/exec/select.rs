@@ -1395,7 +1395,7 @@ fn scan_note(src: &Source<'_>, t: &Table, conj: &[&BExpr]) -> String {
         }
     };
     let filtered = if conj.is_empty() { String::new() } else { format!(" ({} condition(s) pushed down)", conj.len()) };
-    format!("scan {} [{} rows]: {how}{filtered}", src.alias, t.len())
+    format!("scan {} [{} rows]: {how}{filtered}", src.alias, t.estimated_len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1708,7 +1708,7 @@ fn join_step(
             }
             // Index probing wins unless the right side is far smaller than the left.
             if let Some((_, idx, left_cols)) = best {
-                if left.len() <= t.len().saturating_mul(4) || t.len() > 64 {
+                if left.len() <= t.estimated_len().saturating_mul(4) || t.estimated_len() > 64 {
                     break 'pick Strategy::Index { idx, left_cols };
                 }
             }

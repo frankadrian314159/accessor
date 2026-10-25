@@ -35,7 +35,7 @@ COMMIT;                       -- the order is saved
 * **No nesting.** `BEGIN` inside a transaction is an error; use savepoints.
 * **Not allowed inside a transaction:** checkpointing and compacting the file.
 * **Closing a database with a transaction open rolls it back.**
-* **Isolation.** Transactions never overlap: a database file is open once (see [locking](../extern/locking.md)), and connections that share it through `SharedDatabase` take turns, a transaction keeping the turn until it ends ([concurrency](../concurrency.md)). So the isolation is `SERIALIZABLE`, got by running one at a time, and a transaction sees its own changes immediately and nobody else's.
+* **Isolation.** A `Database` used directly has one transaction at a time. Connections that share a database through `SharedDatabase` ([concurrency](../concurrency.md)) overlap, and each transaction sees a **snapshot** of the committed data as of its beginning plus its own changes (snapshot isolation): no dirty reads, no non-repeatable reads, no phantoms. Two transactions that change the same row cannot both commit: the later one gets `Error::Conflict` and is run again. Snapshot isolation is not serializable: *write skew* is possible.
 
 ## SET CONSTRAINTS
 

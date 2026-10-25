@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::schema::{Column, ForeignKey, IndexDef, TableSchema};
 use crate::value::{DataType, Row, Value};
 
+use super::mvcc::{self, pending, Stamp, View, INF, PENDING};
 use super::stats::{ColumnStats, StatsCache};
 
 pub type RowId = u32;
@@ -15,6 +16,8 @@ pub type RowId = u32;
 #[derive(Clone, Debug)]
 struct Index {
     def: IndexDef,
+    /// An entry for every key any version of a row has, until the version is cleaned away: a search
+    /// finds candidates, and the version a reader can see is checked to have the key.
     tree: BTreeSet<(Vec<Value>, RowId)>,
 }
 
@@ -22,25 +25,55 @@ impl Index {
     fn key(&self, row: &[Value]) -> Vec<Value> {
         self.def.columns.iter().map(|&c| row[c].clone()).collect()
     }
+}
 
-    /// True if another row (not `except`) already holds `key`. Keys that
-    /// contain `Null` never conflict.
-    fn conflicts(&self, key: &[Value], except: Option<RowId>) -> bool {
-        if !self.def.unique || key.iter().any(Value::is_null) {
-            return false;
-        }
-        let k = key.to_vec();
-        self.tree
-            .range((k.clone(), 0)..=(k, RowId::MAX))
-            .any(|(_, id)| Some(*id) != except)
+/// One state of a row. Rows are chains of these, newest first; see [`mvcc`].
+#[derive(Clone, Debug)]
+struct Version {
+    row: Row,
+    begin: Stamp,
+    end: Stamp,
+    prev: Option<Box<Version>>,
+}
+
+impl Version {
+    /// One committed version, still alive: nothing to look up, nothing to clean.
+    fn is_simple(&self) -> bool {
+        self.prev.is_none() && self.begin < PENDING && self.end == INF
     }
+
+    /// This version and the older ones, newest first.
+    fn chain(&self) -> impl Iterator<Item = &Version> {
+        std::iter::successors(Some(self), |v| v.prev.as_deref())
+    }
+
+    fn each_mut(&mut self, f: &mut impl FnMut(&mut Version)) {
+        f(self);
+        if let Some(p) = &mut self.prev {
+            p.each_mut(f);
+        }
+    }
+}
+
+/// `Busy`, remembering which transaction is in the way.
+fn busy(stamp: Stamp, what: String) -> Error {
+    mvcc::blocked_by(stamp);
+    Error::busy(what)
+}
+
+fn simple(slot: &Option<Version>) -> bool {
+    slot.as_ref().is_none_or(Version::is_simple)
 }
 
 #[derive(Clone, Debug)]
 pub struct Table {
     schema: TableSchema,
-    rows: Vec<Option<Row>>,
+    rows: Vec<Option<Version>>,
+    /// Slots whose newest version has not ended.
     live: usize,
+    /// Slots that are not simple: more than one version, a change not yet committed, or a dead row
+    /// waiting to be cleaned away. While there are none, `len` is just `live`.
+    outstanding: usize,
     next_auto: i64,
     indexes: Vec<Index>,
     /// Counts the changes made to the rows or columns, so that statistics worked out earlier can be told from current ones.
@@ -55,29 +88,36 @@ impl Table {
             .iter()
             .map(|def| Index { def: def.clone(), tree: BTreeSet::new() })
             .collect();
-        Table { schema, rows: Vec::new(), live: 0, next_auto: 1, indexes, generation: 0, stats: StatsCache::default() }
+        Table { schema, rows: Vec::new(), live: 0, outstanding: 0, next_auto: 1, indexes, generation: 0, stats: StatsCache::default() }
     }
 
     /// Rebuilds a table from persisted slots, recreating every index.
     pub(crate) fn from_parts(schema: TableSchema, rows: Vec<Option<Row>>, next_auto: i64) -> Result<Self> {
         let mut t = Table::new(schema);
         t.next_auto = next_auto;
-        for (id, row) in rows.into_iter().enumerate() {
-            if let Some(mut row) = row {
-                t.schema.conform_row(&mut row);
-                t.insert_at(id as RowId, row)?;
-            } else {
-                t.rows.push(None);
+        // Rows put back are simply there: committed, and changed in place.
+        let saved = mvcc::view();
+        mvcc::set_view(View::LATEST);
+        let built = (|| {
+            for (id, row) in rows.into_iter().enumerate() {
+                if let Some(mut row) = row {
+                    t.schema.conform_row(&mut row);
+                    t.insert_at(id as RowId, row)?;
+                } else {
+                    t.rows.push(None);
+                }
             }
-        }
-        Ok(t)
+            Ok(())
+        })();
+        mvcc::set_view(saved);
+        built.map(|()| t)
     }
 
     /// Statistics of column `col` (its position): distinct values, common values and a histogram.
     /// They are worked out when first asked for and kept until the table changes.
     pub fn column_stats(&self, col: usize) -> std::sync::Arc<ColumnStats> {
         self.stats.get(self.generation, col, || {
-            ColumnStats::compute(self.rows.iter().flatten().map(|r| &r[col]), self.live)
+            ColumnStats::compute(self.rows.iter().flatten().filter(|v| v.end == INF).map(|v| &v.row[col]), self.live)
         })
     }
 
@@ -87,31 +127,85 @@ impl Table {
     pub fn name(&self) -> &str {
         &self.schema.name
     }
-    /// Number of live rows.
+    /// Number of rows the caller can see.
     pub fn len(&self) -> usize {
-        self.live
+        if self.outstanding == 0 {
+            self.live
+        } else {
+            self.iter().count()
+        }
     }
     pub fn is_empty(&self) -> bool {
-        self.live == 0
+        self.len() == 0
+    }
+    /// About how many rows there are, cheaply: what planning needs. Differs from [`len`](Self::len) only
+    /// while changes are in flight or old versions are waiting to be cleaned away.
+    pub fn estimated_len(&self) -> usize {
+        self.live
     }
     /// Number of slots ever allocated (live rows plus tombstones).
     pub fn slot_count(&self) -> usize {
         self.rows.len()
     }
-    pub(crate) fn raw_slots(&self) -> &[Option<Row>] {
-        &self.rows
+    /// The rows as the last commit left them, slot by slot: what a snapshot file holds. Changes not
+    /// yet committed are left out.
+    pub(crate) fn committed_slots(&self) -> Vec<Option<&Row>> {
+        self.rows
+            .iter()
+            .map(|slot| {
+                let v = slot.as_ref()?.chain().find(|v| v.begin < PENDING)?;
+                (v.end == INF || v.end >= PENDING).then_some(&v.row)
+            })
+            .collect()
     }
     pub fn next_auto(&self) -> i64 {
         self.next_auto
     }
     pub fn get(&self, id: RowId) -> Option<&Row> {
-        self.rows.get(id as usize).and_then(Option::as_ref)
+        self.visible(id).map(|v| &v.row)
     }
     pub fn iter(&self) -> impl Iterator<Item = (RowId, &Row)> + '_ {
-        self.rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.as_ref().map(|r| (i as RowId, r)))
+        let view = mvcc::view();
+        self.rows.iter().enumerate().filter_map(move |(i, slot)| {
+            let v = slot.as_ref()?.chain().find(|v| view.sees(v.begin, v.end))?;
+            Some((i as RowId, &v.row))
+        })
+    }
+
+    /// The version of row `id` the caller can see.
+    fn visible(&self, id: RowId) -> Option<&Version> {
+        let view = mvcc::view();
+        self.rows.get(id as usize)?.as_ref()?.chain().find(|v| view.sees(v.begin, v.end))
+    }
+
+    /// Changes slot `id` with `f`, keeping the counts right.
+    fn edit<R>(&mut self, id: RowId, f: impl FnOnce(&mut Option<Version>) -> R) -> R {
+        let slot = &mut self.rows[id as usize];
+        let (was_simple, was_live) = (simple(slot), slot.as_ref().is_some_and(|v| v.end == INF));
+        let out = f(slot);
+        let (is_simple, is_live) = (simple(slot), slot.as_ref().is_some_and(|v| v.end == INF));
+        self.outstanding = self.outstanding + usize::from(!is_simple) - usize::from(!was_simple);
+        self.live = self.live + usize::from(is_live) - usize::from(was_live);
+        out
+    }
+
+    /// Removes from the indexes the keys that only the versions in `gone` had.
+    fn forget_keys(&mut self, id: RowId, gone: &[Row]) {
+        let mut doomed: Vec<(usize, Vec<Value>)> = Vec::new();
+        {
+            let kept: Vec<&Row> = self.rows.get(id as usize).and_then(Option::as_ref).map_or_else(Vec::new, |h| h.chain().map(|v| &v.row).collect());
+            for (pos, ix) in self.indexes.iter().enumerate() {
+                for row in gone {
+                    let key = ix.key(row);
+                    if !kept.iter().any(|r| ix.key(r) == key) {
+                        doomed.push((pos, key));
+                    }
+                }
+            }
+        }
+        for (pos, key) in doomed {
+            self.indexes[pos].tree.remove(&(key, id));
+        }
     }
 
     fn check_row(&self, row: &[Value]) -> Result<()> {
@@ -142,6 +236,71 @@ impl Table {
         ))
     }
 
+    /// Fails if another row holds `key` in unique index `ix` (`except` is the row being changed). With
+    /// versions the answer can be "it depends on how another transaction ends": that is `Busy`.
+    fn check_unique(&self, ix: &Index, key: &[Value], except: Option<RowId>) -> Result<()> {
+        if !ix.def.unique || key.iter().any(Value::is_null) {
+            return Ok(());
+        }
+        let view = mvcc::view();
+        let k = key.to_vec();
+        for (_, id) in ix.tree.range((k.clone(), 0)..=(k.clone(), RowId::MAX)) {
+            if Some(*id) == except {
+                continue;
+            }
+            let Some(head) = self.rows.get(*id as usize).and_then(Option::as_ref) else { continue };
+            let has = |v: &Version| ix.key(&v.row) == k;
+            if view.txn == 0 {
+                if has(head) {
+                    return Err(self.dup_error(ix));
+                }
+                continue;
+            }
+            let me = pending(view.txn);
+            if head.begin >= PENDING && head.begin != me {
+                if has(head) || head.prev.as_deref().is_some_and(has) {
+                    return Err(busy(if head.begin >= PENDING { head.begin } else { head.end }, format!("the value is being added or changed in unique index '{}' of '{}'", ix.def.name, self.schema.name)));
+                }
+                continue;
+            }
+            if !has(head) {
+                continue;
+            }
+            if head.end >= PENDING && head.end != me {
+                return Err(busy(head.end, format!("the value is being removed from unique index '{}' of '{}'", ix.def.name, self.schema.name)));
+            }
+            if head.end != INF {
+                continue; // deleted, by this transaction or one that has committed
+            }
+            if head.begin == me || head.begin <= view.snapshot {
+                return Err(self.dup_error(ix));
+            }
+            return Err(Error::conflict(format!("the value in unique index '{}' of '{}' was added after this transaction began", ix.def.name, self.schema.name)));
+        }
+        Ok(())
+    }
+
+    /// The newest version of row `id`, if the caller may change the row: it is the one they see, and no
+    /// other transaction has an unfinished change to it.
+    fn writable(&self, id: RowId, view: View) -> Result<&Version> {
+        let missing = || Error::runtime(format!("row {id} does not exist in '{}'", self.schema.name));
+        let head = self.rows.get(id as usize).and_then(Option::as_ref).ok_or_else(missing)?;
+        let me = pending(view.txn);
+        if (head.begin >= PENDING && head.begin != me) || (head.end >= PENDING && head.end != me) {
+            return Err(busy(if head.begin >= PENDING && head.begin != me { head.begin } else { head.end }, format!("row {id} of '{}'", self.schema.name)));
+        }
+        // The row was deleted by a transaction that has committed: if that was after this one's
+        // snapshot, this one still sees it, and must not delete it a second time.
+        if !view.sees(head.begin, head.end) || (head.end != INF && head.end < PENDING) {
+            return Err(if view.sees_death(head.end) {
+                missing()
+            } else {
+                Error::conflict(format!("row {id} of '{}' was changed after this transaction began", self.schema.name))
+            });
+        }
+        Ok(head)
+    }
+
     /// Inserts `row` into slot `id`, which must be empty or past the end.
     pub fn insert_at(&mut self, id: RowId, row: Row) -> Result<()> {
         self.generation += 1;
@@ -152,9 +311,7 @@ impl Table {
         }
         let keys: Vec<Vec<Value>> = self.indexes.iter().map(|ix| ix.key(&row)).collect();
         for (ix, key) in self.indexes.iter().zip(&keys) {
-            if ix.conflicts(key, None) {
-                return Err(self.dup_error(ix));
-            }
+            self.check_unique(ix, key, None)?;
         }
         for (ix, key) in self.indexes.iter_mut().zip(keys) {
             ix.tree.insert((key, id));
@@ -167,45 +324,72 @@ impl Table {
         if slot >= self.rows.len() {
             self.rows.resize(slot + 1, None);
         }
-        self.rows[slot] = Some(row);
-        self.live += 1;
+        let view = mvcc::view();
+        let begin = if view.txn == 0 { 0 } else { pending(view.txn) };
+        self.edit(id, |s| *s = Some(Version { row, begin, end: INF, prev: None }));
         Ok(())
     }
 
-    /// Removes and returns the row in slot `id`.
-    pub fn remove(&mut self, id: RowId) -> Option<Row> {
+    /// Removes and returns the row in slot `id`. With versions the row stays, ended, for those who
+    /// can still see it.
+    pub fn remove(&mut self, id: RowId) -> Result<Row> {
         self.generation += 1;
-        let row = self.rows.get_mut(id as usize)?.take()?;
-        for ix in &mut self.indexes {
-            let key = ix.key(&row);
-            ix.tree.remove(&(key, id));
+        let view = mvcc::view();
+        if view.txn != 0 {
+            let row = self.writable(id, view)?.row.clone();
+            let me = pending(view.txn);
+            self.edit(id, |s| s.as_mut().expect("checked").end = me);
+            return Ok(row);
         }
-        self.live -= 1;
-        Some(row)
+        let missing = || Error::runtime(format!("row {id} does not exist in '{}'", self.schema.name));
+        let old = self.rows.get(id as usize).and_then(Option::as_ref).ok_or_else(missing)?;
+        let row = old.row.clone();
+        self.forget_all(id);
+        self.edit(id, |s| *s = None);
+        Ok(row)
     }
 
-    /// Replaces the row in slot `id`, returning the previous contents.
+    /// Drops every index entry of slot `id`.
+    fn forget_all(&mut self, id: RowId) {
+        let rows: Vec<Row> = self.rows[id as usize].as_ref().map_or_else(Vec::new, |h| h.chain().map(|v| v.row.clone()).collect());
+        for ix in &mut self.indexes {
+            for r in &rows {
+                let key = ix.key(r);
+                ix.tree.remove(&(key, id));
+            }
+        }
+    }
+
+    /// Replaces the row in slot `id`, returning the previous contents. With versions the previous
+    /// contents stay, ended, for those who can still see them.
     pub fn replace(&mut self, id: RowId, new: Row) -> Result<Row> {
         self.generation += 1;
         self.check_row(&new)?;
-        let old = self
-            .get(id)
-            .ok_or_else(|| Error::runtime(format!("row {id} does not exist in '{}'", self.schema.name)))?;
+        let view = mvcc::view();
+        let old = if view.txn != 0 {
+            self.writable(id, view)?
+        } else {
+            self.rows
+                .get(id as usize)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| Error::runtime(format!("row {id} does not exist in '{}'", self.schema.name)))?
+        };
+        let old_row = old.row.clone();
         let mut changed = Vec::new();
         for (pos, ix) in self.indexes.iter().enumerate() {
-            let (ok, nk) = (ix.key(old), ix.key(&new));
+            let (ok, nk) = (ix.key(&old_row), ix.key(&new));
             // Keys equal under the index ordering need no tree update, even
             // if their text differs only in case.
             if ok != nk {
-                if ix.conflicts(&nk, Some(id)) {
-                    return Err(self.dup_error(ix));
-                }
+                self.check_unique(ix, &nk, Some(id))?;
                 changed.push((pos, ok, nk));
             }
         }
         for (pos, ok, nk) in changed {
             let tree = &mut self.indexes[pos].tree;
-            tree.remove(&(ok, id));
+            if view.txn == 0 {
+                tree.remove(&(ok, id));
+            }
             tree.insert((nk, id));
         }
         if let Some(a) = self.schema.autonumber_column() {
@@ -213,19 +397,126 @@ impl Table {
                 self.next_auto = self.next_auto.max(n.saturating_add(1));
             }
         }
-        Ok(self.rows[id as usize].replace(new).expect("checked above"))
+        if view.txn == 0 {
+            self.edit(id, |s| s.as_mut().expect("checked").row = new);
+        } else {
+            let me = pending(view.txn);
+            self.edit(id, |s| {
+                let mut old = s.take().expect("checked");
+                old.end = me;
+                *s = Some(Version { row: new, begin: me, end: INF, prev: Some(Box::new(old)) });
+            });
+        }
+        Ok(old_row)
+    }
+
+    // ----- transactions: taking changes back, making them final, cleaning up --------------------
+
+    /// Takes back the newest version of row `id`, an insert by the transaction that is being undone.
+    pub(crate) fn unwind_insert(&mut self, id: RowId) {
+        self.generation += 1;
+        let gone: Vec<Row> = self.edit(id, |s| {
+            let mut head = s.take().expect("an insert to take back");
+            *s = head.prev.take().map(|b| *b);
+            vec![head.row]
+        });
+        self.forget_keys(id, &gone);
+    }
+
+    /// Takes back the newest version of row `id`, made by an update that is being undone.
+    pub(crate) fn unwind_update(&mut self, id: RowId) {
+        self.generation += 1;
+        let gone: Vec<Row> = self.edit(id, |s| {
+            let mut head = s.take().expect("an update to take back");
+            let mut older = head.prev.take().expect("an update has an older version");
+            older.end = INF;
+            *s = Some(*older);
+            vec![head.row]
+        });
+        self.forget_keys(id, &gone);
+    }
+
+    /// Takes back a delete: the row lives again.
+    pub(crate) fn unwind_delete(&mut self, id: RowId) {
+        self.generation += 1;
+        self.edit(id, |s| s.as_mut().expect("a delete to take back").end = INF);
+    }
+
+    /// Makes the changes transaction `txn` made to row `id` final, at commit timestamp `ts`.
+    pub(crate) fn commit_slot(&mut self, id: RowId, txn: u64, ts: Stamp) {
+        let me = pending(txn);
+        let mut gone = Vec::new();
+        self.edit(id, |s| {
+            let Some(head) = s.as_mut() else { return };
+            drop_mine(head, me, &mut gone);
+            let mut stamp = |v: &mut Version| {
+                if v.begin == me {
+                    v.begin = ts;
+                }
+                if v.end == me {
+                    v.end = ts;
+                }
+            };
+            head.each_mut(&mut stamp);
+        });
+        self.forget_keys(id, &gone);
+    }
+
+    /// Makes every change of transaction `txn` final, wherever it is.
+    pub(crate) fn commit_all(&mut self, txn: u64, ts: Stamp) {
+        for id in 0..self.rows.len() as RowId {
+            if self.rows[id as usize].as_ref().is_some_and(|h| h.chain().any(|v| v.begin == pending(txn) || v.end == pending(txn))) {
+                self.commit_slot(id, txn, ts);
+            }
+        }
+    }
+
+    /// Throws away the versions of row `id` that none of `snapshots` can see (nor any later reader, whose
+    /// snapshot is the last one listed or newer): ones that had ended before every snapshot, and ones
+    /// born after one and replaced before the next. Returns whether the row is now simple.
+    pub(crate) fn clean_slot(&mut self, id: RowId, snapshots: &[u64]) -> bool {
+        let mut gone = Vec::new();
+        self.edit(id, |slot| {
+            let Some(head) = slot.take() else { return };
+            let mut chain = Vec::new();
+            let mut cur = Some(Box::new(head));
+            while let Some(mut v) = cur {
+                cur = v.prev.take();
+                chain.push(v);
+            }
+            let needed = |v: &Version| {
+                v.begin >= PENDING || v.end >= PENDING || v.end == INF || snapshots.iter().any(|&s| v.begin <= s && s < v.end)
+            };
+            let mut kept = Vec::new();
+            for v in chain {
+                if needed(&v) {
+                    kept.push(v);
+                } else {
+                    gone.push(v.row);
+                }
+            }
+            let mut head = None;
+            for mut v in kept.into_iter().rev() {
+                v.prev = head;
+                head = Some(v);
+            }
+            *slot = head.map(|b| *b);
+        });
+        self.forget_keys(id, &gone);
+        simple(&self.rows[id as usize])
     }
 
     pub fn tombstones(&self) -> usize {
         self.rows.len() - self.live
     }
 
-    /// Drops tombstones, renumbering rows and rebuilding indexes.
+    /// Drops tombstones, renumbering rows and rebuilding indexes. Only a table with no versions
+    /// outstanding can be compacted.
     pub(crate) fn compact(&mut self) -> Result<()> {
-        if self.tombstones() == 0 {
+        if self.tombstones() == 0 || self.outstanding > 0 {
             return Ok(());
         }
-        let rows = std::mem::take(&mut self.rows).into_iter().flatten().map(Some).collect();
+        let rows = std::mem::take(&mut self.rows).into_iter().flatten().map(|v| Some(v.row)).collect();
         let mut fresh = Table::from_parts(self.schema.clone(), rows, self.next_auto)?;
         fresh.generation = self.generation + 1;
         std::mem::swap(self, &mut fresh);
@@ -250,15 +541,20 @@ impl Table {
             return Err(Error::catalog("index references an unknown column"));
         }
         let mut ix = Index { def: def.clone(), tree: BTreeSet::new() };
-        for (id, row) in self.iter() {
-            let key = ix.key(row);
-            if ix.conflicts(&key, None) {
-                return Err(Error::constraint(format!(
-                    "cannot create unique index '{}': duplicate values exist",
-                    def.name
-                )));
+        let mut seen: BTreeSet<Vec<Value>> = BTreeSet::new();
+        for (id, slot) in self.rows.iter().enumerate() {
+            let Some(head) = slot else { continue };
+            for (age, v) in head.chain().enumerate() {
+                let key = ix.key(&v.row);
+                let counts = age == 0 && v.end == INF && ix.def.unique && !key.iter().any(Value::is_null);
+                if counts && !seen.insert(key.clone()) {
+                    return Err(Error::constraint(format!(
+                        "cannot create unique index '{}': duplicate values exist",
+                        def.name
+                    )));
+                }
+                ix.tree.insert((key, id as RowId));
             }
-            ix.tree.insert((key, id));
         }
         self.indexes.push(ix);
         self.schema.indexes.push(def);
@@ -356,8 +652,8 @@ impl Table {
                 column.name
             )));
         }
-        for row in self.rows.iter_mut().flatten() {
-            row.push(fill.clone());
+        for head in self.rows.iter_mut().flatten() {
+            head.each_mut(&mut |v| v.row.push(fill.clone()));
         }
         self.schema.columns.push(column);
         Ok(())
@@ -376,8 +672,10 @@ impl Table {
                 ix.def.name
             )));
         }
-        for row in self.rows.iter_mut().flatten() {
-            row.remove(pos);
+        for head in self.rows.iter_mut().flatten() {
+            head.each_mut(&mut |v| {
+                v.row.remove(pos);
+            });
         }
         self.schema.columns.remove(pos);
         // Index keys hold values, not positions, so only the definitions shift.
@@ -465,22 +763,41 @@ impl Table {
         } else if let Some(d) = &schema.columns[pos].default {
             schema.columns[pos].default = Some(if d.is_null() { Value::Null } else { d.coerce_to(data_type)? });
         }
-        let mut rows = Vec::with_capacity(self.rows.len());
-        for slot in &self.rows {
-            rows.push(match slot {
-                Some(r) => {
-                    let mut r = r.clone();
-                    if !r[pos].is_null() {
-                        r[pos] = r[pos]
-                            .coerce_to(data_type)
-                            .map_err(|e| Error::type_err(format!("field '{name}': {e}; no data was changed")))?;
+        let mut converted = self.clone();
+        let mut failure = None;
+        for head in converted.rows.iter_mut().flatten() {
+            head.each_mut(&mut |v| {
+                if failure.is_none() && !v.row[pos].is_null() {
+                    match v.row[pos].coerce_to(data_type) {
+                        Ok(x) => v.row[pos] = x,
+                        Err(e) => failure = Some(Error::type_err(format!("field '{name}': {e}; no data was changed"))),
                     }
-                    Some(r)
                 }
-                None => None,
             });
         }
-        *self = Table::from_parts(schema, rows, self.next_auto)?;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        converted.schema = schema;
+        // The keys changed type with their values: build the indexes again from every version.
+        for pos in 0..converted.indexes.len() {
+            let mut tree = BTreeSet::new();
+            let mut seen: BTreeSet<Vec<Value>> = BTreeSet::new();
+            for (id, slot) in converted.rows.iter().enumerate() {
+                let Some(head) = slot else { continue };
+                for (age, v) in head.chain().enumerate() {
+                    let ix = &converted.indexes[pos];
+                    let key = ix.key(&v.row);
+                    if age == 0 && v.end == INF && ix.def.unique && !key.iter().any(Value::is_null) && !seen.insert(key.clone()) {
+                        return Err(converted.dup_error(ix));
+                    }
+                    tree.insert((key, id as RowId));
+                }
+            }
+            converted.indexes[pos].tree = tree;
+        }
+        converted.generation = self.generation + 1;
+        *self = converted;
         Ok(())
     }
 
@@ -552,6 +869,44 @@ impl Table {
             .collect()
     }
 
+    /// How many versions of rows the table holds in all, dead ones not yet cleaned away included.
+    #[doc(hidden)]
+    pub fn version_count(&self) -> usize {
+        self.rows.iter().flatten().map(|h| h.chain().count()).sum()
+    }
+
+    /// The version chains, for finding out what went wrong.
+    #[doc(hidden)]
+    pub fn dump_chains(&self) -> String {
+        let mut out = String::new();
+        for (i, slot) in self.rows.iter().enumerate() {
+            if let Some(h) = slot {
+                let fmt = |s: Stamp| if s == INF { "inf".to_string() } else if s >= PENDING { format!("p{}", s & !PENDING) } else { s.to_string() };
+                let chain: Vec<String> = h.chain().map(|v| format!("[{}..{} {:?}]", fmt(v.begin), fmt(v.end), v.row)).collect();
+                out.push_str(&format!("row {i}: {}
+", chain.join(" <- ")));
+            }
+        }
+        out
+    }
+
+    /// Slots that still hold more than one version, or an uncommitted or ended one: work for the cleaner.
+    pub(crate) fn unsettled(&self) -> Vec<RowId> {
+        self.rows.iter().enumerate().filter(|(_, s)| !simple(s)).map(|(i, _)| i as RowId).collect()
+    }
+
+    /// The newest state of row `id` whoever made it, committed or not.
+    pub fn get_latest(&self, id: RowId) -> Option<&Row> {
+        self.rows.get(id as usize)?.as_ref().map(|v| &v.row)
+    }
+
+    /// Is row `id`, as the caller sees it, one that has `key` in index `idx`? (The index also holds the
+    /// keys of versions the caller cannot see.)
+    fn has_key(&self, idx: usize, key: &[Value], id: RowId) -> bool {
+        let cols = &self.indexes[idx].def.columns;
+        self.visible(id).is_some_and(|v| cols.iter().zip(key).all(|(&c, k)| v.row[c] == *k))
+    }
+
     /// Row ids whose index key starts with `prefix`.
     pub fn index_prefix(&self, idx: usize, prefix: &[Value]) -> impl Iterator<Item = RowId> + '_ {
         let p = prefix.to_vec();
@@ -560,6 +915,7 @@ impl Table {
             .tree
             .range(start..)
             .take_while(move |(k, _)| k.len() >= p.len() && k[..p.len()] == p[..])
+            .filter(move |(k, id)| self.has_key(idx, k, *id))
             .map(|(_, id)| *id)
     }
 
@@ -571,7 +927,8 @@ impl Table {
         let tree = &self.indexes[idx].tree;
         let range = tree
             .range((p.clone(), 0)..)
-            .take_while(move |(k, _)| k.len() >= p.len() && k[..p.len()] == p[..]);
+            .take_while(move |(k, _)| k.len() >= p.len() && k[..p.len()] == p[..])
+            .filter(move |(k, id)| self.has_key(idx, k, *id));
         if !desc {
             return Box::new(range.map(|(_, id)| *id));
         }
@@ -613,9 +970,72 @@ impl Table {
                 Bound::Included(v) => k[0] <= *v,
                 Bound::Excluded(v) => k[0] < *v,
             })
+            .filter(move |(k, id)| self.has_key(idx, k, *id))
             .map(|(_, id)| *id)
     }
+
+    /// Row ids whose `cols` equal `key` in the *newest* state of the table, which is what a foreign key
+    /// has to respect whatever the caller's snapshot: a row another transaction has committed counts,
+    /// and so does one it has not yet committed, which cannot be counted on and so is `Busy`.
+    pub fn lookup_latest(&self, cols: &[usize], key: &[Value]) -> Result<Vec<RowId>> {
+        if key.iter().any(Value::is_null) {
+            return Ok(Vec::new());
+        }
+        let view = mvcc::view();
+        let me = pending(view.txn);
+        let matches = |v: &Version| cols.iter().zip(key).all(|(&c, k)| v.row[c] == *k);
+        let candidates: Vec<RowId> = {
+            let same_set = |d: &IndexDef| d.columns.len() == cols.len() && cols.iter().all(|c| d.columns.contains(c));
+            match self.indexes.iter().position(|ix| same_set(&ix.def)) {
+                Some(pos) => {
+                    let probe: Vec<Value> = self.indexes[pos]
+                        .def
+                        .columns
+                        .iter()
+                        .map(|c| key[cols.iter().position(|x| x == c).expect("same column set")].clone())
+                        .collect();
+                    let p = probe.clone();
+                    self.indexes[pos]
+                        .tree
+                        .range((probe, 0)..)
+                        .take_while(move |(k, _)| k.len() >= p.len() && k[..p.len()] == p[..])
+                        .map(|(_, id)| *id)
+                        .collect()
+                }
+                None => (0..self.rows.len() as RowId).collect(),
+            }
+        };
+        let mut out = Vec::new();
+        for id in candidates {
+            let Some(head) = self.rows.get(id as usize).and_then(Option::as_ref) else { continue };
+            let other_begin = head.begin >= PENDING && head.begin != me;
+            let other_end = head.end >= PENDING && head.end != me;
+            // A change not yet committed by another transaction: whether the row is there depends on it.
+            if (other_begin && (matches(head) || head.prev.as_deref().is_some_and(matches))) || (other_end && matches(head)) {
+                return Err(busy(if other_begin { head.begin } else { head.end }, format!("a row of '{}' is being changed", self.schema.name)));
+            }
+            if head.end == INF && matches(head) {
+                out.push(id);
+            }
+        }
+        out.dedup();
+        Ok(out)
+    }
 }
+
+/// Drops the versions of this row made by `me` that a later change of `me` has replaced: they were
+/// never seen by anyone else.
+fn drop_mine(v: &mut Version, me: Stamp, gone: &mut Vec<Row>) {
+    while v.prev.as_ref().is_some_and(|p| p.begin == me) {
+        let mut p = v.prev.take().expect("checked");
+        v.prev = p.prev.take();
+        gone.push(p.row);
+    }
+    if let Some(p) = v.prev.as_deref_mut() {
+        drop_mine(p, me, gone);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -656,7 +1076,7 @@ mod tests {
             .index_range(0, Bound::Excluded(Value::Int(20)), Bound::Included(Value::Int(50)))
             .collect();
         assert_eq!(got, vec![3, 4, 5]);
-        t.remove(4);
+        t.remove(4).unwrap();
         t.compact().unwrap();
         assert_eq!(t.slot_count(), 9);
         assert_eq!(t.len(), 9);

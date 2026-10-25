@@ -69,6 +69,7 @@ int main(void) {
 | 9 | `ACC_ERR_MISUSE` | wrong use: NULL or closed handle, index out of range, a parameter with no value |
 | 10 | `ACC_ERR_ENCODING` | text is not valid UTF-8 |
 | 11 | `ACC_ERR_INTERNAL` | a bug in the library (a panic was caught) |
+| 12 | `ACC_ERR_CONFLICT` | two transactions changed the same row and this one must be run again (the C interface has one connection per database, so it cannot happen yet; it is reserved for when connections can overlap, see [concurrency](../concurrency.md)) |
 
 ## Functions
 

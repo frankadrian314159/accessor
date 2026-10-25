@@ -46,6 +46,9 @@ pub const ACC_ERR_MISUSE: c_int = 9;
 pub const ACC_ERR_ENCODING: c_int = 10;
 /// A bug in the library (a panic was caught). The connection stays usable.
 pub const ACC_ERR_INTERNAL: c_int = 11;
+/// Two transactions collided and this one must be retried (only a database shared between
+/// transactions raises it).
+pub const ACC_ERR_CONFLICT: c_int = 12;
 
 /// A text length meaning "the text is NUL-terminated".
 pub const ACC_NTS: usize = usize::MAX; // (the header defines it by hand: cbindgen cannot evaluate usize::MAX)
@@ -119,6 +122,7 @@ impl From<Error> for Failure {
             Error::Io(_) => ACC_ERR_IO,
             Error::Corrupt(_) => ACC_ERR_CORRUPT,
             Error::Locked(_) => ACC_ERR_LOCKED,
+            Error::Conflict(_) | Error::Busy(_) => ACC_ERR_CONFLICT,
         };
         Failure { code, msg: e.to_string() }
     }

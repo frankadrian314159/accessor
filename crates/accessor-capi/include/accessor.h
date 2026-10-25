@@ -84,6 +84,12 @@
  */
 #define ACC_ERR_INTERNAL 11
 
+/**
+ * Two transactions collided and this one must be retried (only a database shared between
+ * transactions raises it).
+ */
+#define ACC_ERR_CONFLICT 12
+
 
 
 /**

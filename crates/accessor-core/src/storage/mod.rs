@@ -1,5 +1,6 @@
 //! Storage layer: tables, the logical operation log, snapshots.
 
+pub mod mvcc;
 pub mod persist;
 pub mod stats;
 pub mod table;

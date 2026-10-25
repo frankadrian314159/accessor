@@ -219,7 +219,7 @@ impl Database {
                     Expr::Column { name: c, .. } => t.schema().column_index(c).is_some_and(|p| t.index_defs().any(|ix| ix.columns.first() == Some(&p))),
                     _ => false,
                 });
-                n >= 2 && (!indexed || n.saturating_mul(50) >= t.len())
+                n >= 2 && (!indexed || n.saturating_mul(50) >= t.estimated_len())
             }
             _ => n >= 32,
         };
