@@ -287,6 +287,41 @@ impl Database {
                 self.table_mut(table)?.alter_column_type(name, *data_type)?;
                 Ok(None)
             }
+            Op::RenameTable { from, to } => {
+                let (kf, kt) = (key(from), key(to));
+                if !self.tables.contains_key(&kf) {
+                    return Err(Error::catalog(format!("the table '{from}' does not exist")));
+                }
+                if kf != kt && (self.tables.contains_key(&kt) || self.views.contains_key(&kt)) {
+                    return Err(Error::catalog(format!("'{to}' already exists")));
+                }
+                let mut t = self.tables.remove(&kf).expect("checked above");
+                t.set_name(to);
+                self.tables.insert(kt, t);
+                for t in self.tables.values_mut() {
+                    t.rename_references(from, to);
+                }
+                // Triggers and saved queries name tables in their text; follow the rename.
+                let triggers = std::mem::take(&mut self.triggers);
+                for (k, def) in triggers {
+                    let sql = crate::sql::parser::rename_table_in_sql(&def.sql, from, to);
+                    let def = parse_trigger(&sql).map(Arc::new).unwrap_or(def);
+                    self.triggers.insert(k, def);
+                }
+                for (_, (_, sql)) in self.views.iter_mut() {
+                    *sql = crate::sql::parser::rename_table_in_sql(sql, from, to);
+                }
+                self.calc_cache.clear();
+                Ok(None)
+            }
+            Op::SetDefault { table, name, value } => {
+                self.table_mut(table)?.set_default(name, value.clone())?;
+                Ok(None)
+            }
+            Op::SetNotNull { table, name, not_null } => {
+                self.table_mut(table)?.set_not_null(name, *not_null)?;
+                Ok(None)
+            }
             Op::AddForeignKey { table, fk } => {
                 self.table_mut(table)?.add_foreign_key(fk.clone())?;
                 Ok(None)
@@ -362,6 +397,17 @@ impl Database {
                 names.push(key(table));
                 undo.triggers = Some(self.triggers.clone()); // they go with their table
             }
+            Op::RenameTable { from, to } => {
+                names.push(key(from));
+                names.push(key(to));
+                for t in self.tables.values() {
+                    if t.schema().foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(from)) {
+                        names.push(key(t.name()));
+                    }
+                }
+                undo.views = Some(self.views.clone());
+                undo.triggers = Some(self.triggers.clone());
+            }
             Op::CreateView { .. } | Op::DropView(_) => undo.views = Some(self.views.clone()),
             Op::CreateTrigger { .. } | Op::DropTrigger(_) => undo.triggers = Some(self.triggers.clone()),
             Op::DropColumn { table, .. } => {
@@ -380,6 +426,8 @@ impl Database {
             | Op::AlterColumnType { table, .. }
             | Op::AddForeignKey { table, .. }
             | Op::DropForeignKey { table, .. }
+            | Op::SetDefault { table, .. }
+            | Op::SetNotNull { table, .. }
             | Op::SetExpression { table, .. } => names.push(key(table)),
             Op::Insert { .. } | Op::Update { .. } | Op::Delete { .. } => {}
         }
@@ -574,6 +622,36 @@ impl Database {
 
     pub fn optimizer_enabled(&self) -> bool {
         self.optimizer_on
+    }
+
+    /// Runs `f` so that it either happens completely or not at all, with or without an open
+    /// transaction (it uses one if there is none, and a savepoint inside one).
+    pub(crate) fn atomically<T>(&mut self, f: impl FnOnce(&mut Database) -> Result<T>) -> Result<T> {
+        const SAVEPOINT: &str = "__atomic";
+        let own = !self.in_transaction();
+        if own {
+            self.begin()?;
+        }
+        self.savepoint(SAVEPOINT)?;
+        match f(self) {
+            Ok(v) => {
+                let released = self.release(SAVEPOINT);
+                if own {
+                    released.and_then(|_| self.commit())?;
+                } else {
+                    released?;
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.rollback_to(SAVEPOINT);
+                let _ = self.release(SAVEPOINT);
+                if own {
+                    let _ = self.rollback();
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Number of changes made in the open transaction (0 when there is none).

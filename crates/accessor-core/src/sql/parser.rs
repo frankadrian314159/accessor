@@ -133,6 +133,37 @@ pub fn qualify_columns(text: &str, prefix: &str, is_column: &dyn Fn(&str) -> boo
     Ok(out)
 }
 
+/// Rewrites references to table `old` in stored SQL (a trigger or saved query) after the table
+/// is renamed to `new`: the name after `FROM`, `JOIN`, `INTO`, `UPDATE` and `ON`, and a name used
+/// as a prefix (`old.column`).
+pub fn rename_table_in_sql(text: &str, old: &str, new: &str) -> String {
+    let Ok(toks) = lex(text) else { return text.to_string() };
+    let mut out = String::new();
+    let mut last = 0;
+    for (i, t) in toks.iter().enumerate() {
+        let (name, len) = match &t.tok {
+            Tok::Ident(s) => (s, s.len()),
+            Tok::Quoted(s) => (s, s.len() + 2),
+            _ => continue,
+        };
+        if !name.eq_ignore_ascii_case(old) {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| &toks[j].tok);
+        let after_dot = matches!(prev, Some(Tok::Sym(".")));
+        let after_keyword = matches!(prev, Some(Tok::Ident(k)) if ["FROM", "JOIN", "INTO", "UPDATE", "ON", "TABLE"].iter().any(|w| k.eq_ignore_ascii_case(w)));
+        let qualifier = matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Sym(".")));
+        if after_dot || !(after_keyword || qualifier) {
+            continue;
+        }
+        out.push_str(&text[last..t.pos]);
+        out.push_str(&format!("[{new}]"));
+        last = t.pos + len;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Rewrites `alias.col` to `table.col` in an UPDATE or DELETE that named its target with an alias.
 fn requalify(st: &mut Statement, alias: &str, table: &str) -> Result<()> {
     crate::sql::walk::walk_statement(st, &mut |e| {
@@ -759,8 +790,25 @@ impl<'a> Parser<'a> {
     }
 
     fn create(&mut self) -> Result<Statement> {
+        let create_pos = self.toks[self.pos - 1].pos;
+        if self.peek_kw("OR") && self.peek_kw_at(1, "REPLACE") {
+            self.advance();
+            self.advance();
+            let mut guarded = false;
+            let mut inner = self.create_object(&mut guarded, create_pos)?;
+            if let Statement::CreateTrigger(def) = &mut inner {
+                // The stored text is a plain CREATE TRIGGER, without the OR REPLACE.
+                if let Some(at) = def.sql.to_ascii_uppercase().find("REPLACE") {
+                    def.sql = format!("CREATE {}", def.sql[at + "REPLACE".len()..].trim_start());
+                }
+            }
+            return match inner {
+                Statement::CreateView { .. } | Statement::CreateTrigger(_) if !guarded => Ok(Statement::OrReplace(Box::new(inner))),
+                _ => Err(Error::syntax("CREATE OR REPLACE works for views, queries and triggers; a table cannot be replaced")),
+            };
+        }
         let mut guarded = false;
-        let st = self.create_object(&mut guarded)?;
+        let st = self.create_object(&mut guarded, create_pos)?;
         Ok(if guarded { Statement::Guarded { missing_ok: false, stmt: Box::new(st) } } else { st })
     }
 
@@ -776,8 +824,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn create_object(&mut self, guarded: &mut bool) -> Result<Statement> {
-        let create_pos = self.toks[self.pos - 1].pos;
+    fn create_object(&mut self, guarded: &mut bool, create_pos: usize) -> Result<Statement> {
         let unique = self.eat_kw("UNIQUE");
         if !unique && self.eat_kw("TRIGGER") {
             return self.trigger(create_pos);
@@ -954,6 +1001,13 @@ impl<'a> Parser<'a> {
         Ok(self.src[start..end].trim().to_string())
     }
 
+    /// Consumes `SET` or `DROP`; true for `DROP`.
+    fn advance_kw_drop(&mut self) -> bool {
+        let drop = self.peek_kw("DROP");
+        self.advance();
+        drop
+    }
+
     /// `NULLS FIRST` or `NULLS LAST` after an ORDER BY item.
     fn nulls_clause(&mut self) -> Result<Option<bool>> {
         if !self.eat_kw("NULLS") {
@@ -1091,6 +1145,9 @@ impl<'a> Parser<'a> {
                 AlterAction::DropColumn(self.ident()?)
             }
         } else if self.eat_kw("RENAME") {
+            if self.eat_kw("TO") {
+                return Ok(Statement::AlterTable { table, action: AlterAction::RenameTable(self.ident()?) });
+            }
             self.eat_kw("COLUMN");
             let from = self.ident()?;
             self.expect_kw("TO")?;
@@ -1098,6 +1155,28 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("ALTER") {
             self.eat_kw("COLUMN");
             let name = self.ident()?;
+            if self.peek_kw("SET") || self.peek_kw("DROP") {
+                let drop = self.advance_kw_drop();
+                let action = if self.eat_kw("DEFAULT") {
+                    if drop {
+                        AlterAction::SetDefault { name, value: None }
+                    } else {
+                        let neg = self.eat_sym("-");
+                        let v = match self.primary()? {
+                            Expr::Literal(v) => v,
+                            _ => return Err(Error::syntax("DEFAULT must be a literal")),
+                        };
+                        let v = if neg { negate_literal(&v).ok_or_else(|| Error::syntax("cannot negate DEFAULT value"))? } else { v };
+                        AlterAction::SetDefault { name, value: Some(v) }
+                    }
+                } else if self.eat_kw("NOT") {
+                    self.expect_kw("NULL")?;
+                    AlterAction::SetNotNull { name, not_null: !drop }
+                } else {
+                    return Err(self.unexpected("DEFAULT or NOT NULL"));
+                };
+                return Ok(Statement::AlterTable { table, action });
+            }
             self.eat_kw("TYPE");
             let type_name = self.type_name()?;
             let (data_type, autonumber) = DataType::from_sql_name(&type_name)

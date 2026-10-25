@@ -182,6 +182,13 @@ impl Database {
                 self.add_check(&table, name.as_deref(), expr)?;
                 return Ok(QueryResult::default());
             }
+            AlterAction::RenameTable(to) => vec![Op::RenameTable { from: table, to: to.clone() }],
+            AlterAction::SetDefault { name, value } => {
+                vec![Op::SetDefault { table, name: name.clone(), value: value.clone() }]
+            }
+            AlterAction::SetNotNull { name, not_null } => {
+                vec![Op::SetNotNull { table, name: name.clone(), not_null: *not_null }]
+            }
             AlterAction::DropConstraint(name) => {
                 let is_fk = self.table_checked(&table)?.schema().foreign_keys.iter().any(|f| f.name.eq_ignore_ascii_case(name));
                 if !is_fk && self.trigger_sql(&format!("{name}_ins")).is_some() {
@@ -304,6 +311,13 @@ impl Database {
             .find(|p| !decls.iter().any(|d| d.name.eq_ignore_ascii_case(p)))
         {
             return Err(Error::syntax(format!("the parameter @{p} is not declared; add it to the query's parameter list")));
+        }
+        // A query that names a missing table or column is refused now, not when first used.
+        // (One with parameters cannot be tried without values.)
+        if decls.is_empty() {
+            let mut probe = select.clone();
+            probe.limit = Some(0);
+            self.unlogged(|| self.run_select_depth(&probe, 1))?;
         }
         self.apply_all(vec![Op::CreateView { name: name.to_string(), sql: sql.to_string() }])?;
         Ok(QueryResult::default())

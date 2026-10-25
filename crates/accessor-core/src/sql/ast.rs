@@ -233,6 +233,11 @@ pub enum AlterAction {
     AlterColumn { name: String, data_type: DataType },
     /// `ALTER COLUMN c CALCULATED AS (expr)`: change a calculated field's expression.
     SetExpression { name: String, expr: String },
+    RenameTable(String),
+    /// `ALTER COLUMN c SET DEFAULT v` (`Some`) or `DROP DEFAULT` (`None`).
+    SetDefault { name: String, value: Option<Value> },
+    /// `ALTER COLUMN c SET NOT NULL` / `DROP NOT NULL`.
+    SetNotNull { name: String, not_null: bool },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +308,8 @@ pub enum Statement {
     Raise(Expr),
     CreateTrigger(Box<TriggerDef>),
     DropTrigger(String),
+    /// `CREATE OR REPLACE VIEW|QUERY|TRIGGER`: drop an existing object of that name, then create.
+    OrReplace(Box<Statement>),
     /// `TRUNCATE [TABLE] t`: delete every record.
     Truncate(String),
     /// `SET TIME ZONE 'Europe/Paris'`: the zone of the session.

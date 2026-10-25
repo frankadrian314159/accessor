@@ -82,6 +82,33 @@ impl Database {
                 }
                 Ok(done)
             }
+            Statement::OrReplace(inner) => {
+                let inner: Statement = (**inner).clone();
+                match &inner {
+                    Statement::CreateView { name, .. } => {
+                        if self.table(name).is_some() {
+                            return Err(Error::catalog(format!("'{name}' is a table and cannot be replaced by a query")));
+                        }
+                        let name = name.clone();
+                        self.atomically(|db| {
+                            if db.view_sql(&name).is_some() {
+                                db.exec_drop_view(&name)?;
+                            }
+                            db.execute_statement(&inner)
+                        })
+                    }
+                    Statement::CreateTrigger(def) => {
+                        let name = def.name.clone();
+                        self.atomically(|db| {
+                            if db.trigger_sql(&name).is_some() {
+                                db.exec_drop_trigger(&name)?;
+                            }
+                            db.execute_statement(&inner)
+                        })
+                    }
+                    _ => Err(Error::runtime("only views, queries and triggers can be replaced")),
+                }
+            }
             Statement::Truncate(table) => self.exec_delete(table, None),
             Statement::Explain(sel) => self.run_explain(sel),
             Statement::Guarded { missing_ok, stmt } => match self.execute_statement(stmt) {

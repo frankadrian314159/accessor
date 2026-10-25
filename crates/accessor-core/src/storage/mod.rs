@@ -6,7 +6,7 @@ pub mod table;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{Column, ForeignKey, IndexDef, TableSchema};
-use crate::value::{DataType, Row};
+use crate::value::{DataType, Row, Value};
 pub use table::{RowId, Table};
 
 /// A single logical mutation. Every change to a database — whether from SQL,
@@ -32,6 +32,11 @@ pub enum Op {
     CreateTrigger { name: String, sql: String },
     DropTrigger(String),
     SetExpression { table: String, name: String, expr: String },
+    RenameTable { from: String, to: String },
+    /// `ALTER COLUMN ... SET DEFAULT v` / `DROP DEFAULT` (`None`).
+    SetDefault { table: String, name: String, value: Option<Value> },
+    /// `ALTER COLUMN ... SET NOT NULL` / `DROP NOT NULL`.
+    SetNotNull { table: String, name: String, not_null: bool },
 }
 
 impl Op {

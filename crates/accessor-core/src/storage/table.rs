@@ -265,6 +265,57 @@ impl Table {
         })
     }
 
+    pub(crate) fn set_name(&mut self, name: &str) {
+        self.schema.name = name.to_string();
+    }
+
+    /// Points relationships that name table `old` at `new`.
+    pub(crate) fn rename_references(&mut self, old: &str, new: &str) {
+        for fk in &mut self.schema.foreign_keys {
+            if fk.ref_table.eq_ignore_ascii_case(old) {
+                fk.ref_table = new.to_string();
+            }
+        }
+    }
+
+    /// Sets (or with `None` removes) the default of a field.
+    pub(crate) fn set_default(&mut self, name: &str, value: Option<Value>) -> Result<()> {
+        let pos = self.column_checked(name)?;
+        let col = &mut self.schema.columns[pos];
+        if col.is_calculated() {
+            return Err(Error::catalog(format!("the field '{name}' is calculated and has no default")));
+        }
+        if col.autonumber {
+            return Err(Error::catalog(format!("the AutoNumber field '{name}' has no default")));
+        }
+        col.default = match value {
+            Some(v) => Some(v.coerce_to(col.data_type).map_err(|e| Error::type_err(format!("default for '{name}': {e}")))?),
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// Makes a field required (refused while any record has no value for it) or optional.
+    pub(crate) fn set_not_null(&mut self, name: &str, not_null: bool) -> Result<()> {
+        let pos = self.column_checked(name)?;
+        if self.schema.columns[pos].is_calculated() {
+            return Err(Error::catalog(format!("the calculated field '{name}' cannot be required")));
+        }
+        if not_null {
+            let missing = self.iter().filter(|(_, r)| r[pos].is_null()).count();
+            if missing > 0 {
+                return Err(Error::constraint(format!(
+                    "cannot make '{name}' required: {missing} record(s) in '{}' have no value for it",
+                    self.schema.name
+                )));
+            }
+        } else if self.schema.columns[pos].primary_key {
+            return Err(Error::catalog(format!("'{name}' is part of the primary key and must have a value")));
+        }
+        self.schema.columns[pos].not_null = not_null;
+        Ok(())
+    }
+
     /// Appends a column; existing rows receive its default (or Null).
     pub(crate) fn add_column(&mut self, mut column: Column) -> Result<()> {
         if self.schema.column_index(&column.name).is_some() {

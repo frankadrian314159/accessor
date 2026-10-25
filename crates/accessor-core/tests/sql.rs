@@ -2378,3 +2378,74 @@ fn time_zones() {
     let plan = db.query("EXPLAIN SELECT id FROM Ev ORDER BY at DESC LIMIT 1").unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n");
     assert!(plan.contains("no sort"), "{plan}");
 }
+
+// ----- CREATE OR REPLACE, RENAME TO, SET/DROP DEFAULT and NOT NULL --------------------------------
+
+#[test]
+fn replace_rename_and_column_settings() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Parent (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE Child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES Parent (id), amt INTEGER CHECK (amt >= 0));
+         CREATE TABLE Log (msg TEXT);
+         CREATE TRIGGER logp AFTER INSERT ON Parent BEGIN INSERT INTO Log VALUES ('added ' & NEW.name); END;
+         CREATE VIEW PV AS SELECT name FROM Parent WHERE id > 0;
+         INSERT INTO Parent VALUES (1, 'a');
+         INSERT INTO Child VALUES (1, 1, 5);",
+    )
+    .unwrap();
+
+    // OR REPLACE for views and triggers; not for tables.
+    db.execute("CREATE OR REPLACE VIEW PV AS SELECT name, id FROM Parent").unwrap();
+    assert_eq!(db.query("SELECT * FROM PV").unwrap().columns, ["name", "id"]);
+    db.execute("CREATE OR REPLACE VIEW Brand AS SELECT 1 AS x").unwrap(); // creates when absent
+    assert!(db.execute("CREATE OR REPLACE TABLE Parent (x INT)").is_err());
+    assert!(db.execute("CREATE OR REPLACE VIEW Parent AS SELECT 1").is_err()); // a table is in the way
+    db.execute("CREATE OR REPLACE TRIGGER logp AFTER INSERT ON Parent BEGIN INSERT INTO Log VALUES ('new ' & NEW.name); END").unwrap();
+    db.execute("INSERT INTO Parent VALUES (2, 'b')").unwrap();
+    assert_eq!(rows(&db, "SELECT msg FROM Log"), [["added a"], ["new b"]]);
+    // A failing replacement leaves the old definition in place.
+    assert!(db.execute("CREATE OR REPLACE VIEW PV AS SELECT nosuchcolumn FROM Parent").is_err());
+    assert_eq!(db.query("SELECT * FROM PV").unwrap().columns, ["name", "id"]);
+
+    // Renaming a table follows its relationships, triggers, checks and saved queries.
+    db.execute("ALTER TABLE Parent RENAME TO Guardian").unwrap();
+    assert!(db.table("Parent").is_none() && db.table("Guardian").is_some());
+    assert_eq!(rows(&db, "SELECT name FROM PV ORDER BY id"), [["a"], ["b"]]);
+    db.execute("INSERT INTO Guardian VALUES (3, 'c')").unwrap();
+    assert_eq!(rows(&db, "SELECT msg FROM Log ORDER BY msg"), [["added a"], ["new b"], ["new c"]]);
+    assert!(db.execute("INSERT INTO Child VALUES (2, 99, 1)").is_err()); // the relationship still holds
+    db.execute("INSERT INTO Child VALUES (2, 3, 1)").unwrap();
+    assert!(db.execute("INSERT INTO Child VALUES (3, 1, -1)").is_err()); // and so does the CHECK
+    assert!(db.execute("DROP TABLE Guardian").is_err()); // Child still refers to it
+    db.execute("ALTER TABLE Child RENAME TO Kid").unwrap();
+    assert_eq!(rows(&db, "SELECT Count(*) FROM Kid"), [["2"]]);
+    assert!(db.execute("INSERT INTO Kid VALUES (9, 1, -5)").is_err());
+    assert!(db.execute("ALTER TABLE Kid RENAME TO Guardian").is_err()); // taken
+    assert!(db.execute("ALTER TABLE Kid RENAME TO PV").is_err()); // taken by a query
+    assert!(db.execute("ALTER TABLE Nothing RENAME TO X").is_err());
+    // It can be rolled back with the rest of a transaction.
+    db.execute("BEGIN; ALTER TABLE Kid RENAME TO Gone; ROLLBACK").unwrap();
+    assert!(db.table("Kid").is_some() && db.table("Gone").is_none());
+    db.execute("INSERT INTO Kid VALUES (4, 1, 1)").unwrap();
+
+    // Defaults and requiredness.
+    db.execute("CREATE TABLE T (a INTEGER, b TEXT, c INTEGER PRIMARY KEY)").unwrap();
+    db.execute("ALTER TABLE T ALTER COLUMN a SET DEFAULT 7").unwrap();
+    db.execute("ALTER TABLE T ALTER COLUMN b SET DEFAULT 'x'").unwrap();
+    db.execute("INSERT INTO T (c) VALUES (1)").unwrap();
+    assert_eq!(rows(&db, "SELECT a, b FROM T"), [["7", "x"]]);
+    db.execute("ALTER TABLE T ALTER COLUMN a DROP DEFAULT").unwrap();
+    db.execute("INSERT INTO T (c) VALUES (2)").unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM T WHERE c = 2"), [[""]]);
+    assert!(db.execute("ALTER TABLE T ALTER COLUMN a SET DEFAULT 'not a number'").is_err());
+    // SET NOT NULL is refused while records lack a value, and then works.
+    let e = db.execute("ALTER TABLE T ALTER COLUMN a SET NOT NULL").unwrap_err();
+    assert!(e.to_string().contains("1 record(s)"), "{e}");
+    db.execute("UPDATE T SET a = 0 WHERE a IS NULL").unwrap();
+    db.execute("ALTER TABLE T ALTER COLUMN a SET NOT NULL").unwrap();
+    assert!(db.execute("INSERT INTO T (c, a) VALUES (3, NULL)").is_err());
+    db.execute("ALTER TABLE T ALTER COLUMN a DROP NOT NULL").unwrap();
+    db.execute("INSERT INTO T (c, a) VALUES (3, NULL)").unwrap();
+    assert!(db.execute("ALTER TABLE T ALTER COLUMN c DROP NOT NULL").is_err()); // primary key
+}
