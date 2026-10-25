@@ -20,7 +20,44 @@ A saved query may be a single `SELECT` (including `WITH`, `VALUES` and set opera
 CREATE QUERY CustomerThree AS EXEC OrdersOf 3;
 ```
 
-A view cannot have a column-name list: a parenthesised list after the name declares *parameters* (see below). The column names come from the select list; use aliases to choose them.
+A query is checked when it is created: one that names a missing table or column is refused then, not when first used. (A query with parameters cannot be tried without values and is checked when it runs.)
+
+### Column names
+
+A parenthesised list of names after the view's name chooses the names of its columns:
+
+```sql
+CREATE VIEW Cheap (code, label, cost) AS SELECT id, name, price FROM Product WHERE price < 1;
+SELECT label FROM Cheap;
+```
+
+The list must have as many names as the query has columns. (A list that starts with a `@parameter` declares parameters instead; see below.) `CREATE OR REPLACE VIEW` changes a view's definition ([ddl.md](ddl.md#create-or-replace)).
+
+### Changing data through a view
+
+`INSERT`, `UPDATE` and `DELETE` work on a **simple view**: one that reads a single table (or another simple view) and shows plain columns of it, with no `DISTINCT`, `GROUP BY`, aggregate, limit, window function, join, sub-query in `FROM`, set operator or parameters. The statement is carried out on the table, with the view's `WHERE` condition added, so only rows the view shows can be updated or deleted:
+
+```sql
+CREATE VIEW Live (code, label) AS SELECT id, name FROM Product WHERE active;
+UPDATE Live SET label = 'renamed' WHERE code = 3;     -- only if product 3 is active
+DELETE FROM Live WHERE code = 4;
+INSERT INTO Live (code, label) VALUES (10, 'new');    -- columns the view does not show take their defaults
+```
+
+Columns are named as the view names them. A view column that is computed (`price * 2 AS twice`) cannot be set, and a view that is not simple refuses a change with the reason ("it joins tables", "it summarises, limits or combines rows", "a column is computed by an expression", ...).
+
+### WITH CHECK OPTION
+
+```sql
+CREATE VIEW Pricey AS SELECT id, name, price FROM Product WHERE price > 5 WITH CHECK OPTION;
+UPDATE Pricey SET price = 1 WHERE id = 4;    -- refused: the row would leave the view
+```
+
+With `WITH CHECK OPTION`, an `INSERT` or `UPDATE` through the view that would produce a row not satisfying the view's condition is refused and changes nothing. (The check is made when the view reads a table directly; for a view built on another view, that view's own option applies.)
+
+### Reading a view
+
+A view that shows every column of one table is *merged* into the query that uses it, so the table's indexes still work: see [../optimizer/views.md](../optimizer/views.md).
 
 ## Parameters
 

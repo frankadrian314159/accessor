@@ -50,6 +50,10 @@ DELETE FROM Orders O
 WHERE NOT EXISTS (SELECT 1 FROM Lines L WHERE L.OrderID = O.ID);
 ```
 
+## Through a view
+
+`INSERT`, `UPDATE` and `DELETE` can name a *simple view* instead of a table; they are carried out on its table, within the view's condition, and `WITH CHECK OPTION` keeps new rows inside the view. See [queries-and-triggers.md](queries-and-triggers.md#changing-data-through-a-view).
+
 ## TRUNCATE
 
 ```sql

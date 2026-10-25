@@ -1,12 +1,12 @@
 # DATETIME
 
-A date with a time of day, to the second. Aliases: `DATE`, `TIME`, `TIMESTAMP` (`TIMESTAMP WITH TIME ZONE` is accepted, but no zone is stored). They are all the same type, so a `DATE` column can hold a time and a `TIME` column a date.
+A date with a time of day, to the second. Aliases: `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE`. For a moment in time that must be shown in different zones, use [`TIMESTAMPTZ`](timestamptz.md). They are all the same type, so a `DATE` column can hold a time and a `TIME` column a date.
 
 ## Representation
 
-A `DATETIME` is a whole number of **seconds since 1970-01-01 00:00:00**, in one fixed time zone. Consequences:
+A `DATETIME` is a whole number of **seconds since 1970-01-01 00:00:00**, as a wall-clock reading with **no time zone**. Consequences:
 
-* There are **no time zones** and no daylight-saving adjustments; store UTC or local time consistently.
+* A `DATETIME` has no zone and no daylight-saving adjustment; it is whatever the clock on the wall said. Convert with `AT TIME ZONE` ([timestamptz.md](timestamptz.md)) when you need to say which zone.
 * There are **no fractions of a second**. `CDate(45000.5)` is half a day, 12:00:00; anything finer than a second is rounded.
 * The range is far wider than any practical need, from year 1 backwards and forwards (the calendar is the proleptic Gregorian one).
 
@@ -41,6 +41,8 @@ A value at midnight shows as the date alone, `2024-03-05`; any other value shows
 Month and year arithmetic is done with `DateAdd`, which clamps to the end of a shorter month: `DateAdd('m', 1, #2024-01-31#)` is 2024-02-29.
 
 ## Functions
+
+Adding a month or a year is done with an [`INTERVAL`](interval.md): `#2024-01-31# + INTERVAL '1 month'` is 2024-02-29.
 
 `Now`, `Date`, `Year`, `Month`, `Day`, `Hour`, `Minute`, `Second`, `Weekday`, `DateAdd`, `DateDiff`, `DateSerial`, `DatePart`, `EXTRACT`, `CDate`: see [datetime functions](../functions/datetime.md).
 

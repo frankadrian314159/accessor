@@ -31,6 +31,7 @@ A script is a sequence of statements separated by semicolons. Empty statements a
                   | '"' { <any character> | '""' } '"'                (* double quotes also make strings *)
 <date-literal>  ::= '#' <date text> '#'
                   | ( DATE | TIMESTAMP | TIME ) <string>
+                  | ( TIMESTAMP | TIME ) WITH TIME ZONE <string>
 <boolean>       ::= TRUE | FALSE | YES | NO
 
 <comment>       ::= '--' { <any character except newline> }
@@ -39,13 +40,13 @@ A script is a sequence of statements separated by semicolons. Empty statements a
 
 Identifiers and keywords are case-insensitive. An identifier that is a reserved word, or contains spaces or punctuation, is written in square brackets: `[Order Details]`, `[Group]`.
 
-The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC DISTINCT DROP ELSE END EXCEPT EXISTS FETCH FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT MOD NATURAL NOT NULL OFFSET ON OR ORDER OUTER PIVOT RIGHT SELECT SET TABLE THEN TOP UNION UPDATE USING VALUES VIEW WHEN WHERE`. Other words that have a meaning in some place (`COUNT`, `YEAR`, `FIRST`, and so on) are not reserved and can be used as names.
+The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC DISTINCT DROP ELSE END EXCEPT EXISTS FETCH FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT MOD NATURAL NOT NULL OFFSET ON OR ORDER OUTER PIVOT RIGHT SELECT SET TABLE THEN TOP UNION UNPIVOT UPDATE USING VALUES VIEW WHEN WHERE`. Other words that have a meaning in some place (`COUNT`, `YEAR`, `FIRST`, and so on) are not reserved and can be used as names.
 
 ## Statements
 
 ```bnf
 <statement> ::= <query>
-              | <explain>
+              | <explain> | <set-time-zone>
               | <insert> | <update> | <delete> | <merge> | <truncate>
               | <create-table> | <create-index> | <create-view> | <create-trigger>
               | <drop> | <alter-table>
@@ -59,6 +60,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                 <select-core> [ <order-by> ] { <row-limit> }
                 PIVOT <concat> [ IN '(' <expr-list> ')' ]
 <explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
+<set-time-zone> ::= SET ( TIME ZONE | TIMEZONE TO ) ( <string> | LOCAL | UTC )
 ```
 
 ### Queries
@@ -82,6 +84,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                     [ WHERE <expr> ]
                     [ GROUP BY <group-element> { ',' <group-element> } ]
                     [ HAVING <expr> ]
+                    [ WINDOW <identifier> AS <window> { ',' <identifier> AS <window> } ]
 
 <select-item>   ::= '*'
                   | <identifier> '.' '*'
@@ -94,7 +97,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <grouping-set>  ::= '(' [ <expr-list> ] ')' | <expr>
 
 <order-by>      ::= ORDER BY <order-item> { ',' <order-item> }
-<order-item>    ::= <expr> [ ASC | DESC ]
+<order-item>    ::= <expr> [ ASC | DESC ] [ NULLS ( FIRST | LAST ) ]
 <row-limit>     ::= LIMIT <integer>
                   | OFFSET <integer> [ ROW | ROWS ]
                   | FETCH ( FIRST | NEXT ) [ <integer> ] ( ROW | ROWS ) ONLY
@@ -106,8 +109,16 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <from-clause>   ::= <from-source> { <join> }
 <from-source>   ::= <table-factor>
                   | '(' <from-clause> ')'                  (* a parenthesised join, as Access writes it *)
-<table-factor>  ::= <identifier> [ [ AS ] <identifier> ]
-                  | '(' <query> ')' [ AS ] <identifier> [ '(' <identifier-list> ')' ]
+<table-factor>  ::= <table-primary> { <pivot-clause> | <unpivot-clause> }
+<table-primary> ::= <identifier> [ [ AS ] <identifier> ]
+                  | [ LATERAL ] '(' <query> ')' [ AS ] <identifier> [ '(' <identifier-list> ')' ]
+                  | [ LATERAL ] <identifier> '(' [ <expr-list> ] ')' [ [ AS ] <identifier> ] [ '(' <identifier-list> ')' ]
+                                                            (* a table function: GENERATE_SERIES, SPLIT_STRING *)
+<pivot-clause>  ::= PIVOT '(' <expr> FOR <concat> IN '(' <pivot-value> { ',' <pivot-value> } ')' ')' [ [ AS ] <identifier> ]
+<pivot-value>   ::= <expr> [ AS ( <identifier> | <string> ) ]
+<unpivot-clause> ::= UNPIVOT [ ( INCLUDE | EXCLUDE ) NULLS ]
+                     '(' <identifier> FOR <identifier> IN '(' <unpivot-column> { ',' <unpivot-column> } ')' ')' [ [ AS ] <identifier> ]
+<unpivot-column> ::= <identifier> [ AS ( <identifier> | <string> ) ]
 
 <join>          ::= ',' <table-factor>
                   | CROSS JOIN <table-factor>
@@ -183,13 +194,15 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                  | TEXT | VARCHAR | CHAR | CHARACTER [ VARYING ] | STRING | MEMO | LONGTEXT | NVARCHAR | NCHAR
                  | NATIONAL ( CHARACTER | CHAR ) [ VARYING ] | CLOB
                  | YESNO | BIT | BOOLEAN | BOOL | LOGICAL
-                 | DATETIME | DATE | TIME | TIMESTAMP [ ( WITH | WITHOUT ) TIME ZONE ]
+                 | DATETIME | DATE | TIME | TIMESTAMP [ WITHOUT TIME ZONE ]
+                 | TIMESTAMPTZ | ( TIMESTAMP | TIME ) WITH TIME ZONE
+                 | INTERVAL
 
 <create-index> ::= CREATE [ UNIQUE ] INDEX [ IF NOT EXISTS ] <identifier> ON <identifier> '(' <identifier-list> ')'
 
-<create-view>  ::= CREATE ( VIEW | QUERY ) [ IF NOT EXISTS ] <identifier>
-                   [ '(' <parameter-decl> { ',' <parameter-decl> } ')' ]
-                   AS ( [ PARAMETERS <parameter-decl-list> ';' ] <query> | <exec> )
+<create-view>  ::= CREATE [ OR REPLACE ] ( VIEW | QUERY ) [ IF NOT EXISTS ] <identifier>
+                   [ '(' ( <parameter-decl> { ',' <parameter-decl> } | <identifier-list> ) ')' ]    (* parameters, or column names *)
+                   AS ( [ PARAMETERS <parameter-decl-list> ';' ] <query> [ WITH CHECK OPTION ] | <exec> )
 <parameters>   ::= PARAMETERS <parameter-decl> { ',' <parameter-decl> }
 <parameter-decl> ::= <parameter> [ <type-name> ]
 
@@ -197,7 +210,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                    [ '(' ] [ <argument> { ',' <argument> } ] [ ')' ]
 <argument>     ::= [ <parameter> '=' ] <expr>
 
-<create-trigger> ::= CREATE TRIGGER <identifier> ( BEFORE | AFTER ) ( INSERT | UPDATE | DELETE )
+<create-trigger> ::= CREATE [ OR REPLACE ] TRIGGER <identifier> ( BEFORE | AFTER ) ( INSERT | UPDATE | DELETE )
                      ON <identifier> [ FOR EACH ROW ] [ WHEN <expr> ]
                      BEGIN <trigger-statement> ';' { <trigger-statement> ';' } END
 <trigger-statement> ::= <insert> | <update> | <delete> | <raise>
@@ -215,8 +228,11 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                  | ADD <check>
                  | DROP [ COLUMN ] <identifier>
                  | DROP CONSTRAINT <identifier>
+                 | RENAME TO <identifier>
                  | RENAME [ COLUMN ] <identifier> TO <identifier>
                  | ALTER [ COLUMN ] <identifier> [ TYPE ] <data-type>
+                 | ALTER [ COLUMN ] <identifier> ( SET | DROP ) DEFAULT [ [ '-' ] <literal> ]    (* the literal only after SET *)
+                 | ALTER [ COLUMN ] <identifier> ( SET | DROP ) NOT NULL
 ```
 
 ### Transactions
@@ -256,12 +272,15 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
 <additive>    ::= <multiplicative> { ( '+' | '-' ) <multiplicative> }
 <multiplicative> ::= <unary> { ( '*' | '/' | '\' | '%' | MOD ) <unary> }
 <unary>       ::= ( '-' | '+' ) <unary> | <power>
-<power>       ::= <primary> [ '^' <unary> ]
+<power>       ::= <at-zone> [ '^' <unary> ]
+<at-zone>     ::= <primary> { AT TIME ZONE <primary> }
 
 <primary>     ::= <literal>
                 | <parameter>
                 | <column-ref>
                 | '(' <expr> ')'
+                | '(' <expr> ',' <expr-list> ')'                (* a row value, only in comparisons and IN *)
+                | ROW '(' <expr-list> ')'
                 | '(' <query> ')'                              (* scalar sub-query *)
                 | [ NOT ] EXISTS '(' <query> ')'
                 | <case>
@@ -269,7 +288,9 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
                 | CURRENT_DATE | CURRENT_TIMESTAMP | CURRENT_TIME | LOCALTIMESTAMP | LOCALTIME
                 | <function-call>
 
-<literal>     ::= <integer> | <decimal> | <double> | <string> | <date-literal> | <boolean> | NULL
+<literal>     ::= <integer> | <decimal> | <double> | <string> | <date-literal> | <interval-literal> | <boolean> | NULL
+<interval-literal> ::= INTERVAL <string> [ <interval-field> [ TO <interval-field> ] ]
+<interval-field>   ::= YEAR | MONTH | DAY | HOUR | MINUTE | SECOND
 <column-ref>  ::= <identifier> [ '.' <identifier> ]
 <expr-list>   ::= <expr> { ',' <expr> }
 <identifier-list> ::= <identifier> { ',' <identifier> }
@@ -285,8 +306,10 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
 <function-call> ::= <identifier> '(' [ '*' | [ DISTINCT ] <expr-list> ] ')'
                     [ FILTER '(' WHERE <expr> ')' ]
                     [ OVER <window> ]
-<window>      ::= '(' [ PARTITION BY <expr-list> ] [ ORDER BY <order-item> { ',' <order-item> } ] [ <frame> ] ')'
+<window>      ::= <identifier>                                   (* OVER w: a window named in the WINDOW clause *)
+                | '(' [ <identifier> ] [ PARTITION BY <expr-list> ] [ ORDER BY <order-item> { ',' <order-item> } ] [ <frame> ] ')'
 <frame>       ::= ( ROWS | RANGE ) ( <bound> | BETWEEN <bound> AND <bound> )
 <bound>       ::= UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING | CURRENT ROW
-                | <integer> PRECEDING | <integer> FOLLOWING
+                | <integer> PRECEDING | <integer> FOLLOWING        (* ROWS: a row count *)
+                | <constant> PRECEDING | <constant> FOLLOWING      (* RANGE: a number, or an interval for dates *)
 ```

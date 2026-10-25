@@ -183,6 +183,68 @@ Correlated sub-queries are allowed in the select list, `WHERE` and `ORDER BY` of
 
 `x > ALL (subquery)` is true when `x` is greater than every value, and true over an empty set. `x > ANY (subquery)` is true when it is greater than at least one, and false over an empty set. `= ANY` is the same as `IN`, and `<> ALL` the same as `NOT IN`. The other combinations are computed with the smallest and largest value of the sub-query, which ignores NULLs; SQL's rule that a NULL in the set makes the answer unknown is not applied. The sub-query must return one column.
 
+## Row values
+
+A parenthesised list of two or more values is a *row value*, which can be compared with another of the same size, or looked up with `IN`:
+
+```sql
+WHERE (Region, Year) = ('East', 2024)
+WHERE (Year, Month) > (2023, 11)                     -- lexicographic: later than November 2023
+WHERE (A, B) IN ((1, 2), (3, 4))
+WHERE (CustID, Day) IN (SELECT CustID, Day FROM Holidays)
+WHERE (Day, ID) > (@last_day, @last_id) ORDER BY Day, ID LIMIT 50   -- keyset paging
+```
+
+`ROW(a, b)` is the same as `(a, b)`. The operators are `=`, `<>`, `<`, `<=`, `>`, `>=`: the parts are compared in order and the first that differs decides (`=` needs all equal, `<>` any different). A NULL part makes the comparison unknown unless an earlier part already decides it. `(a, b) NOT IN (subquery)` is evaluated as `NOT EXISTS`, so a NULL in the sub-query's rows does not make the answer unknown. Row values can only be compared; `SELECT (1, 2)` is an error, and the two sides must have the same number of parts.
+
+Keyset paging with a row comparison reads each page from an index on `(Day, ID)` instead of counting past all the earlier rows with `OFFSET`.
+
+## LATERAL joins and table functions
+
+`LATERAL` lets a sub-query in `FROM` use columns of the tables before it, so it is run for each of their rows:
+
+```sql
+-- the two largest orders of each customer
+SELECT C.Name, T.ID, T.Total
+FROM Customers C,
+     LATERAL (SELECT O.ID, O.Total FROM Orders O WHERE O.CustID = C.ID ORDER BY O.Total DESC LIMIT 2) AS T;
+
+-- customers with no orders still appear
+SELECT C.Name, T.ID
+FROM Customers C LEFT JOIN LATERAL (SELECT ID FROM Orders WHERE CustID = C.ID) AS T ON TRUE;
+```
+
+`CROSS JOIN LATERAL`, `, LATERAL`, `JOIN LATERAL ... ON` and `LEFT JOIN LATERAL ... ON` all work. A lateral item may use any table before it, including an earlier lateral item. `RIGHT` and `FULL` joins cannot have a lateral item as their target. Without any reference to an earlier table, `LATERAL` is just a derived table. The sub-query is run once for each *distinct* set of outer values it uses, and the answer is remembered; `EXPLAIN` reports how many runs there were.
+
+A **table function** is a function used as a table, with optional column names:
+
+```sql
+FROM GENERATE_SERIES(1, 10) AS g (n)
+FROM Article A CROSS JOIN LATERAL SPLIT_STRING(A.Tags, ',') AS T
+```
+
+Its arguments may use earlier tables in the same way. The two table functions are listed in [../functions/table-functions.md](../functions/table-functions.md).
+
+## PIVOT and UNPIVOT
+
+`PIVOT` and `UNPIVOT` after a table in `FROM` turn rows into columns and columns into rows.
+
+```sql
+-- one column per quarter
+SELECT * FROM (SELECT Region, Quarter, Amount FROM Sales) AS s
+PIVOT (SUM(Amount) FOR Quarter IN (1 AS Q1, 2 AS Q2, 3 AS Q3, 4 AS Q4)) AS p;
+
+-- one row per (product, quarter)
+SELECT * FROM Wide
+UNPIVOT (Amount FOR Quarter IN (Q1, Q2, Q3, Q4)) AS u;
+```
+
+**`source PIVOT (aggregate FOR column IN (value [AS label], ...)) [AS alias]`.** The distinct values of `column` listed in `IN` become columns, each holding the aggregate over the rows with that value. The columns of `source` that the aggregate and `column` do not use are the row headings: rows are grouped by them. A cell with no rows is NULL (0 for `COUNT`). The aggregate is any [aggregate function](../functions/aggregate.md). Pivoting is done by the same single grouped pass as a [crosstab](#crosstab-queries-transform--pivot), and the result can be filtered, joined and sorted like any table.
+
+**`source UNPIVOT [INCLUDE | EXCLUDE NULLS] (value_column FOR name_column IN (column [AS label], ...)) [AS alias]`.** For each row of `source` and each listed column, one row is produced with the columns not listed, the column's name (or label) in `name_column` and its value in `value_column`. Rows whose value is NULL are left out unless `INCLUDE NULLS` is given. The values keep their own types.
+
+A pivot with a fixed `IN` list suits queries whose columns are known; `TRANSFORM ... PIVOT` finds the columns from the data.
+
 ## Window functions
 
 A window function computes a value for each row from a set of related rows, without collapsing them:
@@ -199,7 +261,9 @@ FROM Emp;
 
 Window functions may appear in the select list and in `ORDER BY`, not in `WHERE`, `GROUP BY`, `HAVING` or join conditions. In a grouped query they run after grouping, so they can use aggregates: `RANK() OVER (ORDER BY SUM(Sal) DESC)`.
 
-Not supported: named windows (`WINDOW w AS (...)` and `OVER w`), `GROUPS` frames, `EXCLUDE` clauses, and `RANGE` with a numeric offset (use `ROWS`).
+A window used more than once can be named with a `WINDOW` clause (after `HAVING`) and referred to with `OVER w`; `OVER (w ORDER BY x)` adds to it. `RANGE` frames accept an offset (`RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW`). See [../functions/window.md](../functions/window.md).
+
+Not supported: `GROUPS` frames and `EXCLUDE` clauses.
 
 ## Crosstab queries (TRANSFORM … PIVOT)
 
@@ -262,7 +326,13 @@ ORDER BY 2 DESC                    -- a position in the select list
 ORDER BY Mean                      -- an alias from the select list
 ```
 
-NULLs sort before every other value in ascending order, and after them in descending order. Numbers compare by value across all numeric types, text compares case-insensitively.
+NULLs sort before every other value in ascending order, and after them in descending order. `NULLS FIRST` or `NULLS LAST` after an item places them explicitly:
+
+```sql
+ORDER BY Due NULLS LAST, Priority DESC NULLS FIRST
+```
+
+`NULLS FIRST` / `NULLS LAST` work in `ORDER BY` after a set operator and inside window definitions as well, and an index can still deliver the order (see [../optimizer/access-paths.md](../optimizer/access-paths.md#order-by-with-a-limit)). Numbers compare by value across all numeric types, text compares case-insensitively.
 
 ## Limiting rows
 

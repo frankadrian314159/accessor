@@ -11,6 +11,7 @@ The optimizer is on by default. There is nothing to configure: no statistics to 
 | [access-paths.md](access-paths.md) | index selection for a single table, ordered reads that skip the sort, and the `COUNT(*)` shortcut |
 | [estimates.md](estimates.md) | how row counts are estimated, and how good the estimates are |
 | [crosstab.md](crosstab.md) | how `TRANSFORM … PIVOT` queries are executed, and the one-pass method that makes them fast |
+| [views.md](views.md) | how simple views are merged into the queries that use them, and changes through views |
 | [explain.md](explain.md) | reading the output of `EXPLAIN` |
 | [tuning.md](tuning.md) | helping the optimizer: indexes, writing conditions, switching it off, limits |
 
@@ -45,13 +46,14 @@ join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out .
 4. **Index selection.** Each table is read through the best index for its conditions. See [access-paths.md](access-paths.md#choosing-an-index).
 5. **Ordered reads.** `ORDER BY ... LIMIT` that matches an index reads the index in order and stops early. See [access-paths.md](access-paths.md#order-by-with-a-limit).
 6. **One-pass crosstabs.** A `TRANSFORM … PIVOT` query is computed by a single grouped pass instead of one conditional aggregate per column. See [crosstab.md](crosstab.md).
-7. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
+7. **View merging.** A view that is `SELECT * FROM table WHERE ...` is read as its table, with its condition applied during the scan. See [views.md](views.md).
+8. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
 
 And what it deliberately does not do, so that you are not surprised:
 
 * It does not reorder outer joins (`LEFT`, `RIGHT`, `FULL`).
 * It does not keep statistics or need `ANALYZE`; its estimates are simple (see [estimates.md](estimates.md)).
-* It does not look inside sub-queries or views to merge them with the outer query; each is planned on its own.
+* It does not look inside sub-queries, derived tables or views that join, group or project columns to merge them with the outer query; each is planned on its own. (A view of the form `SELECT * FROM table WHERE ...` *is* merged: [views.md](views.md).)
 * It does not cache plans: every statement is planned again each time it runs.
 
 ## Where it sits

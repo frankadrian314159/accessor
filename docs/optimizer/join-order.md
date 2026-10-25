@@ -40,6 +40,10 @@ The "larger of the two" for a linked join reflects the usual shape of a join: a 
 
 Each step applies the join conditions that have just become available ([pushdown.md](pushdown.md)).
 
+## LATERAL and table functions
+
+An item that reads earlier tables (`LATERAL (SELECT ...)`, or a table function whose arguments use them) depends on those tables, so a query containing one keeps the order written and is not reordered. Each such item is run for each row of the tables before it, but only once for every **distinct** set of the outer values it reads, and the answers are remembered: for 10 000 orders belonging to 200 customers, a lateral item that uses only the customer runs 200 times. A table function with constant arguments (`GENERATE_SERIES(1, 100)`) is computed once and is an ordinary, reorderable source. Conditions in the `WHERE` that read only the lateral item's columns are applied to its rows as they come back. `EXPLAIN` says `LATERAL, run N time(s) for M left row(s)`.
+
 ## Join methods
 
 Each step joins the rows so far (the *left*) to the next table (the *right*), by one of three methods:

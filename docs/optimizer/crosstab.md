@@ -47,6 +47,10 @@ With few columns the difference is small (ten columns over 100,000 headings: 2.1
 
 Both passes are ordinary queries, so everything else in the optimizer applies to them: conditions are pushed down, joins are reordered, indexes are used. A crosstab over a three-table join is as well planned as the join alone.
 
+## PIVOT in FROM
+
+`source PIVOT (aggregate FOR column IN (v1, v2, ...))` ([select.md](../sql/select.md#pivot-and-unpivot)) is a crosstab with a fixed list of values: it is rewritten into the same grouped query and takes the same one-pass method, with the same results. `UNPIVOT` is the reverse: it reads the source once and produces one row per listed column; it has no separate plan.
+
 ## When the one-pass method is used
 
 It is used whenever the optimizer is on, except when the query has:

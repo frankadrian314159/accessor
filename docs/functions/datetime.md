@@ -1,6 +1,6 @@
 # Date and time functions
 
-A `DATETIME` is a number of whole seconds since 1970-01-01 00:00:00, in one time zone (there are no zones and no fractions of a second). A value at midnight is shown as a date alone: `2024-03-05`; otherwise as `2024-03-05 14:30:00`.
+A `DATETIME` is a number of whole seconds since 1970-01-01 00:00:00 as a wall-clock reading with no zone, and no fractions of a second. A `TIMESTAMPTZ` is an instant, shown in the session time zone ([types/timestamptz.md](../types/timestamptz.md)); an `INTERVAL` is a length of time ([types/interval.md](../types/interval.md)). A value at midnight is shown as a date alone: `2024-03-05`; otherwise as `2024-03-05 14:30:00`.
 
 Dates are written as literals `#2024-03-05#`, `#2024-03-05 14:30:00#`, `#3/5/2024 2:30 PM#` (month first), or `DATE '2024-03-05'`, `TIMESTAMP '2024-03-05 14:30:00'`. Text is converted when a date is needed.
 
@@ -12,8 +12,10 @@ Arithmetic: `date + n` and `date - n` move by `n` days (fractions of a day work:
 | --- | --- |
 | `Now()` | the current date and time |
 | `Date()` (also `Today()`) | today's date, at midnight |
-| `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, `CURRENT_TIME`, `LOCALTIME` | the same as `Now()` |
-| `CURRENT_DATE` | the same as `Date()` |
+| `CURRENT_TIMESTAMP`, `NowTz()` | the current instant, a `TIMESTAMPTZ` |
+| `LOCALTIMESTAMP`, `CURRENT_TIME`, `LOCALTIME` | the wall clock of the session time zone, a `DATETIME` |
+| `SessionTimeZone()` | the name of the session time zone (`UTC`, `Europe/Paris`, `+05:30`) |
+| `CURRENT_DATE` | today's date in the session time zone, at midnight |
 
 The standard forms are written without parentheses. These functions give a different answer each time, so they are not allowed in [calculated columns](../sql/ddl.md#calculated-columns).
 
@@ -91,6 +93,18 @@ SELECT DateSerial(Year(Now()), Month(Now()) + 1, 0);   -- last day of this month
 ```sql
 SELECT EXTRACT(QUARTER FROM DATE '2024-11-05');   -- 4
 ```
+
+## Time zones and intervals
+
+| Function | Returns |
+| --- | --- |
+| `x AT TIME ZONE zone` | a `TIMESTAMPTZ` as a `DATETIME` wall clock in `zone`, or a `DATETIME` as the `TIMESTAMPTZ` at which `zone`'s clock read it |
+| `TimeZone(zone, x)` | the same, arguments the other way round |
+| `AGE(a, b)` | the calendar difference of two dates as an `INTERVAL`: `AGE(#2024-03-05#, #2021-01-10#)` is `3 years 1 month 24 days` |
+| `MakeInterval(years, months, days, hours, mins, secs)` | an `INTERVAL`; missing arguments are 0 |
+| `CTimestampTz(x)`, `CInterval(x)` | conversions |
+
+`DatePart` and `EXTRACT` also accept an `INTERVAL` (`YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `EPOCH`) and, for a `TIMESTAMPTZ`, the fields `TIMEZONE` (the offset in seconds), `TIMEZONE_HOUR` and `TIMEZONE_MINUTE`. `DateAdd` on a `TIMESTAMPTZ` returns a `TIMESTAMPTZ`, with the shift made on the session zone's wall clock. For a `TIMESTAMPTZ`, `Year`, `Hour` and the other parts read the session zone's wall clock.
 
 ## Related
 

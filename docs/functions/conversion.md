@@ -23,6 +23,8 @@ Converts a value to a [data type](../sql/ddl.md#data-types): `CAST('12' AS INTEG
 | `CRat(x)` | `RATIONAL` | an exact fraction; `CRat(0.75)` is 3/4 |
 | `CStr(x)` | `TEXT` | the text form of any value |
 | `CBool(x)` | `YESNO` | a number is true unless it is zero; text such as `'yes'`, `'true'`, `'no'`, `'false'` |
+| `CTimestampTz(x)` | `TIMESTAMPTZ` | a moment, read in the session time zone if the text has no offset |
+| `CInterval(x)` | `INTERVAL` | `3 days`, `1 year 2 months`, `04:05:06` |
 | `CDate(x)` | `DATETIME` | text in the date formats of the [date page](datetime.md), or a day number |
 
 These conversions are exact where they can be: `CDec(5)` is `5`, `CBig('123456789012345678901234567890')` keeps every digit. Converting an exact number to `FLOAT` or `DOUBLE` can lose precision; the other direction never invents digits.

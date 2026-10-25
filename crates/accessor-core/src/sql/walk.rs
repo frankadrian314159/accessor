@@ -110,6 +110,13 @@ fn walk_factor(t: &mut TableFactor, f: &mut Visitor) -> Result<()> {
         TableFactor::Named { .. } | TableFactor::Materialized { .. } => Ok(()),
         TableFactor::Derived { query, .. } => walk_select(query, f),
         TableFactor::Function { args, .. } => args.iter_mut().try_for_each(|a| walk_expr(a, f)),
+        TableFactor::Pivot { source, agg, pivot, values, .. } => {
+            walk_factor(source, f)?;
+            walk_expr(agg, f)?;
+            walk_expr(pivot, f)?;
+            values.iter_mut().try_for_each(|(v, _)| walk_expr(v, f))
+        }
+        TableFactor::Unpivot { source, .. } => walk_factor(source, f),
     }
 }
 

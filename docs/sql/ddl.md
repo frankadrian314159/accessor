@@ -65,11 +65,13 @@ Each type has a canonical name and aliases; the aliases are what the standard an
 | `CURRENCY` | `MONEY` | exact decimals, shown as money |
 | `RATIONAL` | | exact fractions |
 | `YESNO` | `BOOLEAN`, `BOOL`, `BIT`, `LOGICAL` | true or false |
-| `DATETIME` | `DATE`, `TIME`, `TIMESTAMP` | a date and time of day, to the second |
+| `DATETIME` | `DATE`, `TIME`, `TIMESTAMP` | a date and time of day, to the second, with no time zone |
+| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | a moment in time, shown in a time zone ([types/timestamptz.md](../types/timestamptz.md)) |
+| `INTERVAL` | | a length of time in months, days and seconds ([types/interval.md](../types/interval.md)) |
 | `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL` | an `INTEGER` filled in automatically |
 | `CALCULATED` | | a value computed from the other columns |
 
-A length or precision after a type name (`VARCHAR(50)`, `NUMERIC(10, 2)`) is accepted and ignored: text has no length limit, and decimals have no fixed scale. Use `CAST(x AS DECIMAL(10,2))` or `ROUND` to round a value. `TIMESTAMP WITH TIME ZONE` is accepted, and the zone is ignored: all times are stored as UTC-style seconds without a zone. `INTEGER`, `FLOAT` and the other numeric types behave as described in the README's Numbers section.
+A length or precision after a type name (`VARCHAR(50)`, `NUMERIC(10, 2)`) is accepted and ignored: text has no length limit, and decimals have no fixed scale. Use `CAST(x AS DECIMAL(10,2))` or `ROUND` to round a value. `TIMESTAMP WITH TIME ZONE` makes a `TIMESTAMPTZ`; `TIMESTAMP WITHOUT TIME ZONE` is the plain `DATETIME`. `INTEGER`, `FLOAT` and the other numeric types behave as described in the README's Numbers section.
 
 ### AutoNumber
 
@@ -132,6 +134,11 @@ ALTER TABLE t DROP CONSTRAINT name;
 ALTER TABLE t RENAME [COLUMN] old TO new;
 ALTER TABLE t ALTER [COLUMN] column [TYPE] data-type;
 ALTER TABLE t ALTER [COLUMN] column CALCULATED AS (expr);
+ALTER TABLE t ALTER [COLUMN] column SET DEFAULT literal;
+ALTER TABLE t ALTER [COLUMN] column DROP DEFAULT;
+ALTER TABLE t ALTER [COLUMN] column SET NOT NULL;
+ALTER TABLE t ALTER [COLUMN] column DROP NOT NULL;
+ALTER TABLE t RENAME TO new_name;
 ```
 
 * **ADD COLUMN** fills the new column with its default (or NULL) in existing records.
@@ -139,6 +146,9 @@ ALTER TABLE t ALTER [COLUMN] column CALCULATED AS (expr);
 * **ALTER COLUMN ... TYPE** converts every stored value; if one cannot be converted the whole change is refused and nothing changes. A column cannot be converted to an AutoNumber.
 * **DROP COLUMN**, **RENAME COLUMN** and **ALTER COLUMN** are refused when a foreign key, index, trigger or calculated column depends on the column, with a message that says which.
 * **DROP CONSTRAINT** removes a foreign key or a check by name.
+* **SET DEFAULT** / **DROP DEFAULT** change the value used when an insert leaves the column out. The literal is converted to the column's type at once, so a value that does not fit is refused. Existing records are not touched. Calculated and AutoNumber columns have no default.
+* **SET NOT NULL** makes the column required. It is refused, with the number of offending records, while any record has no value for it. **DROP NOT NULL** makes it optional (but not a primary key column).
+* **RENAME TO** renames the table. Relationships that refer to it, its triggers and checks, and saved queries that name it are rewritten to follow. In a saved query or trigger the name is recognised after `FROM`, `JOIN`, `INTO`, `UPDATE`, `ON` and `TABLE`, and as a prefix (`Old.Column`), so a column that happens to have the old table's name is left alone. The new name must not be a table or a query already.
 
 Schema changes take part in [transactions](transactions.md) and can be rolled back.
 
@@ -149,6 +159,16 @@ DROP TABLE [IF EXISTS] name;
 ```
 
 Removes the table with its data, indexes and triggers. It is refused while another table has a foreign key that refers to it.
+
+## CREATE OR REPLACE
+
+```sql
+CREATE OR REPLACE VIEW name AS query;
+CREATE OR REPLACE QUERY name (@p) AS query;
+CREATE OR REPLACE TRIGGER name ... ;
+```
+
+Replaces the saved query or trigger of that name, or creates it if there is none. It is atomic: if the new definition is refused (it names a missing column, say), the old one is still there. Tables cannot be replaced, and a name that belongs to a table cannot be used for a query.
 
 ## IF EXISTS and IF NOT EXISTS
 

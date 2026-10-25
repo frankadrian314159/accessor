@@ -17,6 +17,7 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | [conditional.md](conditional.md) | `CASE`, `Coalesce`, `Greatest`, `IIf`, `IsNull`, `Least`, `NullIf`, `Nz` |
 | [aggregate.md](aggregate.md) | `Avg`, `Count`, `Every`, `First`, `Grouping`, `Last`, `Max`, `Min`, `StdDev`, `String_Agg`, `Sum`, `Variance`, and relatives |
 | [window.md](window.md) | `Cume_Dist`, `Dense_Rank`, `First_Value`, `Lag`, `Last_Value`, `Lead`, `Nth_Value`, `Ntile`, `Percent_Rank`, `Rank`, `Row_Number`, and aggregates used with `OVER` |
+| [table-functions.md](table-functions.md) | `GENERATE_SERIES`, `SPLIT_STRING` (used in `FROM`) |
 | [format.md](format.md) | `Format` with its number, date and text patterns |
 
 ## Alphabetical list
@@ -24,6 +25,12 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | Function | Page |
 | --- | --- |
 | Abs | [numeric](numeric.md#abs) |
+| AGE | [datetime](datetime.md#time-zones-and-intervals) |
+| AT TIME ZONE, TimeZone | [datetime](datetime.md#time-zones-and-intervals) |
+| CInterval, CTimestampTz | [conversion](conversion.md#conversion-functions) |
+| GENERATE_SERIES, SPLIT_STRING | [table functions](table-functions.md) |
+| MakeInterval | [datetime](datetime.md#time-zones-and-intervals) |
+| NowTz, SessionTimeZone | [datetime](datetime.md#now-and-date) |
 | Acos | [numeric](numeric.md#trigonometric-and-hyperbolic-functions) |
 | Asin | [numeric](numeric.md#trigonometric-and-hyperbolic-functions) |
 | Atan | [numeric](numeric.md#trigonometric-and-hyperbolic-functions) |

@@ -11,7 +11,7 @@ const RESERVED: &[&str] = &[
     "CROSS", "ON", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN", "UNION", "LIMIT", "OFFSET", "SET",
     "VALUES", "INTO", "DISTINCT", "TOP", "ASC", "DESC", "CASE", "WHEN", "THEN", "ELSE", "END", "EXISTS", "INSERT",
     "UPDATE", "DELETE", "CREATE", "DROP", "TABLE", "INDEX", "VIEW", "MOD", "ALL", "NATURAL", "USING", "INTERSECT",
-    "EXCEPT", "FETCH", "PIVOT",
+    "EXCEPT", "FETCH", "PIVOT", "UNPIVOT",
 ];
 
 /// Parses a script of one or more `;`-separated statements.
@@ -219,7 +219,10 @@ fn row_compare(op: BinOp, a: &[Expr], b: &[Expr]) -> Result<Expr> {
                     Some(prev) => bin(BinOp::Or, prev, term),
                 });
             }
-            result.expect("at least one part")
+            // `(a, b) > (x, y)` implies `a >= x`: stating that lets an index on `a` narrow the read
+            // to the rows from `x` on, which is what makes keyset paging cheap.
+            let bound = if matches!(op, BinOp::Lt | BinOp::Le) { BinOp::Le } else { BinOp::Ge };
+            bin(BinOp::And, pair(bound, 0), result.expect("at least one part"))
         }
         _ => return Err(Error::syntax("this operator cannot be used with row values")),
     })
@@ -1676,7 +1679,111 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A table factor followed by any number of `PIVOT (...)` / `UNPIVOT (...)` operators.
     fn table_factor(&mut self) -> Result<TableFactor> {
+        let mut factor = self.table_factor_base()?;
+        loop {
+            if self.peek_kw("PIVOT") && self.pivot_clause_ahead() {
+                self.advance();
+                self.expect_sym("(")?;
+                let agg = self.expr()?;
+                self.expect_kw("FOR")?;
+                let pivot = self.concat()?;
+                self.expect_kw("IN")?;
+                self.expect_sym("(")?;
+                let mut values = Vec::new();
+                loop {
+                    let v = self.expr()?;
+                    let label = if self.eat_kw("AS") {
+                        Some(match self.advance() {
+                            Tok::Str(s) => s,
+                            Tok::Ident(s) | Tok::Quoted(s) => s,
+                            _ => {
+                                self.pos = self.pos.saturating_sub(1);
+                                return Err(self.unexpected("a column name"));
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    values.push((v, label));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                self.expect_sym(")")?;
+                let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { "pivot".to_string() };
+                factor = TableFactor::Pivot { source: Box::new(factor), agg, pivot, values, alias };
+            } else if self.eat_kw("UNPIVOT") {
+                let mut include_nulls = false;
+                if self.eat_kw("INCLUDE") {
+                    self.expect_kw("NULLS")?;
+                    include_nulls = true;
+                } else if self.eat_kw("EXCLUDE") {
+                    self.expect_kw("NULLS")?;
+                }
+                self.expect_sym("(")?;
+                let value_col = self.ident()?;
+                self.expect_kw("FOR")?;
+                let name_col = self.ident()?;
+                self.expect_kw("IN")?;
+                self.expect_sym("(")?;
+                let mut columns = Vec::new();
+                loop {
+                    let c = self.ident()?;
+                    let label = if self.eat_kw("AS") {
+                        Some(match self.advance() {
+                            Tok::Str(s) => s,
+                            Tok::Ident(s) | Tok::Quoted(s) => s,
+                            _ => {
+                                self.pos = self.pos.saturating_sub(1);
+                                return Err(self.unexpected("a label"));
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    columns.push((c, label));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                self.expect_sym(")")?;
+                let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { "unpivot".to_string() };
+                factor = TableFactor::Unpivot { source: Box::new(factor), value_col, name_col, columns, include_nulls, alias };
+            } else {
+                return Ok(factor);
+            }
+        }
+    }
+
+    /// Whether the PIVOT ahead is a `PIVOT (agg FOR column IN (...))` clause on the table just read, as
+    /// opposed to the `PIVOT column` that closes a `TRANSFORM` crosstab: a clause has FOR inside its parentheses.
+    fn pivot_clause_ahead(&self) -> bool {
+        if !matches!(self.peek_at(1), Tok::Sym("(")) {
+            return false;
+        }
+        let mut depth = 0usize;
+        for k in 1.. {
+            match self.peek_at(k) {
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return false;
+                    }
+                }
+                Tok::Ident(w) if depth == 1 && w.eq_ignore_ascii_case("FOR") => return true,
+                Tok::Eof => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn table_factor_base(&mut self) -> Result<TableFactor> {
         let lateral = self.eat_kw("LATERAL");
         if self.peek_sym("(")
             && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH"))

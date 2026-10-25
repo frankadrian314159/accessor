@@ -13,7 +13,9 @@ Every column has one type, chosen when the table is created (`CREATE TABLE t (co
 | `CURRENCY` | [decimal-currency.md](decimal-currency.md) | exact decimal numbers, shown as money |
 | `RATIONAL` | [rational.md](rational.md) | exact fractions |
 | `YESNO` | [yesno.md](yesno.md) | true or false |
-| `DATETIME` | [datetime.md](datetime.md) | a date with a time of day |
+| `DATETIME` | [datetime.md](datetime.md) | a date with a time of day, with no time zone |
+| `TIMESTAMPTZ` | [timestamptz.md](timestamptz.md) | a moment in time, shown in a time zone |
+| `INTERVAL` | [interval.md](interval.md) | a length of time in months, days and seconds |
 | `COUNTER` | [counter.md](counter.md) | an `INTEGER` that numbers itself |
 | `CALCULATED` | [calculated.md](calculated.md) | a value worked out from other columns |
 
@@ -35,7 +37,8 @@ Each type may be written with its own name or with a name from the standard or f
 | `DECIMAL` | `NUMERIC`, `DEC`, `NUMBER` |
 | `CURRENCY` | `MONEY` |
 | `YESNO` | `BOOLEAN`, `BOOL`, `BIT`, `LOGICAL` |
-| `DATETIME` | `DATE`, `TIME`, `TIMESTAMP` (with or without `WITH TIME ZONE`) |
+| `DATETIME` | `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE` |
+| `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE`, `TIME WITH TIME ZONE` |
 | `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL` |
 
 All of `SMALLINT`, `INT` and `BIGINT` are the same 64-bit `INTEGER`; `BIGINT` does *not* mean a `BIGNUM`. A length or precision after a name, as in `VARCHAR(50)` or `NUMERIC(10, 2)`, is accepted and ignored.
@@ -57,7 +60,9 @@ Every type except `COUNTER` and `CALCULATED` can hold NULL, meaning "no value", 
 | a value that came from a sensor or a scientific calculation | `DOUBLE` |
 | a whole number that may exceed 9.2 × 10¹⁸ | `BIGNUM` |
 | a yes/no flag | `YESNO` |
-| a date or timestamp | `DATETIME` |
+| a date or a clock reading that means the same everywhere (a birthday, opening hours) | `DATETIME` |
+| a moment that happened (a login, a payment) | `TIMESTAMPTZ` |
+| a duration, or something to add to dates | `INTERVAL` |
 | a value that is always derived from other columns | `CALCULATED` |
 
 When in doubt about a number, prefer the exact types; they cost a little speed but never surprise.

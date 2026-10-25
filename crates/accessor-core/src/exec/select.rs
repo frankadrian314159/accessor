@@ -91,6 +91,78 @@ impl Database {
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
+            TableFactor::Pivot { source, agg, pivot, values, alias } => {
+                let inner = self.resolve_factor(source, depth)?;
+                // The columns the aggregate and the pivot use are consumed; the rest head the rows.
+                let mut used: Vec<String> = Vec::new();
+                for e in [agg, pivot] {
+                    let mut copy = e.clone();
+                    crate::sql::walk::walk_expr(&mut copy, &mut |x| {
+                        if let Expr::Column { name, .. } = x {
+                            used.push(name.to_ascii_lowercase());
+                        }
+                        Ok(())
+                    })?;
+                }
+                let heads: Vec<String> = inner.names.iter().filter(|n| !used.contains(&n.to_ascii_lowercase())).cloned().collect();
+                let from_factor = match inner.data {
+                    SourceData::Rows(rows) => {
+                        TableFactor::Materialized { rows: Rc::new(rows), columns: inner.names.clone(), alias: inner.alias.clone() }
+                    }
+                    _ => (**source).clone(),
+                };
+                let head_exprs: Vec<Expr> = heads.iter().map(|n| Expr::Column { table: None, name: n.clone() }).collect();
+                let query = Select {
+                    items: head_exprs.iter().map(|e| SelectItem::Expr { expr: e.clone(), alias: None }).collect(),
+                    from: Some(From { first: from_factor, joins: Vec::new() }),
+                    group_by: head_exprs,
+                    crosstab: Some(Box::new(Crosstab {
+                        agg: agg.clone(),
+                        pivot: pivot.clone(),
+                        values: Some(values.iter().map(|(v, _)| v.clone()).collect()),
+                    })),
+                    ..Select::default()
+                };
+                let mut res = self.run_select_depth(&query, depth + 1)?;
+                for (i, (_, label)) in values.iter().enumerate() {
+                    if let Some(l) = label {
+                        res.columns[heads.len() + i] = l.clone();
+                    }
+                }
+                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names: res.columns })
+            }
+            TableFactor::Unpivot { source, value_col, name_col, columns, include_nulls, alias } => {
+                let inner = self.resolve_factor(source, depth)?;
+                let pos: Vec<usize> = columns
+                    .iter()
+                    .map(|(c, _)| {
+                        inner
+                            .names
+                            .iter()
+                            .position(|n| n.eq_ignore_ascii_case(c))
+                            .ok_or_else(|| Error::catalog(format!("the column '{c}' of UNPIVOT was not found")))
+                    })
+                    .collect::<Result<_>>()?;
+                let keep: Vec<usize> = (0..inner.names.len()).filter(|i| !pos.contains(i)).collect();
+                let mut names: Vec<String> = keep.iter().map(|&i| inner.names[i].clone()).collect();
+                names.push(name_col.clone());
+                names.push(value_col.clone());
+                let mut out: Vec<Row> = Vec::new();
+                for slot in 0..inner.slot_count() {
+                    let Some(row) = inner.get(slot) else { continue };
+                    for (k, (col, label)) in columns.iter().enumerate() {
+                        let v = &row[pos[k]];
+                        if v.is_null() && !include_nulls {
+                            continue;
+                        }
+                        let mut r: Row = keep.iter().map(|&i| row[i].clone()).collect();
+                        r.push(Value::text(label.as_deref().unwrap_or(col)));
+                        r.push(v.clone());
+                        out.push(r);
+                    }
+                }
+                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(out), alias: alias.clone(), names })
+            }
             TableFactor::Function { name, args, alias, columns } => {
                 let scope = Scope::default();
                 let mut vals = Vec::with_capacity(args.len());
@@ -1959,6 +2031,7 @@ fn subst_cte(s: &mut Select, name: &str, rows: &Rc<Vec<Row>>, cols: &[String]) {
                 *f = TableFactor::Materialized { rows: Rc::clone(rows), columns: cols.to_vec(), alias };
             }
             TableFactor::Derived { query, .. } => subst_cte(query, name, rows, cols),
+            TableFactor::Pivot { source, .. } | TableFactor::Unpivot { source, .. } => factor(source, name, rows, cols),
             _ => {}
         }
     }

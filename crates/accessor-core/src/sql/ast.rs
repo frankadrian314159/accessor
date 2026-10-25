@@ -95,6 +95,17 @@ pub enum TableFactor {
     /// A parenthesised query. With `lateral`, it may read columns of the tables before it
     /// in the FROM clause and is evaluated once for each of their rows.
     Derived { query: Box<Select>, alias: String, columns: Vec<String>, lateral: bool },
+    /// `source PIVOT (agg FOR column IN (v1, v2, ...))`: the values of `column` become columns.
+    Pivot { source: Box<TableFactor>, agg: Expr, pivot: Expr, values: Vec<(Expr, Option<String>)>, alias: String },
+    /// `source UNPIVOT (value FOR name IN (c1, c2, ...))`: the listed columns become rows.
+    Unpivot {
+        source: Box<TableFactor>,
+        value_col: String,
+        name_col: String,
+        columns: Vec<(String, Option<String>)>,
+        include_nulls: bool,
+        alias: String,
+    },
     /// A table function such as `GENERATE_SERIES(1, 10)`; its arguments may read earlier tables.
     Function { name: String, args: Vec<Expr>, alias: String, columns: Vec<String> },
     /// Rows already computed (the result of a common table expression).

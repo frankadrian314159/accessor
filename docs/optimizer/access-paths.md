@@ -53,6 +53,8 @@ SELECT * FROM Orders WHERE CustID = 7 ORDER BY Placed LIMIT 3;   -- equality, th
 
 **The answer is the same as sorting.** Rows that tie on the sort columns come out in the order they would after a stable sort, that is, by when they were stored, in both directions. NULLs come first when ascending and last when descending, as in a sort.
 
+**NULLS FIRST / NULLS LAST** are honoured. For a single sort column the index still serves them: an index holds NULLs together at one end, so with `ORDER BY x NULLS LAST` the rows with a value are read first and the NULL rows last (and `DESC NULLS FIRST` reads the NULLs first). With several sort columns, an index is used only if the NULLs are where the index naturally puts them (first when ascending, last when descending).
+
 ### When it chooses not to
 
 If another index gives a very selective lookup (the condition matches fewer than about two thousand rows), the optimizer uses that and sorts the few rows: that is cheaper than walking a big index and discarding most of what it finds. If the condition is a range on the sort column, it also uses the normal path.
@@ -69,6 +71,20 @@ compared with the sorting case:
 ```
 sort: top-5 of 25 rows
 ```
+
+## Row values and keyset paging
+
+A row comparison `(a, b) > (x, y)` is the same as `a > x OR (a = x AND b > y)`, and the optimizer also adds the implied `a >= x`, which an index on `a` (or on `(a, b)`) answers as a range. So a page of results "after" a bookmark is read from the index starting at the bookmark, not by skipping rows from the beginning:
+
+```sql
+SELECT Day, ID FROM Log WHERE (Day, ID) > (@lastDay, @lastID) ORDER BY Day, ID LIMIT 50;
+```
+
+with `CREATE INDEX byday ON Log (Day, ID)` is an `index range scan byday` that stops after 50 rows. Compare `OFFSET`, which has to count past every earlier row each time.
+
+## Time ranges
+
+Dates, timestamps and intervals are ordinary indexable values. A range with constant bounds such as ``WHERE At >= TIMESTAMP WITH TIME ZONE '2024-03-05 00:00:00+00:00' AND At < TIMESTAMP WITH TIME ZONE '2024-03-05 00:00:00+00:00' + INTERVAL '1 day'`` has the bound `... + INTERVAL '1 day'` worked out once, before the scan, and becomes an index range scan on `At`. Wrapping the column in a function (`Year(At) = 2024`, `Format(At, ...)`) hides it from the index.
 
 ## COUNT(*)
 

@@ -173,6 +173,7 @@ impl Correlator<'_> {
                         if columns.is_empty() { self.db.table_function_columns(name).unwrap_or_default() } else { columns.clone() },
                     )),
                     TableFactor::Derived { alias, columns, lateral: true, .. } => Some((alias.clone(), columns.clone())),
+                    TableFactor::Pivot { alias, .. } | TableFactor::Unpivot { alias, .. } => Some((alias.clone(), Vec::new())),
                     _ => None,
                 };
                 match named {

@@ -16,6 +16,8 @@ datasheets for working with records directly.
   subqueries including correlated ones; `UNION` / `INTERSECT` / `EXCEPT`;
   `WITH` and `WITH RECURSIVE`; window functions; `MERGE`; Access crosstabs
   (`TRANSFORM … PIVOT`); `CHECK` constraints;
+  row value comparisons, `LATERAL` and table functions, `PIVOT` / `UNPIVOT`, named windows,
+  `NULLS FIRST/LAST`, simple updatable views, `INTERVAL` and time-zone-aware timestamps;
   `CAST`, `Format` and about a hundred functions; `TOP` / `LIMIT` / `FETCH FIRST`;
   `CREATE` / `ALTER` / `DROP` for tables, indexes and queries; and CSV import and
   export. ASQL is a large subset of standard SQL, not all of the latest standard;

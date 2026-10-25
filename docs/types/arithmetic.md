@@ -67,6 +67,19 @@ Text and numbers compare as numbers when the text reads as one: `5 = '5'` is tru
 
 `Sum` uses the addition rules above (a sum of `INTEGER` can become a `BIGNUM`). `Avg` adds exactly and divides once. `Min` and `Max` return a value of the column's own type.
 
+## Dates, intervals and time zones
+
+| Expression | Result |
+| --- | --- |
+| `datetime ± number` | a `DATETIME` that many days away |
+| `datetime - datetime` | the difference as a number of days |
+| `datetime ± interval` | a `DATETIME`; months clamp to the end of a shorter month |
+| `timestamptz ± interval` | a `TIMESTAMPTZ`; months and days follow the session zone's wall clock |
+| `timestamptz - timestamptz` | an `INTERVAL` of elapsed seconds |
+| `interval ± interval`, `interval * n`, `interval / n` | an `INTERVAL` |
+
+See [interval.md](interval.md) and [timestamptz.md](timestamptz.md).
+
 ## Dates and yes/no
 
 A `DATETIME` plus or minus a number is a `DATETIME`; two dates subtract to a number of days. `TRUE` is −1 and `FALSE` is 0 in arithmetic. See [datetime.md](datetime.md) and [yesno.md](yesno.md).

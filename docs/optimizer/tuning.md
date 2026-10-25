@@ -64,7 +64,15 @@ An ordered read stops early only when there is a limit. `ORDER BY Total DESC` al
 
 A `TRANSFORM … PIVOT` query is as wide as the number of distinct pivot values. Pivot on a coarser expression (`PIVOT Year(d)`, not `PIVOT d`), or give an `IN (…)` list ([crosstab.md](crosstab.md)).
 
-## 7. Switch it off to check
+## 7. Page with a bookmark, not with OFFSET
+
+`OFFSET 100000` reads and discards 100 000 rows. Remember the last row of a page and ask for the rows after it with a row comparison, `WHERE (Day, ID) > (@lastDay, @lastID) ORDER BY Day, ID LIMIT 50`, with an index on `(Day, ID)` ([access-paths.md](access-paths.md#row-values-and-keyset-paging)).
+
+## 8. Views
+
+A view of the form `SELECT * FROM table WHERE ...` costs nothing: it is merged into the query ([views.md](views.md)). A view that selects only some columns, joins or summarises is computed first, so put a condition you care about inside the view, or select from the table.
+
+## 9. Switch it off to check
 
 If a result looks wrong, or you want to compare timings, turn the optimizer off:
 

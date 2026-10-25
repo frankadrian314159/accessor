@@ -8,7 +8,9 @@
 | number with a point | `DECIMAL` (exact) | `3.14`, `.5`, `10.00` |
 | number with an exponent | `DOUBLE` | `1e3`, `2.5E-4` |
 | text | `TEXT` | `'it''s'`, `"say ""hi"""` |
+| interval | `INTERVAL` | `INTERVAL '3 days'`, `INTERVAL '1-6' YEAR TO MONTH`, `INTERVAL '90' MINUTE` |
 | date and time | `DATETIME` | `#2024-03-05#`, `#2024-03-05 14:30:00#`, `#3/5/2024 2:30 PM#`, `DATE '2024-03-05'`, `TIMESTAMP '2024-03-05 14:30:00'` |
+| date and time with a zone | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE '2024-03-05 14:30:00+01:00'` |
 | truth values | `YESNO` | `TRUE`, `FALSE`, `YES`, `NO` |
 | nothing | | `NULL` |
 
@@ -27,12 +29,13 @@ From loosest to tightest binding:
 | 1 | `OR` |
 | 2 | `AND` |
 | 3 | `NOT` |
-| 4 | comparisons and predicates: `= <> != < <= > >=`, `IS`, `LIKE`, `BETWEEN`, `IN` |
+| 4 | comparisons and predicates (including row values): `= <> != < <= > >=`, `IS`, `LIKE`, `BETWEEN`, `IN` |
 | 5 | `&`, `\|\|` (join text) |
 | 6 | `+`, `-` |
 | 7 | `*`, `/`, `\` (whole-number division), `%` and `MOD` (remainder) |
 | 8 | unary `-`, `+` |
 | 9 | `^` (power) |
+| 10 | `AT TIME ZONE` |
 
 Arithmetic on the [numeric types](../../README.md#numbers) is exact: the result type depends only on the operand types. `/` gives an exact `DECIMAL` when the quotient terminates and a 50-digit `DECIMAL` otherwise; `RATIONAL` stays exact; a whole-number overflow becomes `BIGNUM`. Dividing by zero is an error. Date arithmetic: a date plus or minus a number is a date that many days away; the difference of two dates is a number of days.
 
@@ -72,6 +75,20 @@ Both the Access and the standard wildcards work in the same pattern:
 | `[!abc]` | one character not in the set |
 
 Matching ignores case. `ESCAPE` names a character that takes away the special meaning of the next one; the pattern and the escape character must be literals: `Code LIKE 'A!_%' ESCAPE '!'`. A literal `[` is written `[[]`.
+
+## Row values
+
+`(a, b)` or `ROW(a, b)` compared with another row of the same size, or used with `IN`; see [select.md](select.md#row-values).
+
+## Time zones and intervals
+
+| Form | Meaning |
+| --- | --- |
+| `x AT TIME ZONE zone` | converts between a `TIMESTAMPTZ` and the wall clock of `zone`; it binds tighter than `^` |
+| `date + INTERVAL '1 month'` | moves a date by a calendar interval |
+| `INTERVAL '1 day' * 3` | scales an interval |
+
+See [../types/timestamptz.md](../types/timestamptz.md) and [../types/interval.md](../types/interval.md).
 
 ## CASE
 

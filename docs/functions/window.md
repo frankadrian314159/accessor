@@ -14,6 +14,8 @@ function(arguments) OVER (
 * `ORDER BY` orders the rows inside each partition. Rows that tie are *peers*.
 * The *frame* says which rows around the current one an aggregate or value function looks at. See [Frames](#frames).
 
+A window can be defined once and used by name: `... OVER w ... WINDOW w AS (PARTITION BY g ORDER BY d)`; see [Named windows](#named-windows).
+
 Window functions may be used in the select list and in `ORDER BY`. In a query with `GROUP BY` they run after the grouping and may use aggregates in their arguments and clauses. See [select.md](../sql/select.md#window-functions) for what is not supported (named windows, `GROUPS` frames, `EXCLUDE`, `RANGE` with an offset).
 
 ## ROW_NUMBER
@@ -70,6 +72,21 @@ FROM Sales;
 
 `DISTINCT` is allowed (`COUNT(DISTINCT x) OVER (...)`).
 
+## Named windows
+
+A `WINDOW` clause, after `HAVING`, names window definitions that functions then use:
+
+```sql
+SELECT Name, Dept, Sal,
+       RANK()       OVER by_dept,
+       SUM(Sal)     OVER by_dept,
+       AVG(Sal)     OVER (by_dept ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM Emp
+WINDOW by_dept AS (PARTITION BY Dept ORDER BY Sal DESC);
+```
+
+`OVER w` uses the window as defined. `OVER (w ...)` starts from `w` and may **add** a part it does not have (an `ORDER BY`, a frame); it cannot change a `PARTITION BY`, `ORDER BY` or frame that `w` already has. A window can be built on another: `WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY d)`. A name that is not defined, a name defined twice and a cycle are errors.
+
 ## Frames
 
 ```
@@ -80,7 +97,14 @@ start, end :=  UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING | U
 ```
 
 * `ROWS` counts rows: `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` is the row and the two before it.
-* `RANGE` works on peers: `CURRENT ROW` means the current row *and all its peers*. Only `UNBOUNDED` and `CURRENT ROW` bounds are supported.
+* `RANGE` works on **values**: `CURRENT ROW` means the current row *and all its peers*, and `x PRECEDING` / `x FOLLOWING` mean the rows whose sort value is within `x` of the current row's. The offset is a constant of the sort column's kind: a number for numbers, an `INTERVAL` for dates and timestamps. A `RANGE` frame with an offset needs exactly one `ORDER BY` column. A row whose sort value is NULL has only its NULL peers in its frame.
+
+```sql
+-- the sales of the last 7 days up to each day
+SUM(Amount) OVER (ORDER BY Day RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW)
+-- the values within 10 of each value
+COUNT(*) OVER (ORDER BY Score RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING)
+```
 * With one bound given, the other end is `CURRENT ROW`.
 
 **Default frame:** with an `ORDER BY`, `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (a running aggregate, peers included); without one, the whole partition.

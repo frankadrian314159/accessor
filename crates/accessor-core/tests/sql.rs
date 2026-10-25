@@ -2585,3 +2585,78 @@ fn named_windows_and_range_offsets() {
     assert!(db.query("SELECT SUM(v) OVER (ORDER BY d RANGE BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM S").is_err());
     assert!(db.query("SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM S").is_err());
 }
+
+// ----- PIVOT and UNPIVOT in FROM -----------------------------------------------------------------
+
+#[test]
+fn pivot_and_unpivot() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Sales (region TEXT, q INTEGER, amount INTEGER, rep TEXT);
+         INSERT INTO Sales VALUES ('East',1,10,'a'),('East',2,20,'a'),('East',2,5,'b'),('West',1,7,'a'),('West',4,3,'c');
+         CREATE TABLE Wide (id INTEGER, q1 INTEGER, q2 INTEGER, q3 INTEGER, tag TEXT);
+         INSERT INTO Wide VALUES (1, 10, 20, NULL, 'x'), (2, 5, NULL, 7, 'y');",
+    )
+    .unwrap();
+    // PIVOT: the columns not used by the aggregate or the pivot column head the rows.
+    let r = db
+        .query("SELECT * FROM Sales PIVOT (SUM(amount) FOR q IN (1, 2, 4)) AS p ORDER BY region, rep")
+        .unwrap();
+    assert_eq!(r.columns, ["region", "rep", "1", "2", "4"]);
+    let rows_: Vec<Vec<String>> = r.rows.iter().map(|x| x.iter().map(|v| v.to_string()).collect()).collect();
+    assert_eq!(rows_[0], ["East", "a", "10", "20", ""]);
+    assert_eq!(rows_[1], ["East", "b", "", "5", ""]);
+    assert_eq!(rows_.len(), 4);
+    // Labels, a derived source to choose the heading columns, and a count that shows 0.
+    let r = db
+        .query("SELECT * FROM (SELECT region, q FROM Sales) AS s PIVOT (COUNT(*) FOR q IN (1 AS first, 2 AS second)) AS p ORDER BY region")
+        .unwrap();
+    assert_eq!(r.columns, ["region", "first", "second"]);
+    let rows_: Vec<Vec<String>> = r.rows.iter().map(|x| x.iter().map(|v| v.to_string()).collect()).collect();
+    assert_eq!(rows_, [["East", "1", "2"], ["West", "1", "0"]]);
+    // The result is an ordinary table: filter it, join it, aggregate it.
+    assert_eq!(
+        rows(&db, "SELECT region FROM Sales PIVOT (SUM(amount) FOR q IN (1, 2)) AS p WHERE [1] IS NOT NULL AND [2] IS NULL"),
+        [["West"]]
+    );
+
+    // UNPIVOT: columns become (name, value) rows; NULLs are left out unless asked for.
+    let r = db.query("SELECT * FROM Wide UNPIVOT (amount FOR quarter IN (q1, q2, q3)) AS u ORDER BY id, quarter").unwrap();
+    assert_eq!(r.columns, ["id", "tag", "quarter", "amount"]);
+    let rows_: Vec<Vec<String>> = r.rows.iter().map(|x| x.iter().map(|v| v.to_string()).collect()).collect();
+    assert_eq!(rows_, [["1", "x", "q1", "10"], ["1", "x", "q2", "20"], ["2", "y", "q1", "5"], ["2", "y", "q3", "7"]]);
+    assert_eq!(rows(&db, "SELECT Count(*) FROM Wide UNPIVOT INCLUDE NULLS (v FOR n IN (q1, q2, q3)) AS u"), [["6"]]);
+    assert_eq!(
+        rows(&db, "SELECT n FROM Wide UNPIVOT (v FOR n IN (q1 AS 'Q one', q2 AS 'Q two')) AS u WHERE id = 1 ORDER BY n"),
+        [["Q one"], ["Q two"]]
+    );
+    // Round trip: unpivot the pivot.
+    let r = rows(
+        &db,
+        "SELECT region, q, v FROM (SELECT region, SUM(amount) AS [1], SUM(amount) AS [2] FROM Sales GROUP BY region) AS t UNPIVOT (v FOR q IN ([1], [2])) AS u ORDER BY region, q",
+    );
+    assert_eq!(r.len(), 4);
+    assert!(db.query("SELECT * FROM Wide UNPIVOT (v FOR n IN (nosuch)) AS u").is_err());
+    assert!(db.query("SELECT * FROM Sales PIVOT (amount FOR q IN (1)) AS p").is_err()); // not an aggregate
+}
+
+#[test]
+fn keyset_paging_with_row_values_uses_the_index() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE Log (Day INTEGER, ID INTEGER, Note TEXT); CREATE INDEX byday ON Log (Day, ID)").unwrap();
+    let mut script = String::new();
+    for i in 0..2000 {
+        script += &format!("INSERT INTO Log VALUES ({}, {i}, 'n');\n", i / 10);
+    }
+    db.execute(&script).unwrap();
+    let sql = "SELECT Day, ID FROM Log WHERE (Day, ID) > (150, 1503) ORDER BY Day, ID LIMIT 3";
+    assert_eq!(rows(&db, sql), [["150", "1504"], ["150", "1505"], ["150", "1506"]]);
+    let plan = plan_text(&db, sql);
+    assert!(plan.contains("index range scan byday") || plan.contains("order by satisfied by index byday"), "{plan}");
+    // The index narrows the read to the rows from the bookmark on.
+    let plan = plan_text(&db, "SELECT Day, ID FROM Log WHERE (Day, ID) > (150, 1503)");
+    assert!(plan.contains("index range scan byday"), "{plan}");
+    // Same answers with the optimizer off.
+    db.set_optimizer(false);
+    assert_eq!(rows(&db, sql), [["150", "1504"], ["150", "1505"], ["150", "1506"]]);
+}

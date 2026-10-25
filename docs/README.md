@@ -3,7 +3,7 @@
 | Folder or file | Contents |
 | --- | --- |
 | [sql/](sql/README.md) | the ASQL language: statements, the BNF grammar, expressions, and how ASQL relates to standard SQL |
-| [functions/](functions/README.md) | every built-in function, by group |
+| [functions/](functions/README.md) | every built-in function and table function, by group |
 | [optimizer/](optimizer/README.md) | the query optimizer: pushdown, join order, access paths, estimates, `EXPLAIN` and tuning |
 | [types/](types/README.md) | the column types, and how they convert and combine |
 
@@ -71,7 +71,7 @@ This is the whole feature set in one place. Each item has its own section later 
 
 **A SQL engine with an Access flavour**
 
-Joins (inner, left, right, full, cross, `USING`, `NATURAL`, and Access-style nested joins), grouping with `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS`, aggregates, subqueries including correlated ones, derived tables, `WITH` and `WITH RECURSIVE`, `UNION`, `INTERSECT` and `EXCEPT`, window functions, `MERGE`, crosstab queries (`TRANSFORM … PIVOT`), `CASE`, `CAST`, `TOP`, `LIMIT` and `FETCH FIRST`, and about a hundred built-in functions including `Format`. Indexes are used automatically for equality and range searches, and for joins. ASQL, as the dialect is called, implements a large part of the core of standard SQL, but not all of the latest standard; [see below](#asql-and-standard-sql).
+Joins (inner, left, right, full, cross, `USING`, `NATURAL`, and Access-style nested joins), grouping with `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS`, aggregates, subqueries including correlated ones, derived tables, `WITH` and `WITH RECURSIVE`, `UNION`, `INTERSECT` and `EXCEPT`, window functions, `MERGE`, crosstab queries (`TRANSFORM … PIVOT`), `PIVOT` and `UNPIVOT`, `LATERAL` joins, table functions, row value comparisons, named windows, `NULLS FIRST/LAST`, simple updatable views, `CASE`, `CAST`, `TOP`, `LIMIT` and `FETCH FIRST`, and about a hundred built-in functions including `Format`. Indexes are used automatically for equality and range searches, and for joins. ASQL, as the dialect is called, implements a large part of the core of standard SQL, but not all of the latest standard; [see below](#asql-and-standard-sql).
 
 **Tables, keys and indexes**
 
@@ -103,7 +103,7 @@ Row-level `BEFORE` and `AFTER` triggers for inserts, updates and deletes, with `
 
 **A numeric tower**
 
-Seven numeric types: `INTEGER`, `BIGNUM`, `FLOAT`, `DOUBLE`, `DECIMAL`, `CURRENCY` and `RATIONAL`, which mix correctly in arithmetic and compare by exact value.
+Seven numeric types: `INTEGER`, `BIGNUM`, `FLOAT`, `DOUBLE`, `DECIMAL`, `CURRENCY` and `RATIONAL`, which mix correctly in arithmetic and compare by exact value. Dates come as `DATETIME` (a wall-clock reading), `TIMESTAMPTZ` (a moment, shown in an IANA time zone) and `INTERVAL` (months, days and seconds).
 
 **Dates and times**
 
@@ -339,6 +339,10 @@ WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total > 100);
 
 Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, `WHERE` and `ORDER BY` of a query without `GROUP BY`, and in the `WHERE` and `SET` of `UPDATE` and `DELETE`.
 
+#### Views you can change
+
+`CREATE VIEW v (a, b) AS SELECT ... [WITH CHECK OPTION]` names the columns, and `INSERT`, `UPDATE` and `DELETE` work on a view of one table, within the view's condition. `CREATE OR REPLACE VIEW` swaps a definition atomically, `ALTER TABLE t RENAME TO new` follows the references, and `ALTER COLUMN c SET DEFAULT / SET NOT NULL` adjust a column. A view that shows all of a table's columns is merged into the queries that read it, so the table's indexes apply. See [queries and triggers](sql/queries-and-triggers.md) and [data definition](sql/ddl.md).
+
 #### Seeing the plan
 
 `EXPLAIN` in front of a query runs it and returns the plan instead of the rows: the join order chosen, the index used for each table, the number of rows each step was expected to produce and did, and whether a sort was needed. See [the optimizer chapter](#the-query-optimizer) and the [EXPLAIN reference](optimizer/explain.md).
@@ -362,6 +366,10 @@ PIVOT Quarter;
 ```
 
 `TRANSFORM` gives the aggregate for each cell, the `SELECT` and `GROUP BY` give the row headings, and `PIVOT` the column whose values become new columns, in ascending order, with a column called `<>` for NULL. `PIVOT Quarter IN (1, 2, 3, 4)` fixes the columns. An empty cell is NULL, or 0 for `Count`. A crosstab can be saved with `CREATE QUERY` and selected from. See the [SQL reference](sql/select.md#crosstab-queries-transform--pivot) and [how the optimizer runs crosstabs](optimizer/crosstab.md).
+
+#### Ordering, row values, LATERAL and pivots
+
+`ORDER BY x NULLS LAST` places NULLs explicitly (an index can still serve it). A row value compares several columns at once: `WHERE (Day, ID) > (@lastDay, @lastID)` pages through results from an index. `LATERAL` runs a sub-query for each row of the tables before it, which makes "top 3 per customer" a one-liner, and `GENERATE_SERIES` and `SPLIT_STRING` supply rows from nothing. `source PIVOT (SUM(x) FOR col IN (...))` and `source UNPIVOT (v FOR name IN (c1, c2))` turn rows into columns and back. See the [SQL reference](sql/select.md).
 
 #### Combining queries
 

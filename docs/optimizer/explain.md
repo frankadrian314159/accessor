@@ -87,6 +87,10 @@ One join step, adding table `T`. `METHOD` is one of:
 
 `group N rows` is the aggregation step, with ` into S grouping set(s)` for `ROLLUP`, `CUBE` and `GROUPING SETS`. `COUNT(*) answered from the table's row count` is the [shortcut](access-paths.md#count).
 
+### `join T: LATERAL, run N time(s) for M left row(s) ...`
+
+A [LATERAL item](join-order.md#lateral-and-table-functions) was run `N` times for `M` rows from the tables before it (once per distinct set of outer values). The plans of the queries it ran follow, indented.
+
 ### `crosstab: ...`
 
 For a [crosstab](crosstab.md): `crosstab: one grouped pass computed C cell(s) for P pivot column(s)` when the one-pass method was used, or `crosstab: P pivot column(s)` for the plain rewrite. The plans of the queries it ran follow, indented.

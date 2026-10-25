@@ -18,6 +18,18 @@ Rows: the value given. Columns: the type of the column it is stored in. "ok" mea
 
 "Parsed" means text that reads as a number is accepted, with surrounding spaces ignored, an exponent allowed (`'1e3'` is 1000), and commas treated as thousands separators (`'1,500'` is 1500); anything else is an error. The date formats are `YYYY-MM-DD`, `YYYY-MM-DD HH:MM[:SS]` (with a space or `T`) and `M/D/YYYY [h:mm[:ss] [AM|PM]]`.
 
+### TIMESTAMPTZ and INTERVAL
+
+| Value | To `TIMESTAMPTZ` | To `INTERVAL` |
+| --- | --- | --- |
+| text | a timestamp with or without an offset; read in the session zone if none | `3 days`, `1 year 2 months`, `04:05:06`, ISO 8601 |
+| `DATETIME` | its wall clock read in the session zone | error |
+| `TIMESTAMPTZ` | ok | error |
+| a number | days since 1899-12-30, then as a `DATETIME` | that many days |
+| `INTERVAL` | error | ok |
+
+`TIMESTAMPTZ` converted to `DATETIME` gives the wall clock in the session zone. See [timestamptz.md](timestamptz.md) and [interval.md](interval.md).
+
 ## Converting in an expression
 
 | Function | Same as | Notes |
@@ -32,6 +44,8 @@ Rows: the value given. Columns: the type of the column it is stored in. "ok" mea
 | `CStr(x)` | `CAST(x AS TEXT)` | |
 | `CBool(x)` | `CAST(x AS YESNO)` | |
 | `CDate(x)` | `CAST(x AS DATETIME)` | |
+| `CTimestampTz(x)` | `CAST(x AS TIMESTAMPTZ)` | read in the session zone when there is no offset |
+| `CInterval(x)` | `CAST(x AS INTERVAL)` | |
 | `Val(text)` | | reads the number at the start of the text, 0 if none; never fails |
 
 `CAST(x AS DECIMAL(p, s))` and `CAST(x AS NUMERIC(p, s))` also round to `s` places, halves to even. The other sizes and precisions are ignored. See the [conversion functions](../functions/conversion.md).
