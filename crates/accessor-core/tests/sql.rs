@@ -3567,3 +3567,149 @@ fn long_reports_are_paged_and_new_page_breaks_work() {
     assert!(!pages[second].contains("grp: 0"));
     assert!(text.contains("1225") && text.contains("3725"), "sums of 0..49 and 50..99"); // 49*50/2, 99*100/2-1225
 }
+
+#[test]
+fn regex_string_and_math_conveniences() {
+    let db = Database::in_memory();
+    let one = |sql: &str| rows(&db, sql)[0][0].clone();
+    // Regular expressions ignore case unless told otherwise, like LIKE.
+    assert_eq!(rows(&db, "SELECT REGEXP_LIKE('Hello World', 'WORLD$'), REGEXP_LIKE('Hello', 'h', 'c'), REGEXP_LIKE('ab12', '^[a-z]+[0-9]+$')"), [["Yes", "No", "Yes"]]);
+    assert_eq!(one(r#"SELECT REGEXP_REPLACE('2024-03-05', '(\d+)-(\d+)-(\d+)', '\3/\2/\1')"#), "05/03/2024");
+    assert_eq!(one("SELECT REGEXP_REPLACE('a1b22c333', '[0-9]+', '#')"), "a#b#c#");
+    assert_eq!(one("SELECT REGEXP_SUBSTR('order 4711 shipped', '[0-9]+')"), "4711");
+    assert_eq!(one(r#"SELECT REGEXP_SUBSTR('key=value', '(\w+)=(\w+)', 2)"#), "value");
+    assert_eq!(one("SELECT REGEXP_SUBSTR('abc', '[0-9]+')"), "");
+    assert_eq!(one("SELECT REGEXP_COUNT('banana', 'an')"), "2");
+    assert!(db.query("SELECT REGEXP_LIKE('x', '(')").is_err());
+    assert!(db.query("SELECT REGEXP_LIKE('x', 'x', 'q')").is_err());
+    // SIMILAR TO matches the whole text.
+    assert_eq!(rows(&db, "SELECT 'abc' SIMILAR TO 'a%', 'abc' SIMILAR TO 'b%', 'abc' NOT SIMILAR TO 'a_c', 'xyz' SIMILAR TO '(x|y)+z', 'a.c' SIMILAR TO 'a.c', 'abc' SIMILAR TO 'a.c'"), [["Yes", "No", "No", "Yes", "Yes", "No"]]);
+    // Padding and friends.
+    assert_eq!(rows(&db, "SELECT LPAD('7', 3, '0'), RPAD('ab', 5, '-'), LPAD('abcdef', 3), REPEAT('ab', 3), REVERSE('abc'), INITCAP('hELLO wORLD')"), [["007", "ab---", "abc", "ababab", "cba", "Hello World"]]);
+    assert_eq!(rows(&db, "SELECT OVERLAY('Txxxxas' PLACING 'hom' FROM 2 FOR 4), OVERLAY('abc' PLACING 'ZZ' FROM 2), OVERLAY('abcdef', 'XY', 3, 1), TRANSLATE('12345', '143', 'ax')"), [["Thomas", "aZZ", "abXYdef", "a2x5"]]);
+    assert_eq!(one("SELECT LPAD('x', 3, '')"), "x");
+    assert!(db.query("SELECT REPEAT('x', 1000000000)").is_err());
+    // Math.
+    assert_eq!(rows(&db, "SELECT Round(PI(), 5), Round(DEGREES(PI()), 6), Round(RADIANS(180), 5), Round(ATAN2(1, 1), 5)"), [["3.14159", "180", "3.14159", "0.7854"]]);
+    assert_eq!(rows(&db, "SELECT TRUNC(-123.4567, 2), TRUNC(123.999), TRUNC(1234, -2), TRUNC(CAST(2.789 AS DOUBLE), 1), TRUNC(CAST(9.99 AS CURRENCY), 1)"), [["-123.45", "123", "1200", "2.7", "$9.90"]]);
+    let r = rows(&db, "SELECT RANDOM() FROM GENERATE_SERIES(1, 200)");
+    let vals: Vec<f64> = r.iter().map(|x| x[0].parse().unwrap()).collect();
+    assert!(vals.iter().all(|v| (0.0..1.0).contains(v)));
+    assert!(vals.windows(2).any(|w| w[0] != w[1]), "a new value each row");
+    // RANDOM is evaluated for every row, never folded to a constant, with or without the optimizer.
+    let mut db2 = Database::in_memory();
+    for on in [true, false] {
+        db2.set_optimizer(on);
+        let r = rows(&db2, "SELECT Count(*) FROM (SELECT RANDOM() AS r FROM GENERATE_SERIES(1, 50)) t WHERE r < 0.5 OR r >= 0.5");
+        assert_eq!(r, [["50"]]);
+    }
+}
+
+#[test]
+fn upserts_deal_with_conflicting_rows() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER, hits INTEGER DEFAULT 1, tag TEXT);
+         CREATE UNIQUE INDEX kv_tag ON kv (tag);",
+    )
+    .unwrap();
+    let r = db.execute("INSERT INTO kv (k, v) VALUES ('a', 1), ('b', 2) ON CONFLICT (k) DO NOTHING").unwrap();
+    assert_eq!(r.affected, 2);
+    // Existing keys are left alone; new ones go in.
+    let r = db.execute("INSERT INTO kv (k, v) VALUES ('a', 100), ('c', 3) ON CONFLICT (k) DO NOTHING").unwrap();
+    assert_eq!(r.affected, 1);
+    assert_eq!(rows(&db, "SELECT k, v FROM kv ORDER BY k"), [["a", "1"], ["b", "2"], ["c", "3"]]);
+    // DO UPDATE reads the existing row and EXCLUDED, the offered one.
+    db.execute("INSERT INTO kv (k, v) VALUES ('a', 10), ('d', 4) ON CONFLICT (k) DO UPDATE SET v = v + EXCLUDED.v, hits = hits + 1").unwrap();
+    assert_eq!(rows(&db, "SELECT k, v, hits FROM kv ORDER BY k"), [["a", "11", "2"], ["b", "2", "1"], ["c", "3", "1"], ["d", "4", "1"]]);
+    // The same key twice in one statement meets itself.
+    db.execute("INSERT INTO kv (k, v) VALUES ('z', 1), ('z', 1), ('z', 1) ON CONFLICT (k) DO UPDATE SET v = v + EXCLUDED.v").unwrap();
+    assert_eq!(rows(&db, "SELECT v FROM kv WHERE k = 'z'"), [["3"]]);
+    // WHERE limits which conflicts update; the others are left as they are.
+    let r = db.execute("INSERT INTO kv (k, v) VALUES ('a', 5), ('b', 50) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v WHERE EXCLUDED.v > v").unwrap();
+    assert_eq!(r.affected, 1);
+    assert_eq!(rows(&db, "SELECT k, v FROM kv WHERE k IN ('a', 'b') ORDER BY k"), [["a", "11"], ["b", "50"]]);
+    // A conflict on any unique key counts when no target is named.
+    db.execute("UPDATE kv SET tag = 'red' WHERE k = 'a'").unwrap();
+    let r = db.execute("INSERT INTO kv (k, v, tag) VALUES ('new', 0, 'red') ON CONFLICT DO NOTHING").unwrap();
+    assert_eq!(r.affected, 0);
+    // ...but NULL never conflicts.
+    db.execute("INSERT INTO kv (k, v, tag) VALUES ('n1', 0, NULL), ('n2', 0, NULL) ON CONFLICT DO NOTHING").unwrap();
+    assert_eq!(rows(&db, "SELECT Count(*) FROM kv WHERE tag IS NULL AND k LIKE 'n*'"), [["2"]]);
+    // The target must be a unique key.
+    assert!(db.execute("INSERT INTO kv (k, v) VALUES ('q', 1) ON CONFLICT (v) DO NOTHING").is_err());
+
+    // REPLACE replaces the whole row (defaults and all).
+    db.execute("REPLACE INTO kv (k, v) VALUES ('a', 7)").unwrap();
+    assert_eq!(rows(&db, "SELECT k, v, hits, tag FROM kv WHERE k = 'a'"), [["a", "7", "1", ""]]);
+    db.execute("INSERT OR REPLACE INTO kv (k, v) VALUES ('b', 8)").unwrap();
+    db.execute("INSERT OR IGNORE INTO kv (k, v) VALUES ('b', 9), ('fresh', 1)").unwrap();
+    assert_eq!(rows(&db, "SELECT k, v FROM kv WHERE k IN ('b', 'fresh') ORDER BY k"), [["b", "8"], ["fresh", "1"]]);
+
+    // RETURNING shows the rows that were inserted or updated, not the ones that were skipped.
+    let r = db.execute("INSERT INTO kv (k, v) VALUES ('a', 1), ('r1', 2) ON CONFLICT (k) DO UPDATE SET v = 99 RETURNING k, v").unwrap();
+    assert_eq!(r.rows.iter().map(|x| format!("{}={}", x[0], x[1])).collect::<Vec<_>>(), ["a=99", "r1=2"]);
+    // Parameters and prepared statements.
+    let p = db.prepare("INSERT INTO kv (k, v) VALUES (@k, @v) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v").unwrap();
+    db.execute_prepared(&p, &[("k", Value::text("p")), ("v", Value::Int(1))]).unwrap();
+    db.execute_prepared(&p, &[("k", Value::text("p")), ("v", Value::Int(2))]).unwrap();
+    assert_eq!(rows(&db, "SELECT v FROM kv WHERE k = 'p'"), [["2"]]);
+    // A failure part-way undoes the whole statement.
+    let n = rows(&db, "SELECT Count(*) FROM kv");
+    assert!(db.execute("INSERT INTO kv (k, v) VALUES ('x1', 1), ('x2', 'not a number') ON CONFLICT (k) DO NOTHING").is_err());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM kv"), n);
+}
+
+#[test]
+fn information_schema_describes_the_catalog() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE SEQUENCE ids START WITH 10;
+         CREATE TABLE Customers (ID COUNTER PRIMARY KEY, Name TEXT NOT NULL, City TEXT DEFAULT 'Rome', Code TEXT);
+         CREATE UNIQUE INDEX byCode ON Customers (Code);
+         CREATE TABLE Orders (OID INTEGER DEFAULT NEXT VALUE FOR ids PRIMARY KEY, CustID INTEGER REFERENCES Customers (ID) ON DELETE CASCADE DEFERRABLE, Total CURRENCY, Tax CALCULATED AS (Total * 0.2));
+         CREATE VIEW Big AS SELECT OID, Total FROM Orders WHERE Total > 100;
+         CREATE VIEW Joined AS SELECT c.Name, o.Total FROM Customers c JOIN Orders o ON o.CustID = c.ID;
+         CREATE FUNCTION dbl(@a INTEGER) RETURNS INTEGER AS @a * 2;
+         CREATE PROCEDURE noop() AS BEGIN RETURN; END;
+         CREATE TRIGGER t1 AFTER INSERT OR UPDATE ON Orders FOR EACH STATEMENT BEGIN SELECT 1; END;
+         CREATE REPORT r1 AS SELECT Name FROM Customers;
+         INSERT INTO Customers (Name) VALUES ('Ada'), ('Grace')",
+    )
+    .unwrap();
+    assert_eq!(rows(&db, "SELECT table_name, table_type, row_count FROM information_schema.tables ORDER BY table_name"),
+        [["Big", "VIEW", ""], ["Customers", "BASE TABLE", "2"], ["Joined", "VIEW", ""], ["Orders", "BASE TABLE", "0"]]);
+    assert_eq!(
+        rows(&db, "SELECT column_name, ordinal_position, data_type, is_nullable, column_default FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'Customers' ORDER BY ordinal_position"),
+        [["ID", "1", "INTEGER", "NO", ""], ["Name", "2", "TEXT", "NO", ""], ["City", "3", "TEXT", "YES", "Rome"], ["Code", "4", "TEXT", "YES", ""]]
+    );
+    assert_eq!(rows(&db, "SELECT column_default FROM information_schema.columns WHERE column_name = 'OID' AND table_name = 'Orders'"), [["NEXT VALUE FOR ids"]]);
+    assert_eq!(rows(&db, "SELECT column_name, calculated_expression FROM information_schema.columns WHERE table_name = 'Orders' AND calculated_expression IS NOT NULL"), [["Tax", "Total * 0.2"]]);
+    // A query's columns are what it returns.
+    assert_eq!(rows(&db, "SELECT column_name FROM information_schema.columns WHERE table_name = 'Joined' ORDER BY ordinal_position"), [["Name"], ["Total"]]);
+    assert_eq!(rows(&db, "SELECT table_name, is_updatable FROM information_schema.views ORDER BY table_name"), [["Big", "YES"], ["Joined", "NO"]]);
+    assert_eq!(
+        rows(&db, "SELECT table_name, constraint_type FROM information_schema.table_constraints ORDER BY table_name, constraint_type"),
+        [["Customers", "PRIMARY KEY"], ["Customers", "UNIQUE"], ["Orders", "FOREIGN KEY"], ["Orders", "PRIMARY KEY"]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT table_name, column_name, referenced_table, referenced_column FROM information_schema.key_column_usage WHERE referenced_table IS NOT NULL"),
+        [["Orders", "CustID", "Customers", "ID"]]
+    );
+    assert_eq!(rows(&db, "SELECT delete_rule, is_deferrable FROM information_schema.referential_constraints"), [["CASCADE", "YES"]]);
+    assert_eq!(rows(&db, "SELECT Count(*) FROM information_schema.indexes WHERE is_unique AND table_name = 'Customers'"), [["2"]]);
+    assert_eq!(rows(&db, "SELECT routine_name, routine_type, data_type FROM information_schema.routines ORDER BY routine_name"), [["dbl", "FUNCTION", "INTEGER"], ["noop", "PROCEDURE", ""]]);
+    assert_eq!(rows(&db, "SELECT parameter_name, data_type FROM information_schema.parameters"), [["a", "INTEGER"]]);
+    assert_eq!(rows(&db, "SELECT sequence_name, start_value FROM information_schema.sequences"), [["ids", "10"]]);
+    assert_eq!(rows(&db, "SELECT trigger_name, action_timing, event_manipulation, action_orientation FROM information_schema.triggers"), [["t1", "AFTER", "INSERT, UPDATE", "STATEMENT"]]);
+    assert_eq!(rows(&db, "SELECT report_name FROM information_schema.reports"), [["r1"]]);
+    // They are tables like any other: joins, aliases, aggregates.
+    assert_eq!(
+        rows(&db, "SELECT t.table_name, Count(*) FROM information_schema.tables t JOIN information_schema.columns c ON c.table_name = t.table_name WHERE t.table_type = 'BASE TABLE' GROUP BY t.table_name ORDER BY 1"),
+        [["Customers", "4"], ["Orders", "4"]]
+    );
+    assert!(db.query("SELECT * FROM information_schema.nosuch").is_err());
+    // Always current.
+    db.execute("ALTER TABLE Customers ADD COLUMN Extra INTEGER").unwrap();
+    assert_eq!(rows(&db, "SELECT Count(*) FROM information_schema.columns WHERE table_name = 'Customers'"), [["5"]]);
+}

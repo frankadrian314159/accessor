@@ -90,7 +90,37 @@ SELECT TRIM(LEADING '0' FROM '000120');      -- '120'
 SELECT TRIM(BOTH 'xy' FROM 'xyxhixy');       -- 'hi'
 ```
 
+## LPad and RPad
+
+`LPAD(text, width [, fill])` and `RPAD(text, width [, fill])` pad the text to `width` characters with `fill` (a space by default; a longer `fill` is repeated and cut). Text already longer than `width` is **cut** to it.
+
+```sql
+SELECT LPAD('7', 3, '0'), RPAD('ab', 5, '-'), LPAD('abcdef', 3);      -- 007, ab---, abc
+```
+
+## Repeat, Reverse and InitCap
+
+`REPEAT(text, n)` (also `REPLICATE`) repeats the text `n` times (nothing for `n` below 1; more than a hundred million characters is an error). `REVERSE(text)` reverses the characters. `INITCAP(text)` (also `PROPER`) makes the first letter of each word upper-case and the rest lower-case; a word is a run of letters and digits.
+
+## Overlay
+
+`OVERLAY(text PLACING replacement FROM start [FOR length])` replaces `length` characters (default: the length of the replacement) from position `start` (counting from 1) with the replacement. The function form `OVERLAY(text, replacement, start [, length])` is the same.
+
+```sql
+SELECT OVERLAY('Txxxxas' PLACING 'hom' FROM 2 FOR 4);     -- Thomas
+```
+
+## Translate
+
+`TRANSLATE(text, from, to)` replaces each character of `from` by the character in the same position of `to`; a character of `from` with no counterpart in `to` is removed.
+
+```sql
+SELECT TRANSLATE('12345', '143', 'ax');                   -- a2x5
+```
+
 ## Related
+
+* [Regular expressions](regex.md): `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `SIMILAR TO`.
 
 * [`Format`](format.md) formats numbers, dates and text with a pattern.
 * [`CStr`](conversion.md#conversion-functions) and `CAST(x AS TEXT)` convert values to text.

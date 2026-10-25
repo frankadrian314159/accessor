@@ -64,7 +64,9 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                 <select-core> [ <order-by> ] { <row-limit> }
                 PIVOT <concat> [ IN '(' <expr-list> ')' ]
 <explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
-<returning>   ::= ( <insert> | <update> | <delete> | <merge> ) RETURNING <select-item> { ',' <select-item> }
+<upsert>      ::= <insert> ON CONFLICT [ '(' <identifier-list> ')' ] DO ( NOTHING | UPDATE SET <assignment> { ',' <assignment> } [ WHERE <expr> ] )
+                | REPLACE INTO ...  | INSERT OR ( REPLACE | IGNORE ) INTO ...
+<returning>   ::= ( <insert> | <upsert> | <update> | <delete> | <merge> ) RETURNING <select-item> { ',' <select-item> }
 <set-time-zone> ::= SET ( TIME ZONE | TIMEZONE TO ) ( <string> | LOCAL | UTC )
 <create-routine> ::= CREATE [ OR REPLACE ] FUNCTION <identifier> '(' [ <routine-param> { ',' <routine-param> } ] ')'
                        [ RETURNS <data-type> ] AS [ RETURN ] <expr>
@@ -152,6 +154,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                   | '(' <from-clause> ')'                  (* a parenthesised join, as Access writes it *)
 <table-factor>  ::= <table-primary> { <pivot-clause> | <unpivot-clause> }
 <table-primary> ::= <identifier> [ [ AS ] <identifier> ]
+                  | INFORMATION_SCHEMA '.' <identifier> [ [ AS ] <identifier> ]
                   | [ LATERAL ] '(' <query> ')' [ AS ] <identifier> [ '(' <identifier-list> ')' ]
                   | [ LATERAL ] <identifier> '(' [ <expr-list> ] ')' [ [ AS ] <identifier> ] [ '(' <identifier-list> ')' ]
                                                             (* a table function: GENERATE_SERIES, SPLIT_STRING *)

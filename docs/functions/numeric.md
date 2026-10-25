@@ -66,6 +66,20 @@ SELECT Power(2, 100);                      -- 1267650600228229401496703205376
 
 `Sin`, `Cos`, `Tan`, `Asin`, `Acos`, `Atan`, `Sinh`, `Cosh`, `Tanh` take and return radians as floating-point numbers. `Asin` and `Acos` of a value outside −1 to 1 is an error.
 
+`Atan2(y, x)` is the angle in radians of the point (x, y), in the right quadrant. `Degrees(x)` and `Radians(x)` convert between the two units, and `Pi()` is π (a `DOUBLE`).
+
+## Trunc
+
+`TRUNC(x [, digits])` (also `TRUNCATE`) cuts the number off after `digits` places **without rounding** (`Round` rounds), keeping its type. A negative `digits` cuts off digits to the left of the point. Exact types stay exact.
+
+```sql
+SELECT TRUNC(-123.4567, 2), TRUNC(123.999), TRUNC(1234, -2);      -- -123.45, 123, 1200
+```
+
+## Random
+
+`RANDOM()` (also `RAND`, `RND`) is a `DOUBLE` from 0 up to, but not including, 1, a new one **for each row** of a query. It is not meant for cryptography. Because it changes from call to call, the optimizer never folds it into a constant. For a whole number from 1 to 6: `1 + Int(Random() * 6)`.
+
 ## Operators
 
 The arithmetic operators `+ - * / \ % MOD ^` and unary minus are described in [expressions](../sql/expressions.md#operators).

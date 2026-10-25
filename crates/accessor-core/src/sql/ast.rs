@@ -319,6 +319,24 @@ pub struct ReportDef {
     pub sql: String,
 }
 
+/// What `INSERT` does with a row that conflicts with an existing one (on a unique key).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConflictAction {
+    /// `DO NOTHING` / `INSERT OR IGNORE`: the new row is dropped.
+    Nothing,
+    /// `REPLACE INTO` / `INSERT OR REPLACE`: the existing row is deleted, the new one inserted.
+    Replace,
+    /// `DO UPDATE SET ... [WHERE ...]`: the existing row is updated; `EXCLUDED.col` is the new row's value.
+    Update { sets: Vec<(String, Expr)>, filter: Option<Expr> },
+}
+
+/// The `ON CONFLICT` part of an insert; `target` is the columns of the unique key (any, if empty).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Conflict {
+    pub target: Vec<String>,
+    pub action: ConflictAction,
+}
+
 /// A parameter of a stored function or procedure.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RoutineParam {
@@ -435,6 +453,8 @@ pub enum Statement {
     DropTrigger(String),
     /// `INSERT | UPDATE | DELETE | MERGE ... RETURNING items`.
     Returning { stmt: Box<Statement>, items: Vec<SelectItem> },
+    /// An `INSERT` that deals with conflicts: `ON CONFLICT`, `REPLACE INTO`, `INSERT OR IGNORE`.
+    Upsert { insert: Box<Statement>, conflict: Conflict },
     CreateReport(Box<ReportDef>),
     DropReport(String),
     /// `RUN REPORT name [AS format]`.

@@ -18,6 +18,7 @@ datasheets for working with records directly.
   (`TRANSFORM … PIVOT`); `CHECK` constraints;
   row value comparisons, `LATERAL` and table functions, `PIVOT` / `UNPIVOT`, named windows,
   `NULLS FIRST/LAST`, simple updatable views, `INTERVAL` and time-zone-aware timestamps;
+  `ON CONFLICT` upserts, regular expressions, `INFORMATION_SCHEMA`,
   stored functions and procedures, `RETURNING`, reports (grouped, totalled, paged;
   text, HTML, Markdown, CSV, PDF), sequences, a `JSON` type with path functions, deferrable foreign keys (`SET CONSTRAINTS`),
   and statement-level, multi-event, `UPDATE OF` and `INSTEAD OF` triggers;

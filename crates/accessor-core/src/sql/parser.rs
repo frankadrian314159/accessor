@@ -454,8 +454,38 @@ impl<'a> Parser<'a> {
     // ----- statements ------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
-        let st = self.statement_inner()?;
-        if self.peek_kw("RETURNING") && matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_)) {
+        let mut st = self.statement_inner()?;
+        if matches!(st, Statement::Insert { .. }) && self.peek_kw("ON") && self.peek_kw_at(1, "CONFLICT") {
+            self.advance();
+            self.advance();
+            let mut target = Vec::new();
+            if self.eat_sym("(") {
+                target = self.ident_list()?;
+                self.expect_sym(")")?;
+            }
+            self.expect_kw("DO")?;
+            let action = if self.eat_kw("NOTHING") {
+                ConflictAction::Nothing
+            } else {
+                self.expect_kw("UPDATE")?;
+                self.expect_kw("SET")?;
+                let mut sets = Vec::new();
+                loop {
+                    let col = self.column_name()?;
+                    self.expect_sym("=")?;
+                    sets.push((col, self.expr()?));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+                ConflictAction::Update { sets, filter }
+            };
+            st = Statement::Upsert { insert: Box::new(st), conflict: Conflict { target, action } };
+        }
+        if self.peek_kw("RETURNING")
+            && matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_) | Statement::Upsert { .. })
+        {
             self.advance();
             let mut items = vec![self.select_item()?];
             while self.eat_sym(",") {
@@ -471,7 +501,27 @@ impl<'a> Parser<'a> {
             return Ok(Statement::Select(self.select()?));
         }
         if self.eat_kw("INSERT") {
-            return self.insert();
+            // SQLite spellings: INSERT OR REPLACE / INSERT OR IGNORE.
+            let action = if self.eat_kw("OR") {
+                if self.eat_kw("REPLACE") {
+                    Some(ConflictAction::Replace)
+                } else {
+                    self.expect_kw("IGNORE")?;
+                    Some(ConflictAction::Nothing)
+                }
+            } else {
+                None
+            };
+            let st = self.insert()?;
+            return Ok(match action {
+                Some(action) => Statement::Upsert { insert: Box::new(st), conflict: Conflict { target: Vec::new(), action } },
+                None => st,
+            });
+        }
+        if self.peek_kw("REPLACE") && self.peek_kw_at(1, "INTO") {
+            self.advance();
+            let st = self.insert()?;
+            return Ok(Statement::Upsert { insert: Box::new(st), conflict: Conflict { target: Vec::new(), action: ConflictAction::Replace } });
         }
         if self.eat_kw("MERGE") {
             return self.merge();
@@ -2307,8 +2357,15 @@ impl<'a> Parser<'a> {
         if lateral {
             return Err(self.unexpected("a sub-query or function after LATERAL"));
         }
-        let name = self.ident()?;
-        let alias = if self.eat_kw("AS") || self.peek_is_alias() { Some(self.ident()?) } else { None };
+        let mut name = self.ident()?;
+        let mut default_alias = None;
+        if name.eq_ignore_ascii_case("information_schema") && self.eat_sym(".") {
+            // The catalog, as tables: INFORMATION_SCHEMA.COLUMNS and so on.
+            let part = self.ident()?;
+            name = format!("information_schema.{}", part.to_ascii_lowercase());
+            default_alias = Some(part);
+        }
+        let alias = if self.eat_kw("AS") || self.peek_is_alias() { Some(self.ident()?) } else { default_alias };
         Ok(TableFactor::Named { name, alias })
     }
 
@@ -2389,11 +2446,21 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let negated = self.peek_kw("NOT")
-                && (self.peek_kw_at(1, "LIKE") || self.peek_kw_at(1, "BETWEEN") || self.peek_kw_at(1, "IN"));
+                && (self.peek_kw_at(1, "LIKE")
+                    || self.peek_kw_at(1, "BETWEEN")
+                    || self.peek_kw_at(1, "IN")
+                    || (self.peek_kw_at(1, "SIMILAR") && self.peek_kw_at(2, "TO")));
             if negated {
                 self.advance();
             }
-            if self.eat_kw("LIKE") {
+            if self.peek_kw("SIMILAR") && self.peek_kw_at(1, "TO") {
+                // `x SIMILAR TO pattern`: a regular-expression-like pattern matching the whole text.
+                self.advance();
+                self.advance();
+                let pattern = self.concat()?;
+                let call = Expr::Function { name: "SIMILAR_TO".into(), args: vec![left, pattern], distinct: false, star: false };
+                left = if negated { Expr::Not(Box::new(call)) } else { call };
+            } else if self.eat_kw("LIKE") {
                 let mut pattern = self.concat()?;
                 if self.eat_kw("ESCAPE") {
                     let esc = self.concat()?;
@@ -2694,6 +2761,26 @@ impl<'a> Parser<'a> {
                         let seq = self.ident()?;
                         let f = if up == "NEXT" { "NEXTVAL" } else { "CURRVAL" };
                         return Ok(Expr::Function { name: f.into(), args: vec![Expr::Literal(Value::text(&seq))], distinct: false, star: false });
+                    }
+                    "OVERLAY" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        self.advance();
+                        self.advance();
+                        let s = self.expr()?;
+                        let mut args = vec![s];
+                        if self.eat_kw("PLACING") {
+                            args.push(self.expr()?);
+                            self.expect_kw("FROM")?;
+                            args.push(self.expr()?);
+                            if self.eat_kw("FOR") {
+                                args.push(self.expr()?);
+                            }
+                        } else {
+                            while self.eat_sym(",") {
+                                args.push(self.expr()?);
+                            }
+                        }
+                        self.expect_sym(")")?;
+                        return Ok(Expr::Function { name: "OVERLAY".into(), args, distinct: false, star: false });
                     }
                     "CAST" if matches!(self.peek_at(1), Tok::Sym("(")) => {
                         self.advance();

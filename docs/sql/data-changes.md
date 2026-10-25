@@ -22,6 +22,30 @@ INSERT INTO Log DEFAULT VALUES;           -- every column takes its default
 
 Values are converted to the column's type (`'12'` into an integer column becomes `12`). A value that cannot be converted fails the statement.
 
+### Conflicts: ON CONFLICT, REPLACE and INSERT OR IGNORE
+
+A row that has the same value as an existing one in a primary key or other unique index is normally an error. These forms say what to do instead:
+
+```sql
+INSERT INTO t (...) VALUES (...) ON CONFLICT [(column, ...)] DO NOTHING;
+INSERT INTO t (...) VALUES (...) ON CONFLICT [(column, ...)] DO UPDATE SET column = expr [, ...] [WHERE condition];
+REPLACE INTO t (...) VALUES (...);              -- the same as INSERT OR REPLACE INTO
+INSERT OR IGNORE INTO t (...) VALUES (...);     -- the same as ON CONFLICT DO NOTHING
+```
+
+| Form | When the new row collides with an existing one |
+| --- | --- |
+| `DO NOTHING` | the new row is dropped |
+| `DO UPDATE SET ...` | the existing row is updated; in the right-hand sides, `EXCLUDED.column` is the value the new row offered and a plain column is the existing row's value. With `WHERE`, only collisions for which it is true are updated (the others are left alone) |
+| `REPLACE` / `INSERT OR REPLACE` | the existing row (or rows, if the new one collides with several) is deleted and the new one inserted, so columns not given take their defaults. Foreign-key actions apply to the delete |
+
+```sql
+INSERT INTO Counter (Word, Hits) VALUES ('hello', 1)
+ON CONFLICT (Word) DO UPDATE SET Hits = Hits + EXCLUDED.Hits;
+```
+
+The conflict target `(column, ...)` must be exactly the columns of the primary key or a unique index; without a target, a collision on any unique key counts. A key with a NULL in it never collides. Rows go in **one at a time**, so a row can collide with an earlier row of the same statement, and the whole statement is all-or-nothing. The result counts rows inserted or updated, not rows skipped. `RETURNING` gives back those rows. The unique indexes are what find the collision, so there is a lookup per row, not a scan.
+
 ## UPDATE
 
 ```sql

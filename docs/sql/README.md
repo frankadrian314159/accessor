@@ -8,10 +8,11 @@ ASQL is the SQL dialect of Accessor. It is a subset of standard SQL with the hab
 | --- | --- |
 | [grammar.md](grammar.md) | the complete grammar in BNF |
 | [select.md](select.md) | queries: joins, grouping, set operators, `WITH`, window functions, sub-queries, crosstabs (`TRANSFORM … PIVOT`) |
-| [data-changes.md](data-changes.md) | `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`, `RETURNING` |
+| [data-changes.md](data-changes.md) | `INSERT` (with `ON CONFLICT`), `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`, `RETURNING` |
 | [ddl.md](ddl.md) | `CREATE`/`ALTER`/`DROP TABLE`, data types, constraints, indexes |
 | [queries-and-triggers.md](queries-and-triggers.md) | saved queries, parameters, `EXEC`, prepared statements, triggers (row, statement, `INSTEAD OF`) |
 | [transactions.md](transactions.md) | `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, `SET CONSTRAINTS` |
+| [information-schema.md](information-schema.md) | `INFORMATION_SCHEMA`: the catalog as tables |
 | [sequences.md](sequences.md) | `CREATE SEQUENCE`, `NEXT VALUE FOR`, sequence defaults |
 | [routines.md](routines.md) | `CREATE FUNCTION` (expression functions) and `CREATE PROCEDURE` (variables, `IF`, `WHILE`), `CALL` |
 | [reports.md](reports.md) | `CREATE REPORT`: grouped, totalled, paged output as text, HTML, Markdown, CSV or PDF |

@@ -14,7 +14,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | Grouping | aggregates with `DISTINCT` and `FILTER`; `ROLLUP`, `CUBE`, `GROUPING SETS`, `GROUPING()` |
 | Aggregates | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `EVERY`, `ANY_VALUE`, `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `STRING_AGG`/`LISTAGG` (without `WITHIN GROUP`) |
 | Window functions | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, aggregates `OVER`, `PARTITION BY`, `ORDER BY`, named windows, `ROWS` frames and `RANGE` frames with or without an offset |
-| Predicates | comparisons, `BETWEEN` (`SYMMETRIC`/`ASYMMETRIC`), `IN`, `LIKE ... ESCAPE`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `IS [NOT] DISTINCT FROM`, `EXISTS`, quantified comparisons |
+| Predicates | `SIMILAR TO`, comparisons, `BETWEEN` (`SYMMETRIC`/`ASYMMETRIC`), `IN`, `LIKE ... ESCAPE`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `IS [NOT] DISTINCT FROM`, `EXISTS`, quantified comparisons |
 | Expressions | searched and simple `CASE`, `CAST`, `COALESCE`, `NULLIF`, `EXTRACT`, `POSITION`, `SUBSTRING ... FROM ... FOR`, `TRIM` with `LEADING`/`TRAILING`/`BOTH`, `CHAR_LENGTH`, `OCTET_LENGTH`, `UPPER`, `LOWER`, `ABS`, `MOD`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG10`, `FLOOR`, `CEIL`, trigonometric functions, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, typed date literals |
 | Data changes | `INSERT` (values, query, `DEFAULT VALUES`), `UPDATE`, `DELETE`, `MERGE` (matched update/delete, not-matched insert), `TRUNCATE TABLE` |
 | Definition | `CREATE`/`ALTER`/`DROP TABLE` (including `RENAME TO`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`); `CREATE OR REPLACE VIEW`/`TRIGGER`; `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`/`SET NULL`; identity columns (`GENERATED ... AS IDENTITY`); generated columns (`GENERATED ALWAYS AS (expr)`); `IF [NOT] EXISTS`; `CREATE`/`DROP INDEX`; `CREATE`/`DROP VIEW`; `CREATE`/`DROP TRIGGER`; `CREATE`/`ALTER`/`DROP SEQUENCE` with `NEXT VALUE FOR`; `DEFERRABLE` foreign keys with `SET CONSTRAINTS`; `SET DEFAULT` and `NO ACTION` referential actions |
@@ -57,7 +57,7 @@ These parts of the standard are not available. Using one gives a syntax error or
 * Collection and structured types: `ARRAY`, `MULTISET`, `ROW`, `REF`, user-defined and distinct types (`CREATE TYPE`).
 * The `XML` type and SQL/XML. SQL/JSON is only partly there: there is no `IS JSON` predicate (use `JSON_VALID`), no `JSON_TABLE`, no `JSON_EXISTS`, and the path language has only keys, positions and `$` (no filters, wildcards or recursive descent).
 * Row values in `SELECT` lists and as sub-query results (`(a, b) = (SELECT x, y ...)`); row comparisons and `IN` work. The `UNIQUE` and `MATCH` predicates.
-* Regular-expression predicates: `SIMILAR TO` and `LIKE_REGEX`; `OVERLAY`, `TRANSLATE`, `NORMALIZE`.
+* `LIKE_REGEX` and `NORMALIZE` (`SIMILAR TO` is there, and the regular-expression functions `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR` and `REGEXP_COUNT` that other systems have).
 * `CURRENT_USER`, `SESSION_USER` and the other user functions (there are no users).
 
 ### Queries
@@ -73,13 +73,13 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 ### Definitions and data changes
 
-* Schemas, catalogs and qualified names (`schema.table`); `CREATE SCHEMA`; `INFORMATION_SCHEMA`.
+* Schemas, catalogs and qualified names (`schema.table`); `CREATE SCHEMA`. `INFORMATION_SCHEMA` exists with the views listed in [information-schema.md](information-schema.md), which is the one schema, with no `catalog` or `schema` columns; the standard's views for privileges, domains, collations and so on are absent.
 * `CREATE DOMAIN`, `CREATE ASSERTION`, collations and character sets (`COLLATE`).
 * `CREATE OR REPLACE TABLE`, `CREATE TABLE ... AS`, `CREATE TABLE ... LIKE`, temporary tables, materialised views, recursive views, views updatable by the standard's fuller rules (joins, aggregates), `WITH LOCAL/CASCADED CHECK OPTION`.
 * `ALTER TABLE` actions `ADD PRIMARY KEY` and `ADD UNIQUE` (use `CREATE UNIQUE INDEX`).
 * Deferrable `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints (only foreign keys can be deferred); `MATCH FULL/PARTIAL`; sequence options `AS type` and `CACHE` are accepted and ignored; `OWNED BY`.
 * Temporal tables (`PERIOD FOR`, `WITH SYSTEM VERSIONING`).
-* `INSERT ... OVERRIDING`. `RETURNING` (a common extension, not in the standard) is available; the standard's data-change delta tables (`SELECT ... FROM FINAL TABLE (INSERT ...)`) are not.
+* `INSERT ... OVERRIDING`. `ON CONFLICT` (a PostgreSQL/SQLite spelling) is available instead of the standard `MERGE` for the common upsert. `RETURNING` (a common extension, not in the standard) is available; the standard's data-change delta tables (`SELECT ... FROM FINAL TABLE (INSERT ...)`) are not.
 * Report writers are outside the standard; `CREATE REPORT` is an extension (see below).
 
 ### Routines, triggers and administration
@@ -91,6 +91,7 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 ## Extensions to the standard
 
+* `ON CONFLICT`, `REPLACE INTO`, `INSERT OR IGNORE`, `RETURNING`, `REGEXP_*`, `LPAD`/`RPAD`, `TRUNC`, `RANDOM`, `INITCAP`.
 * Access-style syntax: `[bracketed names]`, `TOP n`, `&` concatenation, `#date#` literals, `IIf`, `Nz`, `\` and `MOD`, `First`/`Last`, `DateAdd`/`DateDiff`/`DateSerial`, `Format`, `DELETE *`, and crosstab queries (`TRANSFORM … PIVOT`; standard SQL has no pivot clause).
 * A numeric tower with exact arithmetic: `BIGNUM`, `DECIMAL`, `CURRENCY` and `RATIONAL` ([see the README](../../README.md#numbers)).
 * `CALCULATED` columns, parameterised saved queries with `EXEC`, `RAISE` in triggers, `SELECT` in trigger bodies, `LASTVAL`/`SETVAL`.

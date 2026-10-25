@@ -10,7 +10,8 @@ use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::expr::BExpr;
 use crate::schema::TableSchema;
-use crate::sql::ast::{Expr, InsertSource};
+use crate::sql::ast::{Conflict, ConflictAction, Expr, InsertSource, Statement};
+use crate::sql::walk::RowContext;
 use crate::storage::{Op, RowId, Table};
 use crate::value::{Row, Value};
 
@@ -79,6 +80,93 @@ impl Database {
         let n = ops.len();
         self.apply_all(ops)?;
         Ok(QueryResult::affected(n))
+    }
+
+    /// An insert that deals with rows that collide with an existing one on a unique key. The rows
+    /// go in one at a time, so a later row meets the earlier ones of the same statement.
+    pub(crate) fn exec_upsert(&mut self, insert: &Statement, conflict: &Conflict) -> Result<QueryResult> {
+        let Statement::Insert { table, columns, source } = insert else {
+            return Err(Error::runtime("ON CONFLICT follows INSERT"));
+        };
+        let (name, schema) = {
+            let t = self.table_checked(table)?;
+            (t.name().to_string(), t.schema().clone())
+        };
+        let target: Vec<usize> = conflict.target.iter().map(|c| column_pos(&schema, c)).collect::<Result<_>>()?;
+        let same = |a: &[usize], b: &[usize]| a.len() == b.len() && a.iter().all(|c| b.contains(c));
+        if !target.is_empty() && !schema.indexes.iter().any(|ix| ix.unique && same(&ix.columns, &target)) {
+            return Err(Error::catalog(format!(
+                "ON CONFLICT ({}) needs a primary key or unique index on exactly those fields",
+                conflict.target.join(", ")
+            )));
+        }
+        let candidates = self.plan_insert(table, columns, source)?;
+        self.atomically(|db| {
+            let mut affected = 0;
+            for op in candidates {
+                let Op::Insert { row, .. } = op else { continue };
+                // The existing rows this one collides with.
+                let (hits, existing) = {
+                    let t = db.table_checked(&name)?;
+                    let mut hits: Vec<RowId> = Vec::new();
+                    for ix in t.index_defs().filter(|ix| ix.unique && (target.is_empty() || same(&ix.columns, &target))) {
+                        let key: Vec<Value> = ix.columns.iter().map(|&c| row[c].clone()).collect();
+                        if key.iter().all(|v| !v.is_null()) {
+                            hits.extend(t.lookup(&ix.columns, &key));
+                        }
+                    }
+                    hits.sort_unstable();
+                    hits.dedup();
+                    let existing = hits.first().and_then(|&id| t.get(id).cloned());
+                    (hits, existing)
+                };
+                let fresh = |db: &Database| Op::Insert { table: name.clone(), id: db.table(&name).map_or(0, Table::slot_count) as RowId, row: row.clone() };
+                match (&conflict.action, existing) {
+                    (_, None) => {
+                        let op = fresh(db);
+                        db.apply_all(vec![op])?;
+                        affected += 1;
+                    }
+                    (ConflictAction::Nothing, Some(_)) => {}
+                    (ConflictAction::Replace, Some(_)) => {
+                        let mut ops: Vec<Op> = hits.iter().map(|&id| Op::Delete { table: name.clone(), id }).collect();
+                        ops.push(fresh(db));
+                        db.apply_all(ops)?;
+                        affected += 1;
+                    }
+                    (ConflictAction::Update { sets, filter }, Some(old)) => {
+                        // EXCLUDED.col is the row that was offered; the rest read the existing row.
+                        let offered = RowContext { schema: &schema, old: None, new: Some(&row) };
+                        let renamed = |e: &Expr| -> Result<Expr> {
+                            let mut e = e.clone();
+                            crate::sql::walk::walk_expr(&mut e, &mut |x| {
+                                if let Expr::Column { table: Some(t), .. } = x {
+                                    if t.eq_ignore_ascii_case("excluded") {
+                                        *t = "new".into();
+                                    }
+                                }
+                                Ok(())
+                            })?;
+                            offered.bind_expr(&mut e)?;
+                            Ok(e)
+                        };
+                        if let Some(cond) = filter {
+                            let cond = renamed(cond)?;
+                            let scope = table_scope(&schema);
+                            if !Binder::new(db, &scope, 0).bind(&cond)?.eval_bool(&old)? {
+                                continue;
+                            }
+                        }
+                        let sets: Vec<(String, Expr)> = sets.iter().map(|(c, e)| Ok((c.clone(), renamed(e)?))).collect::<Result<_>>()?;
+                        let id = hits[0];
+                        let ops = db.plan_update_ids(&name, &sets, &[id])?;
+                        db.apply_all(ops)?;
+                        affected += 1;
+                    }
+                }
+            }
+            Ok(QueryResult::affected(affected))
+        })
     }
 
     pub(crate) fn exec_update(

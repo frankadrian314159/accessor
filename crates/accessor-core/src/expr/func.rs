@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use super::BExpr;
 use crate::datetime;
 use crate::json;
+use super::extra;
 use crate::tz;
 use crate::error::{Error, Result};
 use crate::decimal::Decimal;
@@ -103,6 +104,24 @@ pub enum ScalarFn {
     Currval,
     Lastval,
     Setval,
+    Lpad,
+    Rpad,
+    Repeat,
+    Reverse,
+    Overlay,
+    Translate,
+    Initcap,
+    RegexpLike,
+    RegexpReplace,
+    RegexpSubstr,
+    RegexpCount,
+    SimilarTo,
+    Atan2,
+    Degrees,
+    Radians,
+    Pi,
+    Random,
+    Trunc,
     JsonValid,
     JsonExtract,
     JsonValue,
@@ -135,6 +154,7 @@ impl ScalarFn {
                 | ScalarFn::Currval
                 | ScalarFn::Lastval
                 | ScalarFn::Setval
+                | ScalarFn::Random
         )
     }
 
@@ -225,6 +245,24 @@ impl ScalarFn {
             "CINTERVAL" => (CInterval, 1, 1),
             "MAKEINTERVAL" | "MAKE_INTERVAL" => (MakeInterval, 1, 6),
             "AGE" => (Age, 2, 2),
+            "LPAD" => (Lpad, 2, 3),
+            "RPAD" => (Rpad, 2, 3),
+            "REPEAT" | "REPLICATE" => (Repeat, 2, 2),
+            "REVERSE" | "STRREVERSE" => (Reverse, 1, 1),
+            "OVERLAY" => (Overlay, 3, 4),
+            "TRANSLATE" => (Translate, 3, 3),
+            "INITCAP" | "PROPER" => (Initcap, 1, 1),
+            "REGEXP_LIKE" => (RegexpLike, 2, 3),
+            "REGEXP_REPLACE" => (RegexpReplace, 3, 4),
+            "REGEXP_SUBSTR" => (RegexpSubstr, 2, 4),
+            "REGEXP_COUNT" => (RegexpCount, 2, 3),
+            "SIMILAR_TO" => (SimilarTo, 2, 2),
+            "ATAN2" => (Atan2, 2, 2),
+            "DEGREES" => (Degrees, 1, 1),
+            "RADIANS" => (Radians, 1, 1),
+            "PI" => (Pi, 0, 0),
+            "RANDOM" | "RAND" | "RND" => (Random, 0, 0),
+            "TRUNC" | "TRUNCATE" => (Trunc, 1, 2),
             "NEXTVAL" => (Nextval, 1, 1),
             "CURRVAL" => (Currval, 1, 1),
             "LASTVAL" => (Lastval, 0, 0),
@@ -339,6 +377,47 @@ fn round_of(v: &Value, digits: u32) -> Result<Value> {
                 Value::Float(rounded.to_f64() as f32)
             } else {
                 Value::Double(rounded.to_f64())
+            }
+        }
+        _ => unreachable!("num_lenient gives numbers"),
+    })
+}
+
+/// `Trunc(x, digits)`: cut off, not rounded, keeping the type.
+fn trunc_of(v: &Value, digits: i64) -> Result<Value> {
+    use num_traits::ToPrimitive;
+    Ok(match &*num_of(v)? {
+        Value::Int(i) => {
+            if digits >= 0 {
+                Value::Int(*i)
+            } else {
+                let (m, _) = extra::truncate(&Decimal::from_i64(*i), digits).parts();
+                m.to_i64().map_or_else(|| Value::Big(m), Value::Int)
+            }
+        }
+        Value::Big(b) => {
+            if digits >= 0 {
+                Value::Big(b.clone())
+            } else {
+                Value::Big(extra::truncate(&Decimal::from_parts(b.clone(), 0), digits).parts().0)
+            }
+        }
+        Value::Dec(d) => Value::Dec(extra::truncate(d, digits)),
+        Value::Currency(d) => Value::Currency(extra::truncate(d, digits)),
+        Value::Rational(r) => {
+            let unit = Rational::from_int(BigInt::from(10u32).pow(digits.unsigned_abs() as u32));
+            if digits >= 0 {
+                Value::Rational(Rational::from_int(r.mul(&unit).trunc()).div(&unit).expect("unit is not zero"))
+            } else {
+                Value::Rational(Rational::from_int(r.div(&unit).expect("unit is not zero").trunc()).mul(&unit))
+            }
+        }
+        n @ (Value::Float(_) | Value::Double(_)) => {
+            let cut = extra::truncate(&n.as_decimal().ok_or_else(|| Error::runtime("Trunc: not a finite number"))?, digits);
+            if matches!(n, Value::Float(_)) {
+                Value::Float(cut.to_f64() as f32)
+            } else {
+                Value::Double(cut.to_f64())
             }
         }
         _ => unreachable!("num_lenient gives numbers"),
@@ -846,6 +925,65 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 other => json::from_value(other),
             };
             Value::Bool(json::contains(&json::document(&vals[0])?, &candidate))
+        }
+        Lpad | Rpad => {
+            let fill = vals.get(2).map(|f| text_of(f).into_owned()).unwrap_or_else(|| " ".to_string());
+            Value::text(&extra::pad(&text_of(&vals[0]), int_of(&vals[1])?, &fill, f == Lpad)?)
+        }
+        Repeat => Value::text(&extra::repeat(&text_of(&vals[0]), int_of(&vals[1])?)?),
+        Reverse => Value::text(&text_of(&vals[0]).chars().rev().collect::<String>()),
+        Overlay => {
+            let len = match vals.get(3) {
+                Some(l) => Some(int_of(l)?),
+                None => None,
+            };
+            Value::text(&extra::overlay(&text_of(&vals[0]), &text_of(&vals[1]), int_of(&vals[2])?, len))
+        }
+        Translate => Value::text(&extra::translate(&text_of(&vals[0]), &text_of(&vals[1]), &text_of(&vals[2]))),
+        Initcap => Value::text(&extra::initcap(&text_of(&vals[0]))),
+        RegexpLike | RegexpCount => {
+            let re = extra::pattern(&text_of(&vals[1]), &vals.get(2).map(|f| text_of(f).into_owned()).unwrap_or_default())?;
+            let text = text_of(&vals[0]);
+            if f == RegexpLike {
+                Value::Bool(re.is_match(&text))
+            } else {
+                Value::Int(re.find_iter(&text).count() as i64)
+            }
+        }
+        SimilarTo => {
+            let re = extra::pattern(&extra::similar_to_regex(&text_of(&vals[1])), "")?;
+            Value::Bool(re.is_match(&text_of(&vals[0])))
+        }
+        RegexpReplace => {
+            let re = extra::pattern(&text_of(&vals[1]), &vals.get(3).map(|f| text_of(f).into_owned()).unwrap_or_default())?;
+            let with = extra::replacement(&text_of(&vals[2]));
+            Value::text(&re.replace_all(&text_of(&vals[0]), with.as_str()))
+        }
+        RegexpSubstr => {
+            let re = extra::pattern(&text_of(&vals[1]), &vals.get(3).map(|f| text_of(f).into_owned()).unwrap_or_default())?;
+            let group = match vals.get(2) {
+                Some(g) => int_of(g)?.max(0) as usize,
+                None => 0,
+            };
+            match re.captures(&text_of(&vals[0])).and_then(|c| c.get(group).map(|m| m.as_str().to_string())) {
+                Some(m) => Value::text(&m),
+                None => Value::Null,
+            }
+        }
+        Atan2 => float_result(f64_of(&vals[0])?.atan2(f64_of(&vals[1])?), &vals[0], "Atan2")?,
+        Degrees => float_result(f64_of(&vals[0])?.to_degrees(), &vals[0], "Degrees")?,
+        Radians => float_result(f64_of(&vals[0])?.to_radians(), &vals[0], "Radians")?,
+        Pi => Value::Double(std::f64::consts::PI),
+        Random => Value::Double(extra::random()),
+        Trunc => {
+            let digits = match vals.get(1) {
+                Some(d) => int_of(d)?,
+                None => 0,
+            };
+            if !(-10_000..=10_000).contains(&digits) {
+                return Err(Error::runtime("Trunc: digits must be between -10000 and 10000"));
+            }
+            trunc_of(&vals[0], digits)?
         }
         Nextval => Value::Int(crate::sequence::next_value(&text_of(&vals[0]))?),
         Currval => Value::Int(crate::sequence::current_value(&text_of(&vals[0]))?),

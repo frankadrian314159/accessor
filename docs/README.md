@@ -339,6 +339,10 @@ WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total > 100);
 
 Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY` (in a grouped query they read the group, so only its grouping columns), and in the `WHERE` and `SET` of `UPDATE` and `DELETE`. When the correlation is through equalities, as in `EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID)`, the optimizer runs the sub-query once and looks the answers up instead (a semi-join): over 5,000 customers and 30,000 orders with no index that is 8 ms instead of 12 s.
 
+#### Upserts, regular expressions and the catalog
+
+`INSERT ... ON CONFLICT (k) DO UPDATE SET n = n + EXCLUDED.n` (or `DO NOTHING`, or `REPLACE INTO`) deals with a row that collides with an existing one on a unique key. `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR` and `SIMILAR TO` match patterns; `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `OVERLAY`, `TRANSLATE` and `INITCAP` shape text; `ATAN2`, `DEGREES`, `RADIANS`, `PI()`, `RANDOM()` and `TRUNC(x, n)` fill gaps in the maths. `SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'Orders'` lists a table's fields, and the other views list constraints, indexes, routines, sequences, triggers and reports. See [data changes](sql/data-changes.md), [regular expressions](functions/regex.md) and the [catalog views](sql/information-schema.md).
+
 #### Stored functions and procedures
 
 `CREATE FUNCTION tax(@amount CURRENCY, @rate DECIMAL = 0.2) AS @amount * @rate` defines an expression you can use anywhere (it is expanded in place, so indexes and the optimizer see through it). `CREATE PROCEDURE` takes a block with `DECLARE`, `SET`, `IF`, `WHILE`, `RETURN` and ordinary SQL statements, run by `CALL` as one all-or-nothing unit. See [routines](sql/routines.md).

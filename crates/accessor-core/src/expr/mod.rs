@@ -2,6 +2,7 @@
 //! function names to enum variants, so per-row evaluation does no lookups.
 
 pub mod format;
+pub(crate) mod extra;
 pub mod func;
 pub mod like;
 

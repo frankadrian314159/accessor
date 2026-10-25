@@ -75,6 +75,10 @@ impl Database {
         match f {
             TableFactor::Named { name, alias } => {
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
+                if let Some(view) = name.strip_prefix("information_schema.") {
+                    let (names, rows) = self.information_schema(view)?;
+                    return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                }
                 if let Some(t) = self.table(name) {
                     let names = t.schema().columns.iter().map(|c| c.name.clone()).collect();
                     return Ok(Source { intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });

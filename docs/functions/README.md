@@ -12,8 +12,9 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 
 | Page | Functions |
 | --- | --- |
-| [text.md](text.md) | `Concat`, `InStr`, `Left`, `Len`, `LCase`, `LTrim`, `Mid`, `OCTET_LENGTH`, `POSITION`, `Replace`, `Right`, `RTrim`, `SUBSTRING`, `Trim`, `UCase` |
-| [numeric.md](numeric.md) | `Abs`, `Acos`, `Asin`, `Atan`, `Ceil`, `Cos`, `Cosh`, `Exp`, `Fix`, `Floor`, `Int`, `Log`, `Log10`, `Mod`, `Power`, `Round`, `Sgn`, `Sin`, `Sinh`, `Sqr`, `Tan`, `Tanh` |
+| [text.md](text.md) | `Concat`, `InStr`, `InitCap`, `Left`, `Len`, `LCase`, `LPad`, `LTrim`, `Mid`, `OCTET_LENGTH`, `Overlay`, `POSITION`, `Repeat`, `Replace`, `Reverse`, `Right`, `RPad`, `RTrim`, `SUBSTRING`, `Translate`, `Trim`, `UCase` |
+| [regex.md](regex.md) | `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_COUNT`, `SIMILAR TO` |
+| [numeric.md](numeric.md) | `Abs`, `Acos`, `Asin`, `Atan`, `Atan2`, `Ceil`, `Cos`, `Cosh`, `Degrees`, `Exp`, `Fix`, `Floor`, `Int`, `Log`, `Log10`, `Mod`, `Pi`, `Power`, `Radians`, `Random`, `Round`, `Sgn`, `Sin`, `Sinh`, `Sqr`, `Tan`, `Tanh`, `Trunc` |
 | [datetime.md](datetime.md) | `Date`, `DateAdd`, `DateDiff`, `DatePart`, `DateSerial`, `Day`, `EXTRACT`, `Hour`, `Minute`, `Month`, `Now`, `Second`, `Weekday`, `Year`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` |
 | [conversion.md](conversion.md) | `CAST`, `CBig`, `CBool`, `CCur`, `CDate`, `CDbl`, `CDec`, `CInt`, `CRat`, `CSng`, `CStr`, `Denominator`, `Numerator`, `Rational`, `TypeName`, `Val` |
 | [conditional.md](conditional.md) | `CASE`, `Coalesce`, `Greatest`, `IIf`, `IsNull`, `Least`, `NullIf`, `Nz` |
@@ -29,6 +30,15 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | Function | Page |
 | --- | --- |
 | Abs | [numeric](numeric.md#abs) |
+| Atan2, Degrees, Pi, Radians | [numeric](numeric.md#trigonometric-and-hyperbolic-functions) |
+| InitCap, Proper | [text](text.md#repeat-reverse-and-initcap) |
+| LPad, RPad | [text](text.md#lpad-and-rpad) |
+| Overlay | [text](text.md#overlay) |
+| Random, Rand, Rnd | [numeric](numeric.md#random) |
+| REGEXP_COUNT, REGEXP_LIKE, REGEXP_REPLACE, REGEXP_SUBSTR, SIMILAR TO | [regex](regex.md) |
+| Repeat, Replicate, Reverse | [text](text.md#repeat-reverse-and-initcap) |
+| Translate | [text](text.md#translate) |
+| Trunc, Truncate | [numeric](numeric.md#trunc) |
 | AGE | [datetime](datetime.md#time-zones-and-intervals) |
 | AT TIME ZONE, TimeZone | [datetime](datetime.md#time-zones-and-intervals) |
 | CInterval, CTimestampTz | [conversion](conversion.md#conversion-functions) |

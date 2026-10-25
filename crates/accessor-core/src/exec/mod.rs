@@ -9,6 +9,7 @@ mod merge;
 mod seq;
 mod routine;
 mod reports;
+mod infoschema;
 mod returning;
 mod prepared;
 mod decorrelate;
@@ -189,6 +190,7 @@ impl Database {
             Statement::Raise(_) => Err(Error::runtime("RAISE can only be used inside a trigger")),
             Statement::CreateTrigger(def) => self.exec_create_trigger(def),
             Statement::DropTrigger(name) => self.exec_drop_trigger(name),
+            Statement::Upsert { insert, conflict } => self.exec_upsert(insert, conflict),
             Statement::CreateReport(def) => self.exec_create_report(def),
             Statement::DropReport(name) => self.exec_drop_report(name),
             Statement::RunReport { name, format } => self.exec_run_report(name, format),

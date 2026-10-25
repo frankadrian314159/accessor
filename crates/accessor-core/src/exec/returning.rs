@@ -18,6 +18,10 @@ impl Database {
     pub(crate) fn exec_returning(&mut self, stmt: &Statement, items: &[SelectItem]) -> Result<QueryResult> {
         let target = match stmt {
             Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. } => table.clone(),
+            Statement::Upsert { insert, .. } => match &**insert {
+                Statement::Insert { table, .. } => table.clone(),
+                _ => return Err(Error::runtime("RETURNING follows INSERT, UPDATE, DELETE or MERGE")),
+            },
             Statement::Merge(m) => m.target.clone(),
             _ => return Err(Error::runtime("RETURNING follows INSERT, UPDATE, DELETE or MERGE")),
         };

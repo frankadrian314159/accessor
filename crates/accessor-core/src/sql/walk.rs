@@ -175,6 +175,14 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
         Statement::Exec { args, .. } => args.iter_mut().try_for_each(|(_, e)| walk_expr(e, f)),
         Statement::Raise(e) => walk_expr(e, f),
         Statement::Guarded { stmt, .. } => walk_statement(stmt, f),
+        Statement::Upsert { insert, conflict } => {
+            walk_statement(insert, f)?;
+            if let ConflictAction::Update { sets, filter } = &mut conflict.action {
+                sets.iter_mut().try_for_each(|(_, e)| walk_expr(e, f))?;
+                filter.iter_mut().try_for_each(|e| walk_expr(e, f))?;
+            }
+            Ok(())
+        }
         Statement::Returning { stmt, items } => {
             walk_statement(stmt, f)?;
             for item in items {

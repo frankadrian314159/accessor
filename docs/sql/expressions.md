@@ -62,6 +62,7 @@ NULL means "no value". Any comparison with NULL is *unknown* (neither true nor f
 | `[NOT] EXISTS (query)` | the query returns a row |
 | `a op ANY / SOME / ALL (query)` | see [quantified comparisons](select.md#quantified-comparisons) |
 | `a [NOT] LIKE pattern [ESCAPE c]` | the text matches the pattern |
+| `a [NOT] SIMILAR TO pattern` | the whole text matches the pattern, in which `%` `_` `\|` `*` `+` `?` `{ }` `( )` `[ ]` have their regular-expression meanings: see [regex.md](../functions/regex.md#similar-to) |
 
 ### LIKE
 
@@ -119,6 +120,7 @@ The first form tests conditions; the second compares one value with each `WHEN` 
 | `EXTRACT(field FROM date)` | [`DatePart`](../functions/datetime.md#datepart) with the field name |
 | `POSITION(needle IN text)` | `InStr(text, needle)` |
 | `SUBSTRING(text FROM start [FOR length])` | `Mid(text, start, length)` |
+| `OVERLAY(text PLACING r FROM n [FOR m])` | [`Overlay`](../functions/text.md#overlay) |
 | `TRIM([LEADING \| TRAILING \| BOTH] [chars] FROM text)` | removes the characters (spaces by default) |
 | `CURRENT_DATE` | `Date()` |
 | `CURRENT_TIMESTAMP`, `CURRENT_TIME`, `LOCALTIMESTAMP`, `LOCALTIME` | `Now()` |
