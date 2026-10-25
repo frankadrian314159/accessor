@@ -87,6 +87,10 @@ One join step, adding table `T`. `METHOD` is one of:
 
 `group N rows` is the aggregation step, with ` into S grouping set(s)` for `ROLLUP`, `CUBE` and `GROUPING SETS`. `COUNT(*) answered from the table's row count` is the [shortcut](access-paths.md#count).
 
+### `crosstab: ...`
+
+For a [crosstab](crosstab.md): `crosstab: one grouped pass computed C cell(s) for P pivot column(s)` when the one-pass method was used, or `crosstab: P pivot column(s)` for the plain rewrite. The plans of the queries it ran follow, indented.
+
 ### `N row(s) returned`
 
 The last line: the number of rows the query itself produced.

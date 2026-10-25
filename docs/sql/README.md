@@ -7,7 +7,7 @@ ASQL is the SQL dialect of Accessor. It is a subset of standard SQL with the hab
 | Document | Contents |
 | --- | --- |
 | [grammar.md](grammar.md) | the complete grammar in BNF |
-| [select.md](select.md) | queries: joins, grouping, set operators, `WITH`, window functions, sub-queries |
+| [select.md](select.md) | queries: joins, grouping, set operators, `WITH`, window functions, sub-queries, crosstabs (`TRANSFORM … PIVOT`) |
 | [data-changes.md](data-changes.md) | `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE` |
 | [ddl.md](ddl.md) | `CREATE`/`ALTER`/`DROP TABLE`, data types, constraints, indexes |
 | [queries-and-triggers.md](queries-and-triggers.md) | saved queries, parameters, `EXEC`, triggers |

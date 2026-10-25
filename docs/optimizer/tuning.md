@@ -60,7 +60,11 @@ SELECT ... FROM A JOIN B ON B.a_id = A.id WHERE B.w = 3;
 
 An ordered read stops early only when there is a limit. `ORDER BY Total DESC` alone sorts everything; `ORDER BY Total DESC LIMIT 20` with an index on `Total` reads twenty rows.
 
-## 6. Switch it off to check
+## 6. Crosstabs: list the columns when you know them
+
+A `TRANSFORM … PIVOT` query is as wide as the number of distinct pivot values. Pivot on a coarser expression (`PIVOT Year(d)`, not `PIVOT d`), or give an `IN (…)` list ([crosstab.md](crosstab.md)).
+
+## 7. Switch it off to check
 
 If a result looks wrong, or you want to compare timings, turn the optimizer off:
 

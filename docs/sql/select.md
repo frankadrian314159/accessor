@@ -201,6 +201,59 @@ Window functions may appear in the select list and in `ORDER BY`, not in `WHERE`
 
 Not supported: named windows (`WINDOW w AS (...)` and `OVER w`), `GROUPS` frames, `EXCLUDE` clauses, and `RANGE` with a numeric offset (use `ROWS`).
 
+## Crosstab queries (TRANSFORM … PIVOT)
+
+A crosstab turns the distinct values of one column into columns of the result, the Access way of laying out a summary. The form is
+
+```sql
+TRANSFORM aggregate
+SELECT row-headings [, other aggregates]
+FROM ...
+[WHERE ...]
+GROUP BY row-headings
+[HAVING ...] [ORDER BY ...]
+PIVOT pivot-column [IN (value, value, ...)];
+```
+
+`TRANSFORM` names the aggregate that goes in each cell. The `SELECT` and `GROUP BY` give the row headings, as for any grouped query. `PIVOT` names the column (or expression) whose values become the new columns.
+
+```sql
+CREATE TABLE Sales (Region TEXT, Quarter INTEGER, Amount CURRENCY);
+-- ... rows ...
+
+TRANSFORM Sum(Amount)
+SELECT Region, Sum(Amount) AS Total
+FROM Sales
+GROUP BY Region
+ORDER BY Region
+PIVOT Quarter;
+```
+
+```
+Region │ Total  │ <>    │ 1      │ 2      │ 3     │ 4
+───────┼────────┼───────┼────────┼────────┼───────┼──────
+East   │ $35.00 │ NULL  │ $10.00 │ $25.00 │ NULL  │ NULL
+North  │ $10.00 │ $1.00 │ NULL   │ NULL   │ $9.00 │ NULL
+West   │ $10.00 │ NULL  │ $7.00  │ NULL   │ NULL  │ $3.00
+```
+
+How the result is laid out:
+
+* The columns are the `SELECT` list (row headings and any other aggregates, such as `Total` above) followed by one column per pivot value.
+* Without an `IN` list the pivot columns are every distinct value that occurs in the rows selected by `FROM` and `WHERE`, in ascending order. A NULL pivot value gets a column called `<>`, first. A column's heading is the value as text.
+* With `IN (…)` the columns are exactly the listed values, in the order given, even if no row has them; rows with other values are not in any pivot column (they still count in the other aggregates in the `SELECT` list).
+* A cell where no row has that heading and value is NULL, except for `Count`, which gives 0.
+* The aggregate can be any [aggregate function](../functions/aggregate.md), including `Count(*)`, `Count(DISTINCT x)`, `Avg`, `Min`, `Max`, with the usual NULL rules. `AS name` after the `TRANSFORM` aggregate is accepted and has no effect.
+* `ORDER BY`, `TOP`, `LIMIT` and `HAVING` apply to the rows (the headings), not to the columns.
+
+The pivot may be an expression: `PIVOT 'Q' & Quarter` makes columns called `Q1`, `Q2`, …, and `PIVOT Year(Placed)` one column per year.
+
+A crosstab can be saved: `CREATE QUERY SalesByQuarter AS TRANSFORM … PIVOT …;`, then `SELECT * FROM SalesByQuarter` (note that the columns of a saved crosstab depend on the data at the time it runs). It can have parameters (`@year`), and it works inside `EXPLAIN`.
+
+`PIVOT` is a reserved word. A crosstab cannot be used as a sub-query or as a derived table directly, but a saved crosstab can be selected from.
+
+How crosstabs are executed, and how the optimizer speeds them up, is described in [../optimizer/crosstab.md](../optimizer/crosstab.md).
+
 ## ORDER BY
 
 ```sql

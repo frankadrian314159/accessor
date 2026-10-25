@@ -2033,3 +2033,84 @@ fn pushdown_keeps_outer_join_semantics() {
     // IS NULL on the nullable side finds the unmatched rows.
     assert_eq!(rows(&db, "SELECT P.n FROM P LEFT JOIN Q ON Q.p_id = P.id WHERE Q.id IS NULL"), vec![vec!["c"]]);
 }
+
+// ----- crosstab queries (TRANSFORM ... PIVOT) ------------------------------------------------
+
+fn sales() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Sales (Region TEXT, Q INTEGER, Amount CURRENCY, Rep TEXT);
+         INSERT INTO Sales VALUES ('East',1,10,'a'),('East',2,20,'b'),('East',2,5,'a'),('West',1,7,'a'),
+                                  ('West',4,3,'c'),('North',3,9,NULL),('North',NULL,1,'a');",
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn crosstab_basics() {
+    let db = sales();
+    let r = db
+        .query("TRANSFORM Sum(Amount) SELECT Region, Sum(Amount) AS Total FROM Sales GROUP BY Region ORDER BY Region PIVOT Q")
+        .unwrap();
+    // The NULL pivot value heads a column called <>, then the values in order.
+    assert_eq!(r.columns, vec!["Region", "Total", "<>", "1", "2", "3", "4"]);
+    let rows: Vec<Vec<String>> = r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect();
+    assert_eq!(rows[0], vec!["East", "$35.00", "", "$10.00", "$25.00", "", ""]);
+    assert_eq!(rows[1], vec!["North", "$10.00", "$1.00", "", "", "$9.00", ""]);
+    assert_eq!(rows[2], vec!["West", "$10.00", "", "$7.00", "", "", "$3.00"]);
+
+    // A fixed column list: other values are left out of the columns, and a count of nothing is 0.
+    let r = db.query("TRANSFORM Count(*) SELECT Region FROM Sales GROUP BY Region ORDER BY Region PIVOT Q IN (2, 4, 9)").unwrap();
+    assert_eq!(r.columns, vec!["Region", "2", "4", "9"]);
+    let rows: Vec<Vec<String>> = r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect();
+    assert_eq!(rows, vec![vec!["East", "2", "0", "0"], vec!["North", "0", "0", "0"], vec!["West", "0", "1", "0"]]);
+
+    // A condition, an expression for the pivot, and a saved crosstab.
+    let r = db
+        .query("TRANSFORM Max(Amount) SELECT Region FROM Sales WHERE Amount > 2 GROUP BY Region ORDER BY 1 PIVOT 'Q' & Q")
+        .unwrap();
+    assert_eq!(r.columns, vec!["Region", "Q1", "Q2", "Q3", "Q4"]); // the row with no Q is filtered out
+    let mut db = db;
+    db.execute("CREATE QUERY CT AS TRANSFORM Sum(Amount) SELECT Region FROM Sales GROUP BY Region PIVOT Rep").unwrap();
+    assert_eq!(db.query("SELECT * FROM CT").unwrap().columns, vec!["Region", "<>", "a", "b", "c"]);
+
+    // Errors say what is wrong.
+    let e = db.query("TRANSFORM Amount SELECT Region FROM Sales GROUP BY Region PIVOT Q").unwrap_err();
+    assert!(e.to_string().contains("aggregate function"), "{e}");
+    assert!(db.query("TRANSFORM Sum(Amount) SELECT Region FROM Sales GROUP BY Region").is_err());
+}
+
+#[test]
+fn the_crosstab_shortcut_gives_the_same_answers() {
+    let mut db = opt_db();
+    let queries = [
+        "TRANSFORM Sum(w) SELECT A.k FROM A JOIN B ON B.a_id = A.id GROUP BY A.k ORDER BY A.k PIVOT B.w IN (1, 2, 3, 4)",
+        "TRANSFORM Count(*) SELECT A.v, Count(*) AS n FROM A JOIN B ON B.a_id = A.id GROUP BY A.v ORDER BY A.v PIVOT A.k",
+        "TRANSFORM Avg(C.z) SELECT B.w FROM B JOIN C ON C.b_id = B.id GROUP BY B.w ORDER BY B.w PIVOT C.z",
+        "TRANSFORM Count(DISTINCT B.id) SELECT A.k FROM A JOIN B ON B.a_id = A.id WHERE B.w < 12 GROUP BY A.k HAVING Count(*) > 3 ORDER BY A.k PIVOT A.v",
+        "TRANSFORM Max(id) SELECT v FROM A GROUP BY v ORDER BY v PIVOT k",
+        "TRANSFORM Min(w) SELECT a_id FROM B WHERE a_id < 12 GROUP BY a_id ORDER BY a_id PIVOT w % 3",
+        "TRANSFORM Count(*) SELECT Count(*) AS total FROM A PIVOT v",
+        "TRANSFORM Sum(z) SELECT Year(#2024-01-01# + id) AS y FROM C GROUP BY Year(#2024-01-01# + id) ORDER BY 1 PIVOT z",
+    ];
+    for sql in queries {
+        db.set_optimizer(true);
+        let on = db.query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        db.set_optimizer(false);
+        let off = db.query(sql).unwrap();
+        assert_eq!(on.columns, off.columns, "{sql}");
+        assert_eq!(on.rows, off.rows, "different cells for {sql}");
+    }
+    // The optimized plan says what it did; the plain one runs one query per column.
+    db.set_optimizer(true);
+    let plan = db
+        .query("EXPLAIN TRANSFORM Sum(w) SELECT a_id FROM B GROUP BY a_id PIVOT w")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| r[0].to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(plan.contains("one grouped pass"), "{plan}");
+}

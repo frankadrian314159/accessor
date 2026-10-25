@@ -14,7 +14,7 @@ DROP VIEW ExpensiveProducts;
 
 `VIEW` and `QUERY` are interchangeable. A saved query is stored as text and appears next to the tables. It can be used in the `FROM` clause of another query, like a table. Saved queries can refer to one another; a query that ends up referring to itself is stopped with an error.
 
-A saved query may be a single `SELECT` (including `WITH`, `VALUES` and set operators), or a call of another saved query:
+A saved query may be a single `SELECT` (including `WITH`, `VALUES` and set operators), a [crosstab](select.md#crosstab-queries-transform--pivot) (`TRANSFORM … PIVOT`), or a call of another saved query:
 
 ```sql
 CREATE QUERY CustomerThree AS EXEC OrdersOf 3;

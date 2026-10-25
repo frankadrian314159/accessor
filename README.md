@@ -14,7 +14,8 @@ datasheets for working with records directly.
 - **SQL** (called ASQL): all the join types including `FULL`, `USING` and
   `NATURAL` and Access-style nested joins; grouping, `ROLLUP` / `CUBE`;
   subqueries including correlated ones; `UNION` / `INTERSECT` / `EXCEPT`;
-  `WITH` and `WITH RECURSIVE`; window functions; `MERGE`; `CHECK` constraints;
+  `WITH` and `WITH RECURSIVE`; window functions; `MERGE`; Access crosstabs
+  (`TRANSFORM … PIVOT`); `CHECK` constraints;
   `CAST`, `Format` and about a hundred functions; `TOP` / `LIMIT` / `FETCH FIRST`;
   `CREATE` / `ALTER` / `DROP` for tables, indexes and queries; and CSV import and
   export. ASQL is a large subset of standard SQL, not all of the latest standard;
@@ -144,6 +145,8 @@ makes its choices from the tables as they are when the query runs.
 - **Access paths.** Each table uses the best index for its conditions. An
   `ORDER BY ... LIMIT` that matches an index reads the index in order and stops
   early instead of sorting, and a bare `SELECT COUNT(*)` is the table's row count.
+  A `TRANSFORM … PIVOT` crosstab is computed in one grouped pass rather than one
+  conditional aggregate per column.
 
 On a table of a million rows, a three-way join filtered to one customer takes
 about 1.8 ms instead of 2.6 s, and `SELECT COUNT(*)` takes 0.02 ms instead of 260 ms.

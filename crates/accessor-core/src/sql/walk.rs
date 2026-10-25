@@ -118,6 +118,13 @@ pub fn walk_select(s: &mut Select, f: &mut Visitor) -> Result<()> {
             walk_select(&mut cte.query, f)?;
         }
     }
+    if let Some(ct) = &mut s.crosstab {
+        walk_expr(&mut ct.agg, f)?;
+        walk_expr(&mut ct.pivot, f)?;
+        if let Some(vals) = &mut ct.values {
+            vals.iter_mut().try_for_each(|v| walk_expr(v, f))?;
+        }
+    }
     for item in &mut s.items {
         if let SelectItem::Expr { expr, .. } = item {
             walk_expr(expr, f)?;

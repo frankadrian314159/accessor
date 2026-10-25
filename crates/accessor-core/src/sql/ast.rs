@@ -142,6 +142,20 @@ pub struct Select {
     /// `group_by`. Empty for an ordinary GROUP BY.
     pub group_sets: Vec<Vec<usize>>,
     pub with: Option<Box<With>>,
+    /// `TRANSFORM ... PIVOT ...`: this select supplies the row headings and the
+    /// crosstab adds one column per pivot value.
+    pub crosstab: Option<Box<Crosstab>>,
+}
+
+/// The `TRANSFORM aggregate ... PIVOT column [IN (values)]` parts of a crosstab query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Crosstab {
+    /// The aggregate computed in each cell, such as `Sum(Amount)`.
+    pub agg: Expr,
+    /// The column or expression whose values become columns.
+    pub pivot: Expr,
+    /// Fixed column values; `None` means every distinct value of `pivot`.
+    pub values: Option<Vec<Expr>>,
 }
 
 /// A `WITH [RECURSIVE]` clause.

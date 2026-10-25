@@ -71,7 +71,7 @@ This is the whole feature set in one place. Each item has its own section later 
 
 **A SQL engine with an Access flavour**
 
-Joins (inner, left, right, full, cross, `USING`, `NATURAL`, and Access-style nested joins), grouping with `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS`, aggregates, subqueries including correlated ones, derived tables, `WITH` and `WITH RECURSIVE`, `UNION`, `INTERSECT` and `EXCEPT`, window functions, `MERGE`, `CASE`, `CAST`, `TOP`, `LIMIT` and `FETCH FIRST`, and about a hundred built-in functions including `Format`. Indexes are used automatically for equality and range searches, and for joins. ASQL, as the dialect is called, implements a large part of the core of standard SQL, but not all of the latest standard; [see below](#asql-and-standard-sql).
+Joins (inner, left, right, full, cross, `USING`, `NATURAL`, and Access-style nested joins), grouping with `HAVING`, `ROLLUP`, `CUBE` and `GROUPING SETS`, aggregates, subqueries including correlated ones, derived tables, `WITH` and `WITH RECURSIVE`, `UNION`, `INTERSECT` and `EXCEPT`, window functions, `MERGE`, crosstab queries (`TRANSFORM … PIVOT`), `CASE`, `CAST`, `TOP`, `LIMIT` and `FETCH FIRST`, and about a hundred built-in functions including `Format`. Indexes are used automatically for equality and range searches, and for joins. ASQL, as the dialect is called, implements a large part of the core of standard SQL, but not all of the latest standard; [see below](#asql-and-standard-sql).
 
 **Tables, keys and indexes**
 
@@ -348,6 +348,20 @@ EXPLAIN SELECT C.Name, L.Item
 FROM Line L JOIN Ord O ON O.ID = L.OrdID JOIN Cust C ON C.ID = O.CustID
 WHERE C.Name = 'c77';
 ```
+
+#### Crosstab queries
+
+The Access crosstab turns the values of one column into columns:
+
+```sql
+TRANSFORM Sum(Amount)
+SELECT Region, Sum(Amount) AS Total
+FROM Sales
+GROUP BY Region
+PIVOT Quarter;
+```
+
+`TRANSFORM` gives the aggregate for each cell, the `SELECT` and `GROUP BY` give the row headings, and `PIVOT` the column whose values become new columns, in ascending order, with a column called `<>` for NULL. `PIVOT Quarter IN (1, 2, 3, 4)` fixes the columns. An empty cell is NULL, or 0 for `Count`. A crosstab can be saved with `CREATE QUERY` and selected from. See the [SQL reference](sql/select.md#crosstab-queries-transform--pivot) and [how the optimizer runs crosstabs](optimizer/crosstab.md).
 
 #### Combining queries
 
@@ -922,7 +936,8 @@ join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out .
 3. **Join method.** An index on the joined table's join columns gives an index nested-loop join, one lookup per row. Otherwise an equality is hashed, building on the smaller side; a join with no equality is a nested loop.
 4. **Access paths.** Each table is read through the best index for its conditions: a unique key with every column equated beats a prefix equality beats a range beats a scan. All the conditions are still tested on every row, so an index can only speed a query up.
 5. **Ordered reads.** `ORDER BY ... LIMIT n` on one table, on plain columns an index holds in that order (perhaps after an equality on its leading columns), reads the index and stops after *n* qualifying rows, with no sort. Descending reads preserve the tie order of a stable sort, so the answer is identical.
-6. **Free counts.** `SELECT COUNT(*) FROM t` with no condition is the table's row count: 0.02 ms over a million rows against 260 ms when scanned.
+6. **One-pass crosstabs.** `TRANSFORM … PIVOT` is computed by grouping once by the row headings and the pivot value, then laying the cells out, instead of testing every row against every column's condition. With 100 pivot columns over 100,000 rows that is 0.52 s instead of 1.26 s, and the gap grows with the columns. The two methods give identical results. See [optimizer/crosstab.md](optimizer/crosstab.md).
+7. **Free counts.** `SELECT COUNT(*) FROM t` with no condition is the table's row count: 0.02 ms over a million rows against 260 ms when scanned.
 
 #### Estimates without statistics
 

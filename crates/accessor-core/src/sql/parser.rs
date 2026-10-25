@@ -11,7 +11,7 @@ const RESERVED: &[&str] = &[
     "CROSS", "ON", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN", "UNION", "LIMIT", "OFFSET", "SET",
     "VALUES", "INTO", "DISTINCT", "TOP", "ASC", "DESC", "CASE", "WHEN", "THEN", "ELSE", "END", "EXISTS", "INSERT",
     "UPDATE", "DELETE", "CREATE", "DROP", "TABLE", "INDEX", "VIEW", "MOD", "ALL", "NATURAL", "USING", "INTERSECT",
-    "EXCEPT", "FETCH",
+    "EXCEPT", "FETCH", "PIVOT",
 ];
 
 /// Parses a script of one or more `;`-separated statements.
@@ -319,7 +319,7 @@ impl<'a> Parser<'a> {
     // ----- statements ------------------------------------------------------
 
     fn statement(&mut self) -> Result<Statement> {
-        if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_sym("(") {
+        if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_kw("TRANSFORM") || self.peek_sym("(") {
             return Ok(Statement::Select(self.select()?));
         }
         if self.eat_kw("INSERT") {
@@ -1044,6 +1044,9 @@ impl<'a> Parser<'a> {
     // ----- SELECT -----------------------------------------------------------
 
     fn select(&mut self) -> Result<Select> {
+        if self.peek_kw("TRANSFORM") {
+            return self.crosstab();
+        }
         let with = if self.peek_kw("WITH") { Some(Box::new(self.with_clause()?)) } else { None };
         let mut sel = self.select_core()?;
         // Set operators combine left to right.
@@ -1068,6 +1071,35 @@ impl<'a> Parser<'a> {
         }
         self.select_tail(&mut sel)?;
         sel.with = with;
+        Ok(sel)
+    }
+
+    /// `TRANSFORM aggregate SELECT ... [ORDER BY ...] PIVOT column [IN (values)]`, the Access crosstab.
+    fn crosstab(&mut self) -> Result<Select> {
+        self.expect_kw("TRANSFORM")?;
+        let agg = self.expr()?;
+        // Access allows a name for the aggregate; the result does not use it.
+        if self.eat_kw("AS") {
+            self.ident()?;
+        }
+        if !self.peek_kw("SELECT") {
+            return Err(self.unexpected("SELECT"));
+        }
+        let mut sel = self.select()?;
+        self.expect_kw("PIVOT")?;
+        let pivot = self.concat()?;
+        let values = if self.eat_kw("IN") {
+            self.expect_sym("(")?;
+            let mut list = vec![self.expr()?];
+            while self.eat_sym(",") {
+                list.push(self.expr()?);
+            }
+            self.expect_sym(")")?;
+            Some(list)
+        } else {
+            None
+        };
+        sel.crosstab = Some(Box::new(Crosstab { agg, pivot, values }));
         Ok(sel)
     }
 

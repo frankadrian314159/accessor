@@ -93,6 +93,9 @@ impl Database {
         if depth > MAX_DEPTH {
             return Err(Error::runtime("queries are nested too deeply (is a saved query referring to itself?)"));
         }
+        if sel.crosstab.is_some() {
+            return self.run_crosstab(sel, depth);
+        }
         if sel.with.is_some() {
             return self.run_with(sel, depth);
         }
@@ -665,6 +668,165 @@ impl Database {
             rows = kept;
         }
         Ok(rows)
+    }
+
+    /// `TRANSFORM agg SELECT heads ... PIVOT col`: the values of `col` become columns.
+    /// The query is rewritten into an ordinary grouped query with one extra aggregate
+    /// per value, restricted to the rows having that value, and then run.
+    fn run_crosstab(&self, sel: &Select, depth: u32) -> Result<QueryResult> {
+        let ct = sel.crosstab.as_ref().expect("checked by the caller");
+        match &ct.agg {
+            Expr::Function { name, .. } if AggFn::from_name(name).is_some() => {}
+            _ => return Err(Error::runtime("TRANSFORM must be followed by an aggregate function such as Sum(...) or Count(*)")),
+        }
+        let mut base = sel.clone();
+        base.crosstab = None;
+        if base.from.is_none() {
+            return Err(Error::runtime("a crosstab query needs a FROM clause"));
+        }
+        if self.optimizer_on {
+            if let Some(result) = self.crosstab_one_pass(sel, ct, depth)? {
+                return Ok(result);
+            }
+        }
+
+        // The columns: the listed values, or every value the rows have, in order.
+        let values: Vec<Value> = match &ct.values {
+            Some(list) => {
+                let scope = Scope::default();
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    out.push(Binder::new(self, &scope, depth).bind(e)?.eval(&[])?.into_owned());
+                }
+                out
+            }
+            None => {
+                let probe = Select {
+                    distinct: true,
+                    items: vec![SelectItem::Expr { expr: ct.pivot.clone(), alias: None }],
+                    from: base.from.clone(),
+                    filter: base.filter.clone(),
+                    with: base.with.clone(),
+                    ..Select::default()
+                };
+                let mut vals: Vec<Value> = self.run_select_depth(&probe, depth + 1)?.rows.into_iter().map(|mut r| r.swap_remove(0)).collect();
+                vals.sort();
+                vals.dedup();
+                vals
+            }
+        };
+        self.note(depth, || format!("crosstab: {} pivot column(s)", values.len()));
+
+        for v in values {
+            let cond = if v.is_null() {
+                Expr::IsNull { expr: Box::new(ct.pivot.clone()), negated: false }
+            } else {
+                Expr::Binary { op: BinOp::Eq, left: Box::new(ct.pivot.clone()), right: Box::new(Expr::Literal(v.clone())) }
+            };
+            let guard = |inner: Expr| Expr::Function {
+                name: "IIF".into(),
+                args: vec![cond.clone(), inner, Expr::Literal(Value::Null)],
+                distinct: false,
+                star: false,
+            };
+            let mut cell = ct.agg.clone();
+            if let Expr::Function { args, star, .. } = &mut cell {
+                if *star {
+                    *star = false;
+                    args.push(guard(Expr::Literal(Value::Int(1))));
+                } else if let Some(a) = args.first_mut() {
+                    let inner = std::mem::replace(a, Expr::Literal(Value::Null));
+                    *a = guard(inner);
+                }
+            }
+            // A missing value is headed "<>" as in Access.
+            let alias = if v.is_null() { "<>".to_string() } else { v.to_string() };
+            base.items.push(SelectItem::Expr { expr: cell, alias: Some(alias) });
+        }
+        self.run_select_depth(&base, depth)
+    }
+
+    /// The optimised crosstab. Instead of one conditional aggregate per pivot column
+    /// (which evaluates every column's condition for every row), group once by the row
+    /// headings *and* the pivot value, so each cell is computed in a single pass, and
+    /// then lay the cells out. The pivot values come out of that same pass, so no
+    /// separate query is needed to discover them. `None` when the shape does not allow
+    /// it, and the plain rewrite is used instead.
+    fn crosstab_one_pass(&self, sel: &Select, ct: &Crosstab, depth: u32) -> Result<Option<QueryResult>> {
+        let Expr::Function { name, args, star, .. } = &ct.agg else { return Ok(None) };
+        let missing = if AggFn::from_name(name) == Some(AggFn::Count) { Value::Int(0) } else { Value::Null };
+        if sel.distinct || !sel.group_sets.is_empty() || !sel.unions.is_empty() || args.len() > 1 || (*star && !args.is_empty()) {
+            return Ok(None);
+        }
+        let keys = &sel.group_by;
+
+        // Every cell: the aggregate for each (row heading, pivot value).
+        let mut cells = Select {
+            from: sel.from.clone(),
+            filter: sel.filter.clone(),
+            with: sel.with.clone(),
+            ..Select::default()
+        };
+        for k in keys {
+            cells.items.push(SelectItem::Expr { expr: k.clone(), alias: None });
+            cells.group_by.push(k.clone());
+        }
+        cells.items.push(SelectItem::Expr { expr: ct.pivot.clone(), alias: None });
+        cells.items.push(SelectItem::Expr { expr: ct.agg.clone(), alias: None });
+        cells.group_by.push(ct.pivot.clone());
+        let grid = self.run_select_depth(&cells, depth + 1)?;
+        let nk = keys.len();
+
+        let mut grid_map: HashMap<Vec<Value>, HashMap<Value, Value>> = HashMap::new();
+        let mut seen: Vec<Value> = Vec::new();
+        for mut row in grid.rows {
+            let cell = row.pop().expect("aggregate column");
+            let pivot = row.pop().expect("pivot column");
+            seen.push(pivot.clone());
+            grid_map.entry(row).or_default().insert(pivot, cell);
+        }
+        let values: Vec<Value> = match &ct.values {
+            Some(list) => {
+                let scope = Scope::default();
+                let mut out = Vec::with_capacity(list.len());
+                for e in list {
+                    out.push(Binder::new(self, &scope, depth).bind(e)?.eval(&[])?.into_owned());
+                }
+                out
+            }
+            None => {
+                seen.sort();
+                seen.dedup();
+                seen
+            }
+        };
+        self.note(depth, || {
+            format!(
+                "crosstab: one grouped pass computed {} cell(s) for {} pivot column(s) (no separate query per column)",
+                grid_map.values().map(HashMap::len).sum::<usize>(),
+                values.len()
+            )
+        });
+
+        // The row headings and any other aggregates of the SELECT, with the heading
+        // values carried along so that each row can find its cells.
+        let mut base = sel.clone();
+        base.crosstab = None;
+        for (i, k) in keys.iter().enumerate() {
+            base.items.push(SelectItem::Expr { expr: k.clone(), alias: Some(format!("__ct{i}")) });
+        }
+        let mut result = self.run_select_depth(&base, depth)?;
+        let visible = result.columns.len() - nk;
+        result.columns.truncate(visible);
+        result.columns.extend(values.iter().map(|v| if v.is_null() { "<>".to_string() } else { v.to_string() }));
+        for row in &mut result.rows {
+            let key: Vec<Value> = row.split_off(visible);
+            let found = grid_map.get(&key);
+            for v in &values {
+                row.push(found.and_then(|m| m.get(v)).cloned().unwrap_or_else(|| missing.clone()));
+            }
+        }
+        Ok(Some(result))
     }
 
     /// `SELECT COUNT(*), ... FROM t` with no condition, grouping or limit.

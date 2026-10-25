@@ -39,7 +39,7 @@ A script is a sequence of statements separated by semicolons. Empty statements a
 
 Identifiers and keywords are case-insensitive. An identifier that is a reserved word, or contains spaces or punctuation, is written in square brackets: `[Order Details]`, `[Group]`.
 
-The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC DISTINCT DROP ELSE END EXCEPT EXISTS FETCH FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT MOD NATURAL NOT NULL OFFSET ON OR ORDER OUTER RIGHT SELECT SET TABLE THEN TOP UNION UPDATE USING VALUES VIEW WHEN WHERE`. Other words that have a meaning in some place (`COUNT`, `YEAR`, `FIRST`, and so on) are not reserved and can be used as names.
+The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC DISTINCT DROP ELSE END EXCEPT EXISTS FETCH FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT MOD NATURAL NOT NULL OFFSET ON OR ORDER OUTER PIVOT RIGHT SELECT SET TABLE THEN TOP UNION UPDATE USING VALUES VIEW WHEN WHERE`. Other words that have a meaning in some place (`COUNT`, `YEAR`, `FIRST`, and so on) are not reserved and can be used as names.
 
 ## Statements
 
@@ -54,6 +54,10 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
               | <raise>
 
 <query>     ::= [ <with-clause> ] <query-body> [ <order-by> ] { <row-limit> }
+              | <crosstab>
+<crosstab>  ::= TRANSFORM <expr> [ AS <identifier> ]
+                <select-core> [ <order-by> ] { <row-limit> }
+                PIVOT <concat> [ IN '(' <expr-list> ')' ]
 <explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
 ```
 
