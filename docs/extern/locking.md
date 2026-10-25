@@ -24,7 +24,7 @@ Opening a database takes an **exclusive operating-system file lock** on a small 
 
 ## What it does not do
 
-It does not allow several readers. There is no shared mode: if two programs must read the same data, one process should own the database and the other should ask it. And it does not stop a program that ignores the convention from opening the `.adb` file with another tool.
+It does not allow several processes. There is no shared mode between processes: if two programs must read the same data, one should own the database and the other ask it. Within one process, threads share a database through `SharedDatabase` and its connections ([concurrency](../concurrency.md)): they are one open, and so share the one lock. And it does not stop a program that ignores the convention from opening the `.adb` file with another tool.
 
 ## Backups
 

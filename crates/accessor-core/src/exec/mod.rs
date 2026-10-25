@@ -53,7 +53,13 @@ impl Database {
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.enter_session();
         let parsed = self.parse_cached(sql)?;
-        match parsed.as_slice() {
+        self.run_read(&parsed)
+    }
+
+    /// Runs statements that [`is_pure_read`](Database::is_pure_read) has accepted (or any one SELECT).
+    pub(crate) fn run_read(&self, parsed: &[Statement]) -> Result<QueryResult> {
+        self.enter_session();
+        match parsed {
             [] => Err(Error::syntax("empty statement")),
             [Statement::Select(s)] => self.run_select(s),
             [Statement::Explain(s)] => self.run_explain(s),

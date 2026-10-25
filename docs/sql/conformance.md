@@ -44,7 +44,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | `GENERATED ALWAYS AS IDENTITY` | the same as `BY DEFAULT`: a supplied value is accepted | a supplied value is refused |
 | Views | simple views take `INSERT`/`UPDATE`/`DELETE` (with `WITH CHECK OPTION`); the rest are read-only; `CREATE VIEW v (cols) AS` names columns; parameters through `CREATE QUERY` | updatable views by a fuller set of rules; `WITH LOCAL/CASCADED CHECK OPTION` |
 | Set operators | `MINUS` is accepted as `EXCEPT` | not standard |
-| Concurrency | one connection per database file, enforced by a file lock ([locking](../extern/locking.md)) | many sessions with isolation levels |
+| Concurrency | a database file is open once (a file lock, [locking](../extern/locking.md)); connections in that process take turns: many readers or one writer, transactions serial ([concurrency](../concurrency.md)) | many sessions with isolation levels |
 
 ## Not implemented
 

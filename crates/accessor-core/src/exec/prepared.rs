@@ -46,6 +46,44 @@ impl Prepared {
     pub fn parameters(&self) -> &[String] {
         &self.params
     }
+
+    pub(crate) fn statements(&self) -> &[Statement] {
+        &self.statements
+    }
+}
+
+impl Database {
+    /// True if running `statements` cannot change the database in any way, so that they may run while
+    /// other readers do: a single `SELECT` or `EXPLAIN` that hands out no sequence numbers. Anything
+    /// that might (a call of `NEXTVAL` or `SETVAL`, of a stored function, or a saved query that
+    /// mentions a sequence) is treated as a write.
+    pub(crate) fn is_pure_read(&self, statements: &[Statement]) -> bool {
+        let mut copy = match statements {
+            [Statement::Select(s)] => s.clone(),
+            [Statement::Explain(s)] => (**s).clone(),
+            _ => return false,
+        };
+        let sequences_in_views = self.views.values().any(|(_, sql)| {
+            let up = sql.to_ascii_uppercase();
+            up.contains("NEXTVAL") || up.contains("SETVAL") || up.contains("NEXT VALUE")
+        });
+        if sequences_in_views {
+            return false;
+        }
+        let mut pure = true;
+        let _ = crate::sql::walk::walk_select(&mut copy, &mut |e| {
+            if let Expr::Function { name, .. } = e {
+                if name.eq_ignore_ascii_case("NEXTVAL")
+                    || name.eq_ignore_ascii_case("SETVAL")
+                    || self.routines.contains_key(&key(name))
+                {
+                    pure = false;
+                }
+            }
+            Ok(())
+        });
+        pure
+    }
 }
 
 fn parameters_of(statements: &[Statement]) -> Vec<String> {
