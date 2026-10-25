@@ -1,0 +1,37 @@
+[package]
+name = "accessor-capi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "accessor_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+accessor-capi = { path = ".." }
+
+# This crate is not part of the main workspace: it needs a nightly compiler and the sanitizers.
+[workspace]
+
+[[bin]]
+name = "strings"
+path = "fuzz_targets/strings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binds"
+path = "fuzz_targets/binds.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

@@ -1,0 +1,1 @@
+SET TIME ZONE 'Asia/Tokyo'; SELECT tz FROM t

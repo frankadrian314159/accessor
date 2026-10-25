@@ -1,0 +1,1 @@
+SELECT REGEXP_REPLACE(s, '(o)(n)', '$2$1'), s SIMILAR TO 'o%', INITCAP(s), TRANSLATE(s, 'on', 'ab') FROM t

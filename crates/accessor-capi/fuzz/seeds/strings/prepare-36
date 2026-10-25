@@ -1,0 +1,1 @@
+SELECT Left(s, 2), Mid(s, 2, 1), InStr(s, 'n'), Replace(s, 'n', 'N'), Len(s), Trim('  x '), UCase(s) FROM t

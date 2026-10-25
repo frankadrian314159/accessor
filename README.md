@@ -52,7 +52,7 @@ datasheets for working with records directly.
 
 The [docs](docs/README.md) folder has an overview of Accessor, a reference for the [SQL language](docs/sql/README.md) with its BNF grammar, the
 [functions](docs/functions/README.md), the [column types](docs/types/README.md), and the
-[query optimizer](docs/optimizer/README.md).
+[query optimizer](docs/optimizer/README.md). To use Accessor from C or Java, see the [C interface](docs/extern/c.md) and the [JDBC driver](docs/extern/jdbc.md).
 
 ## Building and running
 
@@ -62,7 +62,12 @@ You need a recent stable Rust (1.85 or later).
 cargo run --release -p accessor-gui              # the desktop app
 cargo run --release -p accessor-cli -- my.adb    # the shell, on a database file
 cargo test --workspace                           # everything
+cargo build --release -p accessor-capi           # the C library and include/accessor.h
+(cd jdbc && ./build.sh --jar)                    # the JDBC driver, with the library inside
 ```
+
+A database file is open in one connection at a time, in this or any other process
+(`name.adb-lock` beside it holds the lock); a second open fails with a message saying so.
 
 In the desktop app, **File > Load sample data** gives you something to explore.
 Right-click a table for its datasheet, form and design views. Saved queries,
@@ -367,6 +372,8 @@ would go stale (it is only recomputed when its record is saved). Importing CSV m
 | `crates/accessor-core` | The engine: SQL parser and executor, storage, durability, the numeric types. |
 | `crates/accessor-cli`  | The `accessor` shell. |
 | `crates/accessor-gui`  | The `accessor-gui` desktop app, built with [egui](https://github.com/emilk/egui). |
+| `crates/accessor-capi` | The C interface (`accessor.h`, `accessor_capi.dll` / `.so` / `.dylib`), with its C tests and fuzz targets. |
+| `jdbc`                 | The JDBC driver (Java 22+), built on the C interface. |
 
 Performance numbers for the engine come from
 `cargo run --release -p accessor-core --example bench [rows]`.

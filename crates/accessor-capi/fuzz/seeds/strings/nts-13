@@ -1,0 +1,1 @@
+SELECT dt + INTERVAL '1 day', tz AT TIME ZONE 'Europe/Paris', Age(dt, #2020-01-01#) FROM t

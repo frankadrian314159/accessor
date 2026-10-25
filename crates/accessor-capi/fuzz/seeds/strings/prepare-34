@@ -1,0 +1,1 @@
+SELECT CASE WHEN i > 1 THEN 'big' WHEN i = 1 THEN 'one' ELSE 'none' END, IIf(b, 1, 2), Nz(i, 0), Coalesce(s, 'n') FROM t

@@ -20,6 +20,9 @@ pub enum Error {
     Runtime(String),
     #[error("Database file is corrupt: {0}")]
     Corrupt(String),
+    /// Another connection or process has the database file open.
+    #[error("{0}")]
+    Locked(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

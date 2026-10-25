@@ -1,0 +1,1 @@
+PREPARE q AS SELECT * FROM t WHERE i = @i; EXEC q (1); DEALLOCATE q

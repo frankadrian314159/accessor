@@ -44,7 +44,7 @@ fn recovers_from_log_without_checkpoint() {
     db.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')").unwrap();
     db.execute("UPDATE t SET v = 'TWO' WHERE id = 2").unwrap();
     // Simulate a crash: leak the handle so Drop never checkpoints.
-    std::mem::forget(db);
+    db.simulate_crash();
 
     let db = Database::open(&path).unwrap();
     assert_eq!(count(&db, "t"), 2);
@@ -60,7 +60,7 @@ fn torn_log_tail_is_discarded() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     db.execute("INSERT INTO t VALUES (2)").unwrap();
-    std::mem::forget(db);
+    db.simulate_crash();
 
     // Chop the final frame in half, as a power loss mid-write would.
     let wal = wal_path(&path);
@@ -83,7 +83,7 @@ fn corrupt_frame_stops_replay() {
     let mut db = Database::open(&path).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
-    std::mem::forget(db);
+    db.simulate_crash();
     let wal = wal_path(&path);
     let mut f = OpenOptions::new().append(true).open(&wal).unwrap();
     f.write_all(&[9, 0, 0, 0, 1, 2, 3, 4, 0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 0, 0]).unwrap();
@@ -100,7 +100,7 @@ fn uncommitted_transaction_is_not_durable() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
     db.execute("BEGIN").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
-    std::mem::forget(db);
+    db.simulate_crash();
     let db = Database::open(&path).unwrap();
     assert_eq!(count(&db, "t"), 0);
 }
@@ -118,7 +118,7 @@ fn committed_transaction_is_durable_and_compaction_works() {
     }
     db.execute("COMMIT").unwrap();
     db.execute("DELETE FROM t WHERE id % 2 = 0").unwrap();
-    std::mem::forget(db);
+    db.simulate_crash();
 
     let mut db = Database::open(&path).unwrap();
     assert_eq!(count(&db, "t"), 250);
@@ -150,7 +150,7 @@ fn alter_table_survives_log_replay() {
         db.execute("ALTER TABLE t RENAME COLUMN a TO name").unwrap();
         db.execute("ALTER TABLE t DROP COLUMN b").unwrap();
         db.set_durability(Durability::default());
-        std::mem::forget(db); // simulate a crash: only the log holds the changes
+        db.simulate_crash(); // simulate a crash: only the log holds the changes
     }
     let db = Database::open(&path).unwrap();
     let r = db.query("SELECT name, c FROM t ORDER BY id").unwrap();
@@ -171,7 +171,7 @@ fn foreign_keys_survive_reopen_and_log_replay() {
         .unwrap();
         db.checkpoint().unwrap();
         db.execute("DELETE FROM P WHERE ID = 1").unwrap(); // the cascade lands in the log too
-        std::mem::forget(db); // crash
+        db.simulate_crash(); // crash
     }
     let mut db = Database::open(&path).unwrap();
     assert_eq!(count(&db, "C"), 1);
@@ -193,7 +193,7 @@ fn triggers_and_parameter_queries_persist() {
         .unwrap();
         db.checkpoint().unwrap();
         db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
-        std::mem::forget(db); // crash: the trigger's effect is only in the log
+        db.simulate_crash(); // crash: the trigger's effect is only in the log
     }
     let mut db = Database::open(&path).unwrap();
     // Replay applied the logged trigger output exactly once, without re-firing.
@@ -228,7 +228,7 @@ fn calculated_fields_persist() {
         db.execute("INSERT INTO t (id, a, b) VALUES (2, 10, 20)").unwrap();
         db.execute("UPDATE t SET a = 100 WHERE id = 1").unwrap();
         db.execute("ALTER TABLE t ADD COLUMN twice CALCULATED AS (sum * 2)").unwrap();
-        std::mem::forget(db); // crash: everything after the checkpoint is only in the log
+        db.simulate_crash(); // crash: everything after the checkpoint is only in the log
     }
     let mut db = Database::open(&path).unwrap();
     let rows = db.query("SELECT id, sum, twice FROM t ORDER BY id").unwrap().rows;
@@ -425,7 +425,7 @@ fn big_and_fractional_numbers_persist() {
         db.execute("INSERT INTO n (x) VALUES (0.000000000000000000000000000000000001)").unwrap();
         db.execute("UPDATE n SET x = x * x WHERE id = 4").unwrap();
         db.execute("UPDATE n SET x = x + 0.9 WHERE id = 2").unwrap();
-        std::mem::forget(db); // crash
+        db.simulate_crash(); // crash
     }
     let check = |db: &Database| {
         let shown: Vec<String> = db
@@ -491,7 +491,7 @@ fn converting_a_field_to_calculated_survives_a_crash() {
         db.checkpoint().unwrap();
         db.execute("ALTER TABLE t ALTER COLUMN b CALCULATED AS (a * 10)").unwrap();
         db.execute("INSERT INTO t (a) VALUES (3)").unwrap();
-        std::mem::forget(db); // crash: the conversion exists only in the log
+        db.simulate_crash(); // crash: the conversion exists only in the log
     }
     let mut db = Database::open(&path).unwrap();
     let b: Vec<String> = db.query("SELECT b FROM t ORDER BY id").unwrap().rows.iter().map(|r| r[0].to_string()).collect();
@@ -538,7 +538,7 @@ fn every_numeric_type_persists() {
         db.execute(&format!("INSERT INTO z (i, b, f, d, c, m, r) VALUES {row}")).unwrap();
         db.checkpoint().unwrap();
         db.execute(&format!("INSERT INTO z (i, b, f, d, c, m, r) VALUES {row}")).unwrap(); // only in the log
-        std::mem::forget(db); // crash
+        db.simulate_crash(); // crash
     }
     for round in 0..2 {
         let db = Database::open(&path).unwrap();
@@ -638,7 +638,7 @@ fn a_committed_transaction_survives_a_crash_whole() {
         db.execute("INSERT INTO made VALUES (1)").unwrap();
         db.execute("DELETE FROM t WHERE id = 1").unwrap();
         db.commit().unwrap();
-        std::mem::forget(db); // crash: the transaction exists only in the log
+        db.simulate_crash(); // crash: the transaction exists only in the log
     }
     let db = Database::open(&path).unwrap();
     let rows: Vec<String> = db.query("SELECT id, v, extra FROM t").unwrap().rows[0].iter().map(ToString::to_string).collect();
@@ -661,7 +661,7 @@ fn an_uncommitted_or_rolled_back_transaction_leaves_nothing() {
         db.begin().unwrap();
         db.execute("INSERT INTO t VALUES (3, 'never committed')").unwrap();
         db.execute("DROP TABLE t").unwrap();
-        std::mem::forget(db); // crash with the transaction still open
+        db.simulate_crash(); // crash with the transaction still open
     }
     let db = Database::open(&path).unwrap();
     assert_eq!(count(&db, "t"), 1);
@@ -703,7 +703,7 @@ fn savepoints_rolled_back_before_commit_never_reach_the_log() {
         db.execute("INSERT INTO t VALUES (4, 'after')").unwrap();
         db.release("sp").unwrap();
         db.commit().unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path).unwrap();
     let rows: Vec<String> = db.query("SELECT v FROM t ORDER BY id").unwrap().rows.iter().map(|r| r[0].to_string()).collect();
@@ -726,7 +726,7 @@ fn a_torn_commit_loses_the_whole_transaction_never_part_of_it() {
         }
         db.execute("CREATE TABLE late (a INTEGER)").unwrap();
         db.commit().unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     // Power fails while the commit record is being written: its tail is lost.
     let wal = wal_path(&path);
@@ -750,7 +750,7 @@ fn a_transaction_can_span_a_large_amount_of_work() {
         Ok(())
     })
     .unwrap();
-    std::mem::forget(db);
+    db.simulate_crash();
     let db = Database::open(&path).unwrap();
     assert_eq!(count(&db, "big"), 5_000);
     assert_eq!(db.query("SELECT Sum(n) FROM big").unwrap().rows[0][0].to_string(), "24995000");
@@ -800,7 +800,7 @@ fn sequence_values_are_recovered_from_the_log_alone() {
         db.checkpoint().unwrap();
         db.execute("SELECT NEXTVAL('s'), NEXTVAL('s'), NEXTVAL('s')").unwrap();
         // Simulate a crash: skip the clean-close checkpoint.
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path).unwrap();
     assert_eq!(db.sequences()[0].last, Some(3));
@@ -815,7 +815,7 @@ fn deferrable_relationships_survive_reopening() {
         db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED)").unwrap();
         db.checkpoint().unwrap();
         db.execute("CREATE TABLE d (pid INTEGER REFERENCES p (id) DEFERRABLE)").unwrap(); // only in the log
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let mut db = Database::open(&path).unwrap();
     for (t, deferred) in [("c", true), ("d", false)] {
@@ -855,7 +855,7 @@ fn json_columns_survive_reopening() {
         db.execute(r#"CREATE TABLE d (id INTEGER, body JSON); INSERT INTO d VALUES (1, '{"b":[1,2],"a":null}')"#).unwrap();
         db.checkpoint().unwrap();
         db.execute(r#"INSERT INTO d VALUES (2, '[true]')"#).unwrap(); // only in the log
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path).unwrap();
     let r = db.query("SELECT body FROM d ORDER BY id").unwrap();
@@ -877,7 +877,7 @@ fn stored_routines_survive_reopening_and_old_files_still_open() {
         .unwrap();
         db.checkpoint().unwrap();
         db.execute("CREATE FUNCTION trip(@a INTEGER) AS @a * 3").unwrap(); // only in the log
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let mut db = Database::open(&path).unwrap();
     db.execute("CALL add_n(21)").unwrap();
@@ -897,7 +897,7 @@ fn reports_survive_reopening() {
         db.execute("CREATE TABLE s (g TEXT, n INTEGER); INSERT INTO s VALUES ('a', 1), ('a', 2), ('b', 5)").unwrap();
         db.checkpoint().unwrap();
         db.execute("CREATE REPORT r TITLE 'T' BREAK BY g COLUMN n SUM GRAND TOTAL AS SELECT g, n FROM s").unwrap(); // only in the log
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path).unwrap();
     let text = String::from_utf8(db.render_report("r", accessor_core::ReportFormat::Text).unwrap()).unwrap();
@@ -906,4 +906,35 @@ fn reports_survive_reopening() {
     drop(db);
     let db = Database::open(&path).unwrap();
     assert_eq!(db.report_names(), ["r"]);
+}
+
+#[test]
+fn a_database_can_be_open_only_once_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("locked.adb");
+    let mut first = Database::open(&path).unwrap();
+    first.execute("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1)").unwrap();
+    // A second connection, in this process or another, is refused with a message that says why.
+    let err = Database::open(&path).err().expect("the second open must fail");
+    assert!(matches!(err, accessor_core::Error::Locked(_)), "{err}");
+    assert!(err.to_string().contains("in use"), "{err}");
+    // The refusal changed nothing.
+    first.execute("INSERT INTO t VALUES (2)").unwrap();
+    assert_eq!(count(&first, "t"), 2);
+    // Closing releases it.
+    drop(first);
+    let again = Database::open(&path).unwrap();
+    assert_eq!(count(&again, "t"), 2);
+    // A crash releases it too (the operating system drops the lock with the file).
+    again.simulate_crash();
+    let recovered = Database::open(&path).unwrap();
+    assert_eq!(count(&recovered, "t"), 2);
+}
+
+#[test]
+fn different_databases_do_not_lock_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Database::open(dir.path().join("a.adb")).unwrap();
+    let b = Database::open(dir.path().join("b.adb")).unwrap();
+    assert!(a.is_persistent() && b.is_persistent());
 }

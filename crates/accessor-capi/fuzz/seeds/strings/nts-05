@@ -1,0 +1,1 @@
+SELECT (SELECT MAX(i) FROM t x WHERE x.s = t.s) FROM t

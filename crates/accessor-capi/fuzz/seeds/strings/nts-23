@@ -1,0 +1,1 @@
+DELETE FROM t WHERE i IS NULL OR s = 'x'

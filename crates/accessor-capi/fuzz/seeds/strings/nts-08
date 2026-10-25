@@ -1,0 +1,1 @@
+SELECT js -> 'a', JSON_VALUE(js, '$.a[0]'), JSON_SET(js, '$.b', 1) FROM t

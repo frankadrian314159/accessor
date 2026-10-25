@@ -1,0 +1,1 @@
+SELECT Sqr(2), Round(2.675, 2), Int(-1.5), Mod(7, 3), Power(2, 100), Atan2(1, 1), TRUNC(-1.55, 1), Exp(1) FROM t

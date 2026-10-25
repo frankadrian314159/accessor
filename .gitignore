@@ -6,3 +6,7 @@
 # Editor and language-server caches
 .clj-kondo/
 .lsp/
+
+# Build and fuzz output
+jdbc/build/
+*.adb-lock

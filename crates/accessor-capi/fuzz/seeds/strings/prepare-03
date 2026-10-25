@@ -1,0 +1,1 @@
+SELECT a.i, b.s FROM t a LEFT JOIN t b ON a.i = b.i WHERE a.s LIKE 'o*'

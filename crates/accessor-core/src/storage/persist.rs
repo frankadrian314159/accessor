@@ -27,6 +27,8 @@ const WAL_MAGIC: &[u8; 4] = b"ACWL";
 /// Current file format. Version 1 predates foreign keys; it is still read and
 /// is rewritten as version 2 on open.
 const VERSION: u32 = 5;
+/// The version of the file format this build writes (older versions are still read).
+pub const FILE_FORMAT_VERSION: u32 = VERSION;
 const V1: u32 = 1;
 const V2: u32 = 2;
 const V3: u32 = 3;
@@ -105,6 +107,27 @@ pub(crate) struct Persistence {
     pub durability: Durability,
     /// Either file is in an older format and must be rewritten.
     pub needs_upgrade: bool,
+    /// Holds the exclusive lock on the database for as long as it is open (released when dropped).
+    _lock: Option<File>,
+}
+
+/// Takes the exclusive lock that keeps a second connection or process from opening the same
+/// database. The lock is on a small file beside the database (`name.adb-lock`), not on the database
+/// itself, because the database file is replaced at every checkpoint. The operating system drops the
+/// lock when the connection closes or the process dies, so a crash never leaves a database locked.
+/// On a file system that cannot lock (some network shares) the database opens unlocked.
+fn lock_database(path: &Path) -> Result<Option<File>> {
+    use std::fs::TryLockError;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(sibling(path, "-lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Err(Error::Locked(format!(
+            "the database '{}' is in use by another connection or process",
+            path.display()
+        ))),
+        Err(TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(None),
+        Err(TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -124,6 +147,7 @@ impl Persistence {
     /// Opens (or creates) the files for `path`, returning the persisted
     /// snapshot and the committed batches that must be replayed on top of it.
     pub(crate) fn open(path: &Path) -> Result<(Self, Option<Loaded>, Vec<Vec<Op>>)> {
+        let lock = lock_database(path)?;
         let wal_path = sibling(path, "-wal");
         let loaded = if path.exists() { Some(read_snapshot(path)?) } else { None };
         let epoch = loaded.as_ref().map_or(0, |l| l.epoch);
@@ -171,6 +195,7 @@ impl Persistence {
             epoch,
             durability: Durability::default(),
             needs_upgrade: wal_old || loaded.as_ref().is_some_and(|l| l.legacy),
+            _lock: lock,
         };
         Ok((p, loaded, batches))
     }

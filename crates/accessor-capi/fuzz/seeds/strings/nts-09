@@ -1,0 +1,1 @@
+SELECT Format(d, '0.00'), Format(dt, 'yyyy-mm-dd'), CAST(i AS TEXT), CAST(s AS INTEGER) FROM t

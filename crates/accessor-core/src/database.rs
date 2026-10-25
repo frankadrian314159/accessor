@@ -181,6 +181,17 @@ impl Database {
         Ok(db)
     }
 
+    /// Closes the files without the final checkpoint, as if the process had died at this point:
+    /// what was committed is in the log and is recovered when the database is next opened. For
+    /// testing recovery.
+    #[doc(hidden)]
+    pub fn simulate_crash(mut self) {
+        if let Some(tx) = self.tx.take() {
+            self.revert(tx.undo);
+        }
+        self.persist = None;
+    }
+
     pub fn is_persistent(&self) -> bool {
         self.persist.is_some()
     }

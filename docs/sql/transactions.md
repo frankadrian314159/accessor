@@ -35,7 +35,7 @@ COMMIT;                       -- the order is saved
 * **No nesting.** `BEGIN` inside a transaction is an error; use savepoints.
 * **Not allowed inside a transaction:** checkpointing and compacting the file.
 * **Closing a database with a transaction open rolls it back.**
-* **Isolation.** There is one connection at a time to a database, so there are no concurrent transactions to isolate from: a transaction sees its own changes immediately.
+* **Isolation.** There is one connection at a time to a database (the file is locked while it is open, see [locking](../extern/locking.md)), so there are no concurrent transactions to isolate from: a transaction sees its own changes immediately.
 
 ## SET CONSTRAINTS
 

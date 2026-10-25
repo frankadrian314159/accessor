@@ -45,7 +45,7 @@ pub use database::Database;
 pub use error::{Error, Result};
 pub use exec::QueryResult;
 pub use schema::{Column, ForeignKey, IndexDef, RefAction, TableSchema};
-pub use storage::persist::Durability;
+pub use storage::persist::{Durability, FILE_FORMAT_VERSION};
 pub use exec::Prepared;
 pub use report::ReportFormat;
 pub use storage::stats::ColumnStats;

@@ -3,6 +3,7 @@
 | Folder or file | Contents |
 | --- | --- |
 | [sql/](sql/README.md) | the ASQL language: statements, the BNF grammar, expressions, and how ASQL relates to standard SQL |
+| [extern/](extern/README.md) | using Accessor from C and from Java (JDBC), version numbers, locking and how the interface is tested |
 | [functions/](functions/README.md) | every built-in function and table function, by group |
 | [optimizer/](optimizer/README.md) | the query optimizer: pushdown, join order, access paths, estimates, `EXPLAIN` and tuning |
 | [types/](types/README.md) | the column types, and how they convert and combine |
@@ -658,7 +659,7 @@ ROLLBACK TO after_order;        -- undo just the line
 COMMIT;                         -- keep the order
 ```
 
-The rules are short. A statement that fails inside a transaction is undone by itself and the transaction stays open, so you can correct and continue. Schema changes take part: creating, altering and dropping tables, indexes, queries and triggers can all be rolled back. `COMMIT` writes the whole transaction to the log as one checksummed record, so after a crash it is wholly there or wholly absent. Transactions do not nest (use savepoints for that), checkpointing and compacting are refused while one is open, and closing a database with a transaction open rolls it back. There is one connection to a database at a time, so a transaction simply sees its own changes at once.
+The rules are short. A statement that fails inside a transaction is undone by itself and the transaction stays open, so you can correct and continue. Schema changes take part: creating, altering and dropping tables, indexes, queries and triggers can all be rolled back. `COMMIT` writes the whole transaction to the log as one checksummed record, so after a crash it is wholly there or wholly absent. Transactions do not nest (use savepoints for that), checkpointing and compacting are refused while one is open, and closing a database with a transaction open rolls it back. There is one connection to a database at a time (the file is locked, see [locking](extern/locking.md)), so a transaction simply sees its own changes at once.
 
 From Rust, `db.transaction(|db| { ... })` runs a closure inside a transaction, committing if it returns `Ok` and rolling back if it returns `Err`. The desktop app has a Transaction menu and shows a status-bar banner with **Commit** and **Roll back** buttons while one is open; closing the window or opening another database with one open asks what to do.
 
@@ -837,7 +838,7 @@ A user interface that edits a grid does not want to build SQL strings, so there 
 
 `db.set_durability(Durability::OsBuffered)` trades safety against power loss for speed (see [Durability and recovery](#architecture)). `db.checkpoint()` folds the log into the snapshot and `db.compact()` rewrites the file without gaps; both are refused while a transaction is open. When a `Database` is dropped with a transaction open, the transaction is rolled back.
 
-The library is synchronous and single-threaded: mutating calls take `&mut self`, so the borrow checker prevents two writers in one process. Several readers can share a `&Database`. Sharing one file between processes is not supported (see [limits](#limits-and-what-is-missing)).
+The library is synchronous and single-threaded: mutating calls take `&mut self`, so the borrow checker prevents two writers in one process. Several readers can share a `&Database`. Sharing one file between processes is refused by a file lock (see [locking](extern/locking.md)).
 
 ### Architecture
 
@@ -923,11 +924,11 @@ Changes are applied immediately inside a transaction, so reads see them, and for
 
 #### File format and compatibility
 
-The format is versioned (currently 3) and every earlier version is still readable: versions 1 and 2 are older layouts, and the short-lived single `NUMBER` type of an intermediate build is read as `DECIMAL`. Old files are upgraded by rewriting them on first open. The on-disk enumerations keep their original variant order, with the new types appended, so that a file never changes meaning.
+The format is versioned (currently 5) and every earlier version is still readable: versions 1 and 2 are older layouts, and the short-lived single `NUMBER` type of an intermediate build is read as `DECIMAL`. Old files are upgraded by rewriting them on first open. The on-disk enumerations keep their original variant order, with the new types appended, so that a file never changes meaning.
 
 #### Concurrency
 
-One process, one writer. The mutating API takes `&mut Database`, so Rust enforces it within a program. Across processes, there is no file locking: two processes writing the same database would corrupt it, and opening a database from a second program while the first has it open is not supported.
+One connection, one writer. The mutating API takes `&mut Database`, so Rust enforces it within a program. Across connections and processes the database file is **locked**: opening a database that another connection (in this process or any other) has open fails with `Error::Locked`, and the lock is released when the connection closes or the process dies, however it dies. See [locking](extern/locking.md).
 
 #### Testing
 
@@ -1020,7 +1021,7 @@ The reference pages in [sql/conformance.md](sql/conformance.md) give the exact l
 
 - **The optimizer is modest.** Its estimates are table sizes, exact counts for indexed conditions and histograms for the rest, with no knowledge of how columns are related; there is no `ANALYZE` (statistics come and go with the data) and no hints. Outer joins are not reordered, and plans are not cached.
 - **The data must fit in memory.** The whole database is loaded on open. The 200,000-row benchmarks above use a few tens of megabytes.
-- **One process at a time.** There is no file locking, no client/server mode, and no concurrent transactions.
+- **One connection at a time.** A database file is locked while open; there is no client/server mode, no shared read-only mode, and no concurrent transactions.
 - **No time zones, intervals or sub-second times.** A `DATETIME` is whole seconds in a single zone.
 - **No fixed-width types.** `VARCHAR(n)` and `NUMERIC(p, s)` accept their sizes and ignore them; use `CHECK` constraints to limit values.
 - **Correlated subqueries** work in the select list, `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY` and in `UPDATE` and `DELETE`, but not in join conditions.
