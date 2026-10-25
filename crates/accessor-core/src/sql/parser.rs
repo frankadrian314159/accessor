@@ -410,6 +410,8 @@ impl<'a> Parser<'a> {
     fn peek_is_alias(&self) -> bool {
         match self.peek() {
             Tok::Quoted(_) => true,
+            // `FROM t WINDOW w AS (...)`: WINDOW starts a clause here, not an alias.
+            Tok::Ident(s) if s.eq_ignore_ascii_case("WINDOW") && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_kw_at(2, "AS") => false,
             Tok::Ident(s) => !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)),
             _ => false,
         }
@@ -849,8 +851,14 @@ impl<'a> Parser<'a> {
             // Parameters come either as `name(@a, @b) AS ...` or as a leading
             // `PARAMETERS @a, @b;`; both are stored in the latter form.
             let mut params = Vec::new();
+            let mut columns: Vec<String> = Vec::new();
             if self.eat_sym("(") {
-                params = self.param_list()?;
+                // `(@a, @b)` declares parameters; `(a, b)` names the columns of the result.
+                if matches!(self.peek(), Tok::Param(_)) {
+                    params = self.param_list()?;
+                } else {
+                    columns = self.ident_list()?;
+                }
                 self.expect_sym(")")?;
             }
             self.expect_kw("AS")?;
@@ -873,9 +881,23 @@ impl<'a> Parser<'a> {
             let start = self.toks[self.pos].pos;
             self.select()?;
             let end = self.toks[self.pos].pos;
-            let body = self.src[start..end].trim();
+            let mut check = false;
+            if self.peek_kw("WITH") && self.peek_kw_at(1, "CHECK") {
+                self.advance();
+                self.advance();
+                self.expect_kw("OPTION")?;
+                check = true;
+            }
+            let mut body = self.src[start..end].trim().to_string();
+            if !columns.is_empty() {
+                // Names for the columns: the query is wrapped so that they are applied.
+                let names: Vec<String> = columns.iter().map(|c| format!("[{c}]")).collect();
+                body = format!("SELECT * FROM ({body}) AS __v ({})", names.join(", "));
+            }
+            let body = body.as_str();
+            let marker = if check { "/*CHECK OPTION*/ " } else { "" };
             let sql = if params.is_empty() {
-                body.to_string()
+                format!("{marker}{body}")
             } else {
                 let decls: Vec<String> = params
                     .iter()
@@ -884,7 +906,7 @@ impl<'a> Parser<'a> {
                         None => format!("@{}", p.name),
                     })
                     .collect();
-                format!("PARAMETERS {}; {body}", decls.join(", "))
+                format!("{marker}PARAMETERS {}; {body}", decls.join(", "))
             };
             return Ok(Statement::CreateView { name, sql });
         }
@@ -1404,6 +1426,21 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("HAVING") {
             sel.having = Some(self.expr()?);
+        }
+        if self.peek_kw("WINDOW") && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_kw_at(2, "AS") {
+            self.advance();
+            loop {
+                let name = self.ident()?;
+                self.expect_kw("AS")?;
+                let spec = self.window_spec()?;
+                if sel.windows.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    return Err(Error::syntax(format!("the window '{name}' is defined twice")));
+                }
+                sel.windows.push((name, spec));
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
         }
         Ok(sel)
     }
@@ -2395,10 +2432,20 @@ impl<'a> Parser<'a> {
 
     fn window_spec(&mut self) -> Result<WindowSpec> {
         if !self.peek_sym("(") {
-            return Err(Error::syntax("named windows are not supported; write OVER (...)"));
+            // `OVER w` names a window defined in the WINDOW clause.
+            let name = self.ident()?;
+            return Ok(WindowSpec { base: Some(name), ..WindowSpec::default() });
         }
         self.advance();
         let mut spec = WindowSpec::default();
+        // `OVER (w ORDER BY x)` starts from the window w.
+        if let Tok::Ident(w) = self.peek().clone() {
+            let clause = ["PARTITION", "ORDER", "ROWS", "RANGE", "GROUPS"].iter().any(|k| w.eq_ignore_ascii_case(k));
+            if !clause {
+                self.advance();
+                spec.base = Some(w);
+            }
+        }
         if self.eat_kw("PARTITION") {
             self.expect_kw("BY")?;
             loop {
@@ -2435,12 +2482,13 @@ impl<'a> Parser<'a> {
             None
         };
         if let Some(units) = units {
+            let range = units == FrameUnits::Range;
             let (start, end) = if self.eat_kw("BETWEEN") {
-                let s = self.frame_bound()?;
+                let s = self.frame_bound(range)?;
                 self.expect_kw("AND")?;
-                (s, self.frame_bound()?)
+                (s, self.frame_bound(range)?)
             } else {
-                (self.frame_bound()?, FrameBound::CurrentRow)
+                (self.frame_bound(range)?, FrameBound::CurrentRow)
             };
             if self.eat_kw("EXCLUDE") {
                 return Err(Error::syntax("frame EXCLUDE is not supported"));
@@ -2451,7 +2499,7 @@ impl<'a> Parser<'a> {
         Ok(spec)
     }
 
-    fn frame_bound(&mut self) -> Result<FrameBound> {
+    fn frame_bound(&mut self, range: bool) -> Result<FrameBound> {
         if self.eat_kw("UNBOUNDED") {
             return Ok(if self.eat_kw("PRECEDING") {
                 FrameBound::UnboundedPreceding
@@ -2463,6 +2511,19 @@ impl<'a> Parser<'a> {
         if self.eat_kw("CURRENT") {
             self.expect_kw("ROW")?;
             return Ok(FrameBound::CurrentRow);
+        }
+        if range {
+            // RANGE offsets are values (numbers, or intervals for dates), not row counts.
+            let off = match self.unary()? {
+                Expr::Literal(v) if !v.is_null() => v,
+                _ => return Err(Error::syntax("a RANGE offset must be a constant such as 5 or INTERVAL '1 day'")),
+            };
+            return Ok(if self.eat_kw("PRECEDING") {
+                FrameBound::RangePreceding(off)
+            } else {
+                self.expect_kw("FOLLOWING")?;
+                FrameBound::RangeFollowing(off)
+            });
         }
         let n = self.usize_literal()?;
         Ok(if self.eat_kw("PRECEDING") {

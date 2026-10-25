@@ -2449,3 +2449,139 @@ fn replace_rename_and_column_settings() {
     db.execute("INSERT INTO T (c, a) VALUES (3, NULL)").unwrap();
     assert!(db.execute("ALTER TABLE T ALTER COLUMN c DROP NOT NULL").is_err()); // primary key
 }
+
+// ----- views with column lists, and changing data through simple views -------------------------
+
+fn plan_text(db: &Database, sql: &str) -> String {
+    db.query(&format!("EXPLAIN {sql}")).unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn views_with_column_lists_and_updatable_views() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Prod (id INTEGER PRIMARY KEY, name TEXT, price CURRENCY, active YESNO DEFAULT TRUE, stock INTEGER DEFAULT 0);
+         CREATE INDEX pname ON Prod (name);
+         INSERT INTO Prod VALUES (1,'nut',0.10,TRUE,100),(2,'bolt',0.25,TRUE,50),(3,'cog',3,FALSE,0),(4,'gear',9,TRUE,5);",
+    )
+    .unwrap();
+
+    // Names for the columns.
+    db.execute("CREATE VIEW Cheap (code, label, cost) AS SELECT id, name, price FROM Prod WHERE price < 1").unwrap();
+    assert_eq!(db.query("SELECT * FROM Cheap").unwrap().columns, ["code", "label", "cost"]);
+    assert_eq!(rows(&db, "SELECT label FROM Cheap ORDER BY code"), [["nut"], ["bolt"]]);
+    assert!(db.execute("CREATE VIEW Bad (a) AS SELECT id, name FROM Prod").is_err()); // wrong number of names
+    // Parameters still go in the same place.
+    db.execute("CREATE QUERY Over (@p CURRENCY) AS SELECT name FROM Prod WHERE price > @p").unwrap();
+    assert_eq!(db.execute("EXEC Over 5").unwrap().rows[0][0].to_string(), "gear");
+
+    // DELETE, UPDATE and INSERT through a view act on its table, within the view's condition.
+    db.execute("UPDATE Cheap SET cost = cost * 2 WHERE label = 'nut'").unwrap();
+    assert_eq!(rows(&db, "SELECT price FROM Prod WHERE id = 1"), [["$0.20"]]);
+    assert_eq!(db.execute("UPDATE Cheap SET cost = 0.5").unwrap().affected, 2); // not the dearer ones
+    assert_eq!(rows(&db, "SELECT price FROM Prod WHERE id = 4"), [["$9.00"]]);
+    db.execute("INSERT INTO Cheap (code, label, cost) VALUES (10, 'pin', 0.05)").unwrap();
+    assert_eq!(rows(&db, "SELECT name, active, stock FROM Prod WHERE id = 10"), [["pin", "Yes", "0"]]); // base defaults
+    assert_eq!(db.execute("DELETE FROM Cheap WHERE label = 'pin'").unwrap().affected, 1);
+    assert_eq!(db.execute("DELETE FROM Cheap WHERE code = 4").unwrap().affected, 0); // gear is not in the view
+
+    // WITH CHECK OPTION refuses a row that would leave the view.
+    db.execute("CREATE VIEW Active AS SELECT id, name, price FROM Prod WHERE active WITH CHECK OPTION").unwrap();
+    assert!(db.execute("INSERT INTO Active (id, name, price) VALUES (20, 'cam', 1)").is_ok()); // active defaults to TRUE
+    db.execute("CREATE VIEW Pricey AS SELECT id, name, price FROM Prod WHERE price > 5 WITH CHECK OPTION").unwrap();
+    let e = db.execute("UPDATE Pricey SET price = 1 WHERE id = 4").unwrap_err();
+    assert!(e.to_string().contains("CHECK OPTION"), "{e}");
+    assert!(db.execute("INSERT INTO Pricey (id, name, price) VALUES (30, 'x', 2)").is_err());
+    db.execute("UPDATE Pricey SET price = 20 WHERE id = 4").unwrap();
+    // A view over a view.
+    db.execute("CREATE VIEW Pricey2 AS SELECT id, name FROM Pricey").unwrap();
+    db.execute("UPDATE Pricey2 SET name = 'big gear' WHERE id = 4").unwrap();
+    assert_eq!(rows(&db, "SELECT name FROM Prod WHERE id = 4"), [["big gear"]]);
+
+    // Views that cannot take changes say why.
+    db.execute("CREATE VIEW Sum1 AS SELECT Count(*) AS n FROM Prod").unwrap();
+    db.execute("CREATE VIEW Calc AS SELECT id, price * 2 AS twice FROM Prod").unwrap();
+    db.execute("CREATE VIEW Joined AS SELECT P.id, Q.name FROM Prod P JOIN Prod Q ON Q.id = P.id").unwrap();
+    for v in ["Sum1", "Calc", "Joined"] {
+        let e = db.execute(&format!("DELETE FROM {v}")).unwrap_err();
+        assert!(e.to_string().contains("cannot be changed"), "{v}: {e}");
+    }
+    assert!(db.execute("UPDATE Calc SET twice = 1").is_err());
+    assert!(db.execute("INSERT INTO Cheap (nosuch) VALUES (1)").is_err());
+
+    // Reading a view that shows all its table's columns goes through the table's indexes.
+    db.execute("CREATE VIEW Live AS SELECT * FROM Prod WHERE active").unwrap();
+    let plan = plan_text(&db, "SELECT id FROM Live WHERE name = 'nut'");
+    assert!(plan.contains("scan Live") && plan.contains("index pname on name"), "{plan}");
+    for sql in [
+        "SELECT id, name FROM Live WHERE name = 'bolt' OR stock > 90 ORDER BY id",
+        "SELECT Count(*) FROM Live",
+        "SELECT L.id, P.name FROM Live L LEFT JOIN Prod P ON P.id = L.id ORDER BY 1",
+        "SELECT P.id, L.name FROM Prod P LEFT JOIN Live L ON L.id = P.id ORDER BY 1",
+        "SELECT P.id, L.name FROM Prod P RIGHT JOIN Live L ON L.id = P.id ORDER BY 1",
+        "SELECT L.id, P.name FROM Live L FULL JOIN Prod P ON P.id = L.id ORDER BY 1, 2",
+        "SELECT id FROM Live ORDER BY price DESC LIMIT 2",
+    ] {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        assert_eq!(on, rows(&db, sql), "{sql}");
+    }
+}
+
+// ----- named windows and RANGE offsets ---------------------------------------------------------
+
+#[test]
+fn named_windows_and_range_offsets() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE S (d DATETIME, v INTEGER, g TEXT);
+         INSERT INTO S VALUES (#2024-01-01#, 10, 'a'), (#2024-01-02#, 20, 'a'), (#2024-01-04#, 30, 'a'),
+                              (#2024-01-05#, 40, 'a'), (#2024-01-10#, 50, 'a'), (#2024-01-01#, 1, 'b'), (#2024-01-03#, 2, 'b');",
+    )
+    .unwrap();
+    // A window named once and used several times.
+    let r = rows(
+        &db,
+        "SELECT v, SUM(v) OVER w, ROW_NUMBER() OVER w, RANK() OVER (w) FROM S WHERE g = 'a'
+         WINDOW w AS (ORDER BY d) ORDER BY d",
+    );
+    assert_eq!(r[2], ["30", "60", "3", "3"]);
+    // A window based on another may add what it lacks.
+    let r = rows(
+        &db,
+        "SELECT g, v, SUM(v) OVER (byg ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM S
+         WINDOW byg AS (PARTITION BY g) ORDER BY g, d",
+    );
+    assert_eq!(r[1], ["a", "20", "30"]);
+    assert_eq!(r[6], ["b", "2", "3"]);
+    // Two named windows, one built on the other.
+    let r = rows(&db, "SELECT v, SUM(v) OVER w2 FROM S WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY d) ORDER BY g, d");
+    assert_eq!(r[4], ["50", "150"]);
+    // Mistakes are reported.
+    assert!(db.query("SELECT SUM(v) OVER nosuch FROM S").is_err());
+    assert!(db.query("SELECT SUM(v) OVER (w ORDER BY d) FROM S WINDOW w AS (ORDER BY v)").is_err()); // cannot re-order
+    assert!(db.query("SELECT 1 FROM S WINDOW w AS (ORDER BY d), w AS (ORDER BY v)").is_err());
+
+    // RANGE with an offset: the rows within 2 days before (dates take an interval or days).
+    let r = rows(
+        &db,
+        "SELECT v, SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '2 days' PRECEDING AND CURRENT ROW) FROM S WHERE g = 'a' ORDER BY d",
+    );
+    assert_eq!(r.iter().map(|x| x[1].clone()).collect::<Vec<_>>(), ["10", "30", "50", "70", "50"]);
+    // Numbers: a window of values 15 either side of each.
+    let r = rows(&db, "SELECT v, Count(*) OVER (ORDER BY v RANGE BETWEEN 15 PRECEDING AND 15 FOLLOWING) FROM S WHERE g = 'a' ORDER BY v");
+    assert_eq!(r.iter().map(|x| x[1].clone()).collect::<Vec<_>>(), ["2", "3", "3", "3", "2"]);
+    // Descending order flips what preceding means.
+    let r = rows(&db, "SELECT v, Sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 10 PRECEDING AND CURRENT ROW) FROM S WHERE g = 'a' ORDER BY v DESC");
+    assert_eq!(r[0], ["50", "50"]);
+    assert_eq!(r[1], ["40", "90"]);
+    // NULL sort values frame only their peers.
+    db.execute("INSERT INTO S VALUES (NULL, 7, 'c'), (NULL, 8, 'c'), (#2024-02-01#, 9, 'c')").unwrap();
+    let r = rows(&db, "SELECT v, SUM(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '1 day' PRECEDING AND CURRENT ROW) FROM S WHERE g = 'c' ORDER BY d, v");
+    assert_eq!(r, [["7", "15"], ["8", "15"], ["9", "9"]]);
+    // A frame with an offset needs one ORDER BY column and a matching kind of offset.
+    assert!(db.query("SELECT SUM(v) OVER (ORDER BY d, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM S").is_err());
+    assert!(db.query("SELECT SUM(v) OVER (ORDER BY d RANGE BETWEEN 'x' PRECEDING AND CURRENT ROW) FROM S").is_err());
+    assert!(db.query("SELECT SUM(v) OVER (ORDER BY v ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM S").is_err());
+}

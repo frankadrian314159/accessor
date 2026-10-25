@@ -87,10 +87,54 @@ pub struct Binder<'a> {
     /// Whether window functions may be bound here (select list and ORDER BY).
     pub allow_win: bool,
     pub wins: Vec<WinSpecB>,
+    /// The `WINDOW` clause of the select being bound.
+    pub windows: Vec<(String, crate::sql::ast::WindowSpec)>,
 }
 
 /// Rewrites the outer columns that `q` reads (those of `outer`) into parameters, and
 /// returns each parameter's name with the position of the outer column it stands for.
+/// A window spec with the named window it starts from filled in: it may add what the named
+/// window lacks (an ORDER BY, a frame) but not change what it has.
+fn resolve_window(
+    spec: &crate::sql::ast::WindowSpec,
+    named: &[(String, crate::sql::ast::WindowSpec)],
+    depth: u32,
+) -> Result<crate::sql::ast::WindowSpec> {
+    let Some(base_name) = &spec.base else { return Ok(spec.clone()) };
+    if depth > 8 {
+        return Err(Error::runtime("windows are defined in terms of each other in a cycle"));
+    }
+    let found = named
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(base_name))
+        .ok_or_else(|| Error::catalog(format!("the window '{base_name}' is not defined (use WINDOW {base_name} AS (...))")))?;
+    let base = resolve_window(&found.1, named, depth + 1)?;
+    let mut out = spec.clone();
+    out.base = None;
+    if !spec.partition_by.is_empty() {
+        if !base.partition_by.is_empty() {
+            return Err(Error::runtime(format!("a window based on '{base_name}' cannot change its PARTITION BY")));
+        }
+    } else {
+        out.partition_by = base.partition_by;
+    }
+    if !spec.order_by.is_empty() {
+        if !base.order_by.is_empty() {
+            return Err(Error::runtime(format!("a window based on '{base_name}' cannot change its ORDER BY")));
+        }
+    } else {
+        out.order_by = base.order_by;
+    }
+    if spec.frame.is_some() {
+        if base.frame.is_some() {
+            return Err(Error::runtime(format!("a window based on '{base_name}' cannot change its frame")));
+        }
+    } else {
+        out.frame = base.frame;
+    }
+    Ok(out)
+}
+
 pub(crate) fn correlate_select(db: &Database, outer: &Scope, q: &mut Select, depth: u32) -> Result<Vec<(String, usize)>> {
     let mut c = Correlator { db, outer, depth: depth + 1, frames: Vec::new(), found: Vec::new() };
     c.select(q)?;
@@ -261,7 +305,7 @@ pub fn contains_agg(e: &Expr) -> bool {
 
 impl<'a> Binder<'a> {
     pub fn new(db: &'a Database, scope: &'a Scope, depth: u32) -> Self {
-        Binder { db, scope, group: None, depth, allow_corr: false, corr: Vec::new(), allow_win: false, wins: Vec::new() }
+        Binder { db, scope, group: None, depth, allow_corr: false, corr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new() }
     }
 
     pub fn bind(&mut self, e: &Expr) -> Result<BExpr> {
@@ -481,6 +525,8 @@ impl<'a> Binder<'a> {
         let Expr::Function { name, args, distinct, star } = func else {
             return Err(Error::runtime("OVER must follow a function call"));
         };
+        let resolved = resolve_window(spec, &self.windows, 0)?;
+        let spec = &resolved;
         let wf = WinFn::from_name(name)
             .ok_or_else(|| Error::catalog(format!("'{name}' cannot be used as a window function")))?;
         let (min, max) = wf.arity();
@@ -514,7 +560,7 @@ impl<'a> Binder<'a> {
                 sep,
                 partition,
                 order,
-                frame: spec.frame,
+                frame: spec.frame.clone(),
             })
         })();
         self.allow_win = saved;

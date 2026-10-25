@@ -5,6 +5,7 @@ pub mod bind;
 mod check;
 mod ddl;
 mod merge;
+mod viewdml;
 pub(crate) mod optimizer;
 mod proc;
 mod dml;
@@ -68,6 +69,11 @@ impl Database {
         match st {
             Statement::SetTimeZone(name) => self.set_time_zone(name).map(|_| QueryResult::default()),
             Statement::Select(s) => self.run_select(s),
+            Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. }
+                if self.table(table).is_none() && self.view_sql(table).is_some() =>
+            {
+                self.exec_view_dml(st)
+            }
             Statement::Insert { table, columns, source } => self.exec_insert(table, columns, source),
             Statement::Update { table, assignments, filter } => self.exec_update(table, assignments, filter.as_ref()),
             Statement::Delete { table, filter } => self.exec_delete(table, filter.as_ref()),

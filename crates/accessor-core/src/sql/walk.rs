@@ -119,6 +119,10 @@ pub fn walk_select(s: &mut Select, f: &mut Visitor) -> Result<()> {
             walk_select(&mut cte.query, f)?;
         }
     }
+    for (_, spec) in &mut s.windows {
+        spec.partition_by.iter_mut().try_for_each(|x| walk_expr(x, f))?;
+        spec.order_by.iter_mut().try_for_each(|o| walk_expr(&mut o.expr, f))?;
+    }
     if let Some(ct) = &mut s.crosstab {
         walk_expr(&mut ct.agg, f)?;
         walk_expr(&mut ct.pivot, f)?;

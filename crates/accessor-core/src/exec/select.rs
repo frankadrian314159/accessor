@@ -44,6 +44,8 @@ enum LateralKind {
 
 pub(crate) struct Source<'a> {
     pub(crate) data: SourceData<'a>,
+    /// Conditions that belong to the source itself (a merged view's `WHERE`), written for its columns.
+    pub(crate) intrinsic: Vec<BExpr>,
     pub(crate) alias: String,
     pub(crate) names: Vec<String>,
 }
@@ -75,7 +77,7 @@ impl Database {
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
                 if let Some(t) = self.table(name) {
                     let names = t.schema().columns.iter().map(|c| c.name.clone()).collect();
-                    return Ok(Source { data: SourceData::Table(t), alias, names });
+                    return Ok(Source { intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
                 }
                 if self.view_sql(name).is_some() {
                     let (params, q) = self.resolve_query(name, 0)?;
@@ -85,7 +87,7 @@ impl Database {
                         )));
                     }
                     let res = self.run_select_depth(&q, depth + 1)?;
-                    return Ok(Source { data: SourceData::Rows(res.rows), alias, names: res.columns });
+                    return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
@@ -97,23 +99,29 @@ impl Database {
                 }
                 let (cols, rows) = self.table_function(name, &vals)?;
                 let names = rename_columns(cols, columns, alias)?;
-                Ok(Source { data: SourceData::Rows(rows), alias: alias.clone(), names })
+                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
             }
             TableFactor::Derived { query, alias, columns, .. } => {
                 let res = self.run_select_depth(query, depth + 1)?;
                 let names = rename_columns(res.columns, columns, alias)?;
-                Ok(Source { data: SourceData::Rows(res.rows), alias: alias.clone(), names })
+                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
             TableFactor::Materialized { rows, columns, alias } => {
-                Ok(Source { data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
+                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
             }
         }
     }
 
     /// A FROM item resolved with the columns of the items before it in view, which a
     /// LATERAL sub-query or a table function may read.
-    fn resolve_source(&self, f: &TableFactor, scope: &Scope, depth: u32) -> Result<Source<'_>> {
+    fn resolve_source(&self, f: &TableFactor, scope: &Scope, depth: u32, allow_merge: bool) -> Result<Source<'_>> {
         match f {
+            TableFactor::Named { name, alias } if allow_merge && self.table(name).is_none() && self.view_sql(name).is_some() => {
+                match self.merged_view(name, alias.as_deref().unwrap_or(name))? {
+                    Some(src) => Ok(src),
+                    None => self.resolve_factor(f, depth),
+                }
+            }
             TableFactor::Derived { query, alias, columns, lateral: true } => {
                 let mut q = (**query).clone();
                 let outer = super::bind::correlate_select(self, scope, &mut q, depth)?;
@@ -127,7 +135,7 @@ impl Database {
                 probe.limit = Some(0);
                 let probed = self.unlogged(|| self.run_select_depth(&probe, depth + 1))?;
                 let names = rename_columns(probed.columns, columns, alias)?;
-                Ok(Source { data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
+                Ok(Source { intrinsic: Vec::new(), data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
             }
             TableFactor::Function { name, args, alias, columns } => {
                 let mut a = args.clone();
@@ -138,6 +146,7 @@ impl Database {
                 let cols = self.table_function_columns(name)?;
                 let names = rename_columns(cols, columns, alias)?;
                 Ok(Source {
+                    intrinsic: Vec::new(),
                     data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Func(name.clone(), a), outer })),
                     alias: alias.clone(),
                     names,
@@ -309,8 +318,11 @@ impl Database {
         let mut sources = Vec::new();
         let mut scope = Scope::default();
         if let Some(from) = &sel.from {
-            for f in std::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.factor)) {
-                let src = self.resolve_source(f, &scope, depth)?;
+            let few = from.joins.len() < MAX_SOURCES;
+            for (k, f) in std::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.factor)).enumerate() {
+                // A view read as its table cannot be the preserved side of a RIGHT or FULL join.
+                let preserved = k > 0 && matches!(from.joins[k - 1].kind, JoinKind::Right | JoinKind::Full);
+                let src = self.resolve_source(f, &scope, depth, few && !preserved)?;
                 for n in &src.names {
                     scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: false });
                 }
@@ -343,7 +355,17 @@ impl Database {
 
         let mut binder = Binder::new(self, &scope, depth);
         binder.allow_corr = true;
-        let filter = sel.filter.as_ref().map(|f| binder.bind(f)).transpose()?;
+        binder.windows = sel.windows.clone();
+        let mut filter = sel.filter.as_ref().map(|f| binder.bind(f)).transpose()?;
+        // A merged view's own condition joins the query's when it reads a single source.
+        if sources.len() == 1 && !sources[0].intrinsic.is_empty() {
+            for extra in std::mem::take(&mut sources[0].intrinsic) {
+                filter = Some(match filter {
+                    Some(f) => BExpr::Bin(BinOp::And, Box::new(f), Box::new(extra)),
+                    None => extra,
+                });
+            }
+        }
         if is_agg {
             let exprs = sel.group_by.iter().map(|g| binder.bind(g)).collect::<Result<Vec<_>>>()?;
             binder.group = Some(GroupCtx { exprs, aggs: Vec::new() });
@@ -760,7 +782,7 @@ impl Database {
         }
 
         // Conditions on one source alone move into its scan (bound to its own columns).
-        let mut pre: Vec<Vec<BExpr>> = vec![Vec::new(); m];
+        let mut pre: Vec<Vec<BExpr>> = sources.iter().map(|s| s.intrinsic.clone()).collect();
         for p in preds.iter_mut() {
             if p.mask.count_ones() == 1 {
                 let s = p.mask.trailing_zeros() as usize;
@@ -1049,6 +1071,9 @@ impl Database {
             || sel.offset.is_some()
             || sel.distinct
         {
+            return None;
+        }
+        if !sources.first()?.intrinsic.is_empty() {
             return None;
         }
         let SourceData::Table(t) = &sources.first()?.data else { return None };

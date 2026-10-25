@@ -49,6 +49,8 @@ pub enum Expr {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct WindowSpec {
+    /// A named window this one starts from (`OVER (w ORDER BY x)` or `OVER w`).
+    pub base: Option<String>,
     pub partition_by: Vec<Expr>,
     pub order_by: Vec<OrderItem>,
     pub frame: Option<Frame>,
@@ -60,16 +62,20 @@ pub enum FrameUnits {
     Range,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FrameBound {
     UnboundedPreceding,
+    /// `n PRECEDING` in a ROWS frame: n rows.
     Preceding(usize),
     CurrentRow,
     Following(usize),
     UnboundedFollowing,
+    /// `x PRECEDING` in a RANGE frame: rows whose sort value is within `x` before the current one.
+    RangePreceding(Value),
+    RangeFollowing(Value),
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub units: FrameUnits,
     pub start: FrameBound,
@@ -152,6 +158,8 @@ pub struct Select {
     /// `TRANSFORM ... PIVOT ...`: this select supplies the row headings and the
     /// crosstab adds one column per pivot value.
     pub crosstab: Option<Box<Crosstab>>,
+    /// `WINDOW w AS (...)` definitions that window functions can name.
+    pub windows: Vec<(String, WindowSpec)>,
 }
 
 /// The `TRANSFORM aggregate ... PIVOT column [IN (values)]` parts of a crosstab query.

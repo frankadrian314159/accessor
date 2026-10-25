@@ -140,6 +140,12 @@ fn compute_one(rows: &[Row], w: &WinSpecB) -> Result<Vec<Value>> {
 
 fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Value>], desc: &[(bool, Option<bool>)], out: &mut [Value]) -> Result<()> {
     let m = part.len();
+    let uses_offset = |b: &FrameBound| matches!(b, FrameBound::RangePreceding(_) | FrameBound::RangeFollowing(_));
+    if let Some(f) = &w.frame {
+        if (uses_offset(&f.start) || uses_offset(&f.end)) && w.order.len() != 1 {
+            return Err(Error::runtime("a RANGE frame with an offset needs exactly one ORDER BY column"));
+        }
+    }
     // Peer groups: rows that tie on the ORDER BY keys (all rows, without one).
     let mut peer_start = vec![0usize; m];
     let mut peer_end = vec![0usize; m];
@@ -162,7 +168,7 @@ fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Val
         peer_end[p] = end - 1;
     }
 
-    let frame = w.frame.unwrap_or(Frame {
+    let frame = w.frame.clone().unwrap_or(Frame {
         units: FrameUnits::Range,
         start: FrameBound::UnboundedPreceding,
         end: if w.order.is_empty() { FrameBound::UnboundedFollowing } else { FrameBound::CurrentRow },
@@ -170,34 +176,72 @@ fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Val
     let bounds = |p: usize| -> Result<Option<(usize, usize)>> {
         let (lo, hi): (i64, i64) = match frame.units {
             FrameUnits::Rows => {
-                let lo = match frame.start {
+                let lo = match &frame.start {
                     FrameBound::UnboundedPreceding => 0,
-                    FrameBound::Preceding(k) => p as i64 - k as i64,
+                    FrameBound::Preceding(k) => p as i64 - *k as i64,
                     FrameBound::CurrentRow => p as i64,
-                    FrameBound::Following(k) => p as i64 + k as i64,
+                    FrameBound::Following(k) => p as i64 + *k as i64,
                     FrameBound::UnboundedFollowing => return Err(Error::runtime("a frame cannot start at UNBOUNDED FOLLOWING")),
+                    _ => return Err(Error::runtime("a ROWS frame counts rows; use a whole number")),
                 };
-                let hi = match frame.end {
+                let hi = match &frame.end {
                     FrameBound::UnboundedFollowing => m as i64 - 1,
-                    FrameBound::Following(k) => p as i64 + k as i64,
+                    FrameBound::Following(k) => p as i64 + *k as i64,
                     FrameBound::CurrentRow => p as i64,
-                    FrameBound::Preceding(k) => p as i64 - k as i64,
+                    FrameBound::Preceding(k) => p as i64 - *k as i64,
                     FrameBound::UnboundedPreceding => return Err(Error::runtime("a frame cannot end at UNBOUNDED PRECEDING")),
+                    _ => return Err(Error::runtime("a ROWS frame counts rows; use a whole number")),
                 };
                 (lo, hi)
             }
             FrameUnits::Range => {
-                let lo = match frame.start {
+                // The sort value of this row, and where rows within an offset of it begin and end.
+                let (d, nulls_first) = desc.first().copied().unwrap_or((false, None));
+                let key = okeys[part[p]].first();
+                let null_key = key.is_none_or(Value::is_null);
+                let position = |off: &Value, preceding: bool, upper: bool| -> Result<i64> {
+                    let key = key.expect("a RANGE offset has one sort key");
+                    let op = if preceding != d { crate::sql::ast::BinOp::Sub } else { crate::sql::ast::BinOp::Add };
+                    let target = crate::numeric::arith(op, key, off)?;
+                    // Binary search over the partition, which is sorted by this key.
+                    let (mut a, mut b) = (0usize, m);
+                    while a < b {
+                        let mid = (a + b) / 2;
+                        let c = super::select::cmp_nulls(&okeys[part[mid]][0], &target, d, nulls_first);
+                        let before = if upper { c != Ordering::Greater } else { c == Ordering::Less };
+                        if before {
+                            a = mid + 1;
+                        } else {
+                            b = mid;
+                        }
+                    }
+                    Ok(if upper { a as i64 - 1 } else { a as i64 })
+                };
+                let lo = match &frame.start {
                     FrameBound::UnboundedPreceding => 0,
                     FrameBound::CurrentRow => peer_start[p] as i64,
                     FrameBound::UnboundedFollowing => return Err(Error::runtime("a frame cannot start at UNBOUNDED FOLLOWING")),
-                    _ => return Err(Error::runtime("RANGE frames with an offset are not supported; use ROWS")),
+                    FrameBound::RangePreceding(off) | FrameBound::RangeFollowing(off) => {
+                        if null_key {
+                            peer_start[p] as i64
+                        } else {
+                            position(off, matches!(frame.start, FrameBound::RangePreceding(_)), false)?
+                        }
+                    }
+                    _ => return Err(Error::runtime("a RANGE frame takes a value such as 5 or INTERVAL '1 day', not a row count")),
                 };
-                let hi = match frame.end {
+                let hi = match &frame.end {
                     FrameBound::UnboundedFollowing => m as i64 - 1,
                     FrameBound::CurrentRow => peer_end[p] as i64,
                     FrameBound::UnboundedPreceding => return Err(Error::runtime("a frame cannot end at UNBOUNDED PRECEDING")),
-                    _ => return Err(Error::runtime("RANGE frames with an offset are not supported; use ROWS")),
+                    FrameBound::RangePreceding(off) | FrameBound::RangeFollowing(off) => {
+                        if null_key {
+                            peer_end[p] as i64
+                        } else {
+                            position(off, matches!(frame.end, FrameBound::RangePreceding(_)), true)?
+                        }
+                    }
+                    _ => return Err(Error::runtime("a RANGE frame takes a value such as 5 or INTERVAL '1 day', not a row count")),
                 };
                 (lo, hi)
             }
@@ -277,7 +321,7 @@ fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Val
                 }
             };
             let whole = matches!(
-                (frame.start, frame.end),
+                (&frame.start, &frame.end),
                 (FrameBound::UnboundedPreceding, FrameBound::UnboundedFollowing)
             );
             if whole {
@@ -287,7 +331,7 @@ fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Val
                 }
                 let v = st.finish();
                 (0..m).for_each(|p| out[part[p]] = v.clone());
-            } else if frame.start == FrameBound::UnboundedPreceding {
+            } else if matches!(frame.start, FrameBound::UnboundedPreceding) {
                 // A growing frame: feed each row once.
                 let mut st = AggState::new(&spec);
                 let mut fed = 0;
