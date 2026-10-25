@@ -6,6 +6,7 @@ pub mod table;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::{Column, ForeignKey, IndexDef, TableSchema};
+use crate::sequence::SequenceDef;
 use crate::value::{DataType, Row, Value};
 pub use table::{RowId, Table};
 
@@ -37,6 +38,14 @@ pub enum Op {
     SetDefault { table: String, name: String, value: Option<Value> },
     /// `ALTER COLUMN ... SET NOT NULL` / `DROP NOT NULL`.
     SetNotNull { table: String, name: String, not_null: bool },
+    /// Whether a relationship may be (and starts out) deferred; the table's stored form does not carry it.
+    SetForeignKeyTiming { table: String, name: String, deferrable: bool, initially_deferred: bool },
+    CreateSequence(SequenceDef),
+    DropSequence(String),
+    /// `ALTER SEQUENCE`: replaces the definition.
+    AlterSequence(SequenceDef),
+    /// The last number a sequence handed out; written as it happens, outside any transaction.
+    SequenceValue { name: String, last: Option<i64> },
 }
 
 impl Op {

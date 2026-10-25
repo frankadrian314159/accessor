@@ -36,6 +36,7 @@ From loosest to tightest binding:
 | 8 | unary `-`, `+` |
 | 9 | `^` (power) |
 | 10 | `AT TIME ZONE` |
+| 11 | `->`, `->>` (JSON member or element) |
 
 Arithmetic on the [numeric types](../../README.md#numbers) is exact: the result type depends only on the operand types. `/` gives an exact `DECIMAL` when the quotient terminates and a 50-digit `DECIMAL` otherwise; `RATIONAL` stays exact; a whole-number overflow becomes `BIGNUM`. Dividing by zero is an error. Date arithmetic: a date plus or minus a number is a date that many days away; the difference of two dates is a number of days.
 
@@ -89,6 +90,14 @@ Matching ignores case. `ESCAPE` names a character that takes away the special me
 | `INTERVAL '1 day' * 3` | scales an interval |
 
 See [../types/timestamptz.md](../types/timestamptz.md) and [../types/interval.md](../types/interval.md).
+
+## JSON access
+
+`doc -> key` gives the member (text key) or element (whole-number position, from 0) of a JSON document as JSON; `doc ->> key` gives it as text or a number. They chain: `body -> 'items' -> 0 ->> 'name'`. See [functions/json.md](../functions/json.md).
+
+## Sequence values
+
+`NEXT VALUE FOR seq` takes the next number of a [sequence](sequences.md); `PREVIOUS VALUE FOR seq` is its current number.
 
 ## CASE
 

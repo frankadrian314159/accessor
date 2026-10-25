@@ -17,7 +17,9 @@ The names of the standard's features here are descriptive; they are not the feat
 | Predicates | comparisons, `BETWEEN` (`SYMMETRIC`/`ASYMMETRIC`), `IN`, `LIKE ... ESCAPE`, `IS [NOT] NULL`, `IS [NOT] TRUE/FALSE/UNKNOWN`, `IS [NOT] DISTINCT FROM`, `EXISTS`, quantified comparisons |
 | Expressions | searched and simple `CASE`, `CAST`, `COALESCE`, `NULLIF`, `EXTRACT`, `POSITION`, `SUBSTRING ... FROM ... FOR`, `TRIM` with `LEADING`/`TRAILING`/`BOTH`, `CHAR_LENGTH`, `OCTET_LENGTH`, `UPPER`, `LOWER`, `ABS`, `MOD`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG10`, `FLOOR`, `CEIL`, trigonometric functions, `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`, typed date literals |
 | Data changes | `INSERT` (values, query, `DEFAULT VALUES`), `UPDATE`, `DELETE`, `MERGE` (matched update/delete, not-matched insert), `TRUNCATE TABLE` |
-| Definition | `CREATE`/`ALTER`/`DROP TABLE` (including `RENAME TO`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`); `CREATE OR REPLACE VIEW`/`TRIGGER`; `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`/`SET NULL`; identity columns (`GENERATED ... AS IDENTITY`); generated columns (`GENERATED ALWAYS AS (expr)`); `IF [NOT] EXISTS`; `CREATE`/`DROP INDEX`; `CREATE`/`DROP VIEW`; `CREATE`/`DROP TRIGGER` |
+| Definition | `CREATE`/`ALTER`/`DROP TABLE` (including `RENAME TO`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`); `CREATE OR REPLACE VIEW`/`TRIGGER`; `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`/`SET NULL`; identity columns (`GENERATED ... AS IDENTITY`); generated columns (`GENERATED ALWAYS AS (expr)`); `IF [NOT] EXISTS`; `CREATE`/`DROP INDEX`; `CREATE`/`DROP VIEW`; `CREATE`/`DROP TRIGGER`; `CREATE`/`ALTER`/`DROP SEQUENCE` with `NEXT VALUE FOR`; `DEFERRABLE` foreign keys with `SET CONSTRAINTS`; `SET DEFAULT` and `NO ACTION` referential actions |
+| Triggers | `BEFORE`, `AFTER` and `INSTEAD OF`; `FOR EACH ROW` and `FOR EACH STATEMENT`; several events in one trigger; `UPDATE OF column`; `WHEN` |
+| JSON | a `JSON` type; `->`, `->>`; value, query, set, remove, merge-patch, contains, object/array construction, `JSON_ARRAYAGG`, `JSON_EACH` (a simplified form of SQL/JSON, with a limited path language) |
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`; transactional DDL |
 | Types | exact and approximate numerics, character strings, booleans, date-times, `TIMESTAMP WITH TIME ZONE`, `INTERVAL`, with the standard's spellings (`VARCHAR`, `NUMERIC`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, ...) |
 
@@ -52,7 +54,7 @@ These parts of the standard are not available. Using one gives a syntax error or
 * `INTERVAL` is a single type (months, days, seconds), not the standard's separate year-month and day-time classes with qualifiers such as `INTERVAL DAY(3) TO SECOND(2)`; `OVERLAPS`; `TIME WITH TIME ZONE` as a type of its own (it is read as `TIMESTAMPTZ`); sub-second precision.
 * `BLOB`, `BINARY`/`VARBINARY` and binary literals.
 * Collection and structured types: `ARRAY`, `MULTISET`, `ROW`, `REF`, user-defined and distinct types (`CREATE TYPE`).
-* `XML` and `JSON` types, the SQL/XML and SQL/JSON functions and path language.
+* The `XML` type and SQL/XML. SQL/JSON is only partly there: there is no `IS JSON` predicate (use `JSON_VALID`), no `JSON_TABLE`, no `JSON_EXISTS`, and the path language has only keys, positions and `$` (no filters, wildcards or recursive descent).
 * Row values in `SELECT` lists and as sub-query results (`(a, b) = (SELECT x, y ...)`); row comparisons and `IN` work. The `UNIQUE` and `MATCH` predicates.
 * Regular-expression predicates: `SIMILAR TO` and `LIKE_REGEX`; `OVERLAY`, `TRANSLATE`, `NORMALIZE`.
 * `CURRENT_USER`, `SESSION_USER` and the other user functions (there are no users).
@@ -71,17 +73,17 @@ These parts of the standard are not available. Using one gives a syntax error or
 ### Definitions and data changes
 
 * Schemas, catalogs and qualified names (`schema.table`); `CREATE SCHEMA`; `INFORMATION_SCHEMA`.
-* `CREATE DOMAIN`, `CREATE SEQUENCE` and `NEXT VALUE FOR`, `CREATE ASSERTION`, collations and character sets (`COLLATE`).
+* `CREATE DOMAIN`, `CREATE ASSERTION`, collations and character sets (`COLLATE`).
 * `CREATE OR REPLACE TABLE`, `CREATE TABLE ... AS`, `CREATE TABLE ... LIKE`, temporary tables, materialised views, recursive views, views updatable by the standard's fuller rules (joins, aggregates), `WITH LOCAL/CASCADED CHECK OPTION`.
 * `ALTER TABLE` actions `ADD PRIMARY KEY` and `ADD UNIQUE` (use `CREATE UNIQUE INDEX`).
-* Deferrable constraints (`DEFERRABLE`, `SET CONSTRAINTS`), `MATCH FULL/PARTIAL`, `NO ACTION` and `SET DEFAULT` referential actions.
+* Deferrable `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints (only foreign keys can be deferred); `MATCH FULL/PARTIAL`; sequence options `AS type` and `CACHE` are accepted and ignored; `OWNED BY`.
 * Temporal tables (`PERIOD FOR`, `WITH SYSTEM VERSIONING`).
 * `INSERT ... OVERRIDING`.
 
 ### Routines, triggers and administration
 
 * `CREATE FUNCTION`, `CREATE PROCEDURE` and the procedural language (SQL/PSM): variables, `IF`, loops, handlers. The substitutes are parameterised saved queries (`CREATE QUERY`, `EXEC`) and triggers.
-* Triggers: statement-level triggers, `INSTEAD OF`, `REFERENCING OLD/NEW TABLE`, `UPDATE OF column`, one trigger for several events, trigger bodies other than `INSERT`, `UPDATE`, `DELETE` and `RAISE`.
+* Triggers: `REFERENCING OLD/NEW TABLE` transition tables, `INSTEAD OF` on tables, statement triggers that fire when no row changed, `SET NEW.col = ...` in `BEFORE` triggers, procedural trigger bodies.
 * Privileges and roles (`GRANT`, `REVOKE`, `CREATE ROLE`), `SET TRANSACTION` isolation levels, `SET SESSION` statements.
 * The other parts of the standard: client interface (SQL/CLI), foreign data (SQL/MED), Java routines (SQL/JRT), XML (SQL/XML), multidimensional arrays (SQL/MDA), property graphs (SQL/PGQ).
 
@@ -89,5 +91,5 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 * Access-style syntax: `[bracketed names]`, `TOP n`, `&` concatenation, `#date#` literals, `IIf`, `Nz`, `\` and `MOD`, `First`/`Last`, `DateAdd`/`DateDiff`/`DateSerial`, `Format`, `DELETE *`, and crosstab queries (`TRANSFORM … PIVOT`; standard SQL has no pivot clause).
 * A numeric tower with exact arithmetic: `BIGNUM`, `DECIMAL`, `CURRENCY` and `RATIONAL` ([see the README](../../README.md#numbers)).
-* `CALCULATED` columns, parameterised saved queries with `EXEC`, `RAISE` in triggers.
+* `CALCULATED` columns, parameterised saved queries with `EXEC`, `RAISE` in triggers, `SELECT` in trigger bodies, `LASTVAL`/`SETVAL`.
 * `EXPLAIN` and the [query optimizer](../optimizer/README.md).

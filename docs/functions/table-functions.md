@@ -36,6 +36,15 @@ GROUP BY g.d ORDER BY g.d;
 
 Months are added one at a time to the previous value, so a series that starts on the 31st continues on the last day of each month it passes through (31 Jan, 29 Feb, 29 Mar, ...).
 
+## JSON_EACH
+
+`JSON_EACH(doc)` returns one row for each member of a JSON object, or element of a JSON array, with the columns `key` and `value`. For an array `key` is the position (from 0); for an object it is the member name. A scalar `value` is an ordinary SQL value (text, number, yes/no, or NULL for JSON `null`), and an object or array stays `JSON`. A NULL document gives no rows; a document that is not an object or array is an error.
+
+```sql
+SELECT key, value FROM JSON_EACH('{"a": 1, "b": [2, 3]}');           -- a | 1   and   b | [2,3]
+SELECT D.ID, t.value FROM Docs D, LATERAL JSON_EACH(D.Body -> 'tags') AS t;    -- one row per tag
+```
+
 ## SPLIT_STRING
 
 `SPLIT_STRING(text, separator)` returns the pieces of `text` between occurrences of `separator`, with columns `value` (text) and `ordinal` (1, 2, 3, ...). An empty separator splits into characters; a NULL argument gives no rows.

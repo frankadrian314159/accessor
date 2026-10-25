@@ -28,6 +28,13 @@ impl Database {
             c.primary_key = d.primary_key;
             c.not_null = d.not_null || d.primary_key;
             c.autonumber = d.autonumber;
+            if let Some(Value::Text(t)) = &d.default {
+                if let Some(seq) = (**t).strip_prefix(crate::schema::SEQUENCE_DEFAULT) {
+                    if !crate::sequence::exists(&self.seqs, seq) {
+                        return Err(Error::catalog(format!("the sequence '{seq}' does not exist")));
+                    }
+                }
+            }
             c.default = match &d.default {
                 Some(v) => Some(
                     v.coerce_to(d.data_type)
@@ -82,7 +89,10 @@ impl Database {
             schema.indexes.extend(index);
         }
 
-        self.apply_all(vec![Op::CreateTable(schema)])?;
+        let timing: Vec<Op> = schema.foreign_keys.iter().filter(|f| f.deferrable).map(|f| timing_op(&schema.name, f)).collect();
+        let mut ops = vec![Op::CreateTable(schema)];
+        ops.extend(timing);
+        self.apply_all(ops)?;
         Ok(QueryResult::default())
     }
 
@@ -132,7 +142,9 @@ impl Database {
                     }
                     ops.push(Op::AddColumn { table: table.clone(), column: c });
                     ops.extend(index.map(|def| Op::CreateIndex { table: table.clone(), def }));
+                    let timing = fk.deferrable.then(|| timing_op(&table, &fk));
                     ops.push(Op::AddForeignKey { table, fk });
+                    ops.extend(timing);
                 } else {
                     ops.push(Op::AddColumn { table, column: c });
                 }
@@ -175,7 +187,9 @@ impl Database {
                 }
                 let mut ops: Vec<Op> =
                     index.map(|def| Op::CreateIndex { table: table.clone(), def }).into_iter().collect();
+                let timing = fk.deferrable.then(|| timing_op(&table, &fk));
                 ops.push(Op::AddForeignKey { table, fk });
+                ops.extend(timing);
                 ops
             }
             AlterAction::AddCheck { name, expr } => {
@@ -270,6 +284,8 @@ impl Database {
             ref_columns,
             on_delete: def.on_delete,
             on_update: def.on_update,
+            deferrable: def.deferrable,
+            initially_deferred: def.initially_deferred,
         };
         Ok((fk, index))
     }
@@ -350,4 +366,14 @@ fn calculated_column(d: &ColumnDef) -> Result<Column> {
     let mut c = Column::new(d.name.clone(), DataType::Calculated);
     c.default = Some(Value::text(expr));
     Ok(c)
+}
+
+/// The log entry that says a relationship may be deferred.
+fn timing_op(table: &str, fk: &ForeignKey) -> Op {
+    Op::SetForeignKeyTiming {
+        table: table.to_string(),
+        name: fk.name.clone(),
+        deferrable: fk.deferrable,
+        initially_deferred: fk.initially_deferred,
+    }
 }

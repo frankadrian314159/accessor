@@ -72,7 +72,15 @@ A `TRANSFORM … PIVOT` query is as wide as the number of distinct pivot values.
 
 A view of the form `SELECT * FROM table WHERE ...` costs nothing: it is merged into the query ([views.md](views.md)). A view that selects only some columns, joins or summarises is computed first, so put a condition you care about inside the view, or select from the table.
 
-## 9. Switch it off to check
+## 9. JSON columns
+
+A condition on something *inside* a document, such as `WHERE JSON_VALUE(Body, '$.status') = 'open'`, reads and parses the document of every row it examines: an index on `Body` cannot help, because it holds whole documents. If you search a document member often, make it a column of its own: an ordinary column that you fill when you store the document, or a [calculated column](../types/calculated.md) (`Status CALCULATED AS (JSON_VALUE(Body, '$.status'))`) with an index on it. Conditions on that column use the index in the usual way.
+
+## 10. Sequences and volatile functions
+
+`NEXTVAL`, `Now()` and the other functions whose answer changes from call to call are never folded into a constant, so a condition that contains one is not used to pick an index. Take the value first (`SELECT NEXTVAL('s')` in its own statement, or a parameter) when you want to look it up by index.
+
+## 11. Switch it off to check
 
 If a result looks wrong, or you want to compare timings, turn the optimizer off:
 

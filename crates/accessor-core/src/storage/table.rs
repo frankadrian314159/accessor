@@ -327,6 +327,9 @@ impl Table {
         if let Some(d) = column.default.take() {
             column.default = Some(if d.is_null() { d } else { d.coerce_to(column.data_type)? });
         }
+        if column.sequence_default().is_some() && self.live > 0 {
+            return Err(Error::catalog("a column filled from a sequence cannot be added to a table that has records"));
+        }
         // A calculated field's "default" is its expression; its values are computed afterwards.
         let fill = if column.is_calculated() { Value::Null } else { column.default.clone().unwrap_or(Value::Null) };
         if fill.is_null() && column.not_null && self.live > 0 {
@@ -480,6 +483,18 @@ impl Table {
                 }
             }
         }
+    }
+
+    pub(crate) fn set_foreign_key_timing(&mut self, name: &str, deferrable: bool, initially_deferred: bool) -> Result<()> {
+        let fk = self
+            .schema
+            .foreign_keys
+            .iter_mut()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::catalog(format!("no constraint named '{name}' on '{}'", self.schema.name)))?;
+        fk.deferrable = deferrable;
+        fk.initially_deferred = initially_deferred;
+        Ok(())
     }
 
     pub(crate) fn drop_foreign_key(&mut self, name: &str) -> Result<()> {

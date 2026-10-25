@@ -46,7 +46,8 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 
 ```bnf
 <statement> ::= <query>
-              | <explain> | <set-time-zone>
+              | <explain> | <set-time-zone> | <set-constraints>
+              | <create-sequence> | <alter-sequence> | <drop-sequence>
               | <insert> | <update> | <delete> | <merge> | <truncate>
               | <create-table> | <create-index> | <create-view> | <create-trigger>
               | <drop> | <alter-table>
@@ -61,6 +62,14 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                 PIVOT <concat> [ IN '(' <expr-list> ')' ]
 <explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
 <set-time-zone> ::= SET ( TIME ZONE | TIMEZONE TO ) ( <string> | LOCAL | UTC )
+<set-constraints> ::= SET CONSTRAINTS ( ALL | <identifier-list> ) ( DEFERRED | IMMEDIATE )
+
+<create-sequence> ::= CREATE SEQUENCE [ IF NOT EXISTS ] <identifier> { <sequence-option> }
+<alter-sequence>  ::= ALTER SEQUENCE [ IF EXISTS ] <identifier> { <sequence-option> }
+<drop-sequence>   ::= DROP SEQUENCE [ IF EXISTS ] <identifier>
+<sequence-option> ::= AS <identifier> | START [ WITH ] <integer> | INCREMENT [ BY ] <integer>
+                    | MINVALUE <integer> | NO MINVALUE | MAXVALUE <integer> | NO MAXVALUE
+                    | CYCLE | NO CYCLE | CACHE <integer> | RESTART [ WITH <integer> ]   (* RESTART only in ALTER *)
 ```
 
 ### Queries
@@ -73,7 +82,9 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <set-operator>  ::= UNION | INTERSECT | EXCEPT | MINUS
 <query-term>    ::= <select-core>
                   | <values>
-                  | '(' <query> ')'
+                  | NEXT VALUE FOR <identifier> | PREVIOUS VALUE FOR <identifier>
+                | <primary> ( '->' | '->>' ) <primary>                  (* JSON member or element *)
+                | '(' <query> ')'
 
 <values>        ::= VALUES <row> { ',' <row> }
 <row>           ::= '(' <expr> { ',' <expr> } ')'
@@ -177,9 +188,10 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 
 <check>        ::= CHECK '(' <expr> ')'
 <foreign-key>  ::= FOREIGN KEY '(' <identifier-list> ')'
-                   REFERENCES <identifier> [ '(' <identifier-list> ')' ] { <referential-action> }
+                   REFERENCES <identifier> [ '(' <identifier-list> ')' ] { <referential-action> | <timing> }
 <referential-action> ::= ON DELETE <action> | ON UPDATE <action>
-<action>       ::= RESTRICT | CASCADE | SET NULL
+<action>       ::= RESTRICT | CASCADE | SET NULL | SET DEFAULT | NO ACTION
+<timing>       ::= [ NOT ] DEFERRABLE | INITIALLY ( DEFERRED | IMMEDIATE )
 
 <data-type>    ::= <type-name> [ '(' <integer> [ ',' <integer> ] ')' ]     (* the sizes are accepted and ignored *)
                  | CALCULATED [ AS ] '(' <expr> ')'
@@ -196,7 +208,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                  | YESNO | BIT | BOOLEAN | BOOL | LOGICAL
                  | DATETIME | DATE | TIME | TIMESTAMP [ WITHOUT TIME ZONE ]
                  | TIMESTAMPTZ | ( TIMESTAMP | TIME ) WITH TIME ZONE
-                 | INTERVAL
+                 | INTERVAL | JSON | JSONB
 
 <create-index> ::= CREATE [ UNIQUE ] INDEX [ IF NOT EXISTS ] <identifier> ON <identifier> '(' <identifier-list> ')'
 
@@ -210,10 +222,11 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                    [ '(' ] [ <argument> { ',' <argument> } ] [ ')' ]
 <argument>     ::= [ <parameter> '=' ] <expr>
 
-<create-trigger> ::= CREATE [ OR REPLACE ] TRIGGER <identifier> ( BEFORE | AFTER ) ( INSERT | UPDATE | DELETE )
+<create-trigger> ::= CREATE [ OR REPLACE ] TRIGGER <identifier> ( BEFORE | AFTER | INSTEAD OF ) <trigger-event> { OR <trigger-event> }
                      ON <identifier> [ FOR EACH ROW ] [ WHEN <expr> ]
                      BEGIN <trigger-statement> ';' { <trigger-statement> ';' } END
-<trigger-statement> ::= <insert> | <update> | <delete> | <raise>
+<trigger-event> ::= INSERT | DELETE | UPDATE [ OF <identifier-list> ]
+<trigger-statement> ::= <insert> | <update> | <delete> | <query> | <raise>
 <raise>        ::= RAISE <expr>
 
 <drop>         ::= DROP TABLE [ IF EXISTS ] <identifier>

@@ -239,6 +239,8 @@ pub struct ForeignKeyDef {
     pub ref_columns: Vec<String>,
     pub on_delete: RefAction,
     pub on_update: RefAction,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -277,6 +279,8 @@ pub struct ParamDecl {
 pub enum TriggerTiming {
     Before,
     After,
+    /// Replaces the change to a view.
+    InsteadOf,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -286,13 +290,17 @@ pub enum TriggerEvent {
     Delete,
 }
 
-/// A row-level trigger. `sql` is the original `CREATE TRIGGER` text, which is
-/// what gets stored.
+/// A trigger, for each row or each statement. `sql` is the original `CREATE TRIGGER` text,
+/// which is what gets stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TriggerDef {
     pub name: String,
     pub timing: TriggerTiming,
-    pub event: TriggerEvent,
+    pub events: Vec<TriggerEvent>,
+    /// `UPDATE OF a, b`: fires only when one of these columns changes.
+    pub update_of: Vec<String>,
+    /// `FOR EACH STATEMENT`: fires once per statement, with no `OLD` or `NEW`.
+    pub each_statement: bool,
     pub table: String,
     pub when: Option<Expr>,
     pub body: Vec<Statement>,
@@ -327,12 +335,17 @@ pub enum Statement {
     Raise(Expr),
     CreateTrigger(Box<TriggerDef>),
     DropTrigger(String),
+    CreateSequence { name: String, options: crate::sequence::SequenceOptions },
+    AlterSequence { name: String, options: crate::sequence::SequenceOptions },
+    DropSequence(String),
     /// `CREATE OR REPLACE VIEW|QUERY|TRIGGER`: drop an existing object of that name, then create.
     OrReplace(Box<Statement>),
     /// `TRUNCATE [TABLE] t`: delete every record.
     Truncate(String),
     /// `SET TIME ZONE 'Europe/Paris'`: the zone of the session.
     SetTimeZone(String),
+    /// `SET CONSTRAINTS ALL | names DEFERRED | IMMEDIATE`.
+    SetConstraints { names: Option<Vec<String>>, deferred: bool },
     /// `EXPLAIN query`: run the query and report how it was planned.
     Explain(Box<Select>),
     /// `DROP ... IF EXISTS` (`missing_ok`) or `CREATE ... IF NOT EXISTS`.

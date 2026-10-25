@@ -15,7 +15,19 @@ pub struct Column {
     pub default: Option<Value>,
 }
 
+/// Text that stands in for the default of a column filled from a sequence
+/// (`DEFAULT NEXT VALUE FOR s`): this prefix, then the sequence name.
+pub const SEQUENCE_DEFAULT: &str = "\u{1}nextval:";
+
 impl Column {
+    /// The sequence that fills this column when no value is given.
+    pub fn sequence_default(&self) -> Option<&str> {
+        match &self.default {
+            Some(Value::Text(s)) if !self.is_calculated() => (**s).strip_prefix(SEQUENCE_DEFAULT),
+            _ => None,
+        }
+    }
+
     pub fn is_calculated(&self) -> bool {
         self.data_type == DataType::Calculated
     }
@@ -60,10 +72,15 @@ pub enum RefAction {
     Cascade,
     /// Set the referencing fields to Null.
     SetNull,
+    /// Set the referencing fields to their defaults.
+    SetDefault,
+    /// Like `Restrict`, but a deferrable relationship may wait until the transaction ends.
+    NoAction,
 }
 
 impl RefAction {
-    pub const ALL: [RefAction; 3] = [RefAction::Restrict, RefAction::Cascade, RefAction::SetNull];
+    pub const ALL: [RefAction; 5] =
+        [RefAction::Restrict, RefAction::NoAction, RefAction::Cascade, RefAction::SetNull, RefAction::SetDefault];
 
     /// The SQL keyword(s) for this action.
     pub fn sql(self) -> &'static str {
@@ -71,6 +88,8 @@ impl RefAction {
             RefAction::Restrict => "RESTRICT",
             RefAction::Cascade => "CASCADE",
             RefAction::SetNull => "SET NULL",
+            RefAction::SetDefault => "SET DEFAULT",
+            RefAction::NoAction => "NO ACTION",
         }
     }
 }
@@ -85,6 +104,12 @@ pub struct ForeignKey {
     pub ref_columns: Vec<usize>,
     pub on_delete: RefAction,
     pub on_update: RefAction,
+    /// May be checked at the end of the transaction instead of the end of each statement.
+    /// (Not part of the table's stored form; the file keeps it separately.)
+    #[serde(skip)]
+    pub deferrable: bool,
+    #[serde(skip)]
+    pub initially_deferred: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

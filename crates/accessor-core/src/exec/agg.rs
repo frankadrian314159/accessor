@@ -23,6 +23,7 @@ pub enum AggFn {
     VarSamp,
     Every,
     AnyTrue,
+    JsonArrayAgg,
 }
 
 impl AggFn {
@@ -43,6 +44,7 @@ impl AggFn {
             "VARIANCE" | "VAR_SAMP" => AggFn::VarSamp,
             "EVERY" | "BOOL_AND" => AggFn::Every,
             "BOOL_OR" => AggFn::AnyTrue,
+            "JSON_ARRAYAGG" | "JSON_AGG" => AggFn::JsonArrayAgg,
             _ => return None,
         })
     }
@@ -63,6 +65,7 @@ impl AggFn {
             AggFn::VarSamp => "VarSamp",
             AggFn::Every => "Every",
             AggFn::AnyTrue => "AnyTrue",
+            AggFn::JsonArrayAgg => "JsonArrayAgg",
         }
     }
 }
@@ -164,6 +167,7 @@ impl AggState {
             }
             AggFn::Last => self.acc = Some(v.clone()),
             AggFn::StringAgg => self.parts.push(v.to_string()),
+            AggFn::JsonArrayAgg => self.parts.push(crate::json::to_text(&crate::json::from_value(v))),
             AggFn::StddevPop | AggFn::StddevSamp | AggFn::VarPop | AggFn::VarSamp => {
                 let x = v
                     .num_lenient()
@@ -201,6 +205,13 @@ impl AggState {
                     Value::Null
                 } else {
                     Value::text(&self.parts.join(&self.sep))
+                }
+            }
+            AggFn::JsonArrayAgg => {
+                if self.parts.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Json(format!("[{}]", self.parts.join(",")).as_str().into())
                 }
             }
             AggFn::StddevPop | AggFn::StddevSamp | AggFn::VarPop | AggFn::VarSamp => {

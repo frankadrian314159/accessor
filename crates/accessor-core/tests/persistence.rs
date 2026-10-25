@@ -771,3 +771,95 @@ fn intervals_and_zoned_timestamps_survive_a_reopen() {
     assert_eq!(r.rows[0][1].to_string(), "1 month 2 days 03:04:05");
     assert_eq!(db.query("SELECT TypeName(at), TypeName(dur) FROM e").unwrap().rows[0][1].to_string(), "INTERVAL");
 }
+
+#[test]
+fn sequences_persist_and_never_repeat() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seq.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE SEQUENCE s START WITH 10; CREATE TABLE t (id INTEGER DEFAULT NEXTVAL('s'), n TEXT)").unwrap();
+        db.execute("INSERT INTO t (n) VALUES ('a'), ('b')").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t (n) VALUES ('rolled back')").unwrap();
+        db.execute("ROLLBACK").unwrap();
+    }
+    let mut db = Database::open(&path).unwrap();
+    db.execute("INSERT INTO t (n) VALUES ('c')").unwrap();
+    assert_eq!(db.query("SELECT id FROM t WHERE n = 'c'").unwrap().rows[0][0], Value::Int(13));
+    assert_eq!(db.sequences()[0].last, Some(13));
+}
+
+#[test]
+fn sequence_values_are_recovered_from_the_log_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("seqlog.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE SEQUENCE s").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("SELECT NEXTVAL('s'), NEXTVAL('s'), NEXTVAL('s')").unwrap();
+        // Simulate a crash: skip the clean-close checkpoint.
+        std::mem::forget(db);
+    }
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.sequences()[0].last, Some(3));
+}
+
+#[test]
+fn deferrable_relationships_survive_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("defer.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY); CREATE TABLE c (pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED)").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("CREATE TABLE d (pid INTEGER REFERENCES p (id) DEFERRABLE)").unwrap(); // only in the log
+        std::mem::forget(db);
+    }
+    let mut db = Database::open(&path).unwrap();
+    for (t, deferred) in [("c", true), ("d", false)] {
+        let fk = &db.table(t).unwrap().schema().foreign_keys[0];
+        assert!(fk.deferrable, "{t}");
+        assert_eq!(fk.initially_deferred, deferred, "{t}");
+    }
+    db.execute("BEGIN; INSERT INTO c VALUES (1); INSERT INTO p VALUES (1); COMMIT").unwrap();
+}
+
+#[test]
+fn new_style_triggers_survive_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trig.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER); CREATE TABLE log (msg TEXT);
+             CREATE VIEW v AS SELECT id FROM t WHERE n > 0;
+             CREATE TRIGGER s AFTER INSERT OR UPDATE OF n ON t FOR EACH STATEMENT BEGIN INSERT INTO log VALUES ('stmt'); END;
+             CREATE TRIGGER i INSTEAD OF INSERT ON v BEGIN INSERT INTO t VALUES (NEW.id, 1); END",
+        )
+        .unwrap();
+    }
+    let mut db = Database::open(&path).unwrap();
+    db.execute("INSERT INTO v VALUES (5)").unwrap();
+    assert_eq!(count(&db, "log"), 1);
+    assert_eq!(count(&db, "t"), 1);
+}
+
+#[test]
+fn json_columns_survive_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("json.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute(r#"CREATE TABLE d (id INTEGER, body JSON); INSERT INTO d VALUES (1, '{"b":[1,2],"a":null}')"#).unwrap();
+        db.checkpoint().unwrap();
+        db.execute(r#"INSERT INTO d VALUES (2, '[true]')"#).unwrap(); // only in the log
+        std::mem::forget(db);
+    }
+    let db = Database::open(&path).unwrap();
+    let r = db.query("SELECT body FROM d ORDER BY id").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), r#"{"a":null,"b":[1,2]}"#);
+    assert_eq!(r.rows[1][0].to_string(), "[true]");
+    assert_eq!(db.table("d").unwrap().schema().columns[1].data_type, accessor_core::DataType::Json);
+}

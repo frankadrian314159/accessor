@@ -17,11 +17,21 @@ use crate::value::{Row, Value};
 /// Builds a full row from explicitly supplied values: defaults first, then
 /// the supplied values, then type coercion and AutoNumber assignment.
 pub(crate) fn build_row(schema: &TableSchema, positions: &[usize], vals: Vec<Value>, next_auto: &mut i64) -> Result<Row> {
-    let mut row: Row = schema
-        .columns
-        .iter()
-        .map(|c| if c.is_calculated() { Value::Null } else { c.default.clone().unwrap_or(Value::Null) })
-        .collect();
+    let mut row: Row = Vec::with_capacity(schema.columns.len());
+    for (i, c) in schema.columns.iter().enumerate() {
+        row.push(if c.is_calculated() {
+            Value::Null
+        } else if let Some(seq) = c.sequence_default() {
+            // A column that was given a value does not use up a number.
+            if positions.contains(&i) {
+                Value::Null
+            } else {
+                Value::Int(crate::sequence::next_value(seq)?)
+            }
+        } else {
+            c.default.clone().unwrap_or(Value::Null)
+        });
+    }
     for (&p, v) in positions.iter().zip(vals) {
         if schema.columns[p].is_calculated() {
             return Err(Database::calculated_write_error(&schema.name, &schema.columns[p].name));

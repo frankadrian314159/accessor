@@ -313,7 +313,7 @@ impl BExpr {
             BExpr::InList { expr, list, .. } => expr.is_constant() && list.iter().all(BExpr::is_constant),
             BExpr::InSet { expr, .. } => expr.is_constant(),
             BExpr::Func(f, args) => {
-                !matches!(f, ScalarFn::Now | ScalarFn::Date | ScalarFn::NowTz | ScalarFn::LocalNow | ScalarFn::LocalDate) && args.iter().all(BExpr::is_constant)
+                !f.is_volatile() && args.iter().all(BExpr::is_constant)
             }
             BExpr::Case { whens, else_expr } => {
                 whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())

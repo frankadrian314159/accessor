@@ -68,12 +68,16 @@ Each type has a canonical name and aliases; the aliases are what the standard an
 | `DATETIME` | `DATE`, `TIME`, `TIMESTAMP` | a date and time of day, to the second, with no time zone |
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | a moment in time, shown in a time zone ([types/timestamptz.md](../types/timestamptz.md)) |
 | `INTERVAL` | | a length of time in months, days and seconds ([types/interval.md](../types/interval.md)) |
+| `JSON` | `JSONB` | a JSON document ([types/json.md](../types/json.md)) |
 | `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL` | an `INTEGER` filled in automatically |
 | `CALCULATED` | | a value computed from the other columns |
 
 A length or precision after a type name (`VARCHAR(50)`, `NUMERIC(10, 2)`) is accepted and ignored: text has no length limit, and decimals have no fixed scale. Use `CAST(x AS DECIMAL(10,2))` or `ROUND` to round a value. `TIMESTAMP WITH TIME ZONE` makes a `TIMESTAMPTZ`; `TIMESTAMP WITHOUT TIME ZONE` is the plain `DATETIME`. `INTEGER`, `FLOAT` and the other numeric types behave as described in the README's Numbers section.
 
 ### AutoNumber
+
+For a number that is not tied to one table, see [sequences](sequences.md): `DEFAULT NEXT VALUE FOR seq` fills a column from a sequence.
+
 
 A `COUNTER` column (or any `INTEGER` column marked `IDENTITY` / `GENERATED ... AS IDENTITY`) gets the next number when an insert does not supply one: 1, 2, 3, and so on, never reused even after a delete. A supplied value is kept, and later numbers continue after it. A table has at most one AutoNumber column. `GENERATED ALWAYS` is accepted as a spelling of the same thing: values you supply are still accepted.
 
@@ -111,8 +115,27 @@ The referenced columns must be the primary key of the other table or be covered 
 | `RESTRICT` (default) | the change is refused while records refer to it |
 | `CASCADE` | the referring records are deleted, or their key follows the change |
 | `SET NULL` | the referring columns become NULL |
+| `SET DEFAULT` | the referring columns take their `DEFAULT` values (NULL if they have none); the result must itself refer to an existing record, or the change is refused |
+| `NO ACTION` | like `RESTRICT`, but a [deferrable](#deferrable-relationships) relationship may wait until the end of the transaction |
 
-A foreign key column that is NULL refers to nothing and is always allowed. An index on the referencing columns is created automatically. Foreign keys are checked at the end of each statement.
+A foreign key column that is NULL refers to nothing and is always allowed. An index on the referencing columns is created automatically. Foreign keys are checked at the end of each statement, unless they are deferred.
+
+### Deferrable relationships
+
+```sql
+CONSTRAINT FK_Child FOREIGN KEY (ParentID) REFERENCES Parent (ID)
+    DEFERRABLE INITIALLY DEFERRED
+```
+
+| Clause | Meaning |
+| --- | --- |
+| `NOT DEFERRABLE` (default) | always checked at the end of the statement |
+| `DEFERRABLE` or `DEFERRABLE INITIALLY IMMEDIATE` | checked at the end of the statement, but a transaction may defer it with `SET CONSTRAINTS` |
+| `DEFERRABLE INITIALLY DEFERRED` (or just `INITIALLY DEFERRED`) | inside a transaction, checked when it is committed |
+
+Inside a transaction, a deferred relationship may be broken for a while, so rows can be inserted in any order, or two rows can swap keys; when the transaction commits, every deferred relationship is verified, and if one is still broken the whole transaction is rolled back and `COMMIT` fails. [`SET CONSTRAINTS`](transactions.md#set-constraints) changes the timing for the rest of a transaction. Outside a transaction every statement is its own, so nothing is ever deferred.
+
+A deferrable relationship that gives no action behaves as `NO ACTION`; one without a `DEFERRABLE` clause behaves as `RESTRICT`. `RESTRICT` is always checked at once, and so are the actions that change rows (`CASCADE`, `SET NULL`, `SET DEFAULT`): only the check that a row has its parent, and the refusal of `NO ACTION`, wait. Only foreign keys can be deferred; `UNIQUE`, `PRIMARY KEY` and `CHECK` are always immediate.
 
 ## CREATE INDEX
 

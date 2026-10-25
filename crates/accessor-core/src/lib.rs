@@ -32,6 +32,8 @@ pub mod expr;
 mod calc;
 mod numeric;
 mod fk;
+pub mod sequence;
+mod json;
 mod trigger;
 pub mod schema;
 pub mod sql;

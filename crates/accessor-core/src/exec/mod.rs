@@ -5,6 +5,7 @@ pub mod bind;
 mod check;
 mod ddl;
 mod merge;
+mod seq;
 mod viewdml;
 pub(crate) mod optimizer;
 mod proc;
@@ -65,14 +66,34 @@ impl Database {
     }
 
     pub fn execute_statement(&mut self, st: &Statement) -> Result<QueryResult> {
+        let result = self.run_statement(st);
+        // Numbers handed out are logged even if the statement failed or its transaction is rolled back.
+        self.flush_sequences()?;
+        result
+    }
+
+    fn run_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         self.enter_session();
         match st {
+            Statement::SetConstraints { names, deferred } => {
+                self.set_constraints(names.as_deref(), *deferred).map(|_| QueryResult::default())
+            }
             Statement::SetTimeZone(name) => self.set_time_zone(name).map(|_| QueryResult::default()),
             Statement::Select(s) => self.run_select(s),
             Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. }
                 if self.table(table).is_none() && self.view_sql(table).is_some() =>
             {
-                self.exec_view_dml(st)
+                let event = match st {
+                    Statement::Insert { .. } => crate::sql::ast::TriggerEvent::Insert,
+                    Statement::Update { .. } => crate::sql::ast::TriggerEvent::Update,
+                    _ => crate::sql::ast::TriggerEvent::Delete,
+                };
+                let instead = self.instead_of_triggers(table, event);
+                if instead.is_empty() {
+                    self.exec_view_dml(st)
+                } else {
+                    self.exec_instead_of(st, instead)
+                }
             }
             Statement::Insert { table, columns, source } => self.exec_insert(table, columns, source),
             Statement::Update { table, assignments, filter } => self.exec_update(table, assignments, filter.as_ref()),
@@ -139,6 +160,9 @@ impl Database {
             Statement::Raise(_) => Err(Error::runtime("RAISE can only be used inside a trigger")),
             Statement::CreateTrigger(def) => self.exec_create_trigger(def),
             Statement::DropTrigger(name) => self.exec_drop_trigger(name),
+            Statement::CreateSequence { name, options } => self.exec_create_sequence(name, options),
+            Statement::AlterSequence { name, options } => self.exec_alter_sequence(name, options),
+            Statement::DropSequence(name) => self.exec_drop_sequence(name),
             Statement::Begin => self.begin().map(|_| QueryResult::default()),
             Statement::Commit => self.commit().map(|_| QueryResult::default()),
             Statement::Rollback => self.rollback().map(|_| QueryResult::default()),

@@ -60,6 +60,8 @@ pub enum Value {
     TimestampTz(i64),
     /// `INTERVAL`: months, days and seconds.
     Interval(Interval),
+    /// `JSON`: a JSON document, kept as canonical text.
+    Json(Arc<str>),
 }
 
 // ----- on-disk form ---------------------------------------------------------
@@ -85,6 +87,7 @@ enum Wire {
     Currency(Decimal),
     TimestampTz(i64),
     Interval(Interval),
+    Json(Arc<str>),
 }
 
 #[derive(Serialize)]
@@ -104,6 +107,7 @@ enum WireRef<'a> {
     Currency(&'a Decimal),
     TimestampTz(i64),
     Interval(&'a Interval),
+    Json(&'a str),
 }
 
 impl From<Wire> for Value {
@@ -124,6 +128,7 @@ impl From<Wire> for Value {
             Wire::Currency(d) => Value::Currency(d),
             Wire::TimestampTz(t) => Value::TimestampTz(t),
             Wire::Interval(i) => Value::Interval(i),
+            Wire::Json(s) => Value::Json(s),
         }
     }
 }
@@ -144,6 +149,7 @@ impl Serialize for Value {
             Value::Text(t) => WireRef::Text(t),
             Value::TimestampTz(t) => WireRef::TimestampTz(*t),
             Value::Interval(i) => WireRef::Interval(i),
+            Value::Json(s) => WireRef::Json(s),
         }
         .serialize(s)
     }
@@ -175,6 +181,8 @@ pub enum DataType {
     TimestampTz,
     /// A length of time in months, days and seconds.
     Interval,
+    /// A JSON document.
+    Json,
     /// A field whose value is an expression over the other fields of the same
     /// record. The expression is kept in the column's `default`; see
     /// [`crate::schema::Column::expression`].
@@ -199,6 +207,7 @@ enum TypeWire {
     Rational,
     TimestampTz,
     Interval,
+    Json,
 }
 
 impl From<TypeWire> for DataType {
@@ -217,6 +226,7 @@ impl From<TypeWire> for DataType {
             TypeWire::Rational => DataType::Rational,
             TypeWire::TimestampTz => DataType::TimestampTz,
             TypeWire::Interval => DataType::Interval,
+            TypeWire::Json => DataType::Json,
         }
     }
 }
@@ -237,6 +247,7 @@ impl From<DataType> for TypeWire {
             DataType::Calculated => TypeWire::Calculated,
             DataType::TimestampTz => TypeWire::TimestampTz,
             DataType::Interval => TypeWire::Interval,
+            DataType::Json => TypeWire::Json,
         }
     }
 }
@@ -256,6 +267,7 @@ impl DataType {
             DataType::DateTime => "DATETIME",
             DataType::TimestampTz => "TIMESTAMPTZ",
             DataType::Interval => "INTERVAL",
+            DataType::Json => "JSON",
             DataType::Calculated => "CALCULATED",
         }
     }
@@ -285,6 +297,7 @@ impl DataType {
             "DATETIME" | "DATE" | "TIME" | "TIMESTAMP" => (DataType::DateTime, false),
             "TIMESTAMPTZ" => (DataType::TimestampTz, false),
             "INTERVAL" => (DataType::Interval, false),
+            "JSON" | "JSONB" => (DataType::Json, false),
             "CALCULATED" => (DataType::Calculated, false),
             _ => return None,
         })
@@ -506,6 +519,7 @@ impl Value {
             Value::DateTime(_) => DataType::DateTime,
             Value::TimestampTz(_) => DataType::TimestampTz,
             Value::Interval(_) => DataType::Interval,
+            Value::Json(_) => DataType::Json,
             Value::Text(_) => DataType::Text,
         })
     }
@@ -521,6 +535,7 @@ impl Value {
             Value::DateTime(_) | Value::TimestampTz(_) => 3,
             Value::Text(_) => 4,
             Value::Interval(_) => 5,
+            Value::Json(_) => 6,
             _ => 2,
         }
     }
@@ -670,6 +685,15 @@ impl Value {
                 Err(_) => Ordering::Less,
             },
             (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+            (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Json(a), Value::Text(t)) => match crate::json::canonical(t) {
+                Some(c) => (**a).cmp(c.as_str()),
+                None => (**a).cmp(&**t),
+            },
+            (Value::Text(t), Value::Json(b)) => match crate::json::canonical(t) {
+                Some(c) => c.as_str().cmp(&**b),
+                None => (**t).cmp(&**b),
+            },
             (Value::Text(t), n) => match (parse_num(t), n.num()) {
                 (Some(x), Some(y)) => num_cmp(&x, &y),
                 _ => Ordering::Greater,
@@ -706,6 +730,10 @@ impl Value {
         if self.is_null() {
             return Ok(Null);
         }
+        // The stand-in for a sequence default is not a value to convert.
+        if matches!(self, Text(s) if (**s).starts_with(crate::schema::SEQUENCE_DEFAULT)) {
+            return Ok(self.clone());
+        }
         let bad = || Error::type_err(format!("cannot convert {} value '{}' to {}", self.type_label(), self, ty));
         let range = || Error::type_err(format!("'{}' is out of range for {}", self, ty));
         match ty {
@@ -735,6 +763,14 @@ impl Value {
                     Some(f) => Ok(TimestampTz(tz::session().to_utc(datetime::from_ole_days(f)))),
                     None => Err(bad()),
                 },
+            },
+            DataType::Json => match self {
+                Json(_) => Ok(self.clone()),
+                Text(s) => crate::json::canonical(s).map(|c| Json(c.as_str().into())).ok_or_else(bad),
+                Bool(_) | Int(_) | Big(_) | Dec(_) | Currency(_) | Float(_) | Double(_) | Rational(_) => {
+                    Ok(Json(crate::json::to_text(&crate::json::from_value(self)).as_str().into()))
+                }
+                _ => Err(bad()),
             },
             DataType::Interval => match self {
                 Interval(_) => Ok(self.clone()),
@@ -823,6 +859,7 @@ impl Ord for Value {
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
             (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) => a.cmp(b),
             (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+            (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Text(a), Value::Text(b)) => ci_cmp(a, b),
             (Value::Null, Value::Null) => Ordering::Equal,
             (a, b) if a.is_numeric() && b.is_numeric() => num_cmp(a, b),
@@ -890,6 +927,10 @@ impl Hash for Value {
                 5u8.hash(state);
                 i.hash(state);
             }
+            Value::Json(s) => {
+                6u8.hash(state);
+                s.hash(state);
+            }
             Value::Text(s) => {
                 4u8.hash(state);
                 for b in s.bytes() {
@@ -931,6 +972,7 @@ impl fmt::Display for Value {
             Value::DateTime(t) => f.write_str(&datetime::format(*t)),
             Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
             Value::Interval(i) => write!(f, "{i}"),
+            Value::Json(s) => f.write_str(s),
             Value::Text(s) => f.write_str(s),
         }
     }

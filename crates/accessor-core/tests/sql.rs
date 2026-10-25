@@ -600,7 +600,7 @@ fn trigger_definition_rules() {
     bad(&mut db, "CREATE TRIGGER t AFTER INSERT ON Album BEGIN INSERT INTO Log (Msg) VALUES (OLD.Name); END");
     bad(&mut db, "CREATE TRIGGER t AFTER INSERT ON Album BEGIN INSERT INTO Log (Msg) VALUES (NEW.Nope); END");
     bad(&mut db, "CREATE TRIGGER t AFTER INSERT ON Album BEGIN INSERT INTO Album VALUES (9, 'x', 1, 2000); END");
-    bad(&mut db, "CREATE TRIGGER t AFTER INSERT ON Album BEGIN SELECT 1; END");
+    bad(&mut db, "CREATE TRIGGER t AFTER INSERT ON Album BEGIN DROP TABLE Log; END");
     bad(&mut db, "CREATE TRIGGER t AFTER INSERT ON Album BEGIN END");
     bad(&mut db, "RAISE 'outside a trigger'");
 
@@ -2659,4 +2659,311 @@ fn keyset_paging_with_row_values_uses_the_index() {
     // Same answers with the optimizer off.
     db.set_optimizer(false);
     assert_eq!(rows(&db, sql), [["150", "1504"], ["150", "1505"], ["150", "1506"]]);
+}
+
+#[test]
+fn sequences_count_and_cycle() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE SEQUENCE s START WITH 10 INCREMENT BY 5").unwrap();
+    assert_eq!(rows(&db, "SELECT NEXTVAL('s'), NEXT VALUE FOR s, CURRVAL('s'), LASTVAL()"), [["10", "15", "15", "15"]]);
+    // Each row of a query gets its own number.
+    db.execute("CREATE TABLE t (a INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    assert_eq!(rows(&db, "SELECT a, NEXTVAL('s') FROM t ORDER BY a"), [["1", "20"], ["2", "25"], ["3", "30"]]);
+    assert_eq!(rows(&db, "SELECT SETVAL('s', 100), NEXTVAL('s')"), [["100", "105"]]);
+    assert_eq!(rows(&db, "SELECT SETVAL('s', 7, FALSE), NEXTVAL('s')"), [["7", "7"]]);
+
+    db.execute("CREATE SEQUENCE c MINVALUE 1 MAXVALUE 3 CYCLE; CREATE SEQUENCE d INCREMENT BY -1 START WITH 2 MINVALUE 1 MAXVALUE 5 NO CYCLE").unwrap();
+    assert_eq!(rows(&db, "SELECT NEXTVAL('c'), NEXTVAL('c'), NEXTVAL('c'), NEXTVAL('c')"), [["1", "2", "3", "1"]]);
+    assert_eq!(rows(&db, "SELECT NEXTVAL('d'), NEXTVAL('d')"), [["2", "1"]]);
+    assert!(db.query("SELECT NEXTVAL('d')").unwrap_err().to_string().contains("limit"));
+    assert!(db.query("SELECT CURRVAL('nosuch')").is_err());
+    db.execute("CREATE SEQUENCE fresh").unwrap();
+    assert!(db.query("SELECT CURRVAL('fresh')").is_err()); // nothing handed out yet
+
+    db.execute("ALTER SEQUENCE d RESTART WITH 2 MAXVALUE 5; ALTER SEQUENCE c INCREMENT BY 2").unwrap();
+    assert_eq!(rows(&db, "SELECT NEXTVAL('d'), NEXTVAL('d')"), [["2", "1"]]);
+    assert!(db.execute("CREATE SEQUENCE s").is_err());
+    db.execute("CREATE SEQUENCE IF NOT EXISTS s; DROP SEQUENCE IF EXISTS nosuch").unwrap();
+    assert!(db.execute("CREATE SEQUENCE bad INCREMENT BY 0").is_err());
+    assert!(db.execute("CREATE SEQUENCE bad START WITH 9 MAXVALUE 5").is_err());
+    db.execute("DROP SEQUENCE s").unwrap();
+    assert!(db.query("SELECT NEXTVAL('s')").is_err());
+    assert_eq!(db.sequences().len(), 3);
+}
+
+#[test]
+fn sequences_fill_columns_and_survive_rollback() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE SEQUENCE ids START WITH 100").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER DEFAULT NEXT VALUE FOR ids PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO t (name) VALUES ('a'), ('b')").unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (7, 'explicit')").unwrap(); // no number used up
+    db.execute("INSERT INTO t (name) VALUES ('c')").unwrap();
+    assert_eq!(rows(&db, "SELECT id, name FROM t ORDER BY id"), [["7", "explicit"], ["100", "a"], ["101", "b"], ["102", "c"]]);
+    // A rolled-back insert still used its number.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t (name) VALUES ('gone')").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    db.execute("INSERT INTO t (name) VALUES ('d')").unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM t WHERE name = 'd'"), [["104"]]);
+    // A sequence made in a rolled-back transaction is gone.
+    db.execute("BEGIN; CREATE SEQUENCE temp; ROLLBACK").unwrap();
+    assert!(db.query("SELECT NEXTVAL('temp')").is_err());
+    // The default must name a sequence that exists.
+    assert!(db.execute("CREATE TABLE u (id INTEGER DEFAULT NEXTVAL('nosuch'))").is_err());
+    // Also settable later.
+    db.execute("CREATE TABLE v (id INTEGER, n TEXT)").unwrap();
+    db.execute("ALTER TABLE v ALTER COLUMN id SET DEFAULT NEXT VALUE FOR ids").unwrap();
+    db.execute("INSERT INTO v (n) VALUES ('x')").unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM v"), [["105"]]);
+}
+
+#[test]
+fn nextval_is_not_folded_by_the_optimizer() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE SEQUENCE s; CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    for on in [true, false] {
+        db.set_optimizer(on);
+        db.execute("ALTER SEQUENCE s RESTART").unwrap();
+        // Evaluated for every row, not once.
+        assert_eq!(rows(&db, "SELECT NEXTVAL('s') FROM t"), [["1"], ["2"], ["3"]], "optimizer {on}");
+    }
+}
+
+#[test]
+fn deferrable_relationships_wait_for_the_commit() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY);
+         CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER, CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TABLE lazy (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) DEFERRABLE);
+         CREATE TABLE strict (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id))",
+    )
+    .unwrap();
+    // Outside a transaction each statement is checked as it ends.
+    assert!(db.execute("INSERT INTO c VALUES (1, 5)").is_err());
+    // Inside one, the child may come before its parent.
+    db.execute("BEGIN; INSERT INTO c VALUES (1, 5); INSERT INTO p VALUES (5); COMMIT").unwrap();
+    assert_eq!(rows(&db, "SELECT id, pid FROM c"), [["1", "5"]]);
+    // A violation that is still there at COMMIT undoes the whole transaction.
+    let err = db.execute("BEGIN; INSERT INTO p VALUES (6); INSERT INTO c VALUES (2, 9); COMMIT").unwrap_err();
+    assert!(err.to_string().contains("cannot commit"), "{err}");
+    assert!(!db.in_transaction());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM c"), [["1"]]);
+    assert_eq!(rows(&db, "SELECT Count(*) FROM p"), [["1"]]);
+    // Fixing it before COMMIT is fine; deleting a parent that still has children is caught late as well.
+    db.execute("BEGIN; DELETE FROM p WHERE id = 5; INSERT INTO p VALUES (5); COMMIT").unwrap();
+    assert!(db.execute("BEGIN; DELETE FROM p WHERE id = 5; COMMIT").is_err());
+    // DEFERRABLE alone starts immediate; SET CONSTRAINTS defers it for the transaction.
+    assert!(db.execute("BEGIN; INSERT INTO lazy VALUES (1, 7)").is_err());
+    db.execute("ROLLBACK").unwrap();
+    db.execute("BEGIN; SET CONSTRAINTS ALL DEFERRED; INSERT INTO lazy VALUES (1, 7); INSERT INTO p VALUES (7); COMMIT").unwrap();
+    // IMMEDIATE checks at once what was waiting, and the transaction stays open if it fails.
+    db.execute("BEGIN; SET CONSTRAINTS fk_c DEFERRED; INSERT INTO c VALUES (3, 99)").unwrap();
+    assert!(db.execute("SET CONSTRAINTS fk_c IMMEDIATE").is_err());
+    assert!(db.in_transaction());
+    db.execute("DELETE FROM c WHERE id = 3; COMMIT").unwrap();
+    // Relationships that are not deferrable cannot be named.
+    assert!(db.execute("SET CONSTRAINTS nosuch DEFERRED").is_err());
+    assert!(db.execute("BEGIN; SET CONSTRAINTS fk_strict_pid DEFERRED").is_err());
+    db.execute("ROLLBACK").unwrap();
+    assert!(db.execute("BEGIN; INSERT INTO strict VALUES (1, 100)").is_err());
+    db.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn set_default_and_no_action() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO p VALUES (0, 'nobody'), (1, 'a'), (2, 'b');
+         CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 0 REFERENCES p (id) ON DELETE SET DEFAULT ON UPDATE CASCADE);
+         INSERT INTO c VALUES (1, 1), (2, 2), (3, 1);",
+    )
+    .unwrap();
+    db.execute("DELETE FROM p WHERE id = 1").unwrap();
+    assert_eq!(rows(&db, "SELECT id, pid FROM c ORDER BY id"), [["1", "0"], ["2", "2"], ["3", "0"]]);
+    db.execute("UPDATE p SET id = 20 WHERE id = 2").unwrap();
+    assert_eq!(rows(&db, "SELECT pid FROM c WHERE id = 2"), [["20"]]);
+    // A default that points nowhere is refused.
+    db.execute("DELETE FROM c; DELETE FROM p WHERE id = 0").unwrap();
+    db.execute("INSERT INTO c VALUES (9, 20)").unwrap();
+    assert!(db.execute("DELETE FROM p WHERE id = 20").is_err());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM p"), [["1"]]);
+
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p (id) ON DELETE NO ACTION ON UPDATE NO ACTION)").unwrap();
+    db.execute("INSERT INTO d VALUES (1, 20)").unwrap();
+    assert!(db.execute("DELETE FROM p WHERE id = 20").is_err());
+    assert!(db.execute("UPDATE p SET id = 21 WHERE id = 20").is_err());
+}
+
+#[test]
+fn statement_triggers_fire_once_per_statement() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+         CREATE TABLE log (seq COUNTER PRIMARY KEY, msg TEXT);
+         CREATE TRIGGER before_ins BEFORE INSERT ON t FOR EACH STATEMENT BEGIN INSERT INTO log (msg) VALUES ('before insert'); END;
+         CREATE TRIGGER after_ins AFTER INSERT ON t FOR EACH STATEMENT BEGIN INSERT INTO log (msg) VALUES ('after insert'); END;
+         CREATE TRIGGER after_any AFTER UPDATE OR DELETE ON t FOR EACH STATEMENT BEGIN INSERT INTO log (msg) VALUES ('changed'); END;
+         CREATE TRIGGER each_row AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO log (msg) VALUES ('row ' & NEW.id); END",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+    // The statement triggers wrap the row ones, and run once however many rows there are.
+    assert_eq!(
+        rows(&db, "SELECT msg FROM log ORDER BY seq"),
+        [["before insert"], ["row 1"], ["row 2"], ["row 3"], ["after insert"]]
+    );
+    db.execute("DELETE FROM log").unwrap();
+    db.execute("UPDATE t SET n = n + 1").unwrap();
+    db.execute("DELETE FROM t WHERE id > 1").unwrap();
+    assert_eq!(rows(&db, "SELECT msg FROM log ORDER BY seq"), [["changed"], ["changed"]]);
+    // Statement triggers have no row to look at.
+    assert!(db.execute("CREATE TRIGGER bad AFTER INSERT ON t FOR EACH STATEMENT BEGIN INSERT INTO log (msg) VALUES (NEW.id); END").is_err());
+}
+
+#[test]
+fn triggers_with_several_events_and_update_of() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price INTEGER);
+         CREATE TABLE log (seq COUNTER PRIMARY KEY, msg TEXT);
+         CREATE TRIGGER seen AFTER INSERT OR UPDATE ON items BEGIN INSERT INTO log (msg) VALUES ('saved ' & NEW.name); END;
+         CREATE TRIGGER gone AFTER DELETE ON items BEGIN INSERT INTO log (msg) VALUES ('deleted ' & OLD.name); END;
+         CREATE TRIGGER repriced AFTER UPDATE OF price ON items BEGIN INSERT INTO log (msg) VALUES (OLD.price & ' -> ' & NEW.price); END",
+    )
+    .unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'pen', 5)").unwrap();
+    db.execute("UPDATE items SET name = 'biro' WHERE id = 1").unwrap(); // not the price
+    db.execute("UPDATE items SET price = 6 WHERE id = 1").unwrap();
+    db.execute("UPDATE items SET price = 6 WHERE id = 1").unwrap(); // unchanged: no repricing
+    db.execute("DELETE FROM items").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT msg FROM log ORDER BY seq"),
+        [["saved pen"], ["saved biro"], ["5 -> 6"], ["saved biro"], ["saved biro"], ["deleted biro"]]
+    );
+    // OLD does not exist for an INSERT.
+    assert!(db.execute("CREATE TRIGGER bad AFTER INSERT OR DELETE ON items BEGIN INSERT INTO log (msg) VALUES (OLD.name); END").is_err());
+    assert!(db.execute("CREATE TRIGGER bad AFTER UPDATE OF nosuch ON items BEGIN INSERT INTO log (msg) VALUES ('x'); END").is_err());
+    assert!(db.execute("CREATE TRIGGER bad AFTER INSERT OR INSERT ON items BEGIN INSERT INTO log (msg) VALUES ('x'); END").is_err());
+}
+
+#[test]
+fn trigger_bodies_can_select() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE SEQUENCE audit_no;
+         CREATE TABLE t (id INTEGER PRIMARY KEY);
+         CREATE TABLE audit (num INTEGER, id INTEGER);
+         CREATE TRIGGER stamp AFTER INSERT ON t BEGIN SELECT NEXTVAL('audit_no'); INSERT INTO audit VALUES (CURRVAL('audit_no'), NEW.id); END",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (7), (8)").unwrap();
+    assert_eq!(rows(&db, "SELECT num, id FROM audit ORDER BY num"), [["1", "7"], ["2", "8"]]);
+}
+
+#[test]
+fn instead_of_triggers_make_any_query_changeable() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE person (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE phone (person INTEGER REFERENCES person (id) ON DELETE CASCADE, number TEXT);
+         CREATE VIEW directory AS SELECT p.id, p.name, f.number FROM person p JOIN phone f ON f.person = p.id;
+         CREATE TRIGGER dir_in INSTEAD OF INSERT ON directory BEGIN
+             INSERT INTO person VALUES (NEW.id, NEW.name);
+             INSERT INTO phone VALUES (NEW.id, NEW.number);
+         END;
+         CREATE TRIGGER dir_up INSTEAD OF UPDATE ON directory BEGIN
+             UPDATE person SET name = NEW.name WHERE id = OLD.id;
+             UPDATE phone SET number = NEW.number WHERE person = OLD.id AND number = OLD.number;
+         END;
+         CREATE TRIGGER dir_del INSTEAD OF DELETE ON directory BEGIN
+             DELETE FROM person WHERE id = OLD.id;
+         END",
+    )
+    .unwrap();
+    // The view joins two tables, so without triggers it cannot be changed.
+    assert!(db.execute("CREATE VIEW plain AS SELECT p.id FROM person p JOIN phone f ON f.person = p.id; INSERT INTO plain VALUES (1)").is_err());
+    let r = db.execute("INSERT INTO directory VALUES (1, 'Ada', '555-1'), (2, 'Grace', '555-2')").unwrap();
+    assert_eq!(r.affected, 2);
+    assert_eq!(rows(&db, "SELECT name, number FROM directory ORDER BY id"), [["Ada", "555-1"], ["Grace", "555-2"]]);
+    let r = db.execute("UPDATE directory SET number = '555-9', name = name & '!' WHERE id = 2").unwrap();
+    assert_eq!(r.affected, 1);
+    assert_eq!(rows(&db, "SELECT name, number FROM directory ORDER BY id"), [["Ada", "555-1"], ["Grace!", "555-9"]]);
+    db.execute("DELETE FROM directory WHERE name LIKE 'A*'").unwrap();
+    assert_eq!(rows(&db, "SELECT name FROM directory"), [["Grace!"]]);
+    // A failing trigger undoes the whole statement.
+    db.execute("CREATE TRIGGER dir_bad INSTEAD OF INSERT ON directory WHEN NEW.id > 100 BEGIN RAISE 'too big'; END").unwrap();
+    assert!(db.execute("INSERT INTO directory VALUES (3, 'Linus', '555-3'), (101, 'X', '1')").is_err());
+    assert_eq!(rows(&db, "SELECT Count(*) FROM person"), [["1"]]);
+    // Only queries can have INSTEAD OF triggers, and they go away with the query.
+    assert!(db.execute("CREATE TRIGGER t1 INSTEAD OF INSERT ON person BEGIN RAISE 'x'; END").is_err());
+    assert!(db.execute("CREATE TRIGGER t2 AFTER INSERT ON directory BEGIN RAISE 'x'; END").is_err());
+    db.execute("DROP VIEW directory").unwrap();
+    assert!(db.trigger_names().is_empty());
+}
+
+#[test]
+fn json_values_and_functions() {
+    let mut db = Database::in_memory();
+    db.execute(
+        r#"CREATE TABLE docs (id INTEGER PRIMARY KEY, body JSON);
+           INSERT INTO docs VALUES (1, '{"name": "Ada", "tags": ["math", "code"], "age": 36, "address": {"city": "London"}}');
+           INSERT INTO docs VALUES (2, '{"name": "Grace", "tags": [], "age": 85.5}');
+           INSERT INTO docs VALUES (3, NULL)"#,
+    )
+    .unwrap();
+    // The text is checked and stored in a canonical form.
+    assert!(db.execute("INSERT INTO docs VALUES (4, '{broken')").is_err());
+    assert_eq!(rows(&db, "SELECT body FROM docs WHERE id = 2"), [[r#"{"age":85.5,"name":"Grace","tags":[]}"#]]);
+    assert_eq!(rows(&db, "SELECT JSON_VALID('[1,2]'), JSON_VALID('[1,'), JSON_VALID(body) FROM docs WHERE id = 1"), [["Yes", "No", "Yes"]]);
+
+    // Paths and operators.
+    assert_eq!(
+        rows(&db, "SELECT JSON_VALUE(body, '$.name'), JSON_VALUE(body, '$.age'), JSON_VALUE(body, '$.address.city'), JSON_VALUE(body, '$.tags[1]') FROM docs WHERE id = 1"),
+        [["Ada", "36", "London", "code"]]
+    );
+    assert_eq!(rows(&db, "SELECT JSON_EXTRACT(body, '$.tags'), JSON_EXTRACT(body, '$.nope') FROM docs WHERE id = 1"), [[r#"["math","code"]"#, ""]]);
+    assert_eq!(rows(&db, "SELECT body -> 'name', body ->> 'name', body -> 'tags' -> 0, body -> 'tags' ->> 1 FROM docs WHERE id = 1"), [["\"Ada\"", "Ada", "\"math\"", "code"]]);
+    assert_eq!(rows(&db, "SELECT id FROM docs WHERE body ->> 'name' = 'Grace'"), [["2"]]);
+    // Numbers come back as numbers: arithmetic and comparison work.
+    assert_eq!(rows(&db, "SELECT id FROM docs WHERE JSON_VALUE(body, '$.age') > 40"), [["2"]]);
+    assert_eq!(rows(&db, "SELECT JSON_VALUE(body, '$.age') + 1 FROM docs WHERE id = 2"), [["86.5"]]);
+    assert_eq!(rows(&db, "SELECT JSON_LENGTH(body, '$.tags'), JSON_TYPE(body, '$.age'), JSON_TYPE(body), JSON_KEYS(body) FROM docs WHERE id = 1"), [["2", "number", "object", r#"["address","age","name","tags"]"#]]);
+
+    // Building and changing documents.
+    assert_eq!(rows(&db, "SELECT JSON_OBJECT('a', 1, 'b', JSON_ARRAY(1, 'x', NULL, TRUE))"), [[r#"{"a":1,"b":[1,"x",null,true]}"#]]);
+    assert_eq!(rows(&db, r#"SELECT JSON_SET('{"a":1}', '$.b', 2), JSON_SET('{"a":1}', '$.a', 'x'), JSON_REMOVE('{"a":1,"b":2}', '$.a')"#), [[r#"{"a":1,"b":2}"#, r#"{"a":"x"}"#, r#"{"b":2}"#]]);
+    assert_eq!(rows(&db, r#"SELECT JSON_MERGE_PATCH('{"a":1,"b":{"c":2}}', '{"b":{"c":null,"d":3}}')"#), [[r#"{"a":1,"b":{"d":3}}"#]]);
+    assert_eq!(rows(&db, r#"SELECT JSON_CONTAINS('{"a":[1,2,3]}', '{"a":[2]}'), JSON_CONTAINS('{"a":1}', '{"a":2}')"#), [["Yes", "No"]]);
+    db.execute(r#"UPDATE docs SET body = JSON_SET(body, '$.age', 37) WHERE id = 1"#).unwrap();
+    assert_eq!(rows(&db, "SELECT JSON_VALUE(body, '$.age') FROM docs WHERE id = 1"), [["37"]]);
+    // NULL documents give NULL.
+    assert_eq!(rows(&db, "SELECT JSON_VALUE(body, '$.name') FROM docs WHERE id = 3"), [[""]]);
+
+    // Equal documents compare equal however they were written; CAST works both ways.
+    assert_eq!(rows(&db, r#"SELECT CAST('{"b":1, "a":2}' AS JSON) = CAST('{"a":2,"b":1}' AS JSON), CAST(CAST('[1]' AS JSON) AS TEXT)"#), [["Yes", "[1]"]]);
+    assert_eq!(rows(&db, "SELECT TO_JSON('hi'), TO_JSON(5), TO_JSON(TRUE)"), [["\"hi\"", "5", "true"]]);
+
+    // Rows from a document, and a document from rows.
+    assert_eq!(rows(&db, "SELECT key, value FROM JSON_EACH('{\"x\": 1, \"y\": [2]}') ORDER BY key"), [["x", "1"], ["y", "[2]"]]);
+    assert_eq!(rows(&db, "SELECT value FROM JSON_EACH('[10, 20, 30]') WHERE key >= 1 ORDER BY key"), [["20"], ["30"]]);
+    assert_eq!(rows(&db, "SELECT JSON_ARRAYAGG(id) FROM docs WHERE id < 3"), [["[1,2]"]]);
+    assert!(db.query("SELECT JSON_VALUE('[1]', 'bad path')").is_err());
+}
+
+#[test]
+fn json_results_are_the_same_with_the_optimizer_off() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, body JSON); CREATE INDEX byid ON d (id)").unwrap();
+    for i in 0..50 {
+        db.execute(&format!(r#"INSERT INTO d VALUES ({i}, '{{"n": {i}, "even": {}}}')"#, i % 2 == 0)).unwrap();
+    }
+    let sql = "SELECT id FROM d WHERE JSON_VALUE(body, '$.even') = TRUE AND id > 40 ORDER BY id";
+    let on = rows(&db, sql);
+    db.set_optimizer(false);
+    assert_eq!(on, rows(&db, sql));
+    assert_eq!(on.len(), 4);
 }

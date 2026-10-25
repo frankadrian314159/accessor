@@ -46,6 +46,14 @@ The result is an `INTEGER`.
 SELECT Dept, STRING_AGG(Name, ', ') FROM Emp GROUP BY Dept;
 ```
 
+## JSON_ARRAYAGG
+
+`JSON_ARRAYAGG(expr)` (also `JSON_AGG`) collects the non-NULL values of a group into a JSON array, in the order the rows are read; the result is NULL for a group with no values. Values become JSON as `TO_JSON` makes them; a `JSON` value is embedded as a document.
+
+```sql
+SELECT Dept, JSON_ARRAYAGG(Name) FROM Emp GROUP BY Dept;     -- ["Ada","Grace"]
+```
+
 ## Variance and standard deviation
 
 | Function | Meaning |

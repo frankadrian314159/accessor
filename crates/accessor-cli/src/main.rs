@@ -294,6 +294,9 @@ impl Shell {
                 if fk.on_update != accessor_core::RefAction::Restrict {
                     line.push_str(&format!(" ON UPDATE {}", fk.on_update.sql()));
                 }
+                if fk.deferrable {
+                    line.push_str(if fk.initially_deferred { " DEFERRABLE INITIALLY DEFERRED" } else { " DEFERRABLE" });
+                }
                 lines.push(line);
             }
             println!("CREATE TABLE {} (\n{}\n);", t.name(), lines.join(",\n"));

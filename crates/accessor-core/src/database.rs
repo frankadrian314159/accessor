@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::sequence::SequenceDef;
 use crate::sql::ast::{Statement, TriggerDef};
 use crate::sql::parse_statement;
 use crate::storage::persist::{Durability, Persistence};
@@ -20,6 +21,10 @@ struct Tx {
     /// How to take back everything done so far, oldest first.
     undo: Vec<Undo>,
     savepoints: Vec<Savepoint>,
+    /// `SET CONSTRAINTS` in force, latest last: the relationship (`None`: all) and whether it is deferred.
+    modes: Vec<(Option<String>, bool)>,
+    /// Deferred relationships (child table, constraint) to verify when the transaction ends.
+    pending: std::collections::BTreeSet<(String, String)>,
 }
 
 /// A point in a transaction that can be returned to without abandoning the rest.
@@ -43,6 +48,8 @@ pub(crate) struct CatalogUndo {
     tables: Vec<(String, Option<Table>)>,
     views: Option<BTreeMap<String, (String, String)>>,
     triggers: Option<BTreeMap<String, Arc<TriggerDef>>>,
+    /// Lowercase sequence name and its definition before the change (`None`: it did not exist).
+    sequence: Option<(String, Option<SequenceDef>)>,
 }
 
 pub struct Database {
@@ -51,6 +58,8 @@ pub struct Database {
     pub(crate) views: BTreeMap<String, (String, String)>,
     /// Triggers by lowercase name; the definition keeps its own source text.
     pub(crate) triggers: BTreeMap<String, Arc<TriggerDef>>,
+    /// Sequences; shared with the expression evaluator (`NEXTVAL`).
+    pub(crate) seqs: crate::sequence::Shared,
     /// Compiled calculated-field expressions per table; see `calc.rs`.
     pub(crate) calc_cache: crate::calc::CalcCache,
     /// Whether the batch being applied touches a table with calculated fields.
@@ -76,6 +85,7 @@ impl Database {
             tables: BTreeMap::new(),
             views: BTreeMap::new(),
             triggers: BTreeMap::new(),
+            seqs: Default::default(),
             calc_cache: Default::default(),
             calc_active: false,
             plan_log: Default::default(),
@@ -98,6 +108,17 @@ impl Database {
             }
             for (n, s) in l.views {
                 db.views.insert(key(&n), (n, s));
+            }
+            {
+                let mut s = db.seqs.lock().expect("fresh lock");
+                for d in l.sequences {
+                    s.defs.insert(key(&d.name), d);
+                }
+            }
+            for (table, name, deferrable, initially_deferred) in l.fk_timing {
+                if let Some(t) = db.tables.get_mut(&key(&table)) {
+                    let _ = t.set_foreign_key_timing(&name, deferrable, initially_deferred);
+                }
             }
             for (_, sql) in l.triggers {
                 let def = parse_trigger(&sql)?;
@@ -230,6 +251,7 @@ impl Database {
                 self.views
                     .remove(&key(name))
                     .ok_or_else(|| Error::catalog(format!("the query '{name}' does not exist")))?;
+                self.triggers.retain(|_, t| !t.table.eq_ignore_ascii_case(name)); // INSTEAD OF triggers go with their query
                 Ok(None)
             }
             Op::AddColumn { table, column } => {
@@ -322,6 +344,10 @@ impl Database {
                 self.table_mut(table)?.set_not_null(name, *not_null)?;
                 Ok(None)
             }
+            Op::SetForeignKeyTiming { table, name, deferrable, initially_deferred } => {
+                self.table_mut(table)?.set_foreign_key_timing(name, *deferrable, *initially_deferred)?;
+                Ok(None)
+            }
             Op::AddForeignKey { table, fk } => {
                 self.table_mut(table)?.add_foreign_key(fk.clone())?;
                 Ok(None)
@@ -330,9 +356,45 @@ impl Database {
                 self.table_mut(table)?.drop_foreign_key(name)?;
                 Ok(None)
             }
+            Op::CreateSequence(d) => {
+                let mut s = self.seqs.lock().expect("sequences lock");
+                let k = key(&d.name);
+                if s.defs.contains_key(&k) {
+                    return Err(Error::catalog(format!("the sequence '{}' already exists", d.name)));
+                }
+                s.defs.insert(k, d.clone());
+                Ok(None)
+            }
+            Op::DropSequence(name) => {
+                let mut s = self.seqs.lock().expect("sequences lock");
+                s.defs.remove(&key(name)).ok_or_else(|| Error::catalog(format!("the sequence '{name}' does not exist")))?;
+                Ok(None)
+            }
+            Op::AlterSequence(d) => {
+                let mut s = self.seqs.lock().expect("sequences lock");
+                let slot = s
+                    .defs
+                    .get_mut(&key(&d.name))
+                    .ok_or_else(|| Error::catalog(format!("the sequence '{}' does not exist", d.name)))?;
+                *slot = d.clone();
+                Ok(None)
+            }
+            Op::SequenceValue { name, last } => {
+                // A value logged for a sequence that was since dropped, or never committed, is ignored.
+                if let Some(d) = self.seqs.lock().expect("sequences lock").defs.get_mut(&key(name)) {
+                    d.last = *last;
+                }
+                Ok(None)
+            }
             Op::CreateTrigger { name, sql } => {
                 let def = parse_trigger(sql)?;
-                self.table_checked(&def.table)?;
+                if def.timing == crate::sql::ast::TriggerTiming::InsteadOf {
+                    if !self.views.contains_key(&key(&def.table)) {
+                        return Err(Error::catalog(format!("the query '{}' does not exist", def.table)));
+                    }
+                } else {
+                    self.table_checked(&def.table)?;
+                }
                 let k = key(name);
                 if self.triggers.contains_key(&k) {
                     return Err(Error::catalog(format!("the trigger '{name}' already exists")));
@@ -390,7 +452,7 @@ impl Database {
     /// Records what the schema change `op` is about to replace.
     fn catalog_snapshot(&self, op: &Op) -> CatalogUndo {
         let mut names: Vec<String> = Vec::new();
-        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None };
+        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None, sequence: None };
         match op {
             Op::CreateTable(schema) => names.push(key(&schema.name)),
             Op::DropTable(table) => {
@@ -408,7 +470,17 @@ impl Database {
                 undo.views = Some(self.views.clone());
                 undo.triggers = Some(self.triggers.clone());
             }
-            Op::CreateView { .. } | Op::DropView(_) => undo.views = Some(self.views.clone()),
+            Op::CreateView { .. } => undo.views = Some(self.views.clone()),
+            Op::DropView(_) => {
+                undo.views = Some(self.views.clone());
+                undo.triggers = Some(self.triggers.clone());
+            }
+            Op::CreateSequence(SequenceDef { name, .. }) | Op::DropSequence(name) | Op::AlterSequence(SequenceDef { name, .. }) => {
+                let k = key(name);
+                let old = self.seqs.lock().expect("sequences lock").defs.get(&k).cloned();
+                undo.sequence = Some((k, old));
+            }
+            Op::SequenceValue { .. } => {}
             Op::CreateTrigger { .. } | Op::DropTrigger(_) => undo.triggers = Some(self.triggers.clone()),
             Op::DropColumn { table, .. } => {
                 names.push(key(table));
@@ -426,6 +498,7 @@ impl Database {
             | Op::AlterColumnType { table, .. }
             | Op::AddForeignKey { table, .. }
             | Op::DropForeignKey { table, .. }
+            | Op::SetForeignKeyTiming { table, .. }
             | Op::SetDefault { table, .. }
             | Op::SetNotNull { table, .. }
             | Op::SetExpression { table, .. } => names.push(key(table)),
@@ -453,6 +526,17 @@ impl Database {
         }
         if let Some(triggers) = undo.triggers {
             self.triggers = triggers;
+        }
+        if let Some((k, old)) = undo.sequence {
+            let mut s = self.seqs.lock().expect("sequences lock");
+            match old {
+                Some(d) => {
+                    s.defs.insert(k, d);
+                }
+                None => {
+                    s.defs.remove(&k);
+                }
+            }
         }
         self.calc_cache.clear();
     }
@@ -550,7 +634,27 @@ impl Database {
     /// Makes every change since `begin` permanent.
     pub fn commit(&mut self) -> Result<()> {
         let tx = self.tx.take().ok_or_else(no_transaction)?;
-        self.log(&tx.ops, tx.undo)
+        if let Err(e) = self.verify_deferred(&tx.pending) {
+            self.revert(tx.undo);
+            return Err(e);
+        }
+        // A sequence made in the transaction is logged as it was made; bring its value up to date.
+        let made: Vec<Op> = {
+            let s = self.seqs.lock().expect("sequences lock");
+            tx.ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::CreateSequence(d) | Op::AlterSequence(d) => s.defs.get(&key(&d.name)),
+                    _ => None,
+                })
+                .map(|d| Op::SequenceValue { name: d.name.clone(), last: d.last })
+                .collect()
+        };
+        self.log(&tx.ops, tx.undo)?;
+        if let (Some(p), false) = (&mut self.persist, made.is_empty()) {
+            p.append(&made)?;
+        }
+        Ok(())
     }
 
     /// Takes back every change since `begin`.
@@ -618,6 +722,7 @@ impl Database {
     /// Makes this database's zone the one values are read and shown in.
     pub(crate) fn enter_session(&self) {
         crate::tz::set_session(self.time_zone);
+        crate::sequence::set_current(&self.seqs);
     }
 
     pub fn optimizer_enabled(&self) -> bool {
@@ -695,12 +800,142 @@ impl Database {
         if self.tx.is_some() {
             return Err(Error::runtime("cannot checkpoint inside a transaction"));
         }
+        let sequences: Vec<SequenceDef> = self.seqs.lock().expect("sequences lock").defs.values().cloned().collect();
+        let fk_timing = self.fk_timing();
         if let Some(p) = &mut self.persist {
             p.checkpoint(
                 self.tables.values(),
                 self.views.values().map(|(n, s)| (n.as_str(), s.as_str())),
                 self.triggers.values().map(|t| (t.name.as_str(), t.sql.as_str())),
+                sequences,
+                fk_timing,
             )?;
+        }
+        self.seqs.lock().expect("sequences lock").dirty.clear();
+        Ok(())
+    }
+
+    /// Writes the numbers sequences have handed out since the last time to the log. These are
+    /// never part of a transaction: a number once handed out stays used, even after a rollback.
+    pub(crate) fn flush_sequences(&mut self) -> Result<()> {
+        let ops: Vec<Op> = {
+            let mut s = self.seqs.lock().expect("sequences lock");
+            let names = std::mem::take(&mut s.dirty);
+            names
+                .iter()
+                .filter_map(|n| s.defs.get(n))
+                .map(|d| Op::SequenceValue { name: d.name.clone(), last: d.last })
+                .collect()
+        };
+        match (&mut self.persist, ops.is_empty()) {
+            (Some(p), false) => p.append(&ops),
+            _ => Ok(()),
+        }
+    }
+
+    /// `(table, constraint, deferrable, initially deferred)` for every relationship that can be deferred.
+    fn fk_timing(&self) -> Vec<(String, String, bool, bool)> {
+        let mut out = Vec::new();
+        for t in self.tables.values() {
+            for f in t.schema().foreign_keys.iter().filter(|f| f.deferrable) {
+                out.push((t.name().to_string(), f.name.clone(), f.deferrable, f.initially_deferred));
+            }
+        }
+        out
+    }
+
+    // ----- deferred relationships --------------------------------------------------
+
+    /// True if a violation of `fk` is waiting for the end of the transaction rather than
+    /// being refused at the end of the statement.
+    pub(crate) fn fk_deferred(&self, fk: &crate::schema::ForeignKey) -> bool {
+        let Some(tx) = &self.tx else { return false };
+        if !fk.deferrable {
+            return false;
+        }
+        tx.modes
+            .iter()
+            .rev()
+            .find(|(n, _)| n.as_ref().is_none_or(|n| n.eq_ignore_ascii_case(&fk.name)))
+            .map_or(fk.initially_deferred, |(_, d)| *d)
+    }
+
+    /// Notes that `fk` of `table` must be checked when the transaction ends.
+    pub(crate) fn defer_check(&mut self, table: &str, fk: &str) {
+        if let Some(tx) = &mut self.tx {
+            tx.pending.insert((key(table), key(fk)));
+        }
+    }
+
+    /// Checks every row of the child tables of the given relationships.
+    fn verify_deferred(&self, pending: &std::collections::BTreeSet<(String, String)>) -> Result<()> {
+        for (table, name) in pending {
+            let Some(t) = self.tables.get(table) else { continue };
+            let Some(fk) = t.schema().foreign_keys.iter().find(|f| key(&f.name) == *name) else { continue };
+            let Some(parent) = self.table(&fk.ref_table) else { continue };
+            for (_, row) in t.iter() {
+                let k: Vec<crate::value::Value> = fk.columns.iter().map(|&c| row[c].clone()).collect();
+                if k.iter().any(crate::value::Value::is_null) {
+                    continue;
+                }
+                if parent.lookup(&fk.ref_columns, &k).is_empty() {
+                    let fields: Vec<&str> = fk.columns.iter().map(|&c| t.schema().columns[c].name.as_str()).collect();
+                    return Err(Error::constraint(format!(
+                        "cannot commit: '{}' ({}) requires a matching record in '{}' (relationship '{}')",
+                        t.name(),
+                        fields.join(", "),
+                        fk.ref_table,
+                        fk.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `SET CONSTRAINTS`: defers the named relationships (or all of them) to the end of the
+    /// transaction, or makes them immediate, checking at once what was waiting.
+    pub(crate) fn set_constraints(&mut self, names: Option<&[String]>, deferred: bool) -> Result<()> {
+        if let Some(names) = names {
+            for n in names {
+                let found = self
+                    .tables
+                    .values()
+                    .flat_map(|t| &t.schema().foreign_keys)
+                    .find(|f| f.name.eq_ignore_ascii_case(n))
+                    .ok_or_else(|| Error::catalog(format!("there is no relationship named '{n}'")))?;
+                if !found.deferrable {
+                    return Err(Error::catalog(format!("the relationship '{n}' is not DEFERRABLE")));
+                }
+            }
+        }
+        let Some(tx) = &mut self.tx else { return Ok(()) }; // outside a transaction each statement is its own
+        let entries: Vec<Option<String>> = match names {
+            None => vec![None],
+            Some(ns) => ns.iter().map(|n| Some(n.clone())).collect(),
+        };
+        let before = tx.modes.len();
+        for e in entries {
+            tx.modes.push((e, deferred));
+        }
+        if !deferred {
+            let mine: std::collections::BTreeSet<(String, String)> = tx
+                .pending
+                .iter()
+                .filter(|(_, f)| names.is_none_or(|ns| ns.iter().any(|n| key(n) == *f)))
+                .cloned()
+                .collect();
+            if let Err(e) = self.verify_deferred(&mine) {
+                if let Some(tx) = &mut self.tx {
+                    tx.modes.truncate(before);
+                }
+                return Err(e);
+            }
+            if let Some(tx) = &mut self.tx {
+                for p in &mine {
+                    tx.pending.remove(p);
+                }
+            }
         }
         Ok(())
     }
@@ -723,6 +958,7 @@ impl Drop for Database {
         if let Some(tx) = self.tx.take() {
             self.revert(tx.undo);
         }
+        let _ = self.flush_sequences();
         if self.persist.as_ref().is_some_and(Persistence::is_dirty) {
             let _ = self.checkpoint();
         }

@@ -233,7 +233,8 @@ impl Database {
         Ok(match name.to_ascii_uppercase().as_str() {
             "GENERATE_SERIES" => vec!["generate_series".into()],
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
-            other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES and SPLIT_STRING are available)"))),
+            "JSON_EACH" => vec!["key".into(), "value".into()],
+            other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES, SPLIT_STRING and JSON_EACH are available)"))),
         })
     }
 
@@ -285,6 +286,20 @@ impl Database {
                     text.split(&sep).map(str::to_string).collect()
                 };
                 let rows = parts.into_iter().enumerate().map(|(i, p)| vec![Value::text(&p), Value::Int(i as i64 + 1)]).collect();
+                Ok((cols, rows))
+            }
+            "JSON_EACH" => {
+                if args.len() != 1 {
+                    return Err(wrong("JSON_EACH"));
+                }
+                if args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                let rows = match crate::json::document(&args[0])? {
+                    serde_json::Value::Object(m) => m.iter().map(|(k, v)| vec![Value::text(k), crate::json::to_value(v)]).collect(),
+                    serde_json::Value::Array(a) => a.iter().enumerate().map(|(i, v)| vec![Value::Int(i as i64), crate::json::to_value(v)]).collect(),
+                    _ => return Err(Error::runtime("JSON_EACH needs an object or an array")),
+                };
                 Ok((cols, rows))
             }
             _ => unreachable!("checked by table_function_columns"),

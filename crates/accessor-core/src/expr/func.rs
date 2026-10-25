@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 use super::BExpr;
 use crate::datetime;
+use crate::json;
 use crate::tz;
 use crate::error::{Error, Result};
 use crate::decimal::Decimal;
@@ -98,9 +99,45 @@ pub enum ScalarFn {
     CInterval,
     MakeInterval,
     Age,
+    Nextval,
+    Currval,
+    Lastval,
+    Setval,
+    JsonValid,
+    JsonExtract,
+    JsonValue,
+    JsonGet,
+    JsonGetText,
+    JsonArray,
+    JsonObject,
+    JsonLength,
+    JsonType,
+    JsonKeys,
+    JsonSet,
+    JsonRemove,
+    JsonMergePatch,
+    JsonContains,
+    ToJson,
+    JsonParse,
 }
 
 impl ScalarFn {
+    /// Functions whose value changes from call to call, so they are never folded into a constant.
+    pub fn is_volatile(self) -> bool {
+        matches!(
+            self,
+            ScalarFn::Now
+                | ScalarFn::Date
+                | ScalarFn::NowTz
+                | ScalarFn::LocalNow
+                | ScalarFn::LocalDate
+                | ScalarFn::Nextval
+                | ScalarFn::Currval
+                | ScalarFn::Lastval
+                | ScalarFn::Setval
+        )
+    }
+
     /// Resolves a function name to `(function, min_args, max_args)`.
     pub fn lookup(name: &str) -> Option<(ScalarFn, usize, usize)> {
         use ScalarFn::*;
@@ -188,6 +225,26 @@ impl ScalarFn {
             "CINTERVAL" => (CInterval, 1, 1),
             "MAKEINTERVAL" | "MAKE_INTERVAL" => (MakeInterval, 1, 6),
             "AGE" => (Age, 2, 2),
+            "NEXTVAL" => (Nextval, 1, 1),
+            "CURRVAL" => (Currval, 1, 1),
+            "LASTVAL" => (Lastval, 0, 0),
+            "SETVAL" => (Setval, 2, 3),
+            "JSON_VALID" => (JsonValid, 1, 1),
+            "JSON_EXTRACT" | "JSON_QUERY" => (JsonExtract, 2, 2),
+            "JSON_VALUE" => (JsonValue, 2, 2),
+            "JSON_GET" => (JsonGet, 2, 2),
+            "JSON_GET_TEXT" => (JsonGetText, 2, 2),
+            "JSON_ARRAY" => (JsonArray, 0, usize::MAX),
+            "JSON_OBJECT" => (JsonObject, 0, usize::MAX),
+            "JSON_LENGTH" | "JSON_ARRAY_LENGTH" => (JsonLength, 1, 2),
+            "JSON_TYPE" => (JsonType, 1, 2),
+            "JSON_KEYS" => (JsonKeys, 1, 2),
+            "JSON_SET" => (JsonSet, 3, 3),
+            "JSON_REMOVE" => (JsonRemove, 2, 2),
+            "JSON_MERGE_PATCH" | "JSON_MERGE" => (JsonMergePatch, 2, 2),
+            "JSON_CONTAINS" => (JsonContains, 2, 2),
+            "TO_JSON" => (ToJson, 1, 1),
+            "JSON" | "JSON_PARSE" => (JsonParse, 1, 1),
             _ => return None,
         })
     }
@@ -195,7 +252,19 @@ impl ScalarFn {
     /// Functions that tolerate (and may transform) `Null` arguments; all
     /// others yield `Null` as soon as any argument is `Null`.
     fn handles_null(self) -> bool {
-        matches!(self, ScalarFn::Nz | ScalarFn::IsNull | ScalarFn::Coalesce | ScalarFn::Iif | ScalarFn::NullIf | ScalarFn::Concat)
+        matches!(
+            self,
+            ScalarFn::Nz
+                | ScalarFn::IsNull
+                | ScalarFn::Coalesce
+                | ScalarFn::Iif
+                | ScalarFn::NullIf
+                | ScalarFn::Concat
+                | ScalarFn::JsonArray
+                | ScalarFn::JsonObject
+                | ScalarFn::JsonSet
+                | ScalarFn::ToJson
+        )
     }
 }
 
@@ -691,6 +760,105 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 .and_then(|((d, m), s)| d.add(&m)?.add(&s))
                 .ok_or_else(|| Error::runtime("interval out of range"))?;
             Value::Interval(iv)
+        }
+        JsonValid => Value::Bool(match &*vals[0] {
+            Value::Json(_) => true,
+            Value::Text(s) => json::canonical(s).is_some(),
+            _ => false,
+        }),
+        JsonParse => vals[0].coerce_to(crate::value::DataType::Json)?,
+        ToJson => json::json_value(&json::from_value(&vals[0])),
+        JsonExtract | JsonValue => {
+            let doc = json::document(&vals[0])?;
+            let steps = json::path_steps(&text_of(&vals[1]))?;
+            match json::get(&doc, &steps) {
+                None => Value::Null,
+                Some(found) if f == JsonValue => match found {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => Value::Null,
+                    scalar => json::to_value(scalar),
+                },
+                Some(found) => json::json_value(found),
+            }
+        }
+        JsonGet | JsonGetText => {
+            let doc = json::document(&vals[0])?;
+            let step = match &*vals[1] {
+                Value::Text(k) => json::Step::Key(k.to_string()),
+                other => json::Step::Index(usize::try_from(int_of(other)?).map_err(|_| Error::runtime("a JSON position cannot be negative"))?),
+            };
+            match json::get(&doc, &[step]) {
+                None => Value::Null,
+                Some(found) if f == JsonGet => json::json_value(found),
+                Some(serde_json::Value::Null) => Value::Null,
+                Some(serde_json::Value::String(s)) => Value::text(s),
+                Some(other) => Value::text(&json::to_text(other)),
+            }
+        }
+        JsonArray => json::json_value(&serde_json::Value::Array(vals.iter().map(|v| json::from_value(v)).collect())),
+        JsonObject => {
+            if vals.len() % 2 != 0 {
+                return Err(Error::runtime("JSON_OBJECT takes pairs of a key and a value"));
+            }
+            let mut m = serde_json::Map::new();
+            for pair in vals.chunks(2) {
+                if pair[0].is_null() {
+                    return Err(Error::runtime("a JSON object key cannot be NULL"));
+                }
+                m.insert(text_of(&pair[0]).into_owned(), json::from_value(&pair[1]));
+            }
+            json::json_value(&serde_json::Value::Object(m))
+        }
+        JsonLength | JsonType | JsonKeys => {
+            let doc = json::document(&vals[0])?;
+            let target = match vals.get(1) {
+                Some(p) => json::get(&doc, &json::path_steps(&text_of(p))?),
+                None => Some(&doc),
+            };
+            match (f, target) {
+                (_, None) => Value::Null,
+                (JsonLength, Some(serde_json::Value::Array(a))) => Value::Int(a.len() as i64),
+                (JsonLength, Some(serde_json::Value::Object(m))) => Value::Int(m.len() as i64),
+                (JsonLength, Some(_)) => Value::Int(1),
+                (JsonType, Some(t)) => Value::text(json::type_name(t)),
+                (JsonKeys, Some(serde_json::Value::Object(m))) => {
+                    json::json_value(&serde_json::Value::Array(m.keys().map(|k| serde_json::Value::String(k.clone())).collect()))
+                }
+                _ => Value::Null,
+            }
+        }
+        JsonSet => {
+            if vals[0].is_null() || vals[1].is_null() {
+                return Ok(Value::Null);
+            }
+            let mut doc = json::document(&vals[0])?;
+            json::set(&mut doc, &json::path_steps(&text_of(&vals[1]))?, json::from_value(&vals[2]))?;
+            json::json_value(&doc)
+        }
+        JsonRemove => {
+            let mut doc = json::document(&vals[0])?;
+            json::remove(&mut doc, &json::path_steps(&text_of(&vals[1]))?);
+            json::json_value(&doc)
+        }
+        JsonMergePatch => json::json_value(&json::merge_patch(json::document(&vals[0])?, json::document(&vals[1])?)),
+        JsonContains => {
+            let candidate = match &*vals[1] {
+                Value::Text(s) => json::canonical(s).map_or_else(|| serde_json::Value::String(s.to_string()), |_| json::document(&vals[1]).unwrap_or(serde_json::Value::Null)),
+                other => json::from_value(other),
+            };
+            Value::Bool(json::contains(&json::document(&vals[0])?, &candidate))
+        }
+        Nextval => Value::Int(crate::sequence::next_value(&text_of(&vals[0]))?),
+        Currval => Value::Int(crate::sequence::current_value(&text_of(&vals[0]))?),
+        Lastval => Value::Int(crate::sequence::last_value()?),
+        Setval => {
+            let called = match vals.get(2) {
+                Some(v) => match &**v {
+                    Value::Bool(b) => *b,
+                    _ => return Err(Error::type_err("SETVAL: the third argument must be TRUE or FALSE")),
+                },
+                None => true,
+            };
+            Value::Int(crate::sequence::set_value(&text_of(&vals[0]), int_of(&vals[1])?, called)?)
         }
         Age => Value::Interval(crate::interval::Interval::age(date_of(&vals[0])?, date_of(&vals[1])?)),
         Format => {

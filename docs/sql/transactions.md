@@ -11,6 +11,10 @@ ROLLBACK [TRANSACTION | WORK] TO [SAVEPOINT] name;
 RELEASE [SAVEPOINT] name;
 ```
 
+```sql
+SET CONSTRAINTS {ALL | name [, ...]} {DEFERRED | IMMEDIATE};
+```
+
 ## Example
 
 ```sql
@@ -32,5 +36,23 @@ COMMIT;                       -- the order is saved
 * **Not allowed inside a transaction:** checkpointing and compacting the file.
 * **Closing a database with a transaction open rolls it back.**
 * **Isolation.** There is one connection at a time to a database, so there are no concurrent transactions to isolate from: a transaction sees its own changes immediately.
+
+## SET CONSTRAINTS
+
+Inside a transaction, `SET CONSTRAINTS ALL DEFERRED` (or naming relationships) postpones the checking of [deferrable](ddl.md#deferrable-relationships) relationships until `COMMIT`; `SET CONSTRAINTS ... IMMEDIATE` returns to checking at the end of each statement, and checks at once whatever was waiting. If the check fails, the statement fails and the relationships stay deferred. The setting lasts until the transaction ends. Naming a relationship that is not deferrable is an error; outside a transaction the statement does nothing.
+
+```sql
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+INSERT INTO Child  VALUES (1, 7);     -- parent 7 does not exist yet
+INSERT INTO Parent VALUES (7);
+COMMIT;                               -- verified here: fine
+```
+
+A `COMMIT` that finds a deferred relationship broken rolls back the whole transaction and reports the first broken record. The check reads the rows of the tables whose relationships were deferred, using the parent's index for each; it is one pass over the child rows, so deferring in a transaction that touches millions of rows costs a scan of them at the end.
+
+## Sequences
+
+The numbers [sequences](sequences.md) hand out are not part of a transaction: rolling back does not give them back.
 
 `MERGE` uses a transaction and a savepoint internally so that it is atomic.

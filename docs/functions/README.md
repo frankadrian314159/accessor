@@ -17,7 +17,9 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | [conditional.md](conditional.md) | `CASE`, `Coalesce`, `Greatest`, `IIf`, `IsNull`, `Least`, `NullIf`, `Nz` |
 | [aggregate.md](aggregate.md) | `Avg`, `Count`, `Every`, `First`, `Grouping`, `Last`, `Max`, `Min`, `StdDev`, `String_Agg`, `Sum`, `Variance`, and relatives |
 | [window.md](window.md) | `Cume_Dist`, `Dense_Rank`, `First_Value`, `Lag`, `Last_Value`, `Lead`, `Nth_Value`, `Ntile`, `Percent_Rank`, `Rank`, `Row_Number`, and aggregates used with `OVER` |
-| [table-functions.md](table-functions.md) | `GENERATE_SERIES`, `SPLIT_STRING` (used in `FROM`) |
+| [table-functions.md](table-functions.md) | `GENERATE_SERIES`, `SPLIT_STRING`, `JSON_EACH` (used in `FROM`) |
+| [sequence.md](sequence.md) | `NEXTVAL`, `CURRVAL`, `LASTVAL`, `SETVAL` |
+| [json.md](json.md) | `JSON_VALUE`, `JSON_EXTRACT`, `JSON_SET`, `JSON_OBJECT`, `JSON_ARRAYAGG`, `->`, `->>`, and the rest |
 | [format.md](format.md) | `Format` with its number, date and text patterns |
 
 ## Alphabetical list
@@ -28,7 +30,12 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | AGE | [datetime](datetime.md#time-zones-and-intervals) |
 | AT TIME ZONE, TimeZone | [datetime](datetime.md#time-zones-and-intervals) |
 | CInterval, CTimestampTz | [conversion](conversion.md#conversion-functions) |
-| GENERATE_SERIES, SPLIT_STRING | [table functions](table-functions.md) |
+| GENERATE_SERIES, SPLIT_STRING, JSON_EACH | [table functions](table-functions.md) |
+| JSON_ARRAY, JSON_OBJECT, TO_JSON, JSON_PARSE | [json](json.md#building) |
+| JSON_ARRAYAGG, JSON_AGG | [json](json.md#building) |
+| JSON_CONTAINS, JSON_EXTRACT, JSON_GET, JSON_GET_TEXT, JSON_KEYS, JSON_LENGTH, JSON_TYPE, JSON_VALID, JSON_VALUE | [json](json.md#reading) |
+| JSON_MERGE_PATCH, JSON_REMOVE, JSON_SET | [json](json.md#changing) |
+| NEXTVAL, CURRVAL, LASTVAL, SETVAL | [sequence](sequence.md) |
 | MakeInterval | [datetime](datetime.md#time-zones-and-intervals) |
 | NowTz, SessionTimeZone | [datetime](datetime.md#now-and-date) |
 | Acos | [numeric](numeric.md#trigonometric-and-hyperbolic-functions) |

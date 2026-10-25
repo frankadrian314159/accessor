@@ -59,12 +59,35 @@ impl Database {
     pub(crate) fn apply_enforced(&mut self, ops: &mut Vec<Op>, undo: &mut Vec<Op>) -> Result<()> {
         let refs = self.reference_map();
         let mut queue = VecDeque::new();
-        for op in std::mem::take(ops) {
+        let user_ops = std::mem::take(ops);
+        let statement_events = if self.has_statement_triggers() { self.statement_events(&user_ops) } else { Vec::new() };
+        for (table, event) in &statement_events {
+            self.fire_statement_triggers(TriggerTiming::Before, table, *event, ops, undo, &mut queue, &refs)?;
+        }
+        for op in user_ops {
             self.apply_tracked(op, ops, undo, &mut queue, &refs, 0)?;
         }
+        self.drain_checks(&mut queue, &refs, ops, undo)?;
+        if !statement_events.is_empty() {
+            for (table, event) in &statement_events {
+                self.fire_statement_triggers(TriggerTiming::After, table, *event, ops, undo, &mut queue, &refs)?;
+            }
+            self.drain_checks(&mut queue, &refs, ops, undo)?;
+        }
+        Ok(())
+    }
+
+    /// Checks the relationships touched by the changes queued so far (which may queue more).
+    fn drain_checks(
+        &mut self,
+        queue: &mut VecDeque<Applied>,
+        refs: &RefMap,
+        ops: &mut Vec<Op>,
+        undo: &mut Vec<Op>,
+    ) -> Result<()> {
         while let Some(a) = queue.pop_front() {
             self.check_references_out(&a)?;
-            self.check_references_in(&a, &refs, ops, undo, &mut queue)?;
+            self.check_references_in(&a, refs, ops, undo, queue)?;
         }
         Ok(())
     }
@@ -115,18 +138,26 @@ impl Database {
     }
 
     /// The changed row's own foreign keys must point at existing rows.
-    fn check_references_out(&self, a: &Applied) -> Result<()> {
+    fn check_references_out(&mut self, a: &Applied) -> Result<()> {
         let Some(new) = &a.new else { return Ok(()) };
-        let t = self.table_checked(&a.table)?;
-        // Skip rows a later operation in the same batch already replaced or removed.
-        if t.get(a.id) != Some(new) {
-            return Ok(());
-        }
-        for fk in &t.schema().foreign_keys {
+        let fks = {
+            let t = self.table_checked(&a.table)?;
+            // Skip rows a later operation in the same batch already replaced or removed.
+            if t.get(a.id) != Some(new) {
+                return Ok(());
+            }
+            t.schema().foreign_keys.clone()
+        };
+        for fk in &fks {
             let k = project(new, &fk.columns);
             if k.iter().any(Value::is_null) || a.old.as_ref().is_some_and(|o| project(o, &fk.columns) == k) {
                 continue;
             }
+            if self.fk_deferred(fk) {
+                self.defer_check(&a.table, &fk.name);
+                continue;
+            }
+            let t = self.table_checked(&a.table)?;
             if self.table_checked(&fk.ref_table)?.lookup(&fk.ref_columns, &k).is_empty() {
                 let fields: Vec<&str> = fk.columns.iter().map(|&c| t.schema().columns[c].name.as_str()).collect();
                 return Err(Error::constraint(format!(
@@ -170,7 +201,11 @@ impl Database {
                 continue;
             }
             let action = if new_key.is_some() { fk.on_update } else { fk.on_delete };
-            if action == RefAction::Restrict {
+            if matches!(action, RefAction::Restrict | RefAction::NoAction) {
+                if action == RefAction::NoAction && self.fk_deferred(fk) {
+                    self.defer_check(child_name, &fk.name);
+                    continue;
+                }
                 return Err(Error::constraint(format!(
                     "cannot {} the record in '{}': {} record(s) in '{}' still refer to it",
                     if new_key.is_some() { "change" } else { "delete" },
@@ -188,6 +223,16 @@ impl Database {
                     (RefAction::Cascade, Some(nk)) => {
                         for (&c, v) in fk.columns.iter().zip(nk) {
                             row[c] = v.clone();
+                        }
+                        Op::Update { table, id, row }
+                    }
+                    (RefAction::SetDefault, _) => {
+                        for &c in &fk.columns {
+                            let col = &child.schema().columns[c];
+                            row[c] = match &col.default {
+                                Some(d) if col.sequence_default().is_none() => d.clone(),
+                                _ => Value::Null,
+                            };
                         }
                         Op::Update { table, id, row }
                     }

@@ -339,6 +339,10 @@ WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total > 100);
 
 Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, `WHERE` and `ORDER BY` of a query without `GROUP BY`, and in the `WHERE` and `SET` of `UPDATE` and `DELETE`.
 
+#### Sequences
+
+`CREATE SEQUENCE invoice_no START WITH 1000` makes a counter of its own; `NEXT VALUE FOR invoice_no` (or `NEXTVAL('invoice_no')`) takes the next number, and `DEFAULT NEXT VALUE FOR invoice_no` fills a column. Numbers taken are never given back, even by a rollback, and survive a restart. See [sequences](sql/sequences.md).
+
 #### Views you can change
 
 `CREATE VIEW v (a, b) AS SELECT ... [WITH CHECK OPTION]` names the columns, and `INSERT`, `UPDATE` and `DELETE` work on a view of one table, within the view's condition. `CREATE OR REPLACE VIEW` swaps a definition atomically, `ALTER TABLE t RENAME TO new` follows the references, and `ALTER COLUMN c SET DEFAULT / SET NOT NULL` adjust a column. A view that shows all of a table's columns is merged into the queries that read it, so the table's indexes apply. See [queries and triggers](sql/queries-and-triggers.md) and [data definition](sql/ddl.md).
@@ -370,6 +374,10 @@ PIVOT Quarter;
 #### Ordering, row values, LATERAL and pivots
 
 `ORDER BY x NULLS LAST` places NULLs explicitly (an index can still serve it). A row value compares several columns at once: `WHERE (Day, ID) > (@lastDay, @lastID)` pages through results from an index. `LATERAL` runs a sub-query for each row of the tables before it, which makes "top 3 per customer" a one-liner, and `GENERATE_SERIES` and `SPLIT_STRING` supply rows from nothing. `source PIVOT (SUM(x) FOR col IN (...))` and `source UNPIVOT (v FOR name IN (c1, c2))` turn rows into columns and back. See the [SQL reference](sql/select.md).
+
+#### JSON
+
+A `JSON` column holds a document, checked when it is stored and kept in a canonical form so equal documents are equal. `body -> 'tags' -> 0` and `body ->> 'name'` reach inside; `JSON_VALUE(body, '$.age')` gives an ordinary number; `JSON_SET`, `JSON_REMOVE` and `JSON_MERGE_PATCH` build changed documents; `JSON_EACH` turns a document into rows and `JSON_ARRAYAGG` turns rows into a document. See [the JSON type](types/json.md) and [the JSON functions](functions/json.md).
 
 #### Combining queries
 

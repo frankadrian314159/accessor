@@ -7,7 +7,7 @@ use super::bind::{Binder, Scope};
 use super::QueryResult;
 use crate::database::{key, Database};
 use crate::error::{Error, Result};
-use crate::sql::ast::{Expr, ParamDecl, Select, Statement, TriggerDef, TriggerEvent};
+use crate::sql::ast::{Expr, ParamDecl, Select, Statement, TriggerDef, TriggerEvent, TriggerTiming};
 use crate::sql::walk::{bind_params, bind_params_select, walk_select, RowContext};
 use crate::sql::{parse_query_def, parse_script, QueryDef};
 use crate::storage::Op;
@@ -64,7 +64,7 @@ pub(crate) fn used_params(select: &mut Select) -> Vec<String> {
 }
 
 impl Database {
-    fn eval_const(&self, e: &Expr) -> Result<Value> {
+    pub(crate) fn eval_const(&self, e: &Expr) -> Result<Value> {
         let scope = Scope::default();
         Ok(Binder::new(self, &scope, 0).bind(e)?.eval(&[])?.into_owned())
     }
@@ -135,26 +135,45 @@ impl Database {
     // ----- triggers ---------------------------------------------------------------
 
     pub(crate) fn exec_create_trigger(&mut self, def: &TriggerDef) -> Result<QueryResult> {
-        let table = self.table_checked(&def.table)?;
         if self.triggers.contains_key(&key(&def.name)) {
             return Err(Error::catalog(format!("the trigger '{}' already exists", def.name)));
         }
-        // Dry run: every OLD/NEW/column reference must resolve for this event.
-        let blank: Row = vec![Value::Null; table.schema().columns.len()];
-        let ctx = RowContext {
-            schema: table.schema(),
-            old: (def.event != TriggerEvent::Insert).then_some(&blank),
-            new: (def.event != TriggerEvent::Delete).then_some(&blank),
+        // What the trigger is attached to: a table, or (for INSTEAD OF) a query.
+        let schema = if def.timing == TriggerTiming::InsteadOf {
+            if self.table(&def.table).is_some() || self.view_sql(&def.table).is_none() {
+                return Err(Error::catalog(format!("an INSTEAD OF trigger belongs to a query, and '{}' is not one", def.table)));
+            }
+            crate::trigger::view_schema(&def.table, &self.resolve_factor(&crate::sql::ast::TableFactor::Named { name: def.table.clone(), alias: None }, 0)?.names)
+        } else {
+            self.table_checked(&def.table)?.schema().clone()
         };
-        if let Some(w) = &def.when {
-            ctx.bind_expr(&mut w.clone())?;
+        for c in &def.update_of {
+            if schema.column_index(c).is_none() {
+                return Err(Error::catalog(format!("the field '{c}' does not exist in '{}'", def.table)));
+            }
         }
-        for st in &def.body {
-            let mut st = st.clone();
-            ctx.bind_statement(&mut st)?;
-            if let Statement::Insert { table: target, .. } = &st {
-                if target.eq_ignore_ascii_case(table.name()) {
-                    return Err(Error::catalog("a trigger cannot insert into the table it is attached to"));
+        // Dry run: every OLD/NEW/column reference must resolve for each event.
+        let blank: Row = vec![Value::Null; schema.columns.len()];
+        for event in &def.events {
+            let ctx = if def.each_statement {
+                RowContext { schema: &schema, old: None, new: None }
+            } else {
+                RowContext {
+                    schema: &schema,
+                    old: (*event != TriggerEvent::Insert).then_some(&blank),
+                    new: (*event != TriggerEvent::Delete).then_some(&blank),
+                }
+            };
+            if let Some(w) = &def.when {
+                ctx.bind_expr(&mut w.clone())?;
+            }
+            for st in &def.body {
+                let mut st = st.clone();
+                ctx.bind_statement(&mut st)?;
+                if let Statement::Insert { table: target, .. } = &st {
+                    if target.eq_ignore_ascii_case(&def.table) {
+                        return Err(Error::catalog("a trigger cannot insert into the table it is attached to"));
+                    }
                 }
             }
         }

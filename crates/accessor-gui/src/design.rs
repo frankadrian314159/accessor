@@ -9,7 +9,7 @@ use crate::ui::{bracket, Event};
 /// Tall enough to show every type at once; the default drop-down height would hide the last few.
 const TYPE_LIST_HEIGHT: f32 = 340.0;
 
-const TYPES: [DataType; 12] = [
+const TYPES: [DataType; 13] = [
     DataType::Integer,
     DataType::Bignum,
     DataType::Float,
@@ -22,11 +22,12 @@ const TYPES: [DataType; 12] = [
     DataType::DateTime,
     DataType::TimestampTz,
     DataType::Interval,
+    DataType::Json,
 ];
 
 /// Types offered for a new field. An existing field can only be converted to the
 /// ordinary types (`TYPES`); a field becomes calculated by being created that way.
-const NEW_TYPES: [DataType; 13] = [
+const NEW_TYPES: [DataType; 14] = [
     DataType::Integer,
     DataType::Bignum,
     DataType::Float,
@@ -39,6 +40,7 @@ const NEW_TYPES: [DataType; 13] = [
     DataType::DateTime,
     DataType::TimestampTz,
     DataType::Interval,
+    DataType::Json,
     DataType::Calculated,
 ];
 

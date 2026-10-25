@@ -4,6 +4,7 @@ use super::ast::*;
 use super::lexer::{lex, Tok, Token};
 use crate::error::{Error, Result};
 use crate::schema::RefAction;
+use crate::sequence::SequenceOptions;
 use crate::value::{DataType, Value};
 
 const RESERVED: &[&str] = &[
@@ -449,6 +450,18 @@ impl<'a> Parser<'a> {
             }
             return Ok(Statement::Explain(Box::new(self.select()?)));
         }
+        if self.peek_kw("SET") && self.peek_kw_at(1, "CONSTRAINTS") {
+            self.advance();
+            self.advance();
+            let names = if self.eat_kw("ALL") { None } else { Some(self.ident_list()?) };
+            let deferred = if self.eat_kw("DEFERRED") {
+                true
+            } else {
+                self.expect_kw("IMMEDIATE")?;
+                false
+            };
+            return Ok(Statement::SetConstraints { names, deferred });
+        }
         if self.eat_kw("SET") {
             // SET TIME ZONE 'x' | SET TIMEZONE TO 'x'
             if !self.eat_kw("TIMEZONE") {
@@ -748,23 +761,49 @@ impl<'a> Parser<'a> {
             TriggerTiming::Before
         } else if self.eat_kw("AFTER") {
             TriggerTiming::After
+        } else if self.eat_kw("INSTEAD") {
+            self.expect_kw("OF")?;
+            TriggerTiming::InsteadOf
         } else {
-            return Err(self.unexpected("BEFORE or AFTER"));
+            return Err(self.unexpected("BEFORE, AFTER or INSTEAD OF"));
         };
-        let event = if self.eat_kw("INSERT") {
-            TriggerEvent::Insert
-        } else if self.eat_kw("UPDATE") {
-            TriggerEvent::Update
-        } else if self.eat_kw("DELETE") {
-            TriggerEvent::Delete
-        } else {
-            return Err(self.unexpected("INSERT, UPDATE or DELETE"));
-        };
+        // One or more events: `INSERT OR UPDATE [OF a, b] OR DELETE`.
+        let mut events = Vec::new();
+        let mut update_of = Vec::new();
+        loop {
+            let event = if self.eat_kw("INSERT") {
+                TriggerEvent::Insert
+            } else if self.eat_kw("UPDATE") {
+                if self.eat_kw("OF") {
+                    update_of = self.ident_list()?;
+                }
+                TriggerEvent::Update
+            } else if self.eat_kw("DELETE") {
+                TriggerEvent::Delete
+            } else {
+                return Err(self.unexpected("INSERT, UPDATE or DELETE"));
+            };
+            if events.contains(&event) {
+                return Err(Error::syntax("a trigger names each event only once"));
+            }
+            events.push(event);
+            if !self.eat_kw("OR") {
+                break;
+            }
+        }
         self.expect_kw("ON")?;
         let table = self.ident()?;
+        let mut each_statement = false;
         if self.eat_kw("FOR") {
             self.expect_kw("EACH")?;
-            self.expect_kw("ROW")?;
+            if self.eat_kw("STATEMENT") {
+                each_statement = true;
+            } else {
+                self.expect_kw("ROW")?;
+            }
+        }
+        if each_statement && timing == TriggerTiming::InsteadOf {
+            return Err(Error::syntax("an INSTEAD OF trigger works on each row"));
         }
         let when = if self.eat_kw("WHEN") { Some(self.expr()?) } else { None };
         self.expect_kw("BEGIN")?;
@@ -778,8 +817,11 @@ impl<'a> Parser<'a> {
                 return Err(self.unexpected("END"));
             }
             let st = self.statement()?;
-            if !matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Raise(_)) {
-                return Err(Error::syntax("a trigger body may contain only INSERT, UPDATE, DELETE and RAISE statements"));
+            if !matches!(
+                st,
+                Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Raise(_) | Statement::Select(_)
+            ) {
+                return Err(Error::syntax("a trigger body may contain only INSERT, UPDATE, DELETE, SELECT and RAISE statements"));
             }
             body.push(st);
             if !self.peek_sym(";") && !self.peek_kw("END") {
@@ -791,7 +833,7 @@ impl<'a> Parser<'a> {
         }
         let end = self.toks[self.pos - 1].pos + "END".len();
         let sql = self.src[start..end].to_string();
-        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, event, table, when, body, sql })))
+        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, sql })))
     }
 
     fn create(&mut self) -> Result<Statement> {
@@ -837,6 +879,12 @@ impl<'a> Parser<'a> {
         if self.eat_kw("TABLE") {
             self.if_exists_clause(true, guarded)?;
             return self.create_table();
+        }
+        if !unique && self.eat_kw("SEQUENCE") {
+            self.if_exists_clause(true, guarded)?;
+            let name = self.ident()?;
+            let options = self.sequence_options()?;
+            return Ok(Statement::CreateSequence { name, options });
         }
         if self.eat_kw("INDEX") {
             self.if_exists_clause(true, guarded)?;
@@ -980,30 +1028,73 @@ impl<'a> Parser<'a> {
             ref_columns = self.ident_list()?;
             self.expect_sym(")")?;
         }
-        let (mut on_delete, mut on_update) = (RefAction::Restrict, RefAction::Restrict);
+        let (mut del, mut upd) = self.references_actions()?;
+        // `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]`, before or after the actions.
+        let (mut deferrable, mut initially_deferred) = (false, false);
+        loop {
+            if self.eat_kw("NOT") {
+                self.expect_kw("DEFERRABLE")?;
+                deferrable = false;
+            } else if self.eat_kw("DEFERRABLE") {
+                deferrable = true;
+            } else if self.eat_kw("INITIALLY") {
+                if self.eat_kw("DEFERRED") {
+                    initially_deferred = true;
+                    deferrable = true;
+                } else {
+                    self.expect_kw("IMMEDIATE")?;
+                    initially_deferred = false;
+                }
+            } else if self.peek_kw("ON") {
+                // Actions given after the timing.
+                let more = self.references_actions()?;
+                del = more.0.or(del);
+                upd = more.1.or(upd);
+            } else {
+                break;
+            }
+        }
+        // Without an action, a relationship that can be deferred waits too (NO ACTION); others refuse at once.
+        let default = if deferrable { RefAction::NoAction } else { RefAction::Restrict };
+        let (on_delete, on_update) = (del.unwrap_or(default), upd.unwrap_or(default));
+        Ok(ForeignKeyDef { name, columns, ref_table, ref_columns, on_delete, on_update, deferrable, initially_deferred })
+    }
+
+    /// `ON DELETE x` / `ON UPDATE y` clauses (either, in any order).
+    fn references_actions(&mut self) -> Result<(Option<RefAction>, Option<RefAction>)> {
+        let (mut del, mut upd) = (None, None);
         while self.eat_kw("ON") {
-            let slot = if self.eat_kw("DELETE") {
-                &mut on_delete
+            let is_delete = if self.eat_kw("DELETE") {
+                true
             } else if self.eat_kw("UPDATE") {
-                &mut on_update
+                false
             } else {
                 return Err(self.unexpected("DELETE or UPDATE"));
             };
-            *slot = if self.eat_kw("CASCADE") {
+            let action = if self.eat_kw("CASCADE") {
                 RefAction::Cascade
             } else if self.eat_kw("RESTRICT") {
                 RefAction::Restrict
             } else if self.eat_kw("NO") {
                 self.expect_kw("ACTION")?;
-                RefAction::Restrict
+                RefAction::NoAction
             } else if self.eat_kw("SET") {
-                self.expect_kw("NULL")?;
-                RefAction::SetNull
+                if self.eat_kw("DEFAULT") {
+                    RefAction::SetDefault
+                } else {
+                    self.expect_kw("NULL")?;
+                    RefAction::SetNull
+                }
             } else {
-                return Err(self.unexpected("CASCADE, SET NULL, RESTRICT or NO ACTION"));
+                return Err(self.unexpected("CASCADE, SET NULL, SET DEFAULT, RESTRICT or NO ACTION"));
             };
+            if is_delete {
+                del = Some(action);
+            } else {
+                upd = Some(action);
+            }
         }
-        Ok(ForeignKeyDef { name, columns, ref_table, ref_columns, on_delete, on_update })
+        Ok((del, upd))
     }
 
     /// `[AS] (expression)` after the type name CALCULATED; returns the expression text.
@@ -1127,18 +1218,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("AUTOINCREMENT") || self.eat_kw("IDENTITY") {
                 def.autonumber = true;
             } else if self.eat_kw("DEFAULT") {
-                let neg = self.eat_sym("-");
-                let v = match self.primary()? {
-                    Expr::Literal(v) => v,
-                    _ => return Err(Error::syntax("DEFAULT must be a literal")),
-                };
-                def.default = Some(if neg {
-                    match v {
-                        n => negate_literal(&n).ok_or_else(|| Error::syntax("cannot negate DEFAULT value"))?,
-                    }
-                } else {
-                    v
-                });
+                def.default = Some(self.default_value()?);
             } else {
                 break;
             }
@@ -1146,7 +1226,85 @@ impl<'a> Parser<'a> {
         Ok(def)
     }
 
+    /// The value after `DEFAULT`: a literal, or `NEXT VALUE FOR seq` / `NEXTVAL('seq')`.
+    fn default_value(&mut self) -> Result<Value> {
+        let neg = self.eat_sym("-");
+        self.default_value_after(neg)
+    }
+
+    fn default_value_after(&mut self, neg: bool) -> Result<Value> {
+        match self.primary()? {
+            Expr::Literal(v) if neg => negate_literal(&v).ok_or_else(|| Error::syntax("cannot negate DEFAULT value")),
+            Expr::Literal(v) => Ok(v),
+            Expr::Function { name, args, .. } if !neg && name.eq_ignore_ascii_case("NEXTVAL") => match args.as_slice() {
+                [Expr::Literal(Value::Text(t))] => Ok(Value::text(&format!("{}{}", crate::schema::SEQUENCE_DEFAULT, &**t))),
+                _ => Err(Error::syntax("NEXTVAL in a DEFAULT takes the name of a sequence")),
+            },
+            _ => Err(Error::syntax("DEFAULT must be a literal or NEXT VALUE FOR a sequence")),
+        }
+    }
+
+    /// The options of `CREATE SEQUENCE` and `ALTER SEQUENCE`.
+    fn sequence_options(&mut self) -> Result<SequenceOptions> {
+        let mut o = SequenceOptions::default();
+        loop {
+            if self.eat_kw("AS") {
+                self.ident()?; // the type: all sequences count in 64-bit integers
+            } else if self.eat_kw("START") {
+                self.eat_kw("WITH");
+                o.start = Some(self.signed_int()?);
+            } else if self.eat_kw("INCREMENT") {
+                self.eat_kw("BY");
+                o.increment = Some(self.signed_int()?);
+            } else if self.eat_kw("MINVALUE") {
+                o.min = Some(Some(self.signed_int()?));
+            } else if self.eat_kw("MAXVALUE") {
+                o.max = Some(Some(self.signed_int()?));
+            } else if self.eat_kw("NO") {
+                if self.eat_kw("MINVALUE") {
+                    o.min = Some(None);
+                } else if self.eat_kw("MAXVALUE") {
+                    o.max = Some(None);
+                } else if self.eat_kw("CYCLE") {
+                    o.cycle = Some(false);
+                } else {
+                    return Err(self.unexpected("MINVALUE, MAXVALUE or CYCLE"));
+                }
+            } else if self.eat_kw("CYCLE") {
+                o.cycle = Some(true);
+            } else if self.eat_kw("CACHE") {
+                self.signed_int()?; // accepted and ignored
+            } else if self.eat_kw("RESTART") {
+                o.restart = Some(if self.eat_kw("WITH") { Some(self.signed_int()?) } else { None });
+            } else {
+                return Ok(o);
+            }
+        }
+    }
+
+    fn signed_int(&mut self) -> Result<i64> {
+        let neg = self.eat_sym("-");
+        if !neg {
+            self.eat_sym("+");
+        }
+        match self.advance() {
+            Tok::Int(n) => Ok(if neg { -n } else { n }),
+            _ => {
+                self.pos -= 1;
+                Err(self.unexpected("a whole number"))
+            }
+        }
+    }
+
     fn alter(&mut self) -> Result<Statement> {
+        if self.eat_kw("SEQUENCE") {
+            let mut guarded = false;
+            self.if_exists_clause(false, &mut guarded)?;
+            let name = self.ident()?;
+            let options = self.sequence_options()?;
+            let st = Statement::AlterSequence { name, options };
+            return Ok(if guarded { Statement::Guarded { missing_ok: true, stmt: Box::new(st) } } else { st });
+        }
         self.expect_kw("TABLE")?;
         let table = self.ident()?;
         let action = if self.eat_kw("ADD") {
@@ -1187,11 +1345,7 @@ impl<'a> Parser<'a> {
                         AlterAction::SetDefault { name, value: None }
                     } else {
                         let neg = self.eat_sym("-");
-                        let v = match self.primary()? {
-                            Expr::Literal(v) => v,
-                            _ => return Err(Error::syntax("DEFAULT must be a literal")),
-                        };
-                        let v = if neg { negate_literal(&v).ok_or_else(|| Error::syntax("cannot negate DEFAULT value"))? } else { v };
+                        let v = self.default_value_after(neg)?;
                         AlterAction::SetDefault { name, value: Some(v) }
                     }
                 } else if self.eat_kw("NOT") {
@@ -1239,6 +1393,9 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("VIEW") || self.eat_kw("QUERY") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropView(self.ident()?))
+        } else if self.eat_kw("SEQUENCE") {
+            self.if_exists_clause(false, guarded)?;
+            Ok(Statement::DropSequence(self.ident()?))
         } else if self.eat_kw("TRIGGER") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropTrigger(self.ident()?))
@@ -1251,7 +1408,7 @@ impl<'a> Parser<'a> {
                 Err(self.unexpected("ON"))
             }
         } else {
-            Err(self.unexpected("TABLE, VIEW, INDEX or TRIGGER"))
+            Err(self.unexpected("TABLE, VIEW, INDEX, SEQUENCE or TRIGGER"))
         }
     }
 
@@ -2040,6 +2197,17 @@ impl<'a> Parser<'a> {
 
     fn power(&mut self) -> Result<Expr> {
         let mut base = self.primary()?;
+        // `doc -> 'key'` (JSON) and `doc ->> 'key'` (JSON as text).
+        while matches!(self.peek(), Tok::Sym("->") | Tok::Sym("->>")) {
+            let text = matches!(self.advance(), Tok::Sym("->>"));
+            let key = self.primary()?;
+            base = Expr::Function {
+                name: if text { "JSON_GET_TEXT" } else { "JSON_GET" }.into(),
+                args: vec![base, key],
+                distinct: false,
+                star: false,
+            };
+        }
         // `x AT TIME ZONE 'Europe/Paris'`
         while self.peek_kw("AT") && self.peek_kw_at(1, "TIME") && self.peek_kw_at(2, "ZONE") {
             for _ in 0..3 {
@@ -2195,6 +2363,14 @@ impl<'a> Parser<'a> {
                             _ => "LOCALNOW",
                         };
                         return Ok(Expr::Function { name: f.into(), args: vec![], distinct: false, star: false });
+                    }
+                    "NEXT" | "PREVIOUS" if self.peek_kw_at(1, "VALUE") && self.peek_kw_at(2, "FOR") => {
+                        self.advance();
+                        self.advance();
+                        self.advance();
+                        let seq = self.ident()?;
+                        let f = if up == "NEXT" { "NEXTVAL" } else { "CURRVAL" };
+                        return Ok(Expr::Function { name: f.into(), args: vec![Expr::Literal(Value::text(&seq))], distinct: false, star: false });
                     }
                     "CAST" if matches!(self.peek_at(1), Tok::Sym("(")) => {
                         self.advance();
@@ -2396,6 +2572,7 @@ impl<'a> Parser<'a> {
             DataType::DateTime => "CDATE",
             DataType::TimestampTz => "CTIMESTAMPTZ",
             DataType::Interval => "CINTERVAL",
+            DataType::Json => "JSON_PARSE",
             DataType::Calculated => return Err(Error::syntax("cannot CAST to CALCULATED")),
         };
         let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };

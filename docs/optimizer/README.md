@@ -53,6 +53,7 @@ And what it deliberately does not do, so that you are not surprised:
 
 * It does not reorder outer joins (`LEFT`, `RIGHT`, `FULL`).
 * It does not keep statistics or need `ANALYZE`; its estimates are simple (see [estimates.md](estimates.md)).
+* Functions whose value changes between calls (`NEXTVAL`, `CURRVAL`, `Now`, ...) are never folded into constants and never used to choose an index; everything else, `JSON_*` functions included, is deterministic and folded when its arguments are constants.
 * It does not look inside sub-queries, derived tables or views that join, group or project columns to merge them with the outer query; each is planned on its own. (A view of the form `SELECT * FROM table WHERE ...` *is* merged: [views.md](views.md).)
 * It does not cache plans: every statement is planned again each time it runs.
 
