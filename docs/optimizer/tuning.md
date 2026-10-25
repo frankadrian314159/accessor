@@ -74,7 +74,7 @@ A view of the form `SELECT * FROM table WHERE ...` costs nothing: it is merged i
 
 ## 9. JSON columns
 
-A condition on something *inside* a document, such as `WHERE JSON_VALUE(Body, '$.status') = 'open'`, reads and parses the document of every row it examines: an index on `Body` cannot help, because it holds whole documents. If you search a document member often, make it a column of its own: an ordinary column that you fill when you store the document, or a [calculated column](../types/calculated.md) (`Status CALCULATED AS (JSON_VALUE(Body, '$.status'))`) with an index on it. Conditions on that column use the index in the usual way.
+A condition on something *inside* a document, such as `WHERE JSON_VALUE(Body, '$.status') = 'open'`, reads and parses the document of every row it examines: an index on `Body` cannot help, because it holds whole documents. If you search a document member often, make it a column of its own: an ordinary, typed column that you fill when you store the document (or keep in step with a trigger), with an index on it. Conditions on that column use the index in the usual way. A [calculated column](../types/calculated.md) such as `Status CALCULATED AS (JSON_VALUE(Body, '$.status'))` is convenient for reading, but its type is not fixed, so the optimizer does not probe an index on it; a condition on it is applied to the rows as they are read.
 
 ## 10. Sequences and volatile functions
 
@@ -94,9 +94,9 @@ or `db.set_optimizer(false)` in Rust. Joins then run in the written order, with 
 
 * **Outer joins are not reordered** and conditions are not pushed to their nullable side.
 * **More than 63 tables** in one `FROM` are joined as written.
-* **Sub-queries, views and CTEs are planned separately.** A condition on a derived table is not pushed into it, and a derived table is computed in full before it is joined. A condition like `WHERE d.x = 5` over `(SELECT ... ) AS d` filters after `d` is built; put the condition inside the derived table when you can.
-* **The estimates are simple** ([estimates.md](estimates.md)): good for indexed conditions, crude otherwise. There is no histogram, no correlation between columns, and no `ANALYZE`.
+* **Sub-queries, views and CTEs are planned separately,** except that a derived table or view that is a plain selection of columns of one table is merged ([subqueries.md](subqueries.md#derived-tables-and-views-read-as-their-table)). Any other derived table is computed in full before it is joined, and a condition like `WHERE d.x = 5` over it filters after it is built; put the condition inside the derived table when you can.
+* **The estimates** ([estimates.md](estimates.md)) are exact for indexed conditions and use histograms and common-value counts for the rest. They do not know that columns are related, a sample can miss a rare value, and derived tables have no statistics.
 * **The join order search is greedy**: it picks the best next table at each step and does not try every order, so on a query with many tables it can miss the best order, though it rarely picks a bad one.
-* **No plan cache.** Each run plans again. That is cheap compared with execution, and means a plan always reflects current data; a saved query is re-planned every time it runs.
+* **No plan cache.** Each run plans again. That is cheap compared with execution, and means a plan always reflects current data; a saved query is re-planned every time it runs. The parsed text is cached and statements can be prepared ([prepared.md](prepared.md)).
 * **Ordered reads need one table**, a limit, plain sort columns in one direction, and a matching index.
-* **Correlated sub-queries** run once per distinct outer value, with no attempt to turn them into joins. Where a join would do, writing it as a join (or a derived table with `GROUP BY`) lets the optimizer help.
+* **Correlated sub-queries** whose correlation is a set of equalities are run once and looked up (a semi-join, [subqueries.md](subqueries.md)); others run once per distinct outer value. Where a join would do, writing it as a join (or a derived table with `GROUP BY`) lets the optimizer help; an index on the column the sub-query is correlated on makes the per-key run cheap.

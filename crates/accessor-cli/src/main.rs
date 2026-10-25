@@ -27,6 +27,8 @@ Dot-commands:
   .sync on|off               fsync every commit (default on)
   .timezone [NAME]           show or set the session time zone (UTC, +05:30, Europe/Paris)
   .optimizer on|off          turn the query optimizer on or off (for comparing plans)
+  .stats TABLE               column statistics the optimizer uses (distinct values, common values, range)
+  .sequences                 list the sequences and the last number each handed out
   .timer on|off              show statement timings
   .checkpoint                fold the log into the database file
   .compact                   compact and repair
@@ -214,6 +216,38 @@ impl Shell {
                     }
                 }
                 println!("time zone {}", self.db.time_zone());
+            }
+            ".stats" => match self.db.table(rest.trim()) {
+                None => eprintln!("no table named '{}'", rest.trim()),
+                Some(t) => {
+                    println!("{} ({} rows)", t.name(), t.len());
+                    for (i, c) in t.schema().columns.iter().enumerate() {
+                        if c.is_calculated() {
+                            continue;
+                        }
+                        let s = t.column_stats(i);
+                        let range = match (s.bounds.first(), s.bounds.last()) {
+                            (Some(lo), Some(hi)) => format!("{lo} .. {hi}"),
+                            _ => "-".to_string(),
+                        };
+                        let common: Vec<String> =
+                            s.most_common.iter().take(3).map(|(v, f)| format!("{v} ({:.0}%)", f * 100.0)).collect();
+                        println!(
+                            "  {:<16} distinct {}{}  nulls {:.0}%  range {range}  common {}",
+                            c.name,
+                            s.distinct.round(),
+                            if s.sampled { " (est.)" } else { "" },
+                            s.null_fraction() * 100.0,
+                            if common.is_empty() { "-".to_string() } else { common.join(", ") }
+                        );
+                    }
+                }
+            },
+            ".sequences" => {
+                for d in self.db.sequences() {
+                    let last = d.last.map_or("-".to_string(), |n| n.to_string());
+                    println!("{}  start {} increment {} min {} max {}{}  last {last}", d.name, d.start, d.increment, d.min, d.max, if d.cycle { " cycle" } else { "" });
+                }
             }
             ".optimizer" => {
                 self.db.set_optimizer(!rest.eq_ignore_ascii_case("off"));

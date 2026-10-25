@@ -101,7 +101,14 @@ The last line: the number of rows the query itself produced.
 
 ## Sub-queries
 
-A sub-query, derived table or CTE is planned when it runs, and its lines appear **indented** under the lines of the query that runs it. A correlated sub-query runs once for every distinct outer value it reads, so its lines can appear many times.
+A sub-query, derived table or CTE is planned when it runs, and its lines appear **indented** under the lines of the query that runs it. A correlated sub-query runs once for every distinct outer value it reads, so its lines can appear many times, unless it was run once as a [semi-join](subqueries.md#semi-joins). After the lines of the inner queries comes a summary:
+
+```
+correlated sub-query: semi-join, the inner query ran once and kept 600 row(s) in a hash table; 300 lookup(s) for 300 row(s), 0 separate run(s)
+correlated sub-query: ran 5 time(s) for 5 row(s) (once per distinct set of outer values)
+```
+
+In a grouped query the rows are the groups.
 
 ## Comparing plans
 

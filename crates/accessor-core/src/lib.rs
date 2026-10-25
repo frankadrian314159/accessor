@@ -45,5 +45,7 @@ pub use error::{Error, Result};
 pub use exec::QueryResult;
 pub use schema::{Column, ForeignKey, IndexDef, RefAction, TableSchema};
 pub use storage::persist::Durability;
+pub use exec::Prepared;
+pub use storage::stats::ColumnStats;
 pub use storage::{RowId, Table};
 pub use value::{DataType, Row, Value};

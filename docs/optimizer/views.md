@@ -7,10 +7,10 @@ A saved query used in a `FROM` clause is, by default, **computed first and then 
 A view is merged when it
 
 * reads exactly one table (not another view, a join, a derived table or a sub-query in `FROM`),
-* shows **every column** of that table, in the table's order (they may be renamed),
+* shows plain columns of that table (any of them, but **in the table's own order**; they may be renamed),
 * has no `DISTINCT`, grouping, aggregate, limit, window function, set operator or parameters,
 
-that is, it is `SELECT * FROM Table [WHERE condition]`, possibly with a column-name list. Such a view is just a table with an extra condition, so the query reads the table directly and the view's condition is applied **during the scan**, together with the query's own:
+that is, it is `SELECT col, col, ... FROM Table [WHERE condition]` (or `SELECT *`), possibly with a column-name list. Such a view is just a table with an extra condition and some columns hidden, so the query reads the table directly and the view's condition is applied **during the scan**, together with the query's own:
 
 ```sql
 CREATE VIEW Live AS SELECT * FROM Prod WHERE active;
@@ -25,7 +25,7 @@ scan Live [5 rows]: index pname on name = (nut) (2 condition(s) pushed down)
 
 The index on `name` is used even though the query is written against the view. In a join the view's condition filters the table before the join, like any other pushed-down condition, and `COUNT(*)`, `ORDER BY ... LIMIT` and join reordering all see the real table.
 
-Merging never changes the answer. The one place it is not done is where the view would be the **preserved side** of a `RIGHT` or `FULL` join (where a row filtered out by the view must not reappear), and there the view is simply computed first. Views that select only some of a table's columns, or compute columns, are also computed first; they are still correct, only without the index help. If you want index use through a projection, make the view `SELECT *` or select from the table directly.
+Merging never changes the answer. The one place it is not done is where the view would be the **preserved side** of a `RIGHT` or `FULL` join (where a row filtered out by the view must not reappear), and there the view is simply computed first. Views that compute a column, put the columns in another order than the table's, repeat a column, join, group or limit are computed first; they are still correct, only without the index help. If you want index use through such a view, select from the table directly. The same rule merges a derived table, `FROM (SELECT ...) AS d`: see [subqueries.md](subqueries.md#derived-tables-and-views-read-as-their-table). The columns a merged view does not show cannot be named from outside it.
 
 ## Changing data through a view
 

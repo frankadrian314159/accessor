@@ -30,13 +30,13 @@ The optimizer works greedily, one table at a time:
    | Reach | Meaning | Estimated rows out | Work |
    | --- | --- | --- | --- |
    | **unique** | an equality links it to the joined tables and a unique index covers the linked columns, so each row matches at most one | the rows so far (no growth) | one lookup per row |
-   | **index** | an equality links it and some index starts with a linked column | the larger of rows so far and the table's estimate | one lookup per row |
-   | **hash** | an equality links it but no index helps | the larger of the two | rows so far + the table's rows |
+   | **index** | an equality links it and some index starts with a linked column | the equality-join estimate below | one lookup per row |
+   | **hash** | an equality links it but no index helps | the equality-join estimate below | rows so far + the table's rows |
    | **cross** | no equality links it to the joined tables | the product of the two | the product |
 
    It picks the table with the **fewest rows out**, using the work as the tie-break and then the written order. A table with no join condition to the rest is therefore left until last, so that Cartesian products are done on the smallest possible inputs.
 
-The "larger of the two" for a linked join reflects the usual shape of a join: a foreign key joined to its primary key returns about as many rows as the many side has. It is a guess, not a measurement.
+The equality-join estimate is rows so far × the table's rows ÷ the larger distinct count of the two join columns, from the [column statistics](estimates.md#the-estimate-for-a-join). For a foreign key joined to its primary key that is about as many rows as the many side has; for two columns with few distinct values it is a large multiple, which is why such a join is left until the other tables have thinned the inputs. Without statistics for both columns (a derived table, say) the estimate is the larger of the two inputs. It is a guess, not a measurement.
 
 Each step applies the join conditions that have just become available ([pushdown.md](pushdown.md)).
 

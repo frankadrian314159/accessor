@@ -1638,11 +1638,12 @@ fn correlated_subqueries() {
         .query("SELECT Name FROM Customers c WHERE EXISTS (SELECT 1 FROM Orders o WHERE o.CustID = c.ID AND EXISTS (SELECT 1 FROM Orders p WHERE p.CustID = c.ID AND p.Total > o.Total)) ORDER BY 1")
         .unwrap();
     assert_eq!(col(&r, 0), vec!["Ada", "Grace"]);
-    // Not allowed with GROUP BY, with a clear message.
+    // Only grouping columns can be read in a grouped query, with a clear message.
     let e = db
         .query("SELECT City, Count(*) FROM Customers c GROUP BY City HAVING EXISTS (SELECT 1 FROM Orders o WHERE o.CustID = c.ID)")
         .unwrap_err();
-    assert!(e.to_string().contains("outer query"), "{e}");
+    assert!(e.to_string().contains("GROUP BY"), "{e}");
+    // (A sub-query in a grouped query may read the grouping columns: see correlated_subqueries_in_grouped_queries.)
 }
 
 #[test]
@@ -2966,4 +2967,311 @@ fn json_results_are_the_same_with_the_optimizer_off() {
     db.set_optimizer(false);
     assert_eq!(on, rows(&db, sql));
     assert_eq!(on.len(), 4);
+}
+
+#[test]
+fn a_calculated_column_over_json_gives_the_same_answers_with_or_without_an_index() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, body JSON, status CALCULATED AS (JSON_VALUE(body, '$.status')))").unwrap();
+    db.execute("CREATE INDEX bystatus ON d (status)").unwrap();
+    for i in 0..200 {
+        db.execute(&format!(r#"INSERT INTO d (id, body) VALUES ({i}, '{{"status": "{}"}}')"#, if i % 50 == 0 { "open" } else { "closed" })).unwrap();
+    }
+    assert_eq!(rows(&db, "SELECT Count(*) FROM d WHERE status = 'open'"), [["4"]]);
+    // A calculated column has no fixed type, so an index probe could miss values that compare equal
+    // (text '5' and the number 5); the optimizer leaves it to the scan.
+    let plan = plan_text(&db, "SELECT id FROM d WHERE status = 'open'");
+    assert!(plan.contains("full scan"), "{plan}");
+}
+
+#[test]
+fn correlated_subqueries_in_grouped_queries() {
+    let mut db = db();
+    // The select list: a sub-query that reads the grouping column runs once per group.
+    let sql = "SELECT O.CustID, (SELECT C.Name FROM Customers C WHERE C.ID = O.CustID) AS Who, SUM(O.Total) AS T \
+               FROM Orders O GROUP BY O.CustID ORDER BY O.CustID";
+    let expect = [["1", "Ada", "$30.50"], ["2", "Grace", "$12.25"], ["3", "Linus", "$100.00"]];
+    for on in [true, false] {
+        db.set_optimizer(on);
+        assert_eq!(rows(&db, sql), expect, "optimizer {on}");
+    }
+    db.set_optimizer(true);
+    let plan = plan_text(&db, sql);
+    assert!(plan.contains("correlated sub-query: semi-join") && plan.contains("3 lookup(s) for 3 row(s)"), "{plan}");
+
+    // HAVING, with EXISTS, IN and a scalar comparison.
+    assert_eq!(
+        rows(&db, "SELECT O.CustID FROM Orders O GROUP BY O.CustID HAVING EXISTS (SELECT 1 FROM Customers C WHERE C.ID = O.CustID AND C.City = 'London')"),
+        [["1"]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT O.CustID FROM Orders O GROUP BY O.CustID HAVING O.CustID IN (SELECT C.ID FROM Customers C WHERE C.City LIKE '*s*') ORDER BY 1"),
+        [["3"]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT O.CustID, COUNT(*) FROM Orders O GROUP BY O.CustID HAVING SUM(O.Total) > (SELECT C.Credit + 10 FROM Customers C WHERE C.ID = O.CustID) ORDER BY 1"),
+        [["1", "2"], ["2", "2"], ["3", "1"]]
+    );
+    // ORDER BY and GROUP BY themselves.
+    assert_eq!(
+        rows(&db, "SELECT O.CustID FROM Orders O GROUP BY O.CustID ORDER BY (SELECT C.Name FROM Customers C WHERE C.ID = O.CustID) DESC"),
+        [["3"], ["2"], ["1"]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT (SELECT C.City FROM Customers C WHERE C.ID = O.CustID) AS City, COUNT(*) FROM Orders O GROUP BY (SELECT C.City FROM Customers C WHERE C.ID = O.CustID) ORDER BY 1"),
+        [["Helsinki", "1"], ["London", "2"], ["NYC", "2"]]
+    );
+    // Together with a window function.
+    assert_eq!(
+        rows(&db, "SELECT (SELECT C.Name FROM Customers C WHERE C.ID = O.CustID), RANK() OVER (ORDER BY SUM(O.Total) DESC) FROM Orders O GROUP BY O.CustID ORDER BY 2"),
+        [["Linus", "1"], ["Ada", "2"], ["Grace", "3"]]
+    );
+    // Only grouping columns can be read.
+    let err = db.query("SELECT O.CustID, (SELECT C.Name FROM Customers C WHERE C.Credit = O.Total) FROM Orders O GROUP BY O.CustID").unwrap_err();
+    assert!(err.to_string().contains("GROUP BY"), "{err}");
+}
+
+fn big_customers() -> Database {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE Cust (ID INTEGER PRIMARY KEY, Name TEXT, City TEXT, Code TEXT);
+         CREATE TABLE Ord (OID INTEGER PRIMARY KEY, CustID INTEGER, Total INTEGER);",
+    )
+    .unwrap();
+    let mut script = String::new();
+    for i in 0..300 {
+        script += &format!("INSERT INTO Cust VALUES ({i}, 'c{i}', '{}', '{}');\n", ["Oslo", "Rome", "Kyiv"][i % 3], i);
+    }
+    // Customers 0..199 have orders (3 each), the rest have none; some orders have no customer.
+    for o in 0..600 {
+        script += &format!("INSERT INTO Ord VALUES ({o}, {}, {});\n", if o % 20 == 0 { "NULL".to_string() } else { (o % 200).to_string() }, o % 50);
+    }
+    db.execute(&script).unwrap();
+    db
+}
+
+#[test]
+fn correlated_subqueries_become_semi_joins() {
+    let mut db = big_customers();
+    let queries = [
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total > 40) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE NOT EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE c.Name IN (SELECT 'c' & o.Total FROM Ord o WHERE o.CustID = c.ID) ORDER BY ID",
+        "SELECT ID, (SELECT COUNT(*) FROM Ord o WHERE o.CustID = c.ID) FROM Cust c ORDER BY ID",
+        "SELECT ID, (SELECT MAX(o.Total) FROM Ord o WHERE o.CustID = c.ID) FROM Cust c ORDER BY ID",
+        "SELECT ID, (SELECT SUM(o.Total) FROM Ord o WHERE o.CustID = c.ID AND o.Total > 10) FROM Cust c ORDER BY ID",
+        "SELECT OID, (SELECT c.Name FROM Cust c WHERE c.ID = o.CustID) FROM Ord o ORDER BY OID",
+        "SELECT ID FROM Cust c WHERE c.ID = (SELECT MIN(o.CustID) FROM Ord o WHERE o.Total = c.ID) ORDER BY ID",
+        // Not purely equalities, so these keep running per key.
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total > c.ID % 50) ORDER BY ID",
+        // Keys of different kinds (a number against text) compare by coercion.
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.Code) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total = c.ID % 50) ORDER BY ID",
+    ];
+    for sql in queries {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        let off = rows(&db, sql);
+        assert_eq!(on, off, "{sql}");
+    }
+    db.set_optimizer(true);
+    // The plain ones are hashed, and the answers are the ones expected.
+    let plan = plan_text(&db, queries[0]);
+    assert!(plan.contains("semi-join") && plan.contains(", 0 separate run(s)"), "{plan}");
+    assert_eq!(rows(&db, "SELECT Count(*) FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID)"), [["190"]]);
+    assert_eq!(rows(&db, "SELECT Count(*) FROM Cust c WHERE NOT EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID)"), [["110"]]);
+    // A count of nothing is 0, and the other aggregates give NULL.
+    assert_eq!(rows(&db, "SELECT (SELECT COUNT(*) FROM Ord o WHERE o.CustID = c.ID), (SELECT MAX(o.Total) FROM Ord o WHERE o.CustID = c.ID) FROM Cust c WHERE ID = 250"), [["0", ""]]);
+    // A scalar sub-query that finds two rows is still an error, where it is looked at.
+    assert!(db.query("SELECT ID, (SELECT o.Total FROM Ord o WHERE o.CustID = c.ID) FROM Cust c").is_err());
+    // Mixed kinds fall back to running the query, not to wrong answers.
+    let plan = plan_text(&db, queries[9]);
+    assert!(plan.contains("0 lookup(s)") && plan.contains("300 separate run(s)"), "{plan}");
+    // With few outer rows and an index, running the query for each is cheaper and is kept.
+    db.execute("CREATE INDEX byc ON Ord (CustID)").unwrap();
+    let plan = plan_text(&db, "SELECT ID FROM Cust c WHERE ID < 5 AND EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID)");
+    assert!(plan.contains("ran 5 time(s)"), "{plan}");
+}
+
+#[test]
+fn simple_derived_tables_are_read_as_their_table() {
+    let mut db = big_customers();
+    let queries = [
+        "SELECT ID, Name FROM (SELECT ID, Name FROM Cust WHERE City = 'Rome') d WHERE d.ID > 250 ORDER BY ID",
+        "SELECT * FROM (SELECT ID, City FROM Cust WHERE ID < 6) AS d ORDER BY ID",
+        "SELECT d.* FROM (SELECT ID, Name FROM Cust) AS d WHERE d.ID = 7",
+        "SELECT k, n FROM (SELECT ID, Name FROM Cust) AS d (k, n) WHERE k BETWEEN 3 AND 5 ORDER BY k",
+        "SELECT d.Name, o.Total FROM (SELECT ID, Name FROM Cust WHERE ID < 5) d JOIN Ord o ON o.CustID = d.ID ORDER BY d.Name, o.Total",
+        "SELECT c.ID, d.Total FROM Cust c LEFT JOIN (SELECT CustID, Total FROM Ord WHERE Total > 45) d ON d.CustID = c.ID WHERE c.ID < 10 ORDER BY c.ID, d.Total",
+        "SELECT Count(*) FROM (SELECT ID FROM Cust WHERE Name LIKE 'c1*') d",
+        // Not simple: computed, reordered, limited or grouped columns are computed first.
+        "SELECT x FROM (SELECT ID + 1 AS x FROM Cust WHERE ID < 4) d ORDER BY x",
+        "SELECT Name, ID FROM (SELECT Name, ID FROM Cust WHERE ID < 4) d ORDER BY ID",
+        "SELECT * FROM (SELECT ID, Name FROM Cust ORDER BY ID DESC LIMIT 3) d ORDER BY ID",
+    ];
+    for sql in queries {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        let off = rows(&db, sql);
+        assert_eq!(on, off, "{sql}");
+    }
+    db.set_optimizer(true);
+    // A condition on the outside reaches the table's index through the derived table.
+    let plan = plan_text(&db, "SELECT Name FROM (SELECT ID, Name FROM Cust WHERE City = 'Rome') d WHERE d.ID = 7");
+    assert!(plan.contains("index lookup") || plan.contains("PrimaryKey"), "{plan}");
+    // Columns the derived table does not show cannot be used.
+    assert!(db.query("SELECT d.City FROM (SELECT ID FROM Cust) d").is_err());
+    assert!(db.query("SELECT City FROM (SELECT ID FROM Cust) d").is_err());
+    assert_eq!(rows(&db, "SELECT * FROM (SELECT ID FROM Cust WHERE ID = 3) d").len(), 1);
+    // Views that show only some columns are merged too.
+    db.execute("CREATE VIEW romans AS SELECT ID, Name FROM Cust WHERE City = 'Rome'").unwrap();
+    let plan = plan_text(&db, "SELECT Name FROM romans WHERE ID = 7");
+    assert!(plan.contains("index lookup") || plan.contains("PrimaryKey"), "{plan}");
+    assert_eq!(rows(&db, "SELECT * FROM romans WHERE ID = 7"), [["7", "c7"]]);
+}
+
+/// The first "est N" in the plan of `sql`.
+fn estimate_of(db: &Database, sql: &str) -> i64 {
+    let plan = plan_text(db, sql);
+    let at = plan.find("est ").unwrap_or_else(|| panic!("no estimate in\n{plan}")) + 4;
+    plan[at..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn statistics_sharpen_the_estimates_for_unindexed_columns() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT, v INTEGER, note TEXT)").unwrap();
+    let mut script = String::new();
+    for i in 0..2000 {
+        let status = if i < 1900 { "open" } else if i < 1990 { "closed" } else { "rare" };
+        let note = if i % 4 == 0 { "NULL".to_string() } else { format!("'n{i}'") };
+        script += &format!("INSERT INTO t VALUES ({i}, '{status}', {i}, {note});\n");
+    }
+    db.execute(&script).unwrap();
+    let near = |got: i64, want: i64| (got - want).abs() <= want / 5 + 3;
+    // Skew: 95% of the rows are open, which a fixed one in ten would badly underestimate.
+    let open = estimate_of(&db, "SELECT * FROM t WHERE status = 'open'");
+    assert!(near(open, 1900), "open {open}");
+    let closed = estimate_of(&db, "SELECT * FROM t WHERE status = 'closed'");
+    assert!(near(closed, 90), "closed {closed}");
+    let rare = estimate_of(&db, "SELECT * FROM t WHERE status = 'rare'");
+    assert!(near(rare, 10), "rare {rare}");
+    // Ranges follow the histogram, not a fixed third.
+    let high = estimate_of(&db, "SELECT * FROM t WHERE v > 1800");
+    assert!(near(high, 199), "high {high}");
+    let band = estimate_of(&db, "SELECT * FROM t WHERE v BETWEEN 100 AND 299");
+    assert!(near(band, 200), "band {band}");
+    // OR, IN, NOT, NULLs and prefixes.
+    let either = estimate_of(&db, "SELECT * FROM t WHERE status = 'closed' OR status = 'rare'");
+    assert!(near(either, 100), "either {either}");
+    let list = estimate_of(&db, "SELECT * FROM t WHERE status IN ('closed', 'rare')");
+    assert!(near(list, 100), "list {list}");
+    let not_open = estimate_of(&db, "SELECT * FROM t WHERE status <> 'open'");
+    assert!(near(not_open, 100), "not_open {not_open}");
+    let nulls = estimate_of(&db, "SELECT * FROM t WHERE note IS NULL");
+    assert!(near(nulls, 500), "nulls {nulls}");
+    let prefix = estimate_of(&db, "SELECT * FROM t WHERE note LIKE 'n19*'");
+    assert!(prefix < 300, "prefix {prefix}");
+    // The estimates change with the data.
+    db.execute("DELETE FROM t WHERE status = 'open'").unwrap();
+    let after = estimate_of(&db, "SELECT * FROM t WHERE status = 'closed'");
+    assert!(near(after, 90), "after {after}");
+    assert_eq!(rows(&db, "SELECT Count(*) FROM t WHERE status = 'closed'"), [["90"]]);
+}
+
+#[test]
+fn statistics_do_not_change_answers() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE a (k INTEGER, x INTEGER); CREATE TABLE b (k INTEGER, y INTEGER); CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER)").unwrap();
+    let mut script = String::new();
+    for i in 0..300 {
+        script += &format!("INSERT INTO a VALUES ({}, {i}); INSERT INTO b VALUES ({}, {i}); INSERT INTO c VALUES ({i}, {});\n", i % 10, i % 10, i % 300);
+    }
+    db.execute(&script).unwrap();
+    let sql = "SELECT Count(*) FROM a JOIN b ON a.k = b.k JOIN c ON c.id = a.x WHERE c.k < 20";
+    let on = rows(&db, sql);
+    db.set_optimizer(false);
+    assert_eq!(on, rows(&db, sql));
+    assert_eq!(on, [["600"]]);
+    // The many-to-many join of a and b (9,000 rows) is left until the selective one has thinned a.
+    db.set_optimizer(true);
+    let plan = plan_text(&db, sql);
+    assert!(plan.contains("join order: c -> a -> b"), "{plan}");
+}
+
+#[test]
+fn prepared_statements_run_many_times() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)").unwrap();
+    let insert = db.prepare("INSERT INTO t VALUES (@id, @name, @score)").unwrap();
+    assert_eq!(insert.parameters(), ["id", "name", "score"]);
+    for i in 0..50 {
+        db.execute_prepared(&insert, &[("id", Value::Int(i)), ("name", Value::text(&format!("n{i}"))), ("score", Value::Int(i * 2))]).unwrap();
+    }
+    let find = db.prepare("SELECT name, score FROM t WHERE id = @id OR score > @min ORDER BY id").unwrap();
+    let r = db.query_prepared(&find, &[("id", Value::Int(3)), ("min", Value::Int(94))]).unwrap();
+    assert_eq!(col(&r, 0), ["n3", "n48", "n49"]);
+    let r = db.query_prepared(&find, &[("@id", Value::Int(0)), ("min", Value::Int(1000))]).unwrap();
+    assert_eq!(col(&r, 0), ["n0"]);
+    // The same prepared statement sees changed data.
+    db.execute("UPDATE t SET name = 'zero' WHERE id = 0").unwrap();
+    assert_eq!(col(&db.query_prepared(&find, &[("id", Value::Int(0)), ("min", Value::Int(1000))]).unwrap(), 0), ["zero"]);
+    // A missing parameter, a script, and a statement that changes things are all handled.
+    assert!(db.query_prepared(&find, &[("id", Value::Int(0))]).is_err());
+    assert!(db.query_prepared(&insert, &[("id", Value::Int(0)), ("name", Value::Null), ("score", Value::Null)]).is_err());
+    let script = db.prepare("DELETE FROM t WHERE id >= @cut; SELECT Count(*) FROM t").unwrap();
+    let r = db.execute_prepared(&script, &[("cut", Value::Int(10))]).unwrap();
+    assert_eq!(col(&r, 0), ["10"]);
+    // A schema change in between is seen by the next run (nothing about the table was kept).
+    db.execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'x'").unwrap();
+    assert_eq!(col(&db.query_prepared(&db.prepare("SELECT extra FROM t WHERE id = @i").unwrap(), &[("i", Value::Int(1))]).unwrap(), 0), ["x"]);
+    // ...and so is the new column: three values no longer fit four columns.
+    assert!(db.execute_prepared(&insert, &[("id", Value::Int(99)), ("name", Value::text("a")), ("score", Value::Int(1))]).is_err());
+}
+
+#[test]
+fn prepare_and_exec_in_sql() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    db.execute("PREPARE by_id AS SELECT name FROM t WHERE id = @id; PREPARE add_row AS INSERT INTO t VALUES (@id, @name)").unwrap();
+    assert_eq!(rows_of(&mut db, "EXEC by_id (2)"), [["b"]]);
+    assert_eq!(rows_of(&mut db, "EXEC by_id (@id = 3)"), [["c"]]);
+    db.execute("EXEC add_row (4, 'd')").unwrap();
+    db.execute("EXEC add_row (@name = 'e', @id = 5)").unwrap();
+    assert_eq!(rows_of(&mut db, "EXECUTE by_id (5)"), [["e"]]);
+    assert!(db.execute("EXEC by_id (1, 2)").is_err());
+    assert!(db.execute("EXEC by_id").is_err());
+    assert!(db.execute("EXEC nosuch (1)").is_err());
+    // A saved query of the same name cannot be shadowed, and DEALLOCATE forgets.
+    db.execute("CREATE QUERY saved AS SELECT 1").unwrap();
+    assert!(db.execute("PREPARE saved AS SELECT 2").is_err());
+    db.execute("DEALLOCATE by_id").unwrap();
+    assert!(db.execute("EXEC by_id (1)").is_err());
+    assert!(db.execute("DEALLOCATE by_id").is_err());
+    db.execute("DEALLOCATE ALL").unwrap();
+    assert!(db.execute("EXEC add_row (6, 'f')").is_err());
+}
+
+fn rows_of(db: &mut Database, sql: &str) -> Vec<Vec<String>> {
+    db.execute(sql).unwrap().rows.iter().map(|r| r.iter().map(|v| v.to_string()).collect()).collect()
+}
+
+#[test]
+fn repeated_text_is_read_once_and_still_correct() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+    for i in 0..5 {
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(rows(&db, "SELECT Count(*) FROM t"), [[(i + 1).to_string()]]);
+    }
+    // The cache holds the parsed text, never answers: a schema change is still seen.
+    db.execute("DROP TABLE t").unwrap();
+    assert!(db.query("SELECT Count(*) FROM t").is_err());
+    db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+    assert_eq!(rows(&db, "SELECT Count(*) FROM t"), [["0"]]);
+    assert!(db.query("SELECT 1; SELECT 2").is_err());
+    assert!(db.query("").is_err());
+    assert!(db.query("DELETE FROM t").is_err());
 }

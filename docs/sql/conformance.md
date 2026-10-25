@@ -10,7 +10,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | --- | --- |
 | Queries | `SELECT` with `DISTINCT`/`ALL`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`; derived tables; `VALUES` as a table; `WITH` and `WITH RECURSIVE`; `UNION`, `INTERSECT`, `EXCEPT` with `ALL`/`DISTINCT`; `OFFSET ... ROWS` and `FETCH FIRST/NEXT ... ROWS ONLY`; `NULLS FIRST/LAST`; row value comparisons |
 | Joins | inner, left, right, full outer and cross joins; `ON`, `USING`, `NATURAL`; parenthesised joins; `LATERAL`; table functions; `PIVOT` and `UNPIVOT` |
-| Sub-queries | scalar, `IN`, `EXISTS`, `ANY`/`SOME`/`ALL`, derived tables, correlated sub-queries (in `SELECT`, `WHERE` and `ORDER BY` of ungrouped queries, and in `UPDATE`/`DELETE`) |
+| Sub-queries | scalar, `IN`, `EXISTS`, `ANY`/`SOME`/`ALL`, derived tables, correlated sub-queries (in `SELECT`, `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY`, and in `UPDATE`/`DELETE`) |
 | Grouping | aggregates with `DISTINCT` and `FILTER`; `ROLLUP`, `CUBE`, `GROUPING SETS`, `GROUPING()` |
 | Aggregates | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `EVERY`, `ANY_VALUE`, `STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`, `STRING_AGG`/`LISTAGG` (without `WITHIN GROUP`) |
 | Window functions | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, aggregates `OVER`, `PARTITION BY`, `ORDER BY`, named windows, `ROWS` frames and `RANGE` frames with or without an offset |
@@ -67,8 +67,8 @@ These parts of the standard are not available. Using one gives a syntax error or
 * Ordered-set and hypothetical-set aggregates (`WITHIN GROUP`: `PERCENTILE_CONT`, `LISTAGG ... WITHIN GROUP`); `ARRAY_AGG`; `GROUP BY DISTINCT`.
 * `SEARCH` and `CYCLE` clauses of recursive queries.
 * Row pattern recognition (`MATCH_RECOGNIZE`), polymorphic table functions, property graph queries (SQL/PGQ).
-* Correlated sub-queries in `GROUP BY` queries, `HAVING`, join conditions and `INSERT ... VALUES`.
-* Cursors (`DECLARE CURSOR`, `FETCH`, positioned update and delete), dynamic SQL (`PREPARE`, `EXECUTE IMMEDIATE`), embedded SQL.
+* Correlated sub-queries in join conditions and `INSERT ... VALUES`; in a grouped query they may read only the grouping columns.
+* Cursors (`DECLARE CURSOR`, `FETCH`, positioned update and delete), `EXECUTE IMMEDIATE`, embedded SQL. (`PREPARE`, `EXEC` and `DEALLOCATE` exist, with `@name` parameters rather than `?` or `$1`.)
 
 ### Definitions and data changes
 

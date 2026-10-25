@@ -175,7 +175,7 @@ let r = db.query("SELECT Name FROM Customer WHERE Name LIKE 'g*'")?;
 assert_eq!(r.rows, vec![vec![Value::text("Grace")]]);
 ```
 
-The section on [using the library](#using-the-library) covers parameters, transactions, cell-level editing, CSV and error handling.
+The section on [using the library](#using-the-library) covers parameters, transactions, cell-level editing, CSV and error handling. A statement that is run many times with different values can be read once with `db.prepare("... @id ...")` and run with `execute_prepared` or `query_prepared`; the engine also remembers the parsed form of recent SQL text. See [prepared statements](optimizer/prepared.md).
 
 #### The files on disk
 
@@ -337,7 +337,7 @@ FROM Customers C
 WHERE EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID AND O.Total > 100);
 ```
 
-Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, `WHERE` and `ORDER BY` of a query without `GROUP BY`, and in the `WHERE` and `SET` of `UPDATE` and `DELETE`.
+Names resolve to the subquery's own tables first, and to the outer query only when the subquery has no column of that name. They nest to any depth. A subquery runs once for each distinct combination of outer values it reads, and the answers are remembered, so a correlated subquery over a thousand customers who live in ten cities, correlated on city, runs ten times. They are allowed in the select list, `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY` (in a grouped query they read the group, so only its grouping columns), and in the `WHERE` and `SET` of `UPDATE` and `DELETE`. When the correlation is through equalities, as in `EXISTS (SELECT 1 FROM Orders O WHERE O.CustID = C.ID)`, the optimizer runs the sub-query once and looks the answers up instead (a semi-join): over 5,000 customers and 30,000 orders with no index that is 8 ms instead of 12 s.
 
 #### Sequences
 
@@ -953,11 +953,13 @@ join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out .
 4. **Access paths.** Each table is read through the best index for its conditions: a unique key with every column equated beats a prefix equality beats a range beats a scan. All the conditions are still tested on every row, so an index can only speed a query up.
 5. **Ordered reads.** `ORDER BY ... LIMIT n` on one table, on plain columns an index holds in that order (perhaps after an equality on its leading columns), reads the index and stops after *n* qualifying rows, with no sort. Descending reads preserve the tie order of a stable sort, so the answer is identical.
 6. **One-pass crosstabs.** `TRANSFORM … PIVOT` is computed by grouping once by the row headings and the pivot value, then laying the cells out, instead of testing every row against every column's condition. With 100 pivot columns over 100,000 rows that is 0.52 s instead of 1.26 s, and the gap grows with the columns. The two methods give identical results. See [optimizer/crosstab.md](optimizer/crosstab.md).
-7. **Free counts.** `SELECT COUNT(*) FROM t` with no condition is the table's row count: 0.02 ms over a million rows against 260 ms when scanned.
+7. **Semi-joins.** A correlated `EXISTS`, `IN` or aggregate sub-query whose correlation is an equality is run once and looked up, instead of once per outer row's key; without an index on the inner column, 8 ms instead of 12 s. See [optimizer/subqueries.md](optimizer/subqueries.md).
+8. **Merged derived tables.** `FROM (SELECT cols FROM t WHERE ...) AS d` and views like it are read as the table `t`, so the outer query can use `t`'s indexes.
+9. **Free counts.** `SELECT COUNT(*) FROM t` with no condition is the table's row count: 0.02 ms over a million rows against 260 ms when scanned.
 
-#### Estimates without statistics
+#### Estimates and statistics
 
-The optimizer's guesses are cheap and stateless. A table's size is known exactly. For a condition an index can answer, the estimate is the exact number of index entries it would visit, counted up to 4,096 (past that, a tenth of the table for an equality and a third for a range). A unique key is exactly one row. Conditions no index answers each keep a fixed fraction: 0.1 for an equality, 0.33 for a comparison, 0.25 for `BETWEEN` and `LIKE`, and so on. A join on an equality is guessed to return as many rows as the larger input unless a unique index limits it to one match per row. Nothing is stored, so there is nothing to go stale after a bulk load. The price is that estimates for unindexed conditions are crude; an index on the filtered column makes the estimate exact, and `EXPLAIN` prints the estimate beside the real count so that a poor guess is easy to see.
+The optimizer's guesses are made from the tables as they are, and nothing about them is stored. A table's size is known exactly. For a condition an index can answer, the estimate is the exact number of index entries it would visit, counted up to 4,096; a unique key is exactly one row. For a condition no index answers, it uses *column statistics*: the number of distinct values, the commonest values with their shares, and a histogram of the rest. They are worked out from the rows the first time a query needs them (from a sample, for a big table) and thrown away when the table changes, so a column that is 95% `'open'` is known to be, and a range such as `v > 1800` over values from 0 to 1999 is estimated at a tenth of the table, not a third. A join on an equality is estimated from the distinct counts of the two columns, so a many-to-many join is seen for the explosion it is. Nothing is stored in the file, there is nothing to run, and nothing goes stale after a bulk load. `.stats table` in the shell shows them, and `EXPLAIN` prints the estimate beside the real count so that a poor guess is easy to see.
 
 #### EXPLAIN
 
@@ -967,7 +969,7 @@ The optimizer's guesses are cheap and stateless. A table's size is known exactly
 
 `.optimizer off` in the shell, or `db.set_optimizer(false)`, runs queries exactly as written: joins in the written order, conditions applied after the joins, no ordered index reads or count shortcut. The answers are the same, only slower, which is how it is tested: a test builds data with NULLs, ties and several index shapes, runs nearly forty query shapes with the optimizer on and off, and requires identical answers and identical row order.
 
-It has limits. Outer joins are not reordered; more than 63 tables in a `FROM` are joined as written; sub-queries, views and common table expressions are planned on their own, so a condition on a derived table is not pushed inside it; the join search is greedy, not exhaustive; and plans are not cached. The usual cure for a slow query is an index on the filtered or joined column, then a look at the plan. The [tuning guide](optimizer/tuning.md) lists the symptoms and remedies, and the rest of the [optimizer reference](optimizer/README.md) goes into each decision in detail.
+It has limits. Outer joins are not reordered; more than 63 tables in a `FROM` are joined as written; sub-queries, views and common table expressions are planned on their own, so a condition on a derived table is not pushed inside it; the join search is greedy, not exhaustive; and plans are not cached (the parsed SQL is, and statements can be prepared). The usual cure for a slow query is an index on the filtered or joined column, then a look at the plan. The [tuning guide](optimizer/tuning.md) lists the symptoms and remedies, and the rest of the [optimizer reference](optimizer/README.md) goes into each decision in detail.
 
 ### Performance
 
@@ -1000,12 +1002,12 @@ The reference pages in [sql/conformance.md](sql/conformance.md) give the exact l
 
 ### Limits and what is missing
 
-- **The optimizer is simple.** Its estimates are table sizes, exact counts for indexed conditions and fixed fractions for the rest; there is no `ANALYZE` and no hints. Outer joins are not reordered.
+- **The optimizer is modest.** Its estimates are table sizes, exact counts for indexed conditions and histograms for the rest, with no knowledge of how columns are related; there is no `ANALYZE` (statistics come and go with the data) and no hints. Outer joins are not reordered, and plans are not cached.
 - **The data must fit in memory.** The whole database is loaded on open. The 200,000-row benchmarks above use a few tens of megabytes.
 - **One process at a time.** There is no file locking, no client/server mode, and no concurrent transactions.
 - **No time zones, intervals or sub-second times.** A `DATETIME` is whole seconds in a single zone.
 - **No fixed-width types.** `VARCHAR(n)` and `NUMERIC(p, s)` accept their sizes and ignore them; use `CHECK` constraints to limit values.
-- **Correlated subqueries** work in the select list, `WHERE` and `ORDER BY` of ungrouped queries and in `UPDATE` and `DELETE`, but not under `GROUP BY`, in `HAVING` or in join conditions.
+- **Correlated subqueries** work in the select list, `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY` and in `UPDATE` and `DELETE`, but not in join conditions.
 - **Windows:** no named windows, `GROUPS` frames, `EXCLUDE`, or `RANGE` offsets.
 - **Views are read-only** and have no column list. A table cannot be renamed.
 - **No stored procedures with control flow.** Parameterised queries and triggers cover the common uses.

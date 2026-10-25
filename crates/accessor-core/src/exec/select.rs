@@ -9,7 +9,7 @@ use std::rc::Rc;
 use super::agg::{AggFn, AggSpec, AggState};
 use super::bind::{contains_agg, Binder, CorrKind, CorrSpec, GroupCtx, Scope, ScopeCol};
 use super::optimizer::{choose_order, estimate, nullable, source_mask, Pred, MAX_SOURCES};
-use super::window::{self, MASK_COL, WIN_BASE};
+use super::window::{self, GCORR_BASE, MASK_COL, WIN_BASE};
 use super::QueryResult;
 use crate::database::Database;
 use crate::error::{Error, Result};
@@ -194,6 +194,10 @@ impl Database {
                     None => self.resolve_factor(f, depth),
                 }
             }
+            TableFactor::Derived { query, alias, columns, lateral: false } if allow_merge => match self.merged_derived(query, alias, columns)? {
+                Some(src) => Ok(src),
+                None => self.resolve_factor(f, depth),
+            },
             TableFactor::Derived { query, alias, columns, lateral: true } => {
                 let mut q = (**query).clone();
                 let outer = super::bind::correlate_select(self, scope, &mut q, depth)?;
@@ -411,7 +415,7 @@ impl Database {
                 let preserved = k > 0 && matches!(from.joins[k - 1].kind, JoinKind::Right | JoinKind::Full);
                 let src = self.resolve_source(f, &scope, depth, few && !preserved)?;
                 for n in &src.names {
-                    scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: false });
+                    scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: n.starts_with(super::viewdml::HIDDEN_COLUMN) });
                 }
                 sources.push(src);
             }
@@ -455,7 +459,7 @@ impl Database {
         }
         if is_agg {
             let exprs = sel.group_by.iter().map(|g| binder.bind(g)).collect::<Result<Vec<_>>>()?;
-            binder.group = Some(GroupCtx { exprs, aggs: Vec::new() });
+            binder.group = Some(GroupCtx { exprs, asts: sel.group_by.clone(), aggs: Vec::new() });
         }
         binder.allow_win = true;
         let out_b = out_items.iter().map(|(_, e)| binder.bind(e)).collect::<Result<Vec<_>>>()?;
@@ -481,6 +485,8 @@ impl Database {
         }
         let group = binder.group.take();
         let corr = std::mem::take(&mut binder.corr);
+        let gcorr = std::mem::take(&mut binder.gcorr);
+        let n_gcorr = gcorr.len();
         let mut wins = std::mem::take(&mut binder.wins);
 
         // Hidden columns follow the row: the grouping mask (grouped queries),
@@ -494,8 +500,10 @@ impl Database {
         let remap = move |i: usize| {
             if i == MASK_COL {
                 mask_pos
+            } else if i >= GCORR_BASE {
+                extra_base + (i - GCORR_BASE)
             } else if i >= WIN_BASE {
-                extra_base + (i - WIN_BASE)
+                extra_base + n_gcorr + (i - WIN_BASE)
             } else {
                 i
             }
@@ -563,6 +571,9 @@ impl Database {
         if let Some(g) = group {
             self.note(depth, || format!("group {} rows{}", rows.len(), if sel.group_sets.is_empty() { String::new() } else { format!(" into {} grouping set(s)", sel.group_sets.len()) }));
             rows = aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets)?;
+            if !gcorr.is_empty() {
+                rows = self.add_corr_columns(rows, &gcorr, depth)?;
+            }
             if let Some(h) = &having {
                 let mut kept = Vec::with_capacity(rows.len());
                 for r in rows {
@@ -647,28 +658,45 @@ impl Database {
     /// row. A sub-query runs once per distinct set of outer values it reads.
     pub(crate) fn add_corr_columns(&self, mut rows: Vec<Row>, specs: &[CorrSpec], depth: u32) -> Result<Vec<Row>> {
         const CACHE_LIMIT: usize = 4096;
+        let input_rows = rows.len();
+        let runs = std::cell::Cell::new(0usize);
         let mut caches: Vec<HashMap<Vec<Value>, Rc<Vec<Row>>>> = specs.iter().map(|_| HashMap::new()).collect();
+        // Sub-queries whose correlation is all equalities may be run once and looked up (a semi-join).
+        let hashed: Vec<Option<super::decorrelate::Hashed>> =
+            specs.iter().map(|s| self.hash_subquery(s, &rows, depth)).collect::<Result<_>>()?;
+        let mut probes = 0usize;
         for row in &mut rows {
-            for (spec, cache) in specs.iter().zip(&mut caches) {
+            for ((spec, cache), hash) in specs.iter().zip(&mut caches).zip(&hashed) {
                 let key: Vec<Value> = spec.outer.iter().map(|(_, c)| row[*c].clone()).collect();
-                let result = match cache.get(&key) {
-                    Some(r) => Rc::clone(r),
-                    None => {
-                        let values: HashMap<String, Value> =
-                            spec.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
-                        let mut q = spec.query.clone();
-                        crate::sql::walk::bind_params_select(&mut q, &values)?;
-                        let res = self.run_select_depth(&q, depth + 1)?;
-                        if !matches!(spec.kind, CorrKind::Exists { .. }) && res.columns.len() != 1 {
-                            return Err(Error::runtime("a sub-query used as a value must return exactly one column"));
-                        }
-                        if cache.len() >= CACHE_LIMIT {
-                            cache.clear();
-                        }
-                        let rc = Rc::new(res.rows);
-                        cache.insert(key, Rc::clone(&rc));
-                        rc
+                let fast = hash.as_ref().and_then(|h| {
+                    let k = h.key_of(row);
+                    h.can_answer(&k).then(|| h.lookup(&k))
+                });
+                let result = match fast {
+                    Some(r) => {
+                        probes += 1;
+                        r
                     }
+                    None => match cache.get(&key) {
+                        Some(r) => Rc::clone(r),
+                        None => {
+                            let values: HashMap<String, Value> =
+                                spec.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
+                            let mut q = spec.query.clone();
+                            crate::sql::walk::bind_params_select(&mut q, &values)?;
+                            runs.set(runs.get() + 1);
+                            let res = self.run_select_depth(&q, depth + 1)?;
+                            if !matches!(spec.kind, CorrKind::Exists { .. }) && res.columns.len() != 1 {
+                                return Err(Error::runtime("a sub-query used as a value must return exactly one column"));
+                            }
+                            if cache.len() >= CACHE_LIMIT {
+                                cache.clear();
+                            }
+                            let rc = Rc::new(res.rows);
+                            cache.insert(key, Rc::clone(&rc));
+                            rc
+                        }
+                    },
                 };
                 let v = match &spec.kind {
                     CorrKind::Scalar => {
@@ -698,6 +726,18 @@ impl Database {
                 row.push(v);
             }
         }
+        self.note(depth, || {
+            let plural = if specs.len() == 1 { "y" } else { "ies" };
+            let built: usize = hashed.iter().flatten().map(|h| h.inner_rows).sum();
+            if hashed.iter().any(Option::is_some) {
+                format!(
+                    "correlated sub-quer{plural}: semi-join, the inner query ran once and kept {built} row(s) in a hash table; {probes} lookup(s) for {input_rows} row(s), {} separate run(s)",
+                    runs.get()
+                )
+            } else {
+                format!("correlated sub-quer{plural}: ran {} time(s) for {input_rows} row(s) (once per distinct set of outer values)", runs.get())
+            }
+        });
         Ok(rows)
     }
 
@@ -811,7 +851,14 @@ impl Database {
                     out
                 }
             };
-            self.note(depth, || format!("  -> {} rows", rows.len()));
+            self.note(depth, || {
+                if self.optimizer_on && matches!(base.data, SourceData::Table(_)) && !conj.is_empty() {
+                    let conds: Vec<BExpr> = conj.iter().map(|c| (*c).clone()).collect();
+                    format!("  -> est {:.0} rows, actual {}", super::optimizer::estimate(base, &conds), rows.len())
+                } else {
+                    format!("  -> {} rows", rows.len())
+                }
+            });
             return Ok(rows);
         }
 
@@ -1366,7 +1413,7 @@ fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, Expr)>> {
             }
             SelectItem::QualifiedWildcard(t) => {
                 let before = out.len();
-                for c in scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(t)) {
+                for c in scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(t) && !c.name.starts_with(super::viewdml::HIDDEN_COLUMN)) {
                     out.push((c.name.clone(), Expr::Column { table: Some(c.table.clone()), name: c.name.clone() }));
                 }
                 if out.len() == before {

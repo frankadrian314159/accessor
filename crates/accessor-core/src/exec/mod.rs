@@ -1,11 +1,14 @@
 //! Statement execution.
 
+pub use prepared::Prepared;
 pub mod agg;
 pub mod bind;
 mod check;
 mod ddl;
 mod merge;
 mod seq;
+mod prepared;
+mod decorrelate;
 mod viewdml;
 pub(crate) mod optimizer;
 mod proc;
@@ -16,7 +19,6 @@ pub(crate) mod window;
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::sql::ast::Statement;
-use crate::sql::{parse_script, parse_statement};
 use crate::value::Row;
 
 /// The outcome of a statement: a result set for SELECT, a row count for DML.
@@ -37,8 +39,8 @@ impl Database {
     /// Runs every statement in `sql`, returning the result of the last one.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let mut last = QueryResult::default();
-        for st in parse_script(sql)? {
-            last = self.execute_statement(&st)?;
+        for st in self.parse_cached(sql)?.iter() {
+            last = self.execute_statement(st)?;
         }
         Ok(last)
     }
@@ -46,10 +48,13 @@ impl Database {
     /// Runs a single read-only SELECT.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.enter_session();
-        match parse_statement(sql)? {
-            Statement::Select(s) => self.run_select(&s),
-            Statement::Explain(s) => self.run_explain(&s),
-            _ => Err(Error::runtime("query() only accepts SELECT statements")),
+        let parsed = self.parse_cached(sql)?;
+        match parsed.as_slice() {
+            [] => Err(Error::syntax("empty statement")),
+            [Statement::Select(s)] => self.run_select(s),
+            [Statement::Explain(s)] => self.run_explain(s),
+            [_] => Err(Error::runtime("query() only accepts SELECT statements")),
+            _ => Err(Error::syntax("expected a single statement")),
         }
     }
 
@@ -160,6 +165,8 @@ impl Database {
             Statement::Raise(_) => Err(Error::runtime("RAISE can only be used inside a trigger")),
             Statement::CreateTrigger(def) => self.exec_create_trigger(def),
             Statement::DropTrigger(name) => self.exec_drop_trigger(name),
+            Statement::Prepare { name, statement } => self.exec_prepare(name, statement),
+            Statement::Deallocate(name) => self.exec_deallocate(name),
             Statement::CreateSequence { name, options } => self.exec_create_sequence(name, options),
             Statement::AlterSequence { name, options } => self.exec_alter_sequence(name, options),
             Statement::DropSequence(name) => self.exec_drop_sequence(name),

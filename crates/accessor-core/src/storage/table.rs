@@ -8,6 +8,8 @@ use crate::error::{Error, Result};
 use crate::schema::{Column, ForeignKey, IndexDef, TableSchema};
 use crate::value::{DataType, Row, Value};
 
+use super::stats::{ColumnStats, StatsCache};
+
 pub type RowId = u32;
 
 #[derive(Clone, Debug)]
@@ -41,6 +43,9 @@ pub struct Table {
     live: usize,
     next_auto: i64,
     indexes: Vec<Index>,
+    /// Counts the changes made to the rows or columns, so that statistics worked out earlier can be told from current ones.
+    generation: u64,
+    stats: StatsCache,
 }
 
 impl Table {
@@ -50,7 +55,7 @@ impl Table {
             .iter()
             .map(|def| Index { def: def.clone(), tree: BTreeSet::new() })
             .collect();
-        Table { schema, rows: Vec::new(), live: 0, next_auto: 1, indexes }
+        Table { schema, rows: Vec::new(), live: 0, next_auto: 1, indexes, generation: 0, stats: StatsCache::default() }
     }
 
     /// Rebuilds a table from persisted slots, recreating every index.
@@ -66,6 +71,14 @@ impl Table {
             }
         }
         Ok(t)
+    }
+
+    /// Statistics of column `col` (its position): distinct values, common values and a histogram.
+    /// They are worked out when first asked for and kept until the table changes.
+    pub fn column_stats(&self, col: usize) -> std::sync::Arc<ColumnStats> {
+        self.stats.get(self.generation, col, || {
+            ColumnStats::compute(self.rows.iter().flatten().map(|r| &r[col]), self.live)
+        })
     }
 
     pub fn schema(&self) -> &TableSchema {
@@ -131,6 +144,7 @@ impl Table {
 
     /// Inserts `row` into slot `id`, which must be empty or past the end.
     pub fn insert_at(&mut self, id: RowId, row: Row) -> Result<()> {
+        self.generation += 1;
         self.check_row(&row)?;
         let slot = id as usize;
         if self.rows.get(slot).is_some_and(Option::is_some) {
@@ -160,6 +174,7 @@ impl Table {
 
     /// Removes and returns the row in slot `id`.
     pub fn remove(&mut self, id: RowId) -> Option<Row> {
+        self.generation += 1;
         let row = self.rows.get_mut(id as usize)?.take()?;
         for ix in &mut self.indexes {
             let key = ix.key(&row);
@@ -171,6 +186,7 @@ impl Table {
 
     /// Replaces the row in slot `id`, returning the previous contents.
     pub fn replace(&mut self, id: RowId, new: Row) -> Result<Row> {
+        self.generation += 1;
         self.check_row(&new)?;
         let old = self
             .get(id)
@@ -211,6 +227,7 @@ impl Table {
         }
         let rows = std::mem::take(&mut self.rows).into_iter().flatten().map(Some).collect();
         let mut fresh = Table::from_parts(self.schema.clone(), rows, self.next_auto)?;
+        fresh.generation = self.generation + 1;
         std::mem::swap(self, &mut fresh);
         Ok(())
     }
@@ -318,6 +335,7 @@ impl Table {
 
     /// Appends a column; existing rows receive its default (or Null).
     pub(crate) fn add_column(&mut self, mut column: Column) -> Result<()> {
+        self.generation += 1;
         if self.schema.column_index(&column.name).is_some() {
             return Err(Error::catalog(format!("duplicate column '{}' in table '{}'", column.name, self.schema.name)));
         }
@@ -347,6 +365,7 @@ impl Table {
 
     /// Removes a column. Columns used by an index must be freed first.
     pub(crate) fn drop_column(&mut self, name: &str) -> Result<()> {
+        self.generation += 1;
         let pos = self.column_checked(name)?;
         if self.schema.columns.len() == 1 {
             return Err(Error::catalog("a table must keep at least one field"));
@@ -383,6 +402,7 @@ impl Table {
     /// field if need be. Returns the previous definition. The stored values are
     /// not touched here; the caller recomputes them.
     pub(crate) fn set_expression(&mut self, name: &str, expr: &str) -> Result<Column> {
+        self.generation += 1;
         let pos = self.column_checked(name)?;
         let old = self.schema.columns[pos].clone();
         if !old.is_calculated() && (old.primary_key || old.autonumber) {
@@ -400,6 +420,7 @@ impl Table {
     /// Undoes [`set_expression`](Self::set_expression): puts back the column
     /// definition and the stored values it had.
     pub(crate) fn restore_column(&mut self, pos: usize, column: Column, values: Vec<(RowId, Value)>) -> Result<()> {
+        self.generation += 1;
         self.schema.columns[pos] = column;
         for (id, v) in values {
             if let Some(row) = self.get(id) {
@@ -423,6 +444,7 @@ impl Table {
     /// Converts a column's type. Nothing changes if any value fails to
     /// convert or the converted values violate a unique index.
     pub(crate) fn alter_column_type(&mut self, name: &str, data_type: DataType) -> Result<()> {
+        self.generation += 1;
         let pos = self.column_checked(name)?;
         let col = &self.schema.columns[pos];
         if col.autonumber {

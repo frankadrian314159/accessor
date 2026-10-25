@@ -87,6 +87,16 @@ EXEC name (value, value);
 
 A `PARAMETERS` statement on its own, at the top of a script, does nothing; it exists so that a saved query's text runs as a script too.
 
+## Prepared statements
+
+```sql
+PREPARE name AS statement;
+EXEC name [ ( [@p =] value [, ...] ) ];
+DEALLOCATE [PREPARE] { name | ALL };
+```
+
+`PREPARE` remembers one statement, which may use `@parameters`, for the rest of the session. `EXEC name (v1, v2)` (or `EXECUTE`, or `CALL`) runs it, the values filling the parameters in the order of their first appearance in the statement; `EXEC name (@city = 'Rome')` names them. It is the same `EXEC` as for saved queries: a saved query of that name is used if there is one, and a prepared statement cannot take the name of a saved query. Prepared statements are not stored in the file. From Rust, `Database::prepare`, `execute_prepared` and `query_prepared` do the same without SQL text; see [the optimizer notes on prepared statements](../optimizer/prepared.md).
+
 ## Triggers
 
 A trigger runs statements automatically when rows are inserted, updated or deleted.

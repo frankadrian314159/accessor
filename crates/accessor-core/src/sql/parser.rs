@@ -506,6 +506,17 @@ impl<'a> Parser<'a> {
         if self.eat_kw("EXEC") || self.eat_kw("EXECUTE") || self.eat_kw("CALL") {
             return self.exec();
         }
+        if self.eat_kw("PREPARE") {
+            let name = self.ident()?;
+            self.expect_kw("AS")?;
+            let statement = Box::new(self.statement()?);
+            return Ok(Statement::Prepare { name, statement });
+        }
+        if self.eat_kw("DEALLOCATE") {
+            self.eat_kw("PREPARE");
+            let name = if self.eat_kw("ALL") { "all".to_string() } else { self.ident()? };
+            return Ok(Statement::Deallocate(name));
+        }
         if self.eat_kw("RAISE") {
             return Ok(Statement::Raise(self.expr()?));
         }

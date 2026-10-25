@@ -48,6 +48,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <statement> ::= <query>
               | <explain> | <set-time-zone> | <set-constraints>
               | <create-sequence> | <alter-sequence> | <drop-sequence>
+              | <prepare> | <deallocate>
               | <insert> | <update> | <delete> | <merge> | <truncate>
               | <create-table> | <create-index> | <create-view> | <create-trigger>
               | <drop> | <alter-table>
@@ -62,6 +63,8 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                 PIVOT <concat> [ IN '(' <expr-list> ')' ]
 <explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
 <set-time-zone> ::= SET ( TIME ZONE | TIMEZONE TO ) ( <string> | LOCAL | UTC )
+<prepare>     ::= PREPARE <identifier> AS <statement>
+<deallocate>  ::= DEALLOCATE [ PREPARE ] ( <identifier> | ALL )     (* run with EXEC <identifier> [ '(' <exec-arg> { ',' <exec-arg> } ')' ] *)
 <set-constraints> ::= SET CONSTRAINTS ( ALL | <identifier-list> ) ( DEFERRED | IMMEDIATE )
 
 <create-sequence> ::= CREATE SEQUENCE [ IF NOT EXISTS ] <identifier> { <sequence-option> }

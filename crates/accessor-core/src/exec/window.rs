@@ -17,6 +17,9 @@ use crate::value::{Row, Value};
 pub const WIN_BASE: usize = 1 << 40;
 /// Stand-in for the GROUPING mask column of grouped rows.
 pub const MASK_COL: usize = WIN_BASE - 1;
+/// Placeholder positions for the values of correlated sub-queries in a grouped query; they
+/// follow the grouped row and are renumbered once the sub-queries are counted.
+pub const GCORR_BASE: usize = 1 << 41;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WinFn {

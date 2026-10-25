@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use super::agg::{AggFn, AggSpec};
-use super::window::{WinFn, WinSpecB, MASK_COL, WIN_BASE};
+use super::window::{WinFn, WinSpecB, GCORR_BASE, MASK_COL, WIN_BASE};
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::expr::{BExpr, LikePattern, ScalarFn};
@@ -54,6 +54,8 @@ impl Scope {
 
 pub struct GroupCtx {
     pub exprs: Vec<BExpr>,
+    /// The `GROUP BY` expressions as written, to recognise the same expression in the select list.
+    pub asts: Vec<Expr>,
     pub aggs: Vec<AggSpec>,
 }
 
@@ -84,6 +86,9 @@ pub struct Binder<'a> {
     /// expressions of a SELECT); they collect in `corr`.
     pub allow_corr: bool,
     pub corr: Vec<CorrSpec>,
+    /// Correlated sub-queries in the select list, `HAVING` and `ORDER BY` of a grouped query:
+    /// they read the group's columns and run once per group.
+    pub gcorr: Vec<CorrSpec>,
     /// Whether window functions may be bound here (select list and ORDER BY).
     pub allow_win: bool,
     pub wins: Vec<WinSpecB>,
@@ -306,7 +311,7 @@ pub fn contains_agg(e: &Expr) -> bool {
 
 impl<'a> Binder<'a> {
     pub fn new(db: &'a Database, scope: &'a Scope, depth: u32) -> Self {
-        Binder { db, scope, group: None, depth, allow_corr: false, corr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new() }
+        Binder { db, scope, group: None, depth, allow_corr: false, corr: Vec::new(), gcorr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new() }
     }
 
     pub fn bind(&mut self, e: &Expr) -> Result<BExpr> {
@@ -333,15 +338,34 @@ impl<'a> Binder<'a> {
         if c.found.is_empty() {
             return Ok(None);
         }
-        if !self.allow_corr || self.group.is_some() {
+        if !self.allow_corr {
             return Err(Error::runtime(
-                "a sub-query that refers to the outer query is only allowed in the select list, WHERE clause or ORDER BY of a query without GROUP BY",
+                "a sub-query that refers to the outer query is only allowed in the select list, WHERE clause, GROUP BY, HAVING or ORDER BY of a query",
             ));
         }
-        Ok(Some((rewritten, c.found)))
+        // In a grouped query the sub-query reads the group, so it may only use the grouping columns.
+        let found = match &self.group {
+            None => c.found,
+            Some(g) => c
+                .found
+                .into_iter()
+                .map(|(param, pos)| {
+                    g.exprs
+                        .iter()
+                        .position(|x| *x == BExpr::Col(pos))
+                        .map(|k| (param, k))
+                        .ok_or_else(|| Error::runtime("a sub-query in a grouped query may refer only to columns that are in the GROUP BY"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        Ok(Some((rewritten, found)))
     }
 
     fn add_corr(&mut self, kind: CorrKind, query: Select, outer: Vec<(String, usize)>) -> BExpr {
+        if self.group.is_some() {
+            self.gcorr.push(CorrSpec { query, outer, kind });
+            return BExpr::Col(GCORR_BASE + self.gcorr.len() - 1);
+        }
         self.corr.push(CorrSpec { query, outer, kind });
         BExpr::Col(self.scope.cols.len() + self.corr.len() - 1)
     }
@@ -359,6 +383,11 @@ impl<'a> Binder<'a> {
             }
             // An expression identical to a GROUP BY expression is read from
             // the group key instead of being recomputed.
+            if let Some(i) = self.group.as_ref().and_then(|g| g.asts.iter().position(|a| a == e)) {
+                if !matches!(e, Expr::Literal(_)) {
+                    return Ok(BExpr::Col(i));
+                }
+            }
             if !matches!(e, Expr::Literal(_)) && !contains_agg(e) {
                 let saved = self.group.take();
                 let (corr_ok, win_ok) = (self.allow_corr, self.allow_win);

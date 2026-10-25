@@ -1,8 +1,8 @@
 //! The database handle: catalog, transactions, and durability.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 use crate::sequence::SequenceDef;
@@ -60,6 +60,10 @@ pub struct Database {
     pub(crate) triggers: BTreeMap<String, Arc<TriggerDef>>,
     /// Sequences; shared with the expression evaluator (`NEXTVAL`).
     pub(crate) seqs: crate::sequence::Shared,
+    /// SQL text recently read, with the statements it came to.
+    pub(crate) parse_cache: Mutex<HashMap<String, Arc<Vec<Statement>>>>,
+    /// `PREPARE`d statements of this session.
+    pub(crate) prepared: BTreeMap<String, crate::exec::Prepared>,
     /// Compiled calculated-field expressions per table; see `calc.rs`.
     pub(crate) calc_cache: crate::calc::CalcCache,
     /// Whether the batch being applied touches a table with calculated fields.
@@ -86,6 +90,8 @@ impl Database {
             views: BTreeMap::new(),
             triggers: BTreeMap::new(),
             seqs: Default::default(),
+            parse_cache: Mutex::new(HashMap::new()),
+            prepared: BTreeMap::new(),
             calc_cache: Default::default(),
             calc_active: false,
             plan_log: Default::default(),

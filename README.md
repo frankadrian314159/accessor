@@ -134,8 +134,9 @@ is undone with it.
 ## The query optimizer
 
 A query says *what* rows you want; the optimizer decides *how* to get them, and
-never changes the answer. It is on by default, needs no statistics or hints, and
-makes its choices from the tables as they are when the query runs.
+never changes the answer. It is on by default, needs no hints or `ANALYZE`, and
+makes its choices from the tables as they are when the query runs (column
+statistics are worked out on demand and dropped when a table changes).
 
 - **Pushdown.** A `WHERE` or inner-join `ON` condition that reads one table is
   applied while that table is read, before any join. Conditions are never
@@ -151,6 +152,12 @@ makes its choices from the tables as they are when the query runs.
   early instead of sorting, and a bare `SELECT COUNT(*)` is the table's row count.
   A `TRANSFORM … PIVOT` crosstab is computed in one grouped pass rather than one
   conditional aggregate per column.
+- **Sub-queries.** A correlated `EXISTS`, `IN` or aggregate sub-query whose
+  correlation is an equality runs once and is looked up (a semi-join); a derived
+  table that is a plain selection from one table is read as that table.
+- **Statistics and prepared statements.** Histograms and common-value counts
+  sharpen the estimates for unindexed columns; `prepare` reads SQL once, and the
+  parsed text of recent statements is cached.
 
 On a table of a million rows, a three-way join filtered to one customer takes
 about 1.8 ms instead of 2.6 s, and `SELECT COUNT(*)` takes 0.02 ms instead of 260 ms.

@@ -21,12 +21,14 @@
 //! `EXPLAIN` runs a query and reports these decisions with the estimated and
 //! actual row counts.
 
+use std::ops::Bound;
 use std::sync::Mutex;
 
 use super::select::{choose_access, Access, Source, SourceData};
 use crate::database::Database;
 use crate::expr::BExpr;
 use crate::sql::ast::{BinOp, JoinKind};
+use crate::storage::Table;
 use crate::value::Value;
 
 /// More sources than this are joined in the order written, without pushdown.
@@ -114,6 +116,102 @@ fn selectivity(c: &BExpr) -> f64 {
     }
 }
 
+/// A column of the table compared with a constant, whichever way round it is written.
+fn col_const<'a>(a: &'a BExpr, b: &'a BExpr) -> Option<(usize, &'a Value, bool)> {
+    match (a, b) {
+        (BExpr::Col(c), BExpr::Lit(v)) => Some((*c, v, false)),
+        (BExpr::Lit(v), BExpr::Col(c)) => Some((*c, v, true)),
+        _ => None,
+    }
+}
+
+/// The fraction of a table's rows that satisfy `c`, from the statistics of its columns where it
+/// compares a column with constants, and from fixed guesses where it does not.
+pub(crate) fn cond_selectivity(table: Option<&Table>, c: &BExpr) -> f64 {
+    let stats_for = |col: usize| table.filter(|t| col < t.schema().columns.len()).map(|t| t.column_stats(col));
+    let guess = selectivity(c);
+    let from_stats = || -> Option<f64> {
+        match c {
+            BExpr::Bin(BinOp::And, a, b) => Some(cond_selectivity(table, a) * cond_selectivity(table, b)),
+            BExpr::Bin(BinOp::Or, a, b) => {
+                let (x, y) = (cond_selectivity(table, a), cond_selectivity(table, b));
+                Some((x + y - x * y).clamp(0.0, 1.0))
+            }
+            BExpr::Not(e) => Some(1.0 - cond_selectivity(table, e)),
+            BExpr::Bin(op, a, b) => {
+                let (col, v, flipped) = col_const(a, b)?;
+                let s = stats_for(col)?;
+                let nulls = s.null_fraction();
+                let op = if flipped {
+                    match op {
+                        BinOp::Lt => BinOp::Gt,
+                        BinOp::Le => BinOp::Ge,
+                        BinOp::Gt => BinOp::Lt,
+                        BinOp::Ge => BinOp::Le,
+                        o => *o,
+                    }
+                } else {
+                    *op
+                };
+                match op {
+                    BinOp::Eq => s.eq(v),
+                    BinOp::Ne => s.eq(v).map(|e| (1.0 - nulls - e).max(0.0)),
+                    BinOp::Lt => s.range(&Bound::Unbounded, &Bound::Excluded(v.clone())),
+                    BinOp::Le => s.range(&Bound::Unbounded, &Bound::Included(v.clone())),
+                    BinOp::Gt => s.range(&Bound::Excluded(v.clone()), &Bound::Unbounded),
+                    BinOp::Ge => s.range(&Bound::Included(v.clone()), &Bound::Unbounded),
+                    _ => None,
+                }
+            }
+            BExpr::Between { expr, low, high, negated } => {
+                let (BExpr::Col(col), BExpr::Lit(lo), BExpr::Lit(hi)) = (&**expr, &**low, &**high) else { return None };
+                let s = stats_for(*col)?;
+                let inside = s.range(&Bound::Included(lo.clone()), &Bound::Included(hi.clone()))?;
+                Some(if *negated { (1.0 - s.null_fraction() - inside).max(0.0) } else { inside })
+            }
+            BExpr::IsNull(e, negated) => {
+                let BExpr::Col(col) = &**e else { return None };
+                let n = stats_for(*col)?.null_fraction();
+                Some(if *negated { 1.0 - n } else { n })
+            }
+            BExpr::InList { expr, list, negated } => {
+                let BExpr::Col(col) = &**expr else { return None };
+                let s = stats_for(*col)?;
+                let mut total = 0.0;
+                for item in list {
+                    let BExpr::Lit(v) = item else { return None };
+                    total += s.eq(v)?;
+                }
+                let total = total.min(1.0 - s.null_fraction());
+                Some(if *negated { (1.0 - s.null_fraction() - total).max(0.0) } else { total })
+            }
+            BExpr::InSet { expr, set, negated, .. } => {
+                let BExpr::Col(col) = &**expr else { return None };
+                let s = stats_for(*col)?;
+                let mut total = 0.0;
+                for v in set {
+                    total += s.eq(v)?;
+                }
+                let total = total.min(1.0 - s.null_fraction());
+                Some(if *negated { (1.0 - s.null_fraction() - total).max(0.0) } else { total })
+            }
+            // A pattern with a fixed beginning picks out a range of the text values.
+            BExpr::Like { expr, pattern, negated: false, .. } => {
+                let (BExpr::Col(col), BExpr::Lit(Value::Text(p))) = (&**expr, &**pattern) else { return None };
+                let prefix: String = p.chars().take_while(|ch| !matches!(ch, '*' | '?' | '#' | '[' | '%' | '_')).collect();
+                if prefix.is_empty() {
+                    return None;
+                }
+                let s = stats_for(*col)?;
+                let top = format!("{prefix}\u{10FFFF}");
+                s.range(&Bound::Included(Value::text(&prefix)), &Bound::Included(Value::text(&top)))
+            }
+            _ => None,
+        }
+    };
+    from_stats().map_or(guess, |s| s.clamp(0.0, 1.0))
+}
+
 /// An estimate of the rows `source` yields under `conds` (bound to the source's own columns).
 pub(crate) fn estimate(source: &Source<'_>, conds: &[BExpr]) -> f64 {
     let (total, mut rows) = match &source.data {
@@ -126,14 +224,30 @@ pub(crate) fn estimate(source: &Source<'_>, conds: &[BExpr]) -> f64 {
             match choose_access(t, &refs) {
                 Access::Full => (n, n),
                 Access::Prefix { idx, key } => {
-                    let unique = t.index_defs().nth(idx).is_some_and(|d| d.unique && d.columns.len() == key.len());
+                    let def = t.index_defs().nth(idx);
+                    let unique = def.is_some_and(|d| d.unique && d.columns.len() == key.len());
                     let seen = if unique { 1 } else { t.index_prefix(idx, &key).take(COUNT_CAP).count() };
-                    let est = if seen >= COUNT_CAP { n * 0.1 } else { seen as f64 };
+                    let est = if seen >= COUNT_CAP {
+                        // Too many to count: use what the statistics say about these values.
+                        let sel = def.map(|d| {
+                            d.columns.iter().zip(&key).map(|(&c, v)| t.column_stats(c).eq(v).unwrap_or(0.1)).product::<f64>()
+                        });
+                        n * sel.unwrap_or(0.1)
+                    } else {
+                        seen as f64
+                    };
                     (n, est)
                 }
                 Access::Range { idx, lo, hi } => {
+                    let col = t.index_defs().nth(idx).and_then(|d| d.columns.first().copied());
+                    let (lo_b, hi_b) = (lo.clone(), hi.clone());
                     let seen = t.index_range(idx, lo, hi).take(COUNT_CAP).count();
-                    let est = if seen >= COUNT_CAP { n * 0.33 } else { seen as f64 };
+                    let est = if seen >= COUNT_CAP {
+                        let sel = col.and_then(|c| t.column_stats(c).range(&lo_b, &hi_b));
+                        n * sel.unwrap_or(0.33)
+                    } else {
+                        seen as f64
+                    };
                     (n, est)
                 }
             }
@@ -154,8 +268,12 @@ pub(crate) fn estimate(source: &Source<'_>, conds: &[BExpr]) -> f64 {
         }
         SourceData::Rows(_) | SourceData::Lateral(_) => 0,
     };
+    let table = match &source.data {
+        SourceData::Table(t) => Some(*t),
+        _ => None,
+    };
     for c in conds.iter().skip(answered.min(conds.len())) {
-        rows *= selectivity(c);
+        rows *= cond_selectivity(table, c);
     }
     rows.clamp(if total > 0.0 { 1.0 } else { 0.0 }, total.max(1.0))
 }
@@ -173,9 +291,13 @@ enum Reach {
     Unique,
 }
 
-fn reach(source: &Source<'_>, s: usize, placed: u64, preds: &[Pred], offs: &[usize]) -> Reach {
+/// `(this source's column, another source's column)` for each equality of two plain columns.
+type JoinPairs = Vec<(usize, usize)>;
+
+fn reach(source: &Source<'_>, s: usize, placed: u64, preds: &[Pred], offs: &[usize]) -> (Reach, JoinPairs) {
     let me = 1u64 << s;
     let mut cols: Vec<usize> = Vec::new();
+    let mut pairs: JoinPairs = Vec::new();
     let mut linked = false;
     for p in preds {
         if p.mask & me == 0 || p.mask & !(placed | me) != 0 {
@@ -183,21 +305,23 @@ fn reach(source: &Source<'_>, s: usize, placed: u64, preds: &[Pred], offs: &[usi
         }
         let BExpr::Bin(BinOp::Eq, a, b) = &p.expr else { continue };
         let (ma, mb) = (source_mask(a, offs), source_mask(b, offs));
-        let (mine, other) = if ma == me && mb != 0 && mb & me == 0 {
-            (a, mb)
+        let (mine, theirs) = if ma == me && mb != 0 && mb & me == 0 {
+            (a, b)
         } else if mb == me && ma != 0 && ma & me == 0 {
-            (b, ma)
+            (b, a)
         } else {
             continue;
         };
-        let _ = other;
         linked = true;
         if let BExpr::Col(c) = &**mine {
             cols.push(*c - offs[s]);
+            if let BExpr::Col(oc) = &**theirs {
+                pairs.push((*c - offs[s], *oc));
+            }
         }
     }
     if !linked {
-        return Reach::Cross;
+        return (Reach::Cross, pairs);
     }
     if let SourceData::Table(t) = &source.data {
         let mut best = Reach::Hash;
@@ -209,9 +333,28 @@ fn reach(source: &Source<'_>, s: usize, placed: u64, preds: &[Pred], offs: &[usi
                 best = Reach::Unique;
             }
         }
-        return best;
+        return (best, pairs);
     }
-    Reach::Hash
+    (Reach::Hash, pairs)
+}
+
+/// How many different values the join columns of an equality join have, taking the most selective
+/// pair; `None` when there are no statistics for both sides.
+fn join_distinct(sources: &[Source<'_>], s: usize, pairs: &JoinPairs, offs: &[usize], mine_rows: f64, other_rows: f64) -> Option<f64> {
+    let table = |src: usize| match &sources[src].data {
+        SourceData::Table(t) => Some(*t),
+        _ => None,
+    };
+    let mut best: Option<f64> = None;
+    for &(mc, oc) in pairs {
+        let other = offs.partition_point(|&o| o <= oc).saturating_sub(1);
+        let (Some(mt), Some(ot)) = (table(s), table(other)) else { continue };
+        let dm = mt.column_stats(mc).distinct.min(mine_rows.max(1.0));
+        let dn = ot.column_stats(oc - offs[other]).distinct.min(other_rows.max(1.0));
+        let d = dm.max(dn);
+        best = Some(best.map_or(d, |b: f64| b.max(d)));
+    }
+    best
 }
 
 /// The order to join the sources in: start from the smallest filtered source,
@@ -230,11 +373,17 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
             if placed & (1 << s) != 0 {
                 continue;
             }
-            let r = reach(&sources[s], s, placed, preds, offs);
+            let (r, pairs) = reach(&sources[s], s, placed, preds, offs);
+            // About |A|·|B| / (the larger number of distinct join values), or the larger input when
+            // nothing is known (the foreign-key-to-key pattern).
+            let joined = || match join_distinct(sources, s, &pairs, offs, est[s], current) {
+                Some(d) => (current * est[s] / d).max(1.0),
+                None => current.max(est[s]),
+            };
             let (out, work) = match r {
                 Reach::Unique => (current, current),
-                Reach::Index => (current.max(est[s]), current),
-                Reach::Hash => (current.max(est[s]), current + est[s]),
+                Reach::Index => (joined(), current),
+                Reach::Hash => (joined(), current + est[s]),
                 Reach::Cross => (current * est[s], current * est[s]),
             };
             let better = match &best {

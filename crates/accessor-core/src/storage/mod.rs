@@ -1,6 +1,7 @@
 //! Storage layer: tables, the logical operation log, snapshots.
 
 pub mod persist;
+pub mod stats;
 pub mod table;
 
 use serde::{Deserialize, Serialize};

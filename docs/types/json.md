@@ -33,7 +33,7 @@ Other types are not converted to `JSON` implicitly; `TO_JSON(x)` makes any value
 
 ## Indexes
 
-An index on a `JSON` column indexes whole documents, which helps only for equality of whole documents. To search *inside* documents quickly, index a [calculated](calculated.md) column that extracts the part you search on (`Age CALCULATED AS (JSON_VALUE(Body, '$.age'))`) or keep the field in an ordinary column as well. See [the optimizer notes](../optimizer/tuning.md#json-columns).
+An index on a `JSON` column indexes whole documents, which helps only for equality of whole documents. To search *inside* documents quickly, keep the part you search on in an ordinary, typed column as well (filled when you store the document) and index that. A [calculated](calculated.md) column can show the part but is not used for index lookups. See [the optimizer notes](../optimizer/tuning.md#json-columns).
 
 ## Functions
 

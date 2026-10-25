@@ -344,6 +344,10 @@ pub enum Statement {
     Truncate(String),
     /// `SET TIME ZONE 'Europe/Paris'`: the zone of the session.
     SetTimeZone(String),
+    /// `PREPARE name AS statement`: remember a statement to run later with `EXEC name (args)`.
+    Prepare { name: String, statement: Box<Statement> },
+    /// `DEALLOCATE name` (or `ALL`).
+    Deallocate(String),
     /// `SET CONSTRAINTS ALL | names DEFERRED | IMMEDIATE`.
     SetConstraints { names: Option<Vec<String>>, deferred: bool },
     /// `EXPLAIN query`: run the query and report how it was planned.

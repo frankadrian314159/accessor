@@ -8,15 +8,15 @@ use super::QueryResult;
 use crate::database::{key, Database};
 use crate::error::{Error, Result};
 use crate::sql::ast::{Expr, ParamDecl, Select, Statement, TriggerDef, TriggerEvent, TriggerTiming};
-use crate::sql::walk::{bind_params, bind_params_select, walk_select, RowContext};
-use crate::sql::{parse_query_def, parse_script, QueryDef};
+use crate::sql::walk::{bind_params_select, walk_select, RowContext};
+use crate::sql::{parse_query_def, QueryDef};
 use crate::storage::Op;
 use crate::value::{Row, Value};
 
 /// Pairs supplied values with declared parameters: positional values fill
 /// the declarations in order, named ones (`@p = v`) go where they say.
 /// Declared types, when present, convert the values.
-fn bind_arguments(decls: &[ParamDecl], args: Vec<(Option<String>, Value)>) -> Result<HashMap<String, Value>> {
+pub(crate) fn bind_arguments(decls: &[ParamDecl], args: Vec<(Option<String>, Value)>) -> Result<HashMap<String, Value>> {
     let mut out: HashMap<String, Value> = HashMap::with_capacity(decls.len());
     let mut next = 0;
     for (name, value) in args {
@@ -102,6 +102,11 @@ impl Database {
 
     /// Runs a saved query, binding its parameters to `args`.
     pub(crate) fn exec_exec(&mut self, name: &str, args: &[(Option<String>, Expr)]) -> Result<QueryResult> {
+        if self.view_sql(name).is_none() {
+            if let Some(done) = self.exec_prepared_by_name(name, args)? {
+                return Ok(done);
+            }
+        }
         let select = self.bind_call(name, args, 0)?;
         self.run_select(&select)
     }
@@ -109,27 +114,10 @@ impl Database {
     /// Runs a script in which `@name` parameters are replaced by `params`.
     /// A leading `PARAMETERS` line declares (and type-converts) them.
     pub fn execute_with_params(&mut self, sql: &str, params: &[(&str, Value)]) -> Result<QueryResult> {
-        let mut values: HashMap<String, Value> =
+        let values: HashMap<String, Value> =
             params.iter().map(|(n, v)| (n.trim_start_matches('@').to_ascii_lowercase(), v.clone())).collect();
-        let mut last = QueryResult::default();
-        for mut st in parse_script(sql)? {
-            if let Statement::Parameters(decls) = &st {
-                let given = decls
-                    .iter()
-                    .map(|d| {
-                        let v = values.get(&d.name.to_ascii_lowercase()).cloned().ok_or_else(|| {
-                            Error::runtime(format!("no value was supplied for the parameter @{}", d.name))
-                        })?;
-                        Ok((Some(d.name.clone()), v))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                values.extend(bind_arguments(decls, given)?);
-                continue;
-            }
-            bind_params(&mut st, &values)?;
-            last = self.execute_statement(&st)?;
-        }
-        Ok(last)
+        let statements = self.parse_cached(sql)?;
+        self.run_with_values(&statements, values)
     }
 
     // ----- triggers ---------------------------------------------------------------

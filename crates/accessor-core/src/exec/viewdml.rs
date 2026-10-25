@@ -21,6 +21,10 @@ use crate::sql::walk::walk_expr;
 use crate::sql::{parse_query_def, QueryDef};
 use crate::storage::Op;
 
+/// Column names starting with this cannot be written in a query: the columns of a merged view or
+/// derived table that it does not show.
+pub(crate) const HIDDEN_COLUMN: char = '\u{1}';
+
 /// What a simple view stands for.
 pub(crate) struct ViewTarget {
     /// The table (or view) it reads.
@@ -64,6 +68,12 @@ impl Database {
             }
             _ => (select.clone(), Vec::new()),
         };
+        self.simple_target(&inner, &renames, check, name)
+    }
+
+    /// Analyses a plain `SELECT` (a view's query, or a derived table) that reads one table.
+    pub(crate) fn simple_target(&self, inner: &Select, renames: &[String], check: bool, name: &str) -> Result<ViewTarget> {
+        let cannot = |why: &str| Error::runtime(format!("the query '{name}' cannot be changed: {why}"));
         if inner.distinct
             || inner.top.is_some()
             || inner.limit.is_some()
@@ -105,7 +115,7 @@ impl Database {
             if renames.len() != columns.len() {
                 return Err(cannot("its column list does not match its query"));
             }
-            for (c, r) in columns.iter_mut().zip(&renames) {
+            for (c, r) in columns.iter_mut().zip(renames) {
                 c.0 = r.clone();
             }
         }
@@ -213,12 +223,37 @@ impl Database {
             return Ok(None);
         }
         let Ok(t) = self.view_target(name) else { return Ok(None) };
+        self.merged_target(t, alias)
+    }
+
+    /// A derived table of the same simple kind, read as its table in the same way.
+    pub(crate) fn merged_derived(&self, query: &Select, alias: &str, columns: &[String]) -> Result<Option<Source<'_>>> {
+        if !self.optimizer_on {
+            return Ok(None);
+        }
+        let Ok(t) = self.simple_target(query, columns, false, alias) else { return Ok(None) };
+        self.merged_target(t, alias)
+    }
+
+    /// The scan of the base table that a simple view or derived table stands for. It may show only
+    /// some of the table's columns, as long as they keep the table's order; the others are kept in the
+    /// row under a name nothing can refer to.
+    fn merged_target(&self, t: ViewTarget, alias: &str) -> Result<Option<Source<'_>>> {
         let Some(base) = self.table(&t.base) else { return Ok(None) };
         let schema = base.schema();
-        let same_columns = t.columns.len() == schema.columns.len()
-            && t.columns.iter().zip(&schema.columns).all(|((_, b), c)| b.eq_ignore_ascii_case(&c.name));
-        if !same_columns {
+        let mut positions = Vec::with_capacity(t.columns.len());
+        for (_, b) in &t.columns {
+            match schema.column_index(b) {
+                Some(p) => positions.push(p),
+                None => return Ok(None),
+            }
+        }
+        if !positions.windows(2).all(|w| w[0] < w[1]) {
             return Ok(None);
+        }
+        let mut names: Vec<String> = (0..schema.columns.len()).map(|i| format!("{HIDDEN_COLUMN}{i}")).collect();
+        for ((shown, _), &p) in t.columns.iter().zip(&positions) {
+            names[p] = shown.clone();
         }
         let scope = Scope {
             cols: schema
@@ -235,7 +270,7 @@ impl Database {
             intrinsic,
             data: SourceData::Table(base),
             alias: alias.to_string(),
-            names: t.columns.iter().map(|(v, _)| v.clone()).collect(),
+            names,
         }))
     }
 }
