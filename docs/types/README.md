@@ -5,6 +5,7 @@ Every column has one type, chosen when the table is created (`CREATE TABLE t (co
 | Type | Page | Holds |
 | --- | --- | --- |
 | `TEXT` | [text.md](text.md) | Unicode text of any length |
+| `TEXT` (more names) | PostgreSQL types that have no counterpart here are **read and kept as text**, with none of their operators or functions: `regclass`, `regtype`, `regproc`, `regrole`, `regnamespace` and the other `reg*` names; `bytea`, `uuid`, `inet`, `cidr`, `macaddr`, `xml`, `tsvector`, `tsquery`, `jsonpath`, `pg_lsn`, `tid`, `varbit`; the geometric types `point`, `box`, `polygon`, `path`, `circle`, `line`, `lseg`; and the range and multirange types (`int4range`, `daterange`, `nummultirange`, ...). A table with such a column can be made and filled with text; `'a'::regclass` is the text `a`. `xid`, `xid8` and `oid8` are integers and `timetz` is `TIMESTAMPTZ`. |
 | `INTEGER` | [integers.md](integers.md) | whole numbers from −2⁶³ to 2⁶³−1 |
 | `BIGNUM` | [integers.md](integers.md) | whole numbers of any size |
 | `FLOAT` | [floating-point.md](floating-point.md) | 32-bit binary floating-point numbers |

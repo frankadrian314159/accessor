@@ -4695,3 +4695,133 @@ fn partitions_are_pruned_by_the_where_clause() {
     assert!(!plan(&db, "SELECT * FROM m WHERE d = 12").contains("of 4 tables"));
     assert_eq!(n(&db, "SELECT * FROM m WHERE d = 12"), 1);
 }
+
+#[test]
+fn postgres_statement_forms() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a int, b text, c regclass, d inet, e int4range, f point)").unwrap();
+    db.execute("CREATE INDEX ON t (a); CREATE INDEX CONCURRENTLY IF NOT EXISTS t_b ON t USING btree (b text_pattern_ops DESC NULLS LAST)").unwrap();
+    assert!(db.execute("CREATE INDEX ON t (lower(b))").is_err());
+    db.execute("CREATE TABLE u (LIKE t INCLUDING ALL, z int)").unwrap();
+    assert_eq!(db.query("SELECT * FROM u").unwrap().columns.len(), 7);
+    db.execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY; INSERT INTO t (a) VALUES (1); COMMIT AND CHAIN").unwrap();
+    db.execute("BEGIN; SELECT 1; ABORT; BEGIN TRANSACTION READ WRITE; END").unwrap();
+    db.execute("RESET SESSION AUTHORIZATION; SELECT pg_catalog.lower('X'), public.upper('y')").unwrap();
+    db.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY; ALTER TABLE ONLY t ADD COLUMN g int, ADD COLUMN h int; ALTER TABLE t OWNER TO nobody; ALTER TABLE t SET (fillfactor = 70)").unwrap();
+    db.execute("ALTER TABLE t ALTER COLUMN g SET STATISTICS 100; ALTER TABLE t ALTER COLUMN g SET DATA TYPE bigint; ALTER TABLE IF EXISTS nope ADD COLUMN x int").unwrap();
+    assert_eq!(db.query("SELECT * FROM t").unwrap().columns.len(), 8);
+    db.execute("CREATE TABLESPACE ts LOCATION '/tmp'; CREATE PUBLICATION p FOR ALL TABLES; DROP PUBLICATION p; CREATE STATISTICS s ON a, b FROM t").unwrap();
+    db.execute("CREATE MATERIALIZED VIEW mv AS SELECT a FROM t WHERE a IS NOT NULL").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM mv").unwrap().rows[0][0].to_string(), "1");
+    db.execute("DROP MATERIALIZED VIEW mv").unwrap();
+    db.execute(
+        "CREATE TABLE p (k int) PARTITION BY RANGE (k); CREATE TABLE p1 (k int); CREATE TABLE p2 (k int);
+         ALTER TABLE p ATTACH PARTITION p1 FOR VALUES FROM (0) TO (10);
+         ALTER TABLE p ATTACH PARTITION p2 FOR VALUES FROM (10) TO (20);
+         INSERT INTO p VALUES (3), (15)",
+    )
+    .unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM ONLY p1").unwrap().rows[0][0].to_string(), "1");
+    db.execute("ALTER TABLE p DETACH PARTITION p1").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM p").unwrap().rows[0][0].to_string(), "1");
+}
+
+fn big(db: &mut Database, name: &str, n: i64) {
+    db.execute(&format!("CREATE TABLE {name} (u1 int, u2 int, h int)")).unwrap();
+    let rows: Vec<String> = (0..n).map(|i| format!("({i}, {}, {})", (i * 7) % n, i % 100)).collect();
+    db.execute(&format!("INSERT INTO {name} VALUES {}", rows.join(","))).unwrap();
+}
+
+#[test]
+fn time_limits_and_plans_that_would_not_finish() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 3000);
+    big(&mut db, "b", 3000);
+    db.execute("SET statement_timeout = '50ms'").unwrap();
+    let e = db.execute("SELECT count(*) FROM a x, b y WHERE x.u1 + y.u1 > 0 AND x.h + y.h > -1").unwrap_err().to_string();
+    assert!(e.contains("statement timeout"), "{e}");
+    db.execute("RESET statement_timeout").unwrap();
+    // a plain EXPLAIN stops by itself
+    let t = std::time::Instant::now();
+    let plan = db.query("EXPLAIN SELECT count(*) FROM a x, b y, a z WHERE x.u1 + y.u1 + z.u1 > -1").unwrap();
+    assert!(t.elapsed().as_secs() < 30);
+    let text: Vec<String> = plan.rows.iter().map(|r| r[0].to_string()).collect();
+    assert!(!text.is_empty());
+}
+
+#[test]
+fn or_conditions_filter_each_table_before_the_join() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 4000);
+    big(&mut db, "b", 4000);
+    let t = std::time::Instant::now();
+    let r = db
+        .query("SELECT count(*) FROM a x JOIN b y ON (x.u1 = 1 AND y.u1 = 2) OR (x.u2 = 7 AND y.h = 4)")
+        .unwrap();
+    assert!(t.elapsed().as_secs() < 5);
+    // x.u1 = 1 with y.u1 = 2: one pair; x.u2 = 7 (u1 = 1) with y.h = 4: 40 rows of b
+    assert_eq!(r.rows[0][0].to_string(), "41");
+}
+
+#[test]
+fn conditions_move_into_derived_tables() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 3000);
+    let t = std::time::Instant::now();
+    let r = db.query("SELECT x, count(*) FROM (SELECT p.u1 AS x, q.u1 AS y FROM a p, a q) s WHERE x = 5 GROUP BY x").unwrap();
+    assert!(t.elapsed().as_secs() < 5);
+    assert_eq!(r.rows[0][1].to_string(), "3000");
+    let plan = db.query("EXPLAIN SELECT x, count(*) FROM (SELECT p.u1 AS x, q.u1 AS y FROM a p, a q) s WHERE x < 3 GROUP BY x").unwrap();
+    assert!(plan.rows.iter().any(|r| r[0].to_string().contains("moved into its query")));
+    // conditions that can match NULL stay outside
+    db.execute("CREATE TABLE n (v int); INSERT INTO n VALUES (1), (NULL)").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM (SELECT v AS w FROM n) s WHERE w IS NULL").unwrap().rows[0][0].to_string(), "1");
+}
+
+#[test]
+fn lateral_results_are_looked_up_by_the_join_condition() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 3000);
+    let t = std::time::Instant::now();
+    let r = db
+        .query("SELECT count(*) FROM a t1 LEFT JOIN LATERAL (SELECT t1.h + t2.h AS x, t2.u2 AS k FROM a t2) ss ON t1.u1 = ss.k")
+        .unwrap();
+    assert!(t.elapsed().as_secs() < 20);
+    assert_eq!(r.rows[0][0].to_string(), "3000");
+}
+
+#[test]
+fn recursive_with_inside_a_recursive_part_is_refused() {
+    let mut db = Database::in_memory();
+    let e = db.execute("WITH RECURSIVE q AS (SELECT 1 AS n UNION ALL (WITH RECURSIVE x AS (SELECT n FROM q UNION ALL SELECT n FROM x) SELECT n FROM x)) SELECT * FROM q");
+    assert!(e.is_err());
+}
+
+#[test]
+fn more_postgres_functions() {
+    let db = Database::in_memory();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one("SELECT width_bucket(5.35, 0.024, 10.06, 5)"), "3");
+    assert_eq!(one("SELECT width_bucket(-1, 0, 10, 5)"), "0");
+    assert_eq!(one("SELECT width_bucket(11, 0, 10, 5)"), "6");
+    assert_eq!(one("SELECT encode('abc', 'hex')"), "616263");
+    assert_eq!(one("SELECT encode('abcd', 'base64')"), "YWJjZA==");
+    assert_eq!(one("SELECT decode('YWJjZA==', 'base64')"), "abcd");
+    assert_eq!(one("SELECT decode('616263', 'hex')"), "abc");
+    assert_eq!(one("SELECT left('ahoj', -1) || '|' || right('ahoj', -1)"), "aho|hoj");
+    assert_eq!(one("SELECT to_regclass('x')"), "x");
+}
+
+#[test]
+fn where_on_an_outer_joined_table_filters_it_first_and_keeps_null_rows() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 2000);
+    db.execute("CREATE TABLE s (k int); INSERT INTO s VALUES (1), (2)").unwrap();
+    // a join keeps its answer: null-extended rows are still dropped by the WHERE, IS NULL still finds them
+    assert_eq!(db.query("SELECT count(*) FROM s LEFT JOIN a ON a.u1 = s.k WHERE a.u2 > 0").unwrap().rows[0][0].to_string(), "2");
+    assert_eq!(db.query("SELECT count(*) FROM s LEFT JOIN a ON a.u1 = s.k + 100000 WHERE a.u2 IS NULL").unwrap().rows[0][0].to_string(), "2");
+    let t = std::time::Instant::now();
+    let r = db.query("SELECT count(*) FROM a t1 LEFT JOIN LATERAL (SELECT t1.h + 1 AS c1, t2.h AS c2 FROM a t2) s ON TRUE WHERE s.c1 = s.c2 AND t1.u1 < 100").unwrap();
+    assert!(t.elapsed().as_secs() < 20);
+    assert!(r.rows[0][0].to_string().parse::<i64>().unwrap() > 0);
+}

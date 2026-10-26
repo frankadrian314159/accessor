@@ -108,6 +108,8 @@ Running SQLite's [sqllogictest](../extern/testing.md#sqllogictest) over every fi
 
 The first runs found more, which were fixed rather than excused: `/` now divides like SQLite does (whole numbers truncate; `DIV` is the exact operator), division by zero gives NULL, `ALL` is accepted inside aggregates, `IN ()` and `X'..'` literals are read, `CREATE TRIGGER` without a timing means `BEFORE`, `DROP INDEX name` and `REINDEX` exist, a column that is not grouped may be selected in a grouped query, and `CAST(x AS INTEGER)` truncates. Those that remain different from the standard are in the table above.
 
+Statements about objects that only a server has are read and **ignored**: `CREATE`/`ALTER`/`DROP` of `TABLESPACE`, `DATABASE`, `PUBLICATION`, `SUBSCRIPTION`, `SERVER`, `FOREIGN DATA WRAPPER`/`FOREIGN TABLE`, `USER MAPPING`, `EVENT TRIGGER`, `STATISTICS`, `COLLATION`, `CONVERSION`, `TRANSFORM`, `LANGUAGE`, `TEXT SEARCH ...`, `ACCESS METHOD`, `OPERATOR`, `CAST`, `OWNED BY` and `DEFAULT PRIVILEGES`; and the `ALTER TABLE` actions `ENABLE/DISABLE/FORCE ROW LEVEL SECURITY`, `OWNER TO`, `SET (...)`, `RESET (...)`, `REPLICA IDENTITY`, `CLUSTER ON`, `SET ACCESS METHOD/TABLESPACE/LOGGED/UNLOGGED`, `INHERIT`, `VALIDATE CONSTRAINT`, and `ALTER COLUMN ... SET STATISTICS/STORAGE/COMPRESSION`. Nothing is recorded, so a script that depends on what they do (an operator defined with `CREATE OPERATOR`, a cast with `CREATE CAST`) still fails where it uses the result. `CREATE MATERIALIZED VIEW v AS q` makes a table filled once from `q` (there is no `REFRESH`).
+
 ## Differences found by the PostgreSQL regression suite
 
 See [testing](../extern/testing.md#the-postgresql-regression-suite).

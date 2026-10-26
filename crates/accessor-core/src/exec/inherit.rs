@@ -75,6 +75,11 @@ impl Drop for PruneGuard {
     }
 }
 
+/// The `WHERE` of the query being planned, if one is set.
+pub(crate) fn current_filter() -> Option<Expr> {
+    PRUNE_HINT.with(|h| h.borrow().clone())
+}
+
 /// What a query WHERE says of one column: comparisons with values, or a set of values.
 enum Fact {
     Cmp(BinOp, Value),
@@ -235,6 +240,7 @@ impl Database {
             return Err(Error::runtime("CREATE TABLE expected"));
         };
         let mut parents: Vec<String> = ext.parents.clone();
+        let likes = ext.likes.clone();
         if let Some((p, _)) = &ext.partition_of {
             if !self.is_partitioned(p) {
                 return Err(Error::catalog(format!("\"{p}\" is not partitioned")));
@@ -261,6 +267,26 @@ impl Database {
                     primary_key: false,
                     unique: false,
                     autonumber: c.autonumber,
+                    default: c.default.clone(),
+                    references: None,
+                    expression: None,
+                    check: None,
+                });
+            }
+        }
+        for p in &likes {
+            let pt = self.table_checked(p)?;
+            for c in &pt.schema().columns {
+                if c.is_calculated() || defs.iter().any(|d| d.name.eq_ignore_ascii_case(&c.name)) {
+                    continue;
+                }
+                defs.push(ColumnDef {
+                    name: c.name.clone(),
+                    data_type: c.data_type,
+                    not_null: c.not_null,
+                    primary_key: false,
+                    unique: false,
+                    autonumber: false,
                     default: c.default.clone(),
                     references: None,
                     expression: None,
@@ -308,6 +334,36 @@ impl Database {
             }
             Ok(QueryResult::default())
         })
+    }
+
+    /// `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...` and `DETACH PARTITION child`.
+    pub(crate) fn exec_attach_partition(&mut self, parent: &str, child: &str, bound: Option<&str>) -> Result<QueryResult> {
+        let parent_name = self.table_checked(parent)?.name().to_string();
+        let child_name = self.table_checked(child)?.name().to_string();
+        let link = format!("{}|{}", key(&child_name), key(&parent_name));
+        match bound {
+            Some(b) => {
+                if !self.is_partitioned(&parent_name) {
+                    return Err(Error::catalog(format!("\"{parent_name}\" is not partitioned")));
+                }
+                if self.catalog.contains_key(&("inherit".to_string(), link.clone())) {
+                    return Err(Error::catalog(format!("\"{child_name}\" is already a partition of \"{parent_name}\"")));
+                }
+                let pcols: Vec<String> = self.table_checked(&parent_name)?.schema().columns.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+                let ccols: Vec<String> = self.table_checked(&child_name)?.schema().columns.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+                if pcols != ccols {
+                    return Err(Error::catalog(format!("table \"{child_name}\" does not have the columns of \"{parent_name}\" (same names, same order)")));
+                }
+                self.apply_all(vec![Op::Catalog { kind: "inherit".into(), name: link, value: Some(b.to_string()) }])?;
+            }
+            None => {
+                if !self.catalog.contains_key(&("inherit".to_string(), link.clone())) {
+                    return Err(Error::catalog(format!("\"{child_name}\" is not a partition of \"{parent_name}\"")));
+                }
+                self.apply_all(vec![Op::Catalog { kind: "inherit".into(), name: link, value: None }])?;
+            }
+        }
+        Ok(QueryResult::default())
     }
 
     /// The links to forget once `table` is gone.

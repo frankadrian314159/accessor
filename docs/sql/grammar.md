@@ -403,7 +403,7 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
 <trigger-body>     ::= BEGIN <trigger-statement> ; { <trigger-statement> ; } END | EXECUTE ( FUNCTION | PROCEDURE ) <identifier> '(' ... ')'
 ```
 
-`INSERT ... VALUES` takes `DEFAULT` for an item. `a ~ b`, `a ~* b`, `a !~ b` and `a !~* b` are regular-expression matches (`REGEXP_LIKE`), and a prefix `@` is the absolute value (`@ -5`, but not `@x`, which is a parameter). `VACUUM`, `ANALYZE`, `LOCK`, `COMMENT ON`, `CHECKPOINT`, `DISCARD`, `CLUSTER`, `LISTEN`, `UNLISTEN` and `NOTIFY` are read to the end of the statement and ignored. `CREATE TEMP | UNLOGGED TABLE` makes an ordinary table.
+`BEGIN`/`START TRANSACTION` may be followed by `ISOLATION LEVEL ...`, `READ ONLY`/`READ WRITE` and `[NOT] DEFERRABLE`, and `COMMIT`/`ROLLBACK` by `AND [NO] CHAIN`; they are read and ignored (`END` is `COMMIT`, `ABORT` is `ROLLBACK`). `schema.function(...)` with `pg_catalog` or `public` is the function. `INSERT ... VALUES` takes `DEFAULT` for an item. `a ~ b`, `a ~* b`, `a !~ b` and `a !~* b` are regular-expression matches (`REGEXP_LIKE`), and a prefix `@` is the absolute value (`@ -5`, but not `@x`, which is a parameter). `VACUUM`, `ANALYZE`, `LOCK`, `COMMENT ON`, `CHECKPOINT`, `DISCARD`, `CLUSTER`, `LISTEN`, `UNLISTEN` and `NOTIFY` are read to the end of the statement and ignored. `CREATE TEMP | UNLOGGED TABLE` makes an ordinary table.
 
 `UPDATE ONLY <table>` and `DELETE FROM ONLY <table>` leave out the tables that inherit from it; so does `FROM ONLY <table>`.
 `CREATE FUNCTION` and `CREATE PROCEDURE` also take the PostgreSQL form described in [routines.md](routines.md#postgresql-style-functions-and-procedures).

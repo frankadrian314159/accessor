@@ -36,6 +36,11 @@ pub enum PgFn {
     ToNumber,
     ConcatWs,
     RegexpInstr,
+    WidthBucket,
+    Encode,
+    Decode,
+    Zero,
+    Same,
 }
 
 pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
@@ -62,6 +67,11 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "TO_NUMBER" => (ToNumber, 2, 2),
         "CONCAT_WS" => (ConcatWs, 2, usize::MAX),
         "REGEXP_INSTR" => (RegexpInstr, 2, 7),
+        "WIDTH_BUCKET" => (WidthBucket, 4, 4),
+        "ENCODE" => (Encode, 2, 2),
+        "DECODE" => (Decode, 2, 2),
+        "PG_RELATION_SIZE" | "PG_TOTAL_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" => (Zero, 1, 2),
+        "TO_REGCLASS" | "TO_REGTYPE" | "TO_REGPROC" | "TO_REGROLE" | "TO_REGNAMESPACE" | "TO_REGPROCEDURE" | "TO_REGOPER" | "TO_REGDATABASE" => (Same, 1, 1),
         _ => return None,
     })
 }
@@ -153,6 +163,55 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             }
             finite(x.atanh())?
         }
+        WidthBucket => {
+            let (x, lo, hi) = (double(v(0))?, double(v(1))?, double(v(2))?);
+            let n = match v(3) {
+                Value::Int(n) if *n > 0 => *n,
+                _ => return Err(Error::runtime("count must be greater than zero")),
+            };
+            if lo == hi {
+                return Err(Error::runtime("lower bound cannot equal upper bound"));
+            }
+            let k = if lo < hi {
+                if x < lo { 0 } else if x >= hi { n + 1 } else { ((x - lo) / (hi - lo) * n as f64).floor() as i64 + 1 }
+            } else if x > lo {
+                0
+            } else if x <= hi {
+                n + 1
+            } else {
+                ((lo - x) / (lo - hi) * n as f64).floor() as i64 + 1
+            };
+            Value::Int(k)
+        }
+        Encode => {
+            let s = text(v(0)).into_owned();
+            match text(v(1)).to_ascii_lowercase().as_str() {
+                "hex" => Value::text(&s.bytes().map(|b| format!("{b:02x}")).collect::<String>()),
+                "base64" => Value::text(&base64_encode(s.as_bytes())),
+                "escape" => Value::text(&s),
+                other => return Err(Error::runtime(format!("unrecognized encoding: \"{other}\""))),
+            }
+        }
+        Decode => {
+            let s = text(v(0)).into_owned();
+            let bytes: Vec<u8> = match text(v(1)).to_ascii_lowercase().as_str() {
+                "hex" => {
+                    if s.len() % 2 != 0 {
+                        return Err(Error::runtime("invalid hexadecimal data: odd number of digits"));
+                    }
+                    (0..s.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| Error::runtime("invalid hexadecimal digit")))
+                        .collect::<Result<_>>()?
+                }
+                "base64" => base64_decode(&s)?,
+                "escape" => s.into_bytes(),
+                other => return Err(Error::runtime(format!("unrecognized encoding: \"{other}\""))),
+            };
+            Value::text(&String::from_utf8_lossy(&bytes))
+        }
+        Zero => Value::Int(0),
+        Same => v(0).clone(),
         IsFinite => Value::Bool(true),
         Privilege => Value::Bool(true),
         Sleep => {
@@ -806,4 +865,41 @@ pub fn pg_format(vals: &[Value]) -> Result<Value> {
         }
     }
     Ok(Value::text(&out))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for c in s.chars().filter(|c| !c.is_whitespace() && *c != '=') {
+        let d = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return Err(Error::runtime(format!("invalid symbol \"{c}\" found while decoding base64 sequence"))),
+        };
+        acc = (acc << 6) | d;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
 }

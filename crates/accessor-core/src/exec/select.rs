@@ -183,8 +183,17 @@ impl Database {
                 let names = rename_columns(cols, columns, alias)?;
                 Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
             }
-            TableFactor::Derived { query, alias, columns, .. } => {
-                let res = self.run_select_depth(query, depth + 1)?;
+            TableFactor::Derived { query, alias, columns, lateral } => {
+                // conditions of the outer WHERE on this table's columns are applied inside it, before it is built
+                let pushed = if !*lateral && self.optimizer_on {
+                    super::inherit::current_filter().and_then(|f| super::pushdown::push_into_derived(query, alias, &f))
+                } else {
+                    None
+                };
+                if pushed.is_some() {
+                    self.note(depth, || format!("conditions on {alias} moved into its query"));
+                }
+                let res = self.run_select_depth(pushed.as_ref().unwrap_or(query), depth + 1)?;
                 let names = rename_columns(res.columns, columns, alias)?;
                 Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
@@ -339,7 +348,25 @@ impl Database {
         let mut cache: HashMap<Vec<Value>, Arc<Vec<Row>>> = HashMap::new();
         let mut out: Vec<Row> = Vec::new();
         let mut runs = 0usize;
+        // `ON left.a = lateral.b`: the rows a run produced are looked up by b, not all compared
+        let lw = left.first().map_or(0, Vec::len);
+        let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
+        if let Some(c) = on {
+            for conj in split_and(c) {
+                if let BExpr::Bin(BinOp::Eq, a, b) = conj {
+                    if let (BExpr::Col(x), BExpr::Col(y)) = (&**a, &**b) {
+                        if *x < lw && *y >= lw && *y < lw + rw {
+                            eq_pairs.push((*x, *y - lw));
+                        } else if *y < lw && *x >= lw && *x < lw + rw {
+                            eq_pairs.push((*y, *x - lw));
+                        }
+                    }
+                }
+            }
+        }
+        let mut indexes: HashMap<Vec<Value>, HashMap<Vec<Value>, Vec<usize>>> = HashMap::new();
         for l in &left {
+            super::budget::tick()?;
             let key: Vec<Value> = lat.outer.iter().map(|(_, c)| l[*c].clone()).collect();
             let produced = match cache.get(&key) {
                 Some(r) => Arc::clone(r),
@@ -364,12 +391,30 @@ impl Database {
                         }
                     };
                     let rc = Arc::new(rows);
-                    cache.insert(key, Arc::clone(&rc));
+                    cache.insert(key.clone(), Arc::clone(&rc));
                     rc
                 }
             };
             let mut matched = false;
-            for r in produced.iter() {
+            let order: Vec<usize> = if eq_pairs.is_empty() {
+                (0..produced.len()).collect()
+            } else {
+                let ix = indexes.entry(key.clone()).or_insert_with(|| {
+                    let mut m: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+                    for (i, r) in produced.iter().enumerate() {
+                        let k: Vec<Value> = eq_pairs.iter().map(|(_, rc)| r[*rc].clone()).collect();
+                        if !k.iter().any(Value::is_null) {
+                            m.entry(k).or_default().push(i);
+                        }
+                    }
+                    m
+                });
+                let k: Vec<Value> = eq_pairs.iter().map(|(lc, _)| l[*lc].clone()).collect();
+                if k.iter().any(Value::is_null) { Vec::new() } else { ix.get(&k).cloned().unwrap_or_default() }
+            };
+            for &ri in &order {
+                super::budget::tick()?;
+                let r = &produced[ri];
                 if let Some(p) = right_pre {
                     if !p.eval_bool(r)? {
                         continue;
@@ -677,6 +722,7 @@ impl Database {
             specs.iter().map(|s| self.hash_subquery(s, &rows, depth)).collect::<Result<_>>()?;
         let mut probes = 0usize;
         for row in &mut rows {
+            super::budget::tick()?;
             for ((spec, cache), hash) in specs.iter().zip(&mut caches).zip(&hashed) {
                 let key: Vec<Value> = spec.outer.iter().map(|(_, c)| row[*c].clone()).collect();
                 let fast = hash.as_ref().and_then(|h| {
@@ -927,6 +973,24 @@ impl Database {
             }
         }
 
+        // From `(a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.z = 4)`: a must have x = 1 or x = 3, and b y = 2 or z = 4. Those
+        // conditions on one table filter it before the join; the whole OR is still checked after.
+        if optimize {
+            let mut implied: Vec<Pred> = Vec::new();
+            for p in &preds {
+                if p.mask.count_ones() >= 2 && matches!(p.expr, BExpr::Bin(BinOp::Or, ..)) {
+                    for s in 0..m {
+                        if p.mask & (1 << s) != 0 {
+                            if let Some(e) = implied_on(&p.expr, s, &offs) {
+                                implied.push(Pred { expr: e, mask: 1 << s, from_where: p.from_where, used: false });
+                            }
+                        }
+                    }
+                }
+            }
+            preds.extend(implied);
+        }
+
         // Conditions on one source alone move into its scan (bound to its own columns).
         let mut pre: Vec<Vec<BExpr>> = sources.iter().map(|s| s.intrinsic.clone()).collect();
         for p in preds.iter_mut() {
@@ -936,6 +1000,12 @@ impl Database {
                     let off = offs[s];
                     pre[s].push(p.expr.map_cols(&move |i| i - off));
                     p.used = true;
+                } else if null_rejecting(&p.expr) {
+                    // A WHERE condition on the outer-joined side that NULL cannot satisfy: rows of that side it rejects
+                    // would be thrown away after the join anyway, so they are dropped first. The condition stays for
+                    // the null-extended rows.
+                    let off = offs[s];
+                    pre[s].push(p.expr.map_cols(&move |i| i - off));
                 }
             }
         }
@@ -1618,6 +1688,7 @@ pub(crate) fn candidates<'t>(table: &'t Table, access: Access) -> Box<dyn Iterat
 pub(crate) fn matching_ids(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>) -> Result<Vec<RowId>> {
     let mut ids = Vec::new();
     for (id, row) in candidates(table, choose_access(table, conj)) {
+        super::budget::tick()?;
         if let Some(f) = filter {
             if !f.eval_bool(row)? {
                 continue;
@@ -1646,6 +1717,7 @@ pub(crate) fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>,
         return Ok(out);
     }
     for (_, row) in candidates(table, choose_access(table, conj)) {
+        super::budget::tick()?;
         if let Some(f) = filter {
             if !f.eval_bool(row)? {
                 continue;
@@ -1670,6 +1742,51 @@ enum Strategy {
     /// right row alone), probe with `left` key expressions.
     Hash { left: Vec<BExpr>, right: Vec<BExpr> },
     Scan,
+}
+
+/// Is `e` a comparison of columns and constants, which is never true when a column is NULL?
+fn null_rejecting(e: &BExpr) -> bool {
+    fn leaf(e: &BExpr) -> bool {
+        matches!(e, BExpr::Col(_) | BExpr::Lit(_))
+    }
+    match e {
+        BExpr::Bin(BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, a, b) => leaf(a) && leaf(b),
+        BExpr::Bin(BinOp::And, a, b) => null_rejecting(a) || null_rejecting(b),
+        _ => false,
+    }
+}
+
+/// What `e` requires of source `s` alone, if every way of satisfying it requires something of `s`.
+fn implied_on(e: &BExpr, s: usize, offs: &[usize]) -> Option<BExpr> {
+    let want: u128 = 1 << s;
+    match e {
+        BExpr::Bin(BinOp::Or, ..) => {
+            let mut terms = Vec::new();
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                match x {
+                    BExpr::Bin(BinOp::Or, a, b) => {
+                        stack.push(b);
+                        stack.push(a);
+                    }
+                    other => terms.push(other),
+                }
+            }
+            let mut parts = Vec::new();
+            for t in terms {
+                parts.push(implied_on(t, s, offs)?);
+            }
+            parts.into_iter().reduce(|a, b| BExpr::Bin(BinOp::Or, Box::new(a), Box::new(b)))
+        }
+        BExpr::Bin(BinOp::And, ..) => {
+            let mine: Vec<BExpr> = split_and(e)
+                .into_iter()
+                .filter_map(|c| if source_mask(c, offs) == want { Some(c.clone()) } else { implied_on(c, s, offs) })
+                .collect();
+            mine.into_iter().reduce(|a, b| BExpr::Bin(BinOp::And, Box::new(a), Box::new(b)))
+        }
+        other => (source_mask(other, offs) == want).then(|| other.clone()),
+    }
 }
 
 fn join_step(
@@ -1833,6 +1950,7 @@ fn join_step(
     let mut cands: Vec<usize> = Vec::new();
 
     for l in &left {
+        super::budget::tick()?;
         cands.clear();
         match &strategy {
             Strategy::Scan => cands.extend(0..right.slot_count()),
@@ -1859,6 +1977,7 @@ fn join_step(
 
         let mut matched = false;
         for &slot in &cands {
+            super::budget::tick()?;
             let Some(r) = right.get(slot) else { continue };
             if let Some(p) = right_pre {
                 if !p.eval_bool(r)? {
@@ -1878,6 +1997,7 @@ fn join_step(
                 m[slot] = true;
             }
             out.push(scratch.clone());
+            super::budget::rows(out.len())?;
         }
         if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
             let mut row = l.clone();
@@ -2204,6 +2324,9 @@ impl Database {
         let (recursive, anchors): (Vec<Select>, Vec<Select>) = members.into_iter().partition(|m| mentions_table(m, name));
         if anchors.is_empty() {
             return Err(Error::runtime(format!("the recursive query '{name}' has no starting part that avoids referring to itself")));
+        }
+        if recursive.iter().any(|m| m.with.is_some()) {
+            return Err(Error::runtime(format!("the recursive part of '{name}' cannot contain a WITH of its own")));
         }
         let mut names: Option<Vec<String>> = None;
         let mut rows: Vec<Row> = Vec::new();

@@ -7,7 +7,7 @@ EXPLAIN QUERY PLAN query
 
 `EXPLAIN` shows how a query was planned. The two forms are the same.
 
-**It runs the query.** `EXPLAIN` executes the `SELECT` (it is read-only, so nothing changes) and returns, instead of its rows, a text description of the plan with the real row counts at each step. That makes the figures trustworthy, and it means an `EXPLAIN` of a slow query is as slow as the query. Only queries are run: `EXPLAIN` of an `INSERT`, `UPDATE`, `DELETE` or other statement says what kind of statement it is and that it was **not run**.
+**It runs the query** (a plain `EXPLAIN` gives up after 4 seconds and shows the plan as far as it got, with a line saying so; `EXPLAIN ANALYZE`, or `EXPLAIN (ANALYZE)`, always runs to the end). `EXPLAIN` executes the `SELECT` (it is read-only, so nothing changes) and returns, instead of its rows, a text description of the plan with the real row counts at each step. That makes the figures trustworthy, and it means an `EXPLAIN` of a slow query is as slow as the query. Only queries are run: `EXPLAIN` of an `INSERT`, `UPDATE`, `DELETE` or other statement says what kind of statement it is and that it was **not run**.
 
 **Options.** PostgreSQL's forms are accepted: `EXPLAIN ANALYZE`, `EXPLAIN ANALYZE VERBOSE`, and `EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SETTINGS, BUFFERS, WAL, TIMING, SUMMARY, FORMAT TEXT, ...) query`. They change nothing: the plan is always the plain text plan with the real row counts, there are no cost figures to leave out, and only `FORMAT TEXT` is available (`FORMAT JSON` is an error, like an option that does not exist).
 

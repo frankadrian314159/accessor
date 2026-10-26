@@ -521,13 +521,18 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         LTrim => Value::text(text_of(v0.unwrap()).trim_start()),
         RTrim => Value::text(text_of(v0.unwrap()).trim_end()),
         Left => {
-            let n = int_of(&vals[1])?.max(0) as usize;
-            Value::text(&text_of(&vals[0]).chars().take(n).collect::<String>())
+            // a negative count leaves off that many from the end
+            let s = text_of(&vals[0]);
+            let k = int_of(&vals[1])?;
+            let n = if k >= 0 { k as usize } else { s.chars().count().saturating_sub(k.unsigned_abs() as usize) };
+            Value::text(&s.chars().take(n).collect::<String>())
         }
         Right => {
-            let n = int_of(&vals[1])?.max(0) as usize;
+            // a negative count leaves off that many from the start
             let s = text_of(&vals[0]);
-            let skip = s.chars().count().saturating_sub(n);
+            let k = int_of(&vals[1])?;
+            let len = s.chars().count();
+            let skip = if k >= 0 { len.saturating_sub(k as usize) } else { (k.unsigned_abs() as usize).min(len) };
             Value::text(&s.chars().skip(skip).collect::<String>())
         }
         Mid => {

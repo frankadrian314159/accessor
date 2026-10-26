@@ -60,7 +60,7 @@ impl Database {
     pub(crate) fn is_pure_read(&self, statements: &[Statement]) -> bool {
         let mut copy = match statements {
             [Statement::Select(s)] => s.clone(),
-            [Statement::Explain(s)] => (**s).clone(),
+            [Statement::Explain(s) | Statement::ExplainAnalyze(s)] => (**s).clone(),
             _ => return false,
         };
         let sequences_in_views = self.views.values().any(|(_, sql)| {

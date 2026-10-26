@@ -195,6 +195,8 @@ DROP TABLE [IF EXISTS] name [, name ...] [CASCADE | RESTRICT];
 
 Removes the table with its data, indexes and triggers. It is refused while another table has a foreign key that refers to it, or while tables [inherit from it](inheritance-and-partitioning.md). `CASCADE` drops those along with it: the tables that inherit from it, the queries (views) that mention it, and the foreign keys that point at it. Several names are dropped in order; with `IF EXISTS` the ones that do not exist are skipped.
 
+`CREATE INDEX` may leave out the name (`CREATE INDEX ON t (a)` is named `t_a_idx`), and reads `CONCURRENTLY`, `USING method`, operator classes, `COLLATE`, `NULLS FIRST/LAST`, `INCLUDE (...)`, `WITH (...)` and `TABLESPACE`, ignoring them; an index on an expression and a partial index (`WHERE`) are refused. `ALTER TABLE` takes several actions separated by commas (all or none), `IF EXISTS`, `ONLY`, and `ATTACH PARTITION` / `DETACH PARTITION`. `CREATE TABLE t (LIKE other)` copies the columns, with their `NOT NULL` and defaults but nothing else.
+
 `CREATE TABLE` also takes `INHERITS (parent)`, `PARTITION BY ...` and `PARTITION OF parent FOR VALUES ...` ([inheritance-and-partitioning.md](inheritance-and-partitioning.md)), a schema prefix on the name ([schemas-and-types.md](schemas-and-types.md)), and the storage clauses `WITH (...)`, `TABLESPACE t`, `USING method` and `ON COMMIT ...`, which are read and ignored.
 
 ## CREATE OR REPLACE

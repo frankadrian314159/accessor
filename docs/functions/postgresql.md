@@ -47,7 +47,11 @@ SELECT to_date('March 5, 2024', 'Month DD, YYYY');                          -- 2
 
 `format(pattern, args...)` fills a pattern: `%s` is the argument as text (NULL is empty), `%I` quotes it as an identifier when it needs quoting (NULL is an error), `%L` as a literal (`'it''s'`, NULL is `NULL`), `%%` is a percent sign; `%2$s` takes the second argument, and a width pads (`%10s` right-aligned, `%-10s` left-aligned). A call is read as PostgreSQL's `format` when the first argument is a text containing one of those, or when there are three or more arguments; otherwise it is Access's `Format(value, pattern)`.
 
+`encode(text, 'hex' | 'base64' | 'escape')` and `decode(text, format)` convert between a text and its encoded form (the bytes are read as UTF-8: there is no `bytea` type). `left(s, -n)` and `right(s, -n)` leave off `n` characters from the other end.
+
 ## Mathematics
+
+`width_bucket(x, low, high, count)` is the number of the equal-width bucket `x` falls in (0 below the range, `count + 1` above). `pg_relation_size`, `pg_total_relation_size`, `pg_table_size` and `pg_database_size` are 0; `to_regclass`, `to_regtype`, `to_regproc`, `to_regrole` and `to_regnamespace` return their argument.
 
 `asinh(x)`, `acosh(x)`, `atanh(x)`; the arguments of the last two must be in range.
 

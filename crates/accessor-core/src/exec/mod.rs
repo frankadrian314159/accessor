@@ -3,7 +3,9 @@
 pub use prepared::Prepared;
 pub mod agg;
 pub mod bind;
+mod budget;
 mod catalog;
+pub(crate) mod pushdown;
 mod inherit;
 mod check;
 mod ddl;
@@ -66,16 +68,26 @@ impl Database {
         match parsed {
             [] => Err(Error::syntax("empty statement")),
             [Statement::Select(s)] => self.run_select(s),
-            [Statement::Explain(s)] => self.run_explain(s),
+            [Statement::Explain(s)] => self.run_explain(s, false),
+            [Statement::ExplainAnalyze(s)] => self.run_explain(s, true),
             [_] => Err(Error::runtime("query() only accepts SELECT statements")),
             _ => Err(Error::syntax("expected a single statement")),
         }
     }
 
     /// Runs a query and returns, instead of its rows, how it was planned.
-    fn run_explain(&self, sel: &crate::sql::ast::Select) -> Result<QueryResult> {
+    /// `EXPLAIN` runs the query to count the rows of each step. A plain `EXPLAIN` stops after a few seconds and
+    /// shows the plan as far as it got; `EXPLAIN ANALYZE` runs to the end.
+    fn run_explain(&self, sel: &crate::sql::ast::Select, analyze: bool) -> Result<QueryResult> {
+        let _limit = (!analyze).then(|| budget::limit(std::time::Duration::from_secs(4)));
         let (result, mut lines) = self.collect_plan(|| self.run_select(sel));
-        let result = result?;
+        let result = match result {
+            Err(e) if !analyze && e.to_string().contains(budget::EXPIRED) => {
+                lines.push("(stopped after 4 seconds: this query is too large to run to the end for a plan; EXPLAIN ANALYZE runs it all)".to_string());
+                return Ok(QueryResult { columns: vec!["plan".to_string()], rows: lines.iter().map(|l| vec![crate::value::Value::text(l)]).collect(), affected: 0 });
+            }
+            other => other?,
+        };
         lines.push(format!("{} row(s) returned", result.rows.len()));
         Ok(QueryResult {
             columns: vec!["plan".to_string()],
@@ -93,6 +105,7 @@ impl Database {
 
     fn run_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         self.enter_session();
+        let _timeout = self.settings.get("statement_timeout").and_then(|t| budget::parse_timeout(t)).map(budget::limit);
         if !matches!(st, Statement::Begin | Statement::Commit | Statement::Rollback) {
             self.admit()?;
             if matches!(st, Statement::Select(_) | Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Upsert { .. } | Statement::Returning { .. } | Statement::Exec { .. }) {
@@ -185,7 +198,8 @@ impl Database {
                 }
             }
             Statement::Truncate(table) => self.exec_delete(table, None),
-            Statement::Explain(sel) => self.run_explain(sel),
+            Statement::Explain(sel) => self.run_explain(sel, false),
+            Statement::ExplainAnalyze(sel) => self.run_explain(sel, true),
             Statement::ExplainOther(inner) => Ok(explain_other(inner)),
             Statement::Catalog(c) => {
                 let result = self.exec_catalog(c)?;
@@ -199,6 +213,14 @@ impl Database {
             Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
             Statement::Grant(g) => self.exec_grant(g),
             Statement::Ignored(_) => Ok(QueryResult::default()),
+            Statement::Batch(list) => self.atomically(|db| {
+                let mut last = QueryResult::default();
+                for s in list {
+                    last = db.execute_statement(s)?;
+                }
+                Ok(last)
+            }),
+            Statement::AttachPartition { parent, child, bound } => self.exec_attach_partition(parent, child, bound.as_deref()),
             Statement::CreateTableAs { name, query, with_data } => self.exec_create_table_as(name, query, *with_data),
             Statement::CreateTableExt(ext) => self.exec_create_table_ext(ext),
             Statement::DropTables { names, cascade, if_exists } => self.exec_drop_tables(names, *cascade, *if_exists),

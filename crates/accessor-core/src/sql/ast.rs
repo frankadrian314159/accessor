@@ -490,6 +490,8 @@ pub enum Statement {
     SetConstraints { names: Option<Vec<String>>, deferred: bool },
     /// `EXPLAIN query`: run the query and report how it was planned.
     Explain(Box<Select>),
+    /// `EXPLAIN ANALYZE`: runs the query to the end.
+    ExplainAnalyze(Box<Select>),
     /// `EXPLAIN` of a statement that is not a query: described, not run.
     ExplainOther(Box<Statement>),
     /// Creating or dropping an object kept in the catalog without a table of its own (see `exec/catalog.rs`).
@@ -500,6 +502,10 @@ pub enum Statement {
     Grant(Box<GrantDef>),
     /// `SET ROLE name` / `SET SESSION AUTHORIZATION name`; `None` is `NONE` / `DEFAULT`.
     SetRole(Option<String>),
+    /// Several statements run as one (`ALTER TABLE t ADD a, DROP b`).
+    Batch(Vec<Statement>),
+    /// `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...` (a bound), or `DETACH PARTITION child` (`None`).
+    AttachPartition { parent: String, child: String, bound: Option<String> },
     /// `CREATE TABLE name AS query [WITH [NO] DATA]`.
     CreateTableAs { name: String, query: Box<Select>, with_data: bool },
     /// A command that is read and does nothing (`VACUUM`, `ANALYZE`, `COMMENT ON`, `LOCK`, ...).
@@ -581,6 +587,8 @@ pub struct GrantDef {
 pub struct TableExt {
     pub create: Statement,
     pub parents: Vec<String>,
+    /// `LIKE other`: the columns of those tables, with no link to them.
+    pub likes: Vec<String>,
     /// `(method, columns)` of `PARTITION BY`.
     pub partition_by: Option<(String, Vec<String>)>,
     /// `(parent, bound)` of `PARTITION OF`; the bound is saved as JSON text.

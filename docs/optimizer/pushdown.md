@@ -2,6 +2,25 @@
 
 Joining is the expensive part of most queries, and its cost depends on how many rows go in. *Pushdown* applies each condition as early as possible, so that the join sees only the rows that can matter.
 
+## Into derived tables
+
+A condition of the outer `WHERE` that compares columns of a derived table (a sub-query in `FROM`) with constants is also applied inside it, so the inner query builds only the rows that can survive:
+
+```sql
+SELECT x, count(*) FROM (SELECT p.id AS x, q.id AS y FROM big p, big q) s WHERE x = 5 GROUP BY x;
+-- the inner cross join is run for p.id = 5 only; EXPLAIN says "conditions on s moved into its query"
+```
+
+It is done only when that cannot change the answer: the inner query has no `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, `TOP`, set operator, `WITH` or window, and the columns concerned are computed without aggregates or sub-queries; the condition is a comparison, `BETWEEN` or `IN` (not `IS NULL`, `OR` or a function) between such columns and constants. The outer condition stays where it is.
+
+## Conditions implied by an OR
+
+`ON (a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.z = 4)` cannot be split into per-table conditions, but it says that `a` must have `x = 1` or `x = 3`, and `b` must have `y = 2` or `z = 4`. Those are used to filter each table before the join (and can use an index); the whole `OR` is still checked on the pairs that remain. A table that some branch of the `OR` says nothing about is not filtered.
+
+## LATERAL
+
+The rows a `LATERAL` item produces for one value of the outer columns are remembered, and when the join condition has equalities between the outer columns and the item's columns, they are looked up through a hash instead of being compared one by one.
+
 ## The idea
 
 ```sql

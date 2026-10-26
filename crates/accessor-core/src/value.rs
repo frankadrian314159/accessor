@@ -298,6 +298,14 @@ impl DataType {
             "TIMESTAMPTZ" => (DataType::TimestampTz, false),
             "INTERVAL" => (DataType::Interval, false),
             "JSON" | "JSONB" => (DataType::Json, false),
+            // PostgreSQL types with no counterpart here: the name is accepted and the value kept as text
+            "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR" | "REGROLE" | "REGNAMESPACE" | "REGCONFIG"
+            | "REGDICTIONARY" | "REGCOLLATION" | "BYTEA" | "TSVECTOR" | "TSQUERY" | "JSONPATH" | "INET" | "CIDR" | "MACADDR" | "MACADDR8"
+            | "UUID" | "BOX" | "POINT" | "POLYGON" | "PATH" | "CIRCLE" | "LINE" | "LSEG" | "XML" | "PG_LSN" | "TID" | "CID" | "VARBIT"
+            | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE" | "INT4MULTIRANGE" | "INT8MULTIRANGE"
+            | "NUMMULTIRANGE" | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "REFCURSOR" => (DataType::Text, false),
+            "XID" | "XID8" | "OID8" => (DataType::Integer, false),
+            "TIMETZ" => (DataType::TimestampTz, false),
             "CALCULATED" => (DataType::Calculated, false),
             _ => return None,
         })

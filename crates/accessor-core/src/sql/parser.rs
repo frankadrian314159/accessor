@@ -818,6 +818,79 @@ impl<'a> Parser<'a> {
         Ok(Some(Statement::Catalog(Box::new(CatalogChange { kind, names, value: None, replace: false, cascade }))))
     }
 
+    /// `AND [NO] CHAIN` after COMMIT or ROLLBACK: read and ignored.
+    fn eat_chain(&mut self) {
+        if self.peek_kw("AND") && (self.peek_kw_at(1, "CHAIN") || (self.peek_kw_at(1, "NO") && self.peek_kw_at(2, "CHAIN"))) {
+            while !self.eat_kw("CHAIN") {
+                self.advance();
+            }
+        }
+    }
+
+    /// Is the statement about a kind of object that only a server has (a tablespace, a publication, a text search
+    /// configuration, ...)? Such statements are read and ignored.
+    fn ignorable_object(&self) -> bool {
+        const ALONE: [&str; 15] = [
+            "TABLESPACE", "DATABASE", "PUBLICATION", "SUBSCRIPTION", "SERVER", "FOREIGN", "STATISTICS", "COLLATION", "CONVERSION", "TRANSFORM",
+            "LANGUAGE", "OWNED", "PROCEDURAL", "OPERATOR", "CAST",
+        ];
+        ALONE.iter().any(|w| self.peek_kw(w))
+            || (self.peek_kw("USER") && self.peek_kw_at(1, "MAPPING"))
+            || (self.peek_kw("EVENT") && self.peek_kw_at(1, "TRIGGER"))
+            || (self.peek_kw("TEXT") && self.peek_kw_at(1, "SEARCH"))
+            || (self.peek_kw("ACCESS") && self.peek_kw_at(1, "METHOD"))
+            || (self.peek_kw("DEFAULT") && self.peek_kw_at(1, "PRIVILEGES"))
+            || (self.peek_kw("LARGE") && self.peek_kw_at(1, "OBJECT"))
+    }
+
+    fn ignore_rest(&mut self, what: &str) -> Statement {
+        while !self.at_eof() && !self.peek_sym(";") {
+            self.advance();
+        }
+        Statement::Ignored(what.to_string())
+    }
+
+    /// `FOR VALUES ...` or `DEFAULT` of a partition, as the JSON the catalog keeps.
+    fn partition_bound_text(&mut self) -> Result<String> {
+        let bound = if self.eat_kw("DEFAULT") {
+            serde_json::json!({"kind": "default"})
+        } else {
+            self.expect_kw("FOR")?;
+            self.expect_kw("VALUES")?;
+            if self.eat_kw("IN") {
+                serde_json::json!({"kind": "list", "values": self.bound_list()?})
+            } else if self.eat_kw("FROM") {
+                let from = self.bound_list()?;
+                self.expect_kw("TO")?;
+                let to = self.bound_list()?;
+                serde_json::json!({"kind": "range", "from": from, "to": to})
+            } else if self.eat_kw("WITH") {
+                self.expect_sym("(")?;
+                let (mut modulus, mut remainder) = (0i64, 0i64);
+                loop {
+                    let which = self.ident()?.to_ascii_uppercase();
+                    let Tok::Int(n) = self.advance() else {
+                        self.pos -= 1;
+                        return Err(self.unexpected("a number"));
+                    };
+                    match which.as_str() {
+                        "MODULUS" => modulus = n,
+                        "REMAINDER" => remainder = n,
+                        _ => return Err(Error::syntax("hash partitions take MODULUS and REMAINDER")),
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                serde_json::json!({"kind": "hash", "modulus": modulus, "remainder": remainder})
+            } else {
+                return Err(self.unexpected("IN, FROM or WITH"));
+            }
+        };
+        Ok(bound.to_string())
+    }
+
     fn peek_is_alias(&self) -> bool {
         match self.peek() {
             Tok::Quoted(_) => true,
@@ -932,11 +1005,8 @@ impl<'a> Parser<'a> {
             // `EXPLAIN [ANALYZE] [VERBOSE] [(COSTS OFF, FORMAT TEXT, ...)] statement`. A query is run and its plan
             // shown with the rows it really produced, whatever the options say (they are accepted so that scripts
             // written for other systems run); a statement that is not a query is described and not run.
-            if !(self.eat_kw("ANALYZE") || self.eat_kw("ANALYSE")) {
-                self.eat_kw("VERBOSE");
-            } else {
-                self.eat_kw("VERBOSE");
-            }
+            let mut analyze = self.eat_kw("ANALYZE") || self.eat_kw("ANALYSE");
+            self.eat_kw("VERBOSE");
             if self.peek_sym("(") {
                 self.advance();
                 loop {
@@ -959,6 +1029,9 @@ impl<'a> Parser<'a> {
                     if !KNOWN.contains(&option.as_str()) {
                         return Err(Error::syntax(format!("unrecognized EXPLAIN option '{option}'")));
                     }
+                    if (option == "ANALYZE" || option == "ANALYSE") && !matches!(value.as_deref(), Some("OFF" | "FALSE" | "0")) {
+                        analyze = true;
+                    }
                     if option == "FORMAT" && value.as_deref() != Some("TEXT") {
                         return Err(Error::syntax("only EXPLAIN (FORMAT TEXT) is available"));
                     }
@@ -972,7 +1045,8 @@ impl<'a> Parser<'a> {
             if OTHER.iter().any(|k| self.peek_kw(k)) {
                 return Ok(Statement::ExplainOther(Box::new(self.statement()?)));
             }
-            return Ok(Statement::Explain(Box::new(self.select()?)));
+            let sel = Box::new(self.select()?);
+            return Ok(if analyze { Statement::ExplainAnalyze(sel) } else { Statement::Explain(sel) });
         }
         if self.peek_kw("SET") && !self.peek_kw_at(1, "TIME") && !self.peek_kw_at(1, "TIMEZONE") && !self.peek_kw_at(1, "CONSTRAINTS") && !matches!(self.peek_at(1), Tok::Param(_)) {
             self.advance();
@@ -1022,6 +1096,10 @@ impl<'a> Parser<'a> {
             return Ok(Statement::SetParameter { name, value: Some(parts.join(", ")), local });
         }
         if self.eat_kw("RESET") {
+            if self.eat_kw("SESSION") {
+                self.expect_kw("AUTHORIZATION")?;
+                return Ok(Statement::SetRole(None));
+            }
             if self.eat_kw("ALL") {
                 return Ok(Statement::ResetParameter(None));
             }
@@ -1119,22 +1197,31 @@ impl<'a> Parser<'a> {
         if self.eat_kw("RAISE") {
             return Ok(Statement::Raise(self.expr()?));
         }
-        if self.eat_kw("BEGIN") {
+        if self.eat_kw("BEGIN") || (self.peek_kw("START") && self.peek_kw_at(1, "TRANSACTION") && self.eat_kw("START")) {
             if !self.eat_kw("TRANSACTION") {
                 self.eat_kw("WORK");
+            }
+            // ISOLATION LEVEL ..., READ ONLY / READ WRITE, [NOT] DEFERRABLE: there is one isolation level
+            while matches!(self.peek(), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(),
+                "ISOLATION" | "LEVEL" | "READ" | "WRITE" | "ONLY" | "NOT" | "DEFERRABLE" | "SERIALIZABLE" | "REPEATABLE" | "COMMITTED" | "UNCOMMITTED"))
+                || self.peek_sym(",")
+            {
+                self.advance();
             }
             return Ok(Statement::Begin);
         }
-        if self.eat_kw("COMMIT") {
+        if self.eat_kw("COMMIT") || (self.peek_kw("END") && matches!(self.peek_at(1), Tok::Sym(";") | Tok::Eof | Tok::Ident(_)) && self.eat_kw("END")) {
             if !self.eat_kw("TRANSACTION") {
                 self.eat_kw("WORK");
             }
+            self.eat_chain();
             return Ok(Statement::Commit);
         }
-        if self.eat_kw("ROLLBACK") {
+        if self.eat_kw("ROLLBACK") || self.eat_kw("ABORT") {
             if !self.eat_kw("TRANSACTION") {
                 self.eat_kw("WORK");
             }
+            self.eat_chain();
             if self.eat_kw("TO") {
                 self.eat_kw("SAVEPOINT");
                 return Ok(Statement::RollbackTo(self.ident()?));
@@ -1794,6 +1881,24 @@ impl<'a> Parser<'a> {
     }
 
     fn create_object(&mut self, guarded: &mut bool, create_pos: usize) -> Result<Statement> {
+        if self.ignorable_object() {
+            return Ok(self.ignore_rest("CREATE"));
+        }
+        if self.peek_kw("MATERIALIZED") && self.peek_kw_at(1, "VIEW") {
+            // a materialized view is a table filled once from its query
+            self.advance();
+            self.advance();
+            self.if_exists_clause(true, guarded)?;
+            let name = self.table_ident()?;
+            self.expect_kw("AS")?;
+            let query = Box::new(self.select()?);
+            let mut with_data = true;
+            if self.eat_kw("WITH") {
+                with_data = !self.eat_kw("NO");
+                self.expect_kw("DATA")?;
+            }
+            return Ok(Statement::CreateTableAs { name, query, with_data });
+        }
         // temporary and unlogged tables are ordinary tables here
         while (self.peek_kw("TEMP") || self.peek_kw("TEMPORARY") || self.peek_kw("UNLOGGED") || self.peek_kw("GLOBAL") || self.peek_kw("LOCAL"))
             && (self.peek_kw_at(1, "TABLE") || self.peek_kw_at(1, "VIEW") || self.peek_kw_at(1, "TEMP") || self.peek_kw_at(1, "TEMPORARY") || self.peek_kw_at(1, "SEQUENCE"))
@@ -1833,18 +1938,52 @@ impl<'a> Parser<'a> {
             return Ok(Statement::CreateSequence { name, options });
         }
         if self.eat_kw("INDEX") {
+            self.eat_kw("CONCURRENTLY");
             self.if_exists_clause(true, guarded)?;
-            let name = self.ident()?;
+            let name = if self.peek_kw("ON") { None } else { Some(self.ident()?) };
             self.expect_kw("ON")?;
+            self.eat_kw("ONLY");
             let table = self.table_ident()?;
+            if self.eat_kw("USING") {
+                self.ident()?; // btree, hash, gist, ...: every index is the same kind here
+            }
             self.expect_sym("(")?;
-            let mut columns = vec![self.ident()?];
-            let mut descending = vec![self.index_direction()];
-            while self.eat_sym(",") {
+            let mut columns = Vec::new();
+            let mut descending = Vec::new();
+            loop {
+                if self.peek_sym("(") || matches!(self.peek_at(1), Tok::Sym("(")) {
+                    return Err(Error::syntax("an index on an expression is not supported; index the column"));
+                }
                 columns.push(self.ident()?);
+                // an operator class or collation, then ASC/DESC and NULLS FIRST/LAST
+                if self.eat_kw("COLLATE") {
+                    self.ident()?;
+                }
+                while matches!(self.peek(), Tok::Ident(w) if w.to_ascii_lowercase().ends_with("_ops")) {
+                    self.advance();
+                }
                 descending.push(self.index_direction());
+                if self.eat_kw("NULLS") {
+                    self.advance();
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
             }
             self.expect_sym(")")?;
+            if self.eat_kw("INCLUDE") {
+                self.skip_parens()?;
+            }
+            if self.eat_kw("WITH") {
+                self.skip_parens()?;
+            }
+            if self.eat_kw("TABLESPACE") {
+                self.ident()?;
+            }
+            if self.peek_kw("WHERE") {
+                return Err(Error::syntax("a partial index (CREATE INDEX ... WHERE) is not supported"));
+            }
+            let name = name.unwrap_or_else(|| format!("{}_{}_idx", table.replace('.', "_"), columns.join("_")));
             return Ok(Statement::CreateIndex { name, table, columns, descending, unique });
         }
         if !unique && (self.eat_kw("VIEW") || self.eat_kw("QUERY")) {
@@ -1932,7 +2071,7 @@ impl<'a> Parser<'a> {
             return Ok(Statement::CreateTableAs { name, query, with_data });
         }
         self.pos = save;
-        let st = self.create_table_core()?;
+        let (st, likes) = self.create_table_core()?;
         let mut parents = Vec::new();
         let mut partition_by = None;
         loop {
@@ -1959,10 +2098,10 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        if parents.is_empty() && partition_by.is_none() {
+        if parents.is_empty() && partition_by.is_none() && likes.is_empty() {
             return Ok(st);
         }
-        Ok(Statement::CreateTableExt(Box::new(TableExt { create: st, parents, partition_by, partition_of: None })))
+        Ok(Statement::CreateTableExt(Box::new(TableExt { create: st, parents, likes, partition_by, partition_of: None })))
     }
 
     fn skip_parens(&mut self) -> Result<()> {
@@ -2064,16 +2203,17 @@ impl<'a> Parser<'a> {
         };
         let partition_by = if self.peek_kw("PARTITION") && self.peek_kw_at(1, "BY") { Some(self.partition_by()?) } else { None };
         let create = Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() };
-        Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), partition_by, partition_of: Some((parent, bound.to_string())) })))
+        Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: Vec::new(), partition_by, partition_of: Some((parent, bound.to_string())) })))
     }
 
-    fn create_table_core(&mut self) -> Result<Statement> {
+    fn create_table_core(&mut self) -> Result<(Statement, Vec<String>)> {
         let name = self.table_ident()?;
         self.expect_sym("(")?;
         if self.eat_sym(")") {
             // a table with no columns of its own (all of them inherited)
-            return Ok(Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() });
+            return Ok((Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() }, Vec::new()));
         }
+        let mut likes = Vec::new();
         let mut columns = Vec::new();
         let mut primary_key = Vec::new();
         let mut uniques = Vec::new();
@@ -2086,6 +2226,11 @@ impl<'a> Parser<'a> {
                 checks.push((Some(cname), self.check_clause()?));
             } else if self.peek_kw("CHECK") {
                 checks.push((None, self.check_clause()?));
+            } else if self.eat_kw("LIKE") {
+                likes.push(self.table_ident()?);
+                while !self.at_eof() && !self.peek_sym(",") && !self.peek_sym(")") {
+                    self.advance(); // INCLUDING ALL, EXCLUDING DEFAULTS, ...
+                }
             } else if self.peek_kw("FOREIGN") || self.peek_kw("CONSTRAINT") {
                 foreign_keys.push(self.table_foreign_key()?);
             } else if self.peek_kw("PRIMARY") {
@@ -2112,7 +2257,7 @@ impl<'a> Parser<'a> {
                 checks.push((None, text));
             }
         }
-        Ok(Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks })
+        Ok((Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks }, likes))
     }
 
     /// `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES ...`
@@ -2431,8 +2576,56 @@ impl<'a> Parser<'a> {
             let st = Statement::AlterSequence { name, options };
             return Ok(if guarded { Statement::Guarded { missing_ok: true, stmt: Box::new(st) } } else { st });
         }
+        if self.ignorable_object() {
+            return Ok(self.ignore_rest("ALTER"));
+        }
         self.expect_kw("TABLE")?;
+        let mut if_exists = false;
+        if self.eat_kw("IF") {
+            self.expect_kw("EXISTS")?;
+            if_exists = true;
+        }
+        self.eat_kw("ONLY");
         let table = self.table_ident()?;
+        let mut actions = vec![self.alter_table_action(&table)?];
+        while self.eat_sym(",") {
+            actions.push(self.alter_table_action(&table)?);
+        }
+        let st = if actions.len() == 1 { actions.remove(0) } else { Statement::Batch(actions) };
+        Ok(if if_exists { Statement::Guarded { missing_ok: true, stmt: Box::new(st) } } else { st })
+    }
+
+    /// One action of `ALTER TABLE name action [, action ...]`.
+    fn alter_table_action(&mut self, table: &str) -> Result<Statement> {
+        let table = table.to_string();
+        // properties of a server table that mean nothing here
+        if self.peek_kw("ENABLE") || self.peek_kw("DISABLE") || self.peek_kw("FORCE") || self.peek_kw("NO") && self.peek_kw_at(1, "FORCE")
+            || self.peek_kw("OWNER") || self.peek_kw("REPLICA") || self.peek_kw("CLUSTER") || self.peek_kw("SET") && !self.peek_kw_at(1, "DATA") && !self.peek_kw_at(1, "DEFAULT")
+            || self.peek_kw("RESET") || self.peek_kw("INHERIT") || self.peek_kw("NO") || self.peek_kw("OF") || self.peek_kw("VALIDATE")
+        {
+            let mut depth = 0;
+            while !self.at_eof() && !self.peek_sym(";") && !(depth == 0 && self.peek_sym(",")) {
+                match self.advance() {
+                    Tok::Sym("(") => depth += 1,
+                    Tok::Sym(")") => depth -= 1,
+                    _ => {}
+                }
+            }
+            return Ok(Statement::Ignored("ALTER TABLE".into()));
+        }
+        if self.eat_kw("ATTACH") {
+            self.expect_kw("PARTITION")?;
+            let child = self.table_ident()?;
+            let bound = self.partition_bound_text()?;
+            return Ok(Statement::AttachPartition { parent: table, child, bound: Some(bound) });
+        }
+        if self.eat_kw("DETACH") {
+            self.expect_kw("PARTITION")?;
+            let child = self.table_ident()?;
+            self.eat_kw("CONCURRENTLY");
+            self.eat_kw("FINALIZE");
+            return Ok(Statement::AttachPartition { parent: table, child, bound: None });
+        }
         let action = if self.eat_kw("ADD") {
             if self.peek_kw("CHECK") {
                 AlterAction::AddCheck { name: None, expr: self.check_clause()? }
@@ -2464,6 +2657,25 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("ALTER") {
             self.eat_kw("COLUMN");
             let name = self.ident()?;
+            if self.peek_kw("SET") && self.peek_kw_at(1, "DATA") {
+                self.advance();
+                self.advance();
+            } else if (self.peek_kw("SET") || self.peek_kw("DROP") || self.peek_kw("ADD") || self.peek_kw("RESET") || self.peek_kw("RESTART"))
+                && !self.peek_kw_at(1, "DEFAULT")
+                && !(self.peek_kw_at(1, "NOT") && self.peek_kw_at(2, "NULL"))
+                && !(self.peek_kw("DROP") && self.peek_kw_at(1, "NOT"))
+            {
+                // SET STATISTICS / STORAGE / COMPRESSION / (options), ADD GENERATED, DROP IDENTITY, ...: storage details
+                let mut depth = 0;
+                while !self.at_eof() && !self.peek_sym(";") && !(depth == 0 && self.peek_sym(",")) {
+                    match self.advance() {
+                        Tok::Sym("(") => depth += 1,
+                        Tok::Sym(")") => depth -= 1,
+                        _ => {}
+                    }
+                }
+                return Ok(Statement::Ignored("ALTER COLUMN".into()));
+            }
             if self.peek_kw("SET") || self.peek_kw("DROP") {
                 let drop = self.advance_kw_drop();
                 let action = if self.eat_kw("DEFAULT") {
@@ -2513,6 +2725,15 @@ impl<'a> Parser<'a> {
     }
 
     fn drop_object(&mut self, guarded: &mut bool) -> Result<Statement> {
+        if self.ignorable_object() {
+            return Ok(self.ignore_rest("DROP"));
+        }
+        if self.peek_kw("MATERIALIZED") && self.peek_kw_at(1, "VIEW") {
+            self.advance();
+            self.advance();
+            self.if_exists_clause(false, guarded)?;
+            return Ok(Statement::DropTable(self.table_ident()?));
+        }
         if let Some(st) = self.drop_catalog_object(guarded)? {
             return Ok(st);
         }
@@ -3472,6 +3693,14 @@ impl<'a> Parser<'a> {
             }
             Tok::Quoted(_) => self.column_ref(),
             Tok::Ident(name) => {
+                // pg_catalog.lower(x), public.f(x): the schema of a function is left off
+                if matches!(self.peek_at(1), Tok::Sym(".")) && matches!(self.peek_at(2), Tok::Ident(_)) && matches!(self.peek_at(3), Tok::Sym("("))
+                    && (name.eq_ignore_ascii_case("pg_catalog") || name.eq_ignore_ascii_case("public"))
+                {
+                    self.advance();
+                    self.advance();
+                    return self.primary();
+                }
                 let up = name.to_ascii_uppercase();
                 match up.as_str() {
                     "NULL" => {
