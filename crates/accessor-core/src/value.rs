@@ -277,20 +277,20 @@ impl DataType {
     pub fn from_sql_name(name: &str) -> Option<(DataType, bool)> {
         let n = name.to_ascii_uppercase();
         Some(match n.as_str() {
-            "INTEGER" | "INT" | "LONG" | "SHORT" | "SMALLINT" | "BIGINT" | "BYTE" | "TINYINT" => {
+            "INTEGER" | "INT" | "LONG" | "SHORT" | "SMALLINT" | "BIGINT" | "BYTE" | "TINYINT" | "INT2" | "INT4" | "INT8" | "OID" => {
                 (DataType::Integer, false)
             }
-            "COUNTER" | "AUTOINCREMENT" | "AUTONUMBER" | "SERIAL" => (DataType::Integer, true),
+            "COUNTER" | "AUTOINCREMENT" | "AUTONUMBER" | "SERIAL" | "SERIAL2" | "SERIAL4" | "SERIAL8" | "SMALLSERIAL" | "BIGSERIAL" => (DataType::Integer, true),
             "BIGNUM" => (DataType::Bignum, false),
-            "FLOAT" | "REAL" | "SINGLE" => (DataType::Float, false),
-            "DOUBLE" => (DataType::Double, false),
+            "FLOAT" | "REAL" | "SINGLE" | "FLOAT4" => (DataType::Float, false),
+            "DOUBLE" | "FLOAT8" => (DataType::Double, false),
             // NUMBER is the name of the short-lived single numeric type that
             // DECIMAL replaced; it is still read so older scripts and saved
             // queries keep working.
             "DECIMAL" | "NUMERIC" | "NUMBER" => (DataType::Decimal, false),
             "CURRENCY" | "MONEY" => (DataType::Currency, false),
             "RATIONAL" => (DataType::Rational, false),
-            "TEXT" | "VARCHAR" | "CHAR" | "STRING" | "MEMO" | "LONGTEXT" | "NVARCHAR" | "NCHAR" => {
+            "TEXT" | "VARCHAR" | "CHAR" | "STRING" | "MEMO" | "LONGTEXT" | "NVARCHAR" | "NCHAR" | "BPCHAR" | "NAME" | "CHARACTER" => {
                 (DataType::Text, false)
             }
             "YESNO" | "BIT" | "BOOLEAN" | "BOOL" | "LOGICAL" => (DataType::YesNo, false),
@@ -745,11 +745,19 @@ impl Value {
             }),
             DataType::YesNo => match self {
                 Bool(_) => Ok(self.clone()),
-                Text(s) => match s.trim().to_ascii_lowercase().as_str() {
-                    "yes" | "true" | "on" | "-1" | "1" => Ok(Bool(true)),
-                    "no" | "false" | "off" | "0" => Ok(Bool(false)),
-                    _ => Err(bad()),
-                },
+                Text(s) => {
+                    // As PostgreSQL reads them: true, yes, on, 1 and false, no, off, 0, or any start of true,
+                    // false, yes, no and off that is not ambiguous (t, tr, f, fa, y, ye, n, of ...); also -1.
+                    let t = s.trim().to_ascii_lowercase();
+                    let starts = |word: &str| !t.is_empty() && word.starts_with(t.as_str());
+                    if t == "-1" || t == "1" || t == "on" || starts("true") || starts("yes") {
+                        Ok(Bool(true))
+                    } else if t == "0" || (t.len() >= 2 && "off".starts_with(t.as_str())) || starts("false") || starts("no") {
+                        Ok(Bool(false))
+                    } else {
+                        Err(bad())
+                    }
+                }
                 v => match v.num() {
                     Some(n) => Ok(Bool(!n.is_zero())),
                     None => Err(bad()),

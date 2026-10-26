@@ -4073,3 +4073,67 @@ fn drop_index_can_leave_out_the_table_and_reindex_rebuilds() {
     assert_eq!(ids(&db, "SELECT x FROM a ORDER BY x LIMIT 3"), vec!["1", "2", "3"]);
     assert!(db.execute("INSERT INTO a VALUES (2)").is_err(), "the unique index still holds");
 }
+
+// ----- PostgreSQL type names and typed literals -----------------------------------------------------
+
+#[test]
+fn postgresql_type_names_are_accepted() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE pg (a int2, b int4, c int8, d float4, e float8, f name, g oid, h bpchar, i serial4, j bigint, k double precision, l character varying(10))").unwrap();
+    let types: Vec<String> = db.table("pg").unwrap().schema().columns.iter().map(|c| c.data_type.to_string()).collect();
+    assert_eq!(types, ["INTEGER", "INTEGER", "INTEGER", "FLOAT", "DOUBLE", "TEXT", "INTEGER", "TEXT", "INTEGER", "INTEGER", "DOUBLE", "TEXT"]);
+    assert!(db.table("pg").unwrap().schema().columns[8].autonumber, "serial4 is an AutoNumber");
+    db.execute("INSERT INTO pg (a, b, c, d, e, f, g, h, k, l) VALUES (1, 2, 3, 4.5, 5.5, 'n', 7, 'x', 1.25, 'v')").unwrap();
+    let r = db.query("SELECT CAST(a AS int8), CAST(b AS float8), CAST(c AS int2) FROM pg").unwrap();
+    assert_eq!(r.rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), ["1", "2", "3"]);
+}
+
+#[test]
+fn a_type_name_before_a_string_casts_it() {
+    let db = Database::in_memory();
+    let t = |sql: &str| {
+        let r = db.query(sql).unwrap();
+        format!("{} {}", r.rows[0][0].type_label(), r.rows[0][0])
+    };
+    assert_eq!(t("SELECT bool 't'"), "YESNO Yes");
+    assert_eq!(t("SELECT bool 'false'"), "YESNO No");
+    assert_eq!(t("SELECT boolean 'yes'"), "YESNO Yes");
+    assert_eq!(t("SELECT int4 '42'"), "INTEGER 42");
+    assert_eq!(t("SELECT int8 '9000000000'"), "INTEGER 9000000000");
+    assert_eq!(t("SELECT int2 ' 7 '"), "INTEGER 7");
+    assert_eq!(t("SELECT float8 '1.5e2'"), "DOUBLE 150");
+    assert_eq!(t("SELECT float4 '2.5'"), "FLOAT 2.5");
+    assert_eq!(t("SELECT double precision '3.25'"), "DOUBLE 3.25");
+    assert_eq!(t("SELECT numeric '1.50'"), "DECIMAL 1.5");
+    assert_eq!(t("SELECT text 'abc'"), "TEXT abc");
+    assert_eq!(t("SELECT name 'x'"), "TEXT x");
+    assert_eq!(t("SELECT bigint '5'"), "INTEGER 5");
+    // the older typed literals still work
+    assert_eq!(t("SELECT date '2024-03-01'"), "DATETIME 2024-03-01");
+    assert_eq!(t("SELECT interval '1 day'"), "INTERVAL 1 day");
+    // they work inside expressions, inserts and conditions
+    assert_eq!(t("SELECT int4 '40' + int4 '2'"), "INTEGER 42");
+    assert!(db.query("SELECT int4 'abc'").is_err());
+    assert!(db.query("SELECT bool 'maybe'").is_err());
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE b (f1 bool); INSERT INTO b VALUES (bool 't'), (bool 'f'), (bool 'yes'), (bool 'off')").unwrap();
+    assert_eq!(ids(&db, "SELECT COUNT(*) FROM b WHERE f1 = bool 'true'"), vec!["2"]);
+    // a column or function that happens to be called like a type is still a name
+    db.execute("CREATE TABLE n ([name] TEXT); INSERT INTO n VALUES ('a')").unwrap();
+    assert_eq!(ids(&db, "SELECT [name] FROM n"), vec!["a"]);
+}
+
+#[test]
+fn booleans_are_read_the_way_postgresql_reads_them() {
+    let db = Database::in_memory();
+    let yes = |s: &str| db.query(&format!("SELECT CBool('{s}')")).unwrap().rows[0][0].to_string();
+    for s in ["t", "T", "tr", "tru", "true", "TRUE", "y", "ye", "yes", "on", "1", " true "] {
+        assert_eq!(yes(s), "Yes", "{s}");
+    }
+    for s in ["f", "fa", "fals", "false", "n", "no", "of", "off", "0", " FALSE "] {
+        assert_eq!(yes(s), "No", "{s}");
+    }
+    for s in ["", "o", "tx", "maybe", "truee", "2"] {
+        assert!(db.query(&format!("SELECT CBool('{s}')")).is_err(), "{s}");
+    }
+}

@@ -1,6 +1,6 @@
 //! Runs PostgreSQL's regression tests (`src/test/regress`) against Accessor.
 //!
-//!   accessor-pgreg --pg PATH-TO/src/test/regress [--report FILE] [--timeout SECONDS] [--memory-mb N] [--only a,b,c]
+//!   accessor-pgreg --pg PATH-TO/src/test/regress [--report FILE] [--stall SECONDS] [--timeout SECONDS] [--memory-mb N] [--only a,b,c]
 //!
 //! PostgreSQL's tests compare the whole text `psql` prints, which no other engine can reproduce, so this does
 //! the next best thing: every SQL statement of every test is run, in the order of `parallel_schedule` and in
@@ -649,7 +649,7 @@ fn main() {
         child(&args[1..]);
         return;
     }
-    let (mut pg, mut report, mut timeout, mut memory_mb, mut only) = (PathBuf::new(), PathBuf::from("pg-report.md"), 600u64, 2048usize, String::new());
+    let (mut pg, mut report, mut timeout, mut memory_mb, mut only, mut stall) = (PathBuf::new(), PathBuf::from("pg-report.md"), 1800u64, 2048usize, String::new(), 20u64);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -658,11 +658,12 @@ fn main() {
             "--timeout" => timeout = it.next().and_then(|v| v.parse().ok()).expect("--timeout SECONDS"),
             "--memory-mb" => memory_mb = it.next().and_then(|v| v.parse().ok()).expect("--memory-mb N"),
             "--only" => only = it.next().cloned().expect("--only a,b"),
+            "--stall" => stall = it.next().and_then(|v| v.parse().ok()).expect("--stall SECONDS"),
             _ => {}
         }
     }
     if !pg.join("parallel_schedule").exists() {
-        eprintln!("usage: accessor-pgreg --pg PATH-TO/src/test/regress [--report FILE] [--timeout SECONDS] [--memory-mb N] [--only a,b,c]");
+        eprintln!("usage: accessor-pgreg --pg PATH-TO/src/test/regress [--report FILE] [--stall SECONDS] [--timeout SECONDS] [--memory-mb N] [--only a,b,c]");
         std::process::exit(2);
     }
     let exe = std::env::current_exe().expect("own path");
@@ -685,15 +686,25 @@ fn main() {
         let mut child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("child");
         limit_memory(&child, memory_mb);
         let deadline = Instant::now() + Duration::from_secs(timeout);
+        // The progress file names the statement being run; if it stays the same for `stall` seconds, that
+        // statement is stuck.
+        let (mut last, mut changed) = (String::new(), Instant::now());
         let ok = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if Instant::now() > deadline => {
+                Ok(None) if Instant::now() > deadline || changed.elapsed() > Duration::from_secs(stall) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     break false;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let now = std::fs::read_to_string(&progress).unwrap_or_default();
+                    if now != last {
+                        last = now;
+                        changed = Instant::now();
+                    }
+                }
                 Err(_) => break false,
             }
         };
@@ -705,7 +716,7 @@ fn main() {
             eprintln!("the child died before running anything");
             break;
         };
-        eprintln!("KILLER {t} statement {i}: the process ended or ran past {timeout}s (memory limit {memory_mb} MB)");
+        eprintln!("KILLER {t} statement {i}: the process ended, ran past {timeout}s in all, or spent {stall}s on this statement (memory limit {memory_mb} MB)");
         killers.push((t.clone(), i, String::new()));
         if skip.contains(&(t.clone(), i)) || killers.len() > 60 {
             break;

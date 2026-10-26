@@ -2767,6 +2767,23 @@ impl<'a> Parser<'a> {
                             .ok_or_else(|| Error::syntax(format!("'{text}' is not a valid {up} literal")))?;
                         return Ok(Expr::Literal(Value::DateTime(t)));
                     }
+                    // Any other type name before a string is a cast of that string: int4 '42', bool 't', float8 '1e3',
+                    // numeric '1.50', text 'x', double precision '2.5'.
+                    "DOUBLE" if self.peek_kw_at(1, "PRECISION") && matches!(self.peek_at(2), Tok::Str(_)) => {
+                        self.advance();
+                        self.advance();
+                        let Tok::Str(text) = self.advance() else { unreachable!("checked") };
+                        return Ok(Expr::Function { name: "CDBL".into(), args: vec![Expr::Literal(Value::text(&text))], distinct: false, star: false });
+                    }
+                    n if matches!(self.peek_at(1), Tok::Str(_))
+                        && DataType::from_sql_name(n).is_some_and(|(t, auto)| !auto && t != DataType::Calculated) =>
+                    {
+                        let (ty, _) = DataType::from_sql_name(n).expect("checked");
+                        self.advance();
+                        let Tok::Str(text) = self.advance() else { unreachable!("checked") };
+                        let name = cast_function(ty).expect("not CALCULATED");
+                        return Ok(Expr::Function { name: name.into(), args: vec![Expr::Literal(Value::text(&text))], distinct: false, star: false });
+                    }
                     "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
                         if !matches!(self.peek_at(1), Tok::Sym("(")) =>
                     {
