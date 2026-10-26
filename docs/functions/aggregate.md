@@ -8,7 +8,7 @@ SELECT Dept, COUNT(*), SUM(Sal), AVG(Sal) FROM Emp GROUP BY Dept;
 
 Three modifiers apply to all of them:
 
-* `DISTINCT` considers each value once: `COUNT(DISTINCT City)`.
+* `DISTINCT` considers each value once: `COUNT(DISTINCT City)`. `ALL` is the default, and may be written: `AVG(ALL Price)` is `AVG(Price)`.
 * `FILTER (WHERE condition)` makes the aggregate see only the rows where the condition is true: `COUNT(*) FILTER (WHERE Sal > 100)`.
 * `OVER (...)` turns the aggregate into a [window function](window.md#aggregates-over-a-window).
 

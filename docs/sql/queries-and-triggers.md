@@ -140,7 +140,9 @@ END;
 
 ### Statement triggers
 
-```sql
+```
+
+The timing may be left out, as in SQLite: `CREATE TRIGGER t INSERT ON OrderLine ...` is a `BEFORE` trigger.sql
 CREATE TRIGGER touched AFTER INSERT OR UPDATE OR DELETE ON Product
 FOR EACH STATEMENT
 BEGIN

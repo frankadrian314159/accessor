@@ -34,7 +34,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | Text concatenation | `&` and `\|\|`; NULL counts as empty | `\|\|`; NULL gives NULL |
 | Booleans | also written `YES` and `NO`; a number is true when not zero | `TRUE`/`FALSE`/`UNKNOWN` only |
 | Rounding | `ROUND` and `CAST ... AS DECIMAL(p, s)` round halves to the even digit | implementation-defined (usually half away from zero) |
-| Integer division | `/` is exact division giving a `DECIMAL`; use `\` for whole-number division | `/` on integers is implementation-defined |
+| Division | `/` drops the fraction between whole numbers and divides in floating point otherwise; `DIV` is exact; division by zero is NULL | `/` on integers is implementation-defined; division by zero is an error (SQLSTATE 22012) |
 | Type sizes | `VARCHAR(50)` and `NUMERIC(10, 2)` are accepted but sizes and scales are not enforced | enforced |
 | `TIMESTAMP WITH TIME ZONE` | stored as an instant, shown in the session zone (set with `SET TIME ZONE`, not per column); zones come from the IANA database | per-session zone, `TIME WITH TIME ZONE` is a distinct type |
 | `NULL` ordering | NULL sorts first ascending, last descending unless `NULLS FIRST`/`NULLS LAST` is given | implementation-defined, with `NULLS FIRST/LAST` |

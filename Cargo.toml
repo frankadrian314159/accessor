@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/accessor-core", "crates/accessor-cli", "crates/accessor-gui", "crates/accessor-capi",
-    "crates/accessor-slt"]
+    "crates/accessor-slt", "crates/accessor-pgreg"]
 
 [workspace.package]
 version = "0.1.0"

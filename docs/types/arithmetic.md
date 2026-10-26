@@ -33,17 +33,33 @@ Exact types stay exact until a float is involved. Mixing an exact number with a 
 
 ## Division
 
+There are three kinds of division, so that each of the results people expect is one operator away.
+
+**`x / y`** drops the fraction when both operands are whole numbers, and divides in floating point otherwise:
+
 | Expression | Result |
 | --- | --- |
-| whole number `/` whole number | exact `DECIMAL`, rounded to 50 digits if it does not end: `1 / 4` is 0.25, `1 / 3` is 0.333… (50 digits) |
-| `DECIMAL / DECIMAL`, or any mix of the exact types | the same, a `DECIMAL` |
-| money `/` number | `CURRENCY` |
-| money `/` money | `DECIMAL` (a ratio is not an amount of money) |
-| `RATIONAL / x` or `x / RATIONAL` | `RATIONAL`, exact |
-| float with anything | the float type |
-| anything `/ 0` | an error |
+| `INTEGER` or `BIGNUM` `/` the same | a whole number, truncated toward zero: `7 / 2` is 3, `-7 / 2` is -3, `1 / 3` is 0 |
+| anything with a `DECIMAL`, `CURRENCY` or `RATIONAL` operand | a `DOUBLE`: `7 / 2.0` is 3.5, `1 / 3.0` is 0.3333333333333333 |
+| a `FLOAT` with a `FLOAT` or whole number | a `FLOAT` |
+| a `DOUBLE` with anything | a `DOUBLE` |
 
-`x \ y` is whole-number division and `x MOD y` (or `x % y`) the remainder; both round their operands to whole numbers first and give an `INTEGER` or `BIGNUM`.
+**`x DIV y`** is exact division, in the exact type the operands call for:
+
+| Expression | Result |
+| --- | --- |
+| whole number `DIV` whole number | `DECIMAL`, rounded to 50 digits if it does not end: `1 DIV 4` is 0.25, `1 DIV 3` is 0.333… (50 digits) |
+| `DECIMAL DIV DECIMAL`, or any mix of the exact types | the same, a `DECIMAL` |
+| money `DIV` number | `CURRENCY` |
+| money `DIV` money | `DECIMAL` (a ratio is not an amount of money) |
+| `RATIONAL DIV x` or `x DIV RATIONAL` | `RATIONAL`, exact |
+| float with anything | the float type |
+
+**`x \ y`** is whole-number division after rounding both operands to whole numbers, and `x MOD y` (or `x % y`) is the remainder; both give an `INTEGER` or `BIGNUM`.
+
+**Dividing by zero is NULL**, for all of these (and for dividing an interval, and for `0 ^ -1`). It is not an error, so a column computed as `a / b` is NULL for the rows where `b` is 0, and a condition on it simply does not hold. This is what SQLite and MySQL do; the SQL standard says error. A `FLOAT` or `DOUBLE` result still never becomes infinite or NaN: overflow is an error.
+
+Which one to use: `/` for counts and indexes (`n / 2`) and for approximate measurements; `DIV` for money, percentages and anything where a result such as 0.1 must be exactly 0.1. `Avg` and `Sum` of exact numbers stay exact whatever `/` does.
 
 ## Powers
 

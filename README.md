@@ -264,9 +264,11 @@ The type of an arithmetic result depends only on the types of the operands:
 - A `DOUBLE` operand makes the result a `DOUBLE`; otherwise a `FLOAT` operand makes it a `FLOAT`.
 - Among the exact types, `+ - *` give `RATIONAL` if either side is one, else `CURRENCY`, else
   `DECIMAL`, else `BIGNUM`, else `INTEGER`. An `INTEGER` result too big for 64 bits becomes a `BIGNUM`.
-- `/` is exact: `7 / 2` is the `DECIMAL` 3.5; `1 / 3` is a `DECIMAL` cut at 50 digits; use
-  `CRat(1) / 3` for exactly one third. Money divided by a number is money.
-- Floats are never infinite or NaN: overflow and division by zero are errors.
+- `/` drops the fraction when both sides are whole numbers (`7 / 2` is 3, as in SQLite and PostgreSQL) and
+  divides in floating point otherwise (`7 / 2.0` is 3.5). `DIV` is exact division: `7 DIV 2` is the `DECIMAL`
+  3.5, `1 DIV 3` is a `DECIMAL` cut at 50 digits, `CRat(1) DIV 3` is exactly one third, and money `DIV` a
+  number is money. Dividing by zero gives NULL.
+- Floats are never infinite or NaN: overflow is an error.
 
 Comparison, sorting, indexes, `DISTINCT` and joins all use exact values, so
 `1 = 1.0` and `CRat(2) / 4 = 0.5` are true, while a `DOUBLE` 0.1 is *not* the

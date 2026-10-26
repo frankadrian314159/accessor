@@ -8,6 +8,7 @@
 | number with a point | `DECIMAL` (exact) | `3.14`, `.5`, `10.00` |
 | number with an exponent | `DOUBLE` | `1e3`, `2.5E-4` |
 | text | `TEXT` | `'it''s'`, `"say ""hi"""` |
+| text in hexadecimal | `TEXT` | `X'48656c6c6f'` is `Hello`. There is no `BLOB` type, so the bytes must be valid UTF-8 (`X'ff'` is an error) |
 | interval | `INTERVAL` | `INTERVAL '3 days'`, `INTERVAL '1-6' YEAR TO MONTH`, `INTERVAL '90' MINUTE` |
 | date and time | `DATETIME` | `#2024-03-05#`, `#2024-03-05 14:30:00#`, `#3/5/2024 2:30 PM#`, `DATE '2024-03-05'`, `TIMESTAMP '2024-03-05 14:30:00'` |
 | date and time with a zone | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE '2024-03-05 14:30:00+01:00'` |
@@ -32,13 +33,13 @@ From loosest to tightest binding:
 | 4 | comparisons and predicates (including row values): `= <> != < <= > >=`, `IS`, `LIKE`, `BETWEEN`, `IN` |
 | 5 | `&`, `\|\|` (join text) |
 | 6 | `+`, `-` |
-| 7 | `*`, `/`, `\` (whole-number division), `%` and `MOD` (remainder) |
+| 7 | `*`, `/`, `DIV` (exact division), `\` (whole-number division), `%` and `MOD` (remainder) |
 | 8 | unary `-`, `+` |
 | 9 | `^` (power) |
 | 10 | `AT TIME ZONE` |
 | 11 | `->`, `->>` (JSON member or element) |
 
-Arithmetic on the [numeric types](../../README.md#numbers) is exact: the result type depends only on the operand types. `/` gives an exact `DECIMAL` when the quotient terminates and a 50-digit `DECIMAL` otherwise; `RATIONAL` stays exact; a whole-number overflow becomes `BIGNUM`. Dividing by zero is an error. Date arithmetic: a date plus or minus a number is a date that many days away; the difference of two dates is a number of days.
+Arithmetic on the [numeric types](../../README.md#numbers) is exact: the result type depends only on the operand types. `/` is the exception: it drops the fraction between whole numbers (`7 / 2` is 3) and divides in floating point otherwise, while `DIV` is exact division (`7 DIV 2` is the `DECIMAL` 3.5, a 50-digit `DECIMAL` when the quotient does not end), and dividing by zero is NULL ([arithmetic.md](../types/arithmetic.md#division)); `RATIONAL` stays exact; a whole-number overflow becomes `BIGNUM`. Dividing by zero is an error. Date arithmetic: a date plus or minus a number is a date that many days away; the difference of two dates is a number of days.
 
 `&` joins text and treats NULL as empty; `'a' & NULL & 'b'` is `'ab'`. Numbers and dates are converted to text. `||` is the same operator. `+` is only arithmetic.
 
@@ -57,8 +58,8 @@ NULL means "no value". Any comparison with NULL is *unknown* (neither true nor f
 | `a IS [NOT] DISTINCT FROM b` | like `<>` (`=`) but two NULLs count as equal, and the answer is never unknown |
 | `a [NOT] BETWEEN x AND y` | `x <= a AND a <= y` |
 | `a [NOT] BETWEEN SYMMETRIC x AND y` | between the two, whichever is smaller |
-| `a [NOT] IN (x, y, ...)` | equal to one of the list |
-| `a [NOT] IN (query)` | equal to one of the query's values |
+| `a [NOT] IN (x, y, ...)` | equal to one of the list. An empty list `()` is allowed (as in SQLite and MySQL): `a IN ()` is false and `a NOT IN ()` true, even when `a` is NULL |
+| `a [NOT] IN (query)` | equal to one of the query's values. If the query returns no rows, `a IN` is false and `a NOT IN` true for every `a`, NULL included; if it returns rows, a NULL `a` gives NULL |
 | `[NOT] EXISTS (query)` | the query returns a row |
 | `a op ANY / SOME / ALL (query)` | see [quantified comparisons](select.md#quantified-comparisons) |
 | `a [NOT] LIKE pattern [ESCAPE c]` | the text matches the pattern |

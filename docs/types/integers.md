@@ -34,7 +34,7 @@ The result is **not** converted back to an `INTEGER` when it would fit; the type
 | Operator | Result for whole numbers |
 | --- | --- |
 | `+ - *` | `INTEGER`, or `BIGNUM` on overflow |
-| `/` | exact `DECIMAL` (`7 / 2` is 3.5); see [arithmetic.md](arithmetic.md) |
+| `/` | whole-number division, the fraction dropped (`7 / 2` is 3); `DIV` is exact (`7 DIV 2` is 3.5); see [arithmetic.md](arithmetic.md#division) |
 | `\` | whole-number division, rounded toward zero (`7 \ 2` is 3, `-7 \ 2` is -3) |
 | `MOD`, `%` | remainder with the sign of the left operand (`-7 MOD 3` is -1) |
 | `^` | exact when the exponent is a whole number: `INTEGER` or `BIGNUM` for a non-negative one, an exact `DECIMAL` for a negative one (`2 ^ -1` is 0.5); a `DOUBLE` for a fractional exponent |

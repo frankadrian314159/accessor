@@ -40,7 +40,7 @@ A script is a sequence of statements separated by semicolons. Empty statements a
 
 Identifiers and keywords are case-insensitive. An identifier that is a reserved word, or contains spaces or punctuation, is written in square brackets: `[Order Details]`, `[Group]`.
 
-The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC DISTINCT DROP ELSE END EXCEPT EXISTS FETCH FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT MOD NATURAL NOT NULL OFFSET ON OR ORDER OUTER PIVOT RIGHT SELECT SET TABLE THEN TOP UNION UNPIVOT UPDATE USING VALUES VIEW WHEN WHERE`. Other words that have a meaning in some place (`COUNT`, `YEAR`, `FIRST`, and so on) are not reserved and can be used as names.
+The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC DISTINCT DIV DROP ELSE END EXCEPT EXISTS FETCH FROM FULL GROUP HAVING IN INDEX INNER INSERT INTERSECT INTO IS JOIN LEFT LIKE LIMIT MOD NATURAL NOT NULL OFFSET ON OR ORDER OUTER PIVOT RIGHT SELECT SET TABLE THEN TOP UNION UNPIVOT UPDATE USING VALUES VIEW WHEN WHERE`. Other words that have a meaning in some place (`COUNT`, `YEAR`, `FIRST`, and so on) are not reserved and can be used as names.
 
 ## Statements
 
@@ -256,7 +256,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                    [ '(' ] [ <argument> { ',' <argument> } ] [ ')' ]
 <argument>     ::= [ <parameter> '=' ] <expr>
 
-<create-trigger> ::= CREATE [ OR REPLACE ] TRIGGER <identifier> ( BEFORE | AFTER | INSTEAD OF ) <trigger-event> { OR <trigger-event> }
+<create-trigger> ::= CREATE [ OR REPLACE ] TRIGGER <identifier> [ BEFORE | AFTER | INSTEAD OF ] <trigger-event> { OR <trigger-event> }
                      ON <identifier> [ FOR EACH ROW ] [ WHEN <expr> ]
                      BEGIN <trigger-statement> ';' { <trigger-statement> ';' } END
 <trigger-event> ::= INSERT | DELETE | UPDATE [ OF <identifier-list> ]
@@ -266,7 +266,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <drop>         ::= DROP TABLE [ IF EXISTS ] <identifier>
                  | DROP ( VIEW | QUERY ) [ IF EXISTS ] <identifier>
                  | DROP TRIGGER [ IF EXISTS ] <identifier>
-                 | DROP INDEX [ IF EXISTS ] <identifier> ON <identifier>
+                 | DROP INDEX [ IF EXISTS ] <identifier> [ ON <identifier> ] | REINDEX [ <identifier> ]
 
 <alter-table>  ::= ALTER TABLE <identifier> <alter-action>
 <alter-action> ::= ADD [ COLUMN ] <column-def>
@@ -350,7 +350,7 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
 <trim>        ::= TRIM '(' [ LEADING | TRAILING | BOTH ] [ <expr> ] FROM <expr> ')'
                 | TRIM '(' <expr> ')'
 
-<function-call> ::= <identifier> '(' [ '*' | [ DISTINCT ] <expr-list> ] ')'
+<function-call> ::= <identifier> '(' [ '*' | [ DISTINCT | ALL ] <expr-list> ] ')'
                     [ FILTER '(' WHERE <expr> ')' ]
                     [ OVER <window> ]
 <window>      ::= <identifier>                                   (* OVER w: a window named in the WINDOW clause *)
