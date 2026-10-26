@@ -102,7 +102,33 @@ fn grouping_and_aggregates() {
     let r = db.query("SELECT CustID + 100, Sum(Total) * 2 FROM Orders GROUP BY CustID ORDER BY 1").unwrap();
     assert_eq!(col(&r, 0), vec!["101", "102", "103"]);
 
-    assert!(db.query("SELECT City, Count(*) FROM Customers").is_err());
+    // A column that is neither grouped nor aggregated takes its value from a row of the group (the first),
+    // as in SQLite and MySQL.
+    let r = db.query("SELECT City, Count(*) FROM Customers").unwrap();
+    assert_eq!((r.rows.len(), r.rows[0][1].clone()), (1, Value::Int(4)));
+    assert_eq!(r.rows[0][0], Value::text("London"));
+    let r = db.query("SELECT CustID, Total, Count(*) FROM Orders GROUP BY CustID ORDER BY CustID").unwrap();
+    assert_eq!(col(&r, 2), vec!["2", "2", "1"]);
+    assert_eq!(col(&r, 1), vec!["$10.50", "$5.00", "$100.00"], "the first order of each customer");
+}
+
+#[test]
+fn cast_to_an_integer_drops_the_fraction() {
+    let db = Database::in_memory();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    for (sql, want) in [
+        ("SELECT CAST(2.7 AS INTEGER)", "2"), ("SELECT CAST(-2.7 AS INTEGER)", "-2"), ("SELECT CAST(2.5 AS INTEGER)", "2"),
+        ("SELECT CAST(3.5 AS INTEGER)", "3"), ("SELECT CAST(2.9e0 AS INTEGER)", "2"), ("SELECT CAST(-0.9e0 AS INTEGER)", "0"),
+        ("SELECT CAST(CSng(2.9) AS INTEGER)", "2"), ("SELECT CAST(CCur(2.99) AS INTEGER)", "2"), ("SELECT CAST(CRat(7) DIV 2 AS INTEGER)", "3"),
+        ("SELECT CAST(7 / 2.0 AS INTEGER)", "3"), ("SELECT CAST(3.99e0 AS BIGNUM)", "3"), ("SELECT CAST('12' AS INTEGER)", "12"),
+        ("SELECT CAST(5 AS INTEGER)", "5"),
+        // the Access function still rounds, halves to the even digit
+        ("SELECT CInt(2.7)", "3"), ("SELECT CInt(2.5)", "2"), ("SELECT CInt(3.5)", "4"),
+    ] {
+        assert_eq!(one(sql), want, "{sql}");
+    }
+    assert_eq!(db.query("SELECT CAST(NULL AS INTEGER)").unwrap().rows[0][0], Value::Null);
+    assert!(db.query("SELECT CAST(1e30 AS INTEGER)").is_err());
 }
 
 #[test]

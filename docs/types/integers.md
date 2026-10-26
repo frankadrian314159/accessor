@@ -52,7 +52,7 @@ The result is **not** converted back to an `INTEGER` when it would fit; the type
 | a date | its day number, counted from 1899-12-30 |
 | a number out of range (`INTEGER` only) | an error |
 
-`CInt(x)` (or `CAST(x AS INTEGER)`) and `CBig(x)` (or `CAST(x AS BIGNUM)`) do the same conversion in an expression.
+`CInt(x)` and `CBig(x)` do the same conversion in an expression, rounding a fraction (halves to even). `CAST(x AS INTEGER)` and `CAST(x AS BIGNUM)` convert the same way except that they **drop the fraction, toward zero**, as C, SQLite and Java do: `CAST(2.7 AS INTEGER)` is 2 where `CInt(2.7)` is 3.
 
 ## Display and sorting
 

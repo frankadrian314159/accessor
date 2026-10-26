@@ -9,6 +9,7 @@
 | number with an exponent | `DOUBLE` | `1e3`, `2.5E-4` |
 | text | `TEXT` | `'it''s'`, `"say ""hi"""` |
 | text in hexadecimal | `TEXT` | `X'48656c6c6f'` is `Hello`. There is no `BLOB` type, so the bytes must be valid UTF-8 (`X'ff'` is an error) |
+| type name and text | that type | `int4 '42'`, `bool 't'`, `float8 '1.5e2'`, `numeric '1.50'`, `double precision '3.25'`, `text 'x'`, `date '2024-03-01'`: the text converted to the type, like `CAST('42' AS int4)` (PostgreSQL's typed literal) |
 | interval | `INTERVAL` | `INTERVAL '3 days'`, `INTERVAL '1-6' YEAR TO MONTH`, `INTERVAL '90' MINUTE` |
 | date and time | `DATETIME` | `#2024-03-05#`, `#2024-03-05 14:30:00#`, `#3/5/2024 2:30 PM#`, `DATE '2024-03-05'`, `TIMESTAMP '2024-03-05 14:30:00'` |
 | date and time with a zone | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE '2024-03-05 14:30:00+01:00'` |

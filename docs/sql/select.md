@@ -91,7 +91,7 @@ HAVING COUNT(*) > 1
 ORDER BY Mean DESC;
 ```
 
-Every column in the select list must be a `GROUP BY` expression or be inside an aggregate. An aggregate query with no `GROUP BY` forms one group, and returns exactly one row even over no input. The aggregate functions are listed in [../functions/aggregate.md](../functions/aggregate.md).
+A column in the select list (or in `HAVING` or `ORDER BY`) that is neither a `GROUP BY` expression nor inside an aggregate is allowed, as in SQLite and MySQL: it has the value it has in the **first row** of the group, exactly as `ANY_VALUE(column)` would give it. Which row that is depends on the order the rows are read in, so use it only when the value is the same for the whole group (a column that depends on the grouped one), or write `ANY_VALUE` to say so. (The SQL standard, PostgreSQL and SQL Server refuse such a query.) An aggregate query with no `GROUP BY` forms one group, and returns exactly one row even over no input. The aggregate functions are listed in [../functions/aggregate.md](../functions/aggregate.md).
 
 ### ROLLUP, CUBE and GROUPING SETS
 

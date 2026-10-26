@@ -34,8 +34,8 @@ Rows: the value given. Columns: the type of the column it is stored in. "ok" mea
 
 | Function | Same as | Notes |
 | --- | --- | --- |
-| `CInt(x)`, `CLng(x)` | `CAST(x AS INTEGER)` | rounds, halves to even |
-| `CBig(x)` | `CAST(x AS BIGNUM)` | |
+| `CInt(x)`, `CLng(x)` | `CAST(x AS INTEGER)` | `CInt` rounds, halves to even; **`CAST` drops the fraction** (toward zero) of a `FLOAT`, `DOUBLE`, `DECIMAL`, `CURRENCY` or `RATIONAL`: `CAST(2.7 AS INTEGER)` is 2, `CAST(-2.7 AS INTEGER)` is -2, `CInt(2.7)` is 3 |
+| `CBig(x)` | `CAST(x AS BIGNUM)` | `CBig` rounds; `CAST` drops the fraction, as for `INTEGER` |
 | `CSng(x)`, `CFloat(x)` | `CAST(x AS FLOAT)` | |
 | `CDbl(x)` | `CAST(x AS DOUBLE)` | |
 | `CDec(x)` | `CAST(x AS DECIMAL)` | |

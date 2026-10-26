@@ -33,7 +33,8 @@ The names of the standard's features here are descriptive; they are not the feat
 | `LIKE` wildcards | `*`, `?`, `#` and sets as well as `%` and `_` | `%` and `_` |
 | Text concatenation | `&` and `\|\|`; NULL counts as empty | `\|\|`; NULL gives NULL |
 | Booleans | also written `YES` and `NO`; a number is true when not zero | `TRUE`/`FALSE`/`UNKNOWN` only |
-| Rounding | `ROUND` and `CAST ... AS DECIMAL(p, s)` round halves to the even digit | implementation-defined (usually half away from zero) |
+| Rounding | `ROUND` and `CAST ... AS DECIMAL(p, s)` round halves to the even digit; `CAST` to an integer drops the fraction, while `CInt` rounds | implementation-defined (usually half away from zero; `CAST` to an integer rounds in PostgreSQL, truncates in SQLite) |
+| Columns in a grouped query | a column that is not grouped or aggregated takes its value from the first row of the group | an error |
 | Division | `/` drops the fraction between whole numbers and divides in floating point otherwise; `DIV` is exact; division by zero is NULL | `/` on integers is implementation-defined; division by zero is an error (SQLSTATE 22012) |
 | Type sizes | `VARCHAR(50)` and `NUMERIC(10, 2)` are accepted but sizes and scales are not enforced | enforced |
 | `TIMESTAMP WITH TIME ZONE` | stored as an instant, shown in the session zone (set with `SET TIME ZONE`, not per column); zones come from the IANA database | per-session zone, `TIME WITH TIME ZONE` is a distinct type |

@@ -55,6 +55,9 @@ pub enum ScalarFn {
     Val,
     CStr,
     CInt,
+    /// `CAST(x AS INTEGER)`: like `CInt`, but a number with a fraction is truncated toward zero, not rounded.
+    CastInt,
+    CastBig,
     CSng,
     CDbl,
     CBig,
@@ -201,6 +204,8 @@ impl ScalarFn {
             "VAL" => (Val, 1, 1),
             "CSTR" => (CStr, 1, 1),
             "CINT" | "CLNG" => (CInt, 1, 1),
+            "CAST_INTEGER" => (CastInt, 1, 1),
+            "CAST_BIGNUM" => (CastBig, 1, 1),
             "CSNG" | "CFLOAT" => (CSng, 1, 1),
             "CDBL" => (CDbl, 1, 1),
             "CBIG" => (CBig, 1, 1),
@@ -660,6 +665,8 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         CStr => Value::text(&v0.unwrap().to_string()),
         // Conversions to each numeric type.
         CInt => v0.unwrap().coerce_to(DataType::Integer)?,
+        CastInt => truncated(v0.unwrap())?.coerce_to(DataType::Integer)?,
+        CastBig => truncated(v0.unwrap())?.coerce_to(DataType::Bignum)?,
         CBig => v0.unwrap().coerce_to(DataType::Bignum)?,
         CSng => v0.unwrap().coerce_to(DataType::Float)?,
         CDbl => v0.unwrap().coerce_to(DataType::Double)?,
@@ -1005,4 +1012,15 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         }
         Iif | Nz | IsNull | Coalesce | Now | Date | NowTz | LocalNow | LocalDate | SessionTimeZone => unreachable!("handled above"),
     })
+}
+
+/// A number with a fraction (a `FLOAT`, `DOUBLE`, `DECIMAL`, `CURRENCY` or `RATIONAL`) with the fraction
+/// dropped, toward zero; anything else as it is.
+fn truncated(v: &Value) -> Result<Value> {
+    match v {
+        Value::Float(f) if !f.is_finite() => Ok(v.clone()),
+        Value::Double(f) if !f.is_finite() => Ok(v.clone()),
+        Value::Float(_) | Value::Double(_) | Value::Dec(_) | Value::Currency(_) | Value::Rational(_) => whole_part(v, false),
+        other => Ok(other.clone()),
+    }
 }

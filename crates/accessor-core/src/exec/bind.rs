@@ -416,14 +416,12 @@ impl<'a> Binder<'a> {
                     "the parameter @{name} has no value; run the query with EXEC and supply one"
                 )))
             }
-            Expr::Column { table, name } => {
-                if self.group.is_some() {
-                    return Err(Error::runtime(format!(
-                        "'{name}' must appear in the GROUP BY clause or be used in an aggregate function"
-                    )));
-                }
-                BExpr::Col(self.scope.resolve(table.as_deref(), name)?)
+            Expr::Column { .. } if self.group.is_some() => {
+                // Neither grouped nor aggregated: as in SQLite and MySQL, the value comes from one row of the
+                // group (the first), exactly as `ANY_VALUE(column)` would give it.
+                return self.bind_agg(AggFn::First, std::slice::from_ref(e), false, false);
             }
+            Expr::Column { table, name } => BExpr::Col(self.scope.resolve(table.as_deref(), name)?),
             Expr::Neg(a) => BExpr::Neg(self.boxed(a)?),
             Expr::Not(a) => BExpr::Not(self.boxed(a)?),
             Expr::Binary { op, left, right } => BExpr::Bin(*op, self.boxed(left)?, self.boxed(right)?),

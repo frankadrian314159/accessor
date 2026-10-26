@@ -23,8 +23,8 @@ A `YESNO` column may be NULL, which as a condition means *unknown*. `WHERE` keep
 | Value stored | Result |
 | --- | --- |
 | a number | false if zero, true otherwise |
-| `'yes'`, `'true'`, `'on'`, `'1'` (any case) | true |
-| `'no'`, `'false'`, `'off'`, `'0'` (any case) | false |
+| `'yes'`, `'true'`, `'on'`, `'1'`, or a start of `true` or `yes` (`'t'`, `'tr'`, `'y'`, `'ye'`), any case, as PostgreSQL reads them | true |
+| `'no'`, `'false'`, `'off'`, `'0'`, or a start of `false` or `no` (`'f'`, `'fa'`, `'n'`, `'of'`), any case | false |
 | other text | an error (`cannot convert TEXT value 'maybe' to YESNO`) |
 
 In conditions, a number is also accepted wherever a yes/no is expected, with zero false and any other value true.

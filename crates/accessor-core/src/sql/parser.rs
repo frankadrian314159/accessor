@@ -3013,7 +3013,12 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
         }
         self.expect_sym(")")?;
-        let name = cast_function(ty).ok_or_else(|| Error::syntax("cannot CAST to CALCULATED"))?;
+        let name = match ty {
+            // CAST drops the fraction of a float; the Access function CInt() rounds
+            DataType::Integer => "CAST_INTEGER",
+            DataType::Bignum => "CAST_BIGNUM",
+            _ => cast_function(ty).ok_or_else(|| Error::syntax("cannot CAST to CALCULATED"))?,
+        };
         let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };
         Ok(match (ty, hints.get(1)) {
             (DataType::Decimal | DataType::Currency, Some(scale)) => Expr::Function {

@@ -31,17 +31,17 @@ Each type may be written with its own name or with a name from the standard or f
 
 | Type | Also accepted |
 | --- | --- |
-| `TEXT` | `VARCHAR`, `CHAR`, `CHARACTER`, `CHARACTER VARYING`, `NCHAR`, `NVARCHAR`, `NATIONAL CHARACTER [VARYING]`, `STRING`, `MEMO`, `LONGTEXT`, `CLOB` |
-| `INTEGER` | `INT`, `SMALLINT`, `TINYINT`, `BIGINT`, `LONG`, `SHORT`, `BYTE` |
-| `FLOAT` | `REAL`, `SINGLE` |
-| `DOUBLE` | `DOUBLE PRECISION` |
+| `TEXT` | `VARCHAR`, `CHAR`, `BPCHAR`, `NAME`, `CHARACTER`, `CHARACTER VARYING`, `NCHAR`, `NVARCHAR`, `NATIONAL CHARACTER [VARYING]`, `STRING`, `MEMO`, `LONGTEXT`, `CLOB` |
+| `INTEGER` | `INT`, `SMALLINT`, `TINYINT`, `BIGINT`, `LONG`, `SHORT`, `BYTE`, and PostgreSQL's `INT2`, `INT4`, `INT8`, `OID` (all 64-bit here: the sizes are not enforced) |
+| `FLOAT` | `REAL`, `SINGLE`, `FLOAT4` |
+| `DOUBLE` | `DOUBLE PRECISION`, `FLOAT8` |
 | `DECIMAL` | `NUMERIC`, `DEC`, `NUMBER` |
 | `CURRENCY` | `MONEY` |
 | `YESNO` | `BOOLEAN`, `BOOL`, `BIT`, `LOGICAL` |
 | `DATETIME` | `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMP WITHOUT TIME ZONE` |
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE`, `TIME WITH TIME ZONE` |
 | `JSON` | `JSONB` |
-| `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL` |
+| `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL`, `SERIAL2`, `SERIAL4`, `SERIAL8`, `SMALLSERIAL`, `BIGSERIAL` |
 
 All of `SMALLINT`, `INT` and `BIGINT` are the same 64-bit `INTEGER`; `BIGINT` does *not* mean a `BIGNUM`. A length or precision after a name, as in `VARCHAR(50)` or `NUMERIC(10, 2)`, is accepted and ignored.
 
