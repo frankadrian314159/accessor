@@ -599,6 +599,29 @@ impl Table {
         Ok(())
     }
 
+    /// Builds every index again from the rows (all versions of them). Fails, leaving the old index, if a unique
+    /// index finds a duplicate.
+    pub(crate) fn rebuild_indexes(&mut self) -> Result<()> {
+        self.generation += 1;
+        for pos in 0..self.indexes.len() {
+            let mut tree = BTreeSet::new();
+            let mut seen: BTreeSet<Vec<Cell>> = BTreeSet::new();
+            for (id, slot) in self.rows.iter().enumerate() {
+                let Some(head) = slot else { continue };
+                for (age, v) in head.chain().enumerate() {
+                    let ix = &self.indexes[pos];
+                    let key = ix.key(&v.row);
+                    if age == 0 && v.end == INF && ix.def.unique && !key.iter().any(|c| c.v.is_null()) && !seen.insert(key.clone()) {
+                        return Err(self.dup_error(ix));
+                    }
+                    tree.insert((key, id as RowId));
+                }
+            }
+            self.indexes[pos].tree = tree;
+        }
+        Ok(())
+    }
+
     pub(crate) fn drop_index(&mut self, name: &str) -> Result<()> {
         let pos = self
             .index_position(name)

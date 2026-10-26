@@ -10,7 +10,11 @@ pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// `/`: floating-point division, so `1 / 3` is `0.3333333333333333`.
     Div,
+    /// `DIV`: exact division: `1 DIV 3` is the decimal `0.3333333333333333333333333333` (or a fraction, for
+    /// rationals), with no rounding to a binary number.
+    ExactDiv,
     IntDiv,
     Mod,
     Pow,
@@ -442,7 +446,10 @@ pub enum Statement {
     AlterTable { table: String, action: AlterAction },
     /// `descending[i]` is true for a column written `DESC`.
     CreateIndex { name: String, table: String, columns: Vec<String>, descending: Vec<bool>, unique: bool },
-    DropIndex { name: String, table: String },
+    /// `DROP INDEX name [ON table]`; without the table, the index of that name wherever it is.
+    DropIndex { name: String, table: Option<String> },
+    /// `REINDEX [table | index]`: builds the indexes again from the rows.
+    Reindex(Option<String>),
     CreateView { name: String, sql: String },
     DropView(String),
     /// Header of a parameterised query; a no-op when executed on its own.

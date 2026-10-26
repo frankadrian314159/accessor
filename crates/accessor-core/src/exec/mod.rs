@@ -192,7 +192,8 @@ impl Database {
             Statement::CreateIndex { name, table, columns, descending, unique } => {
                 self.exec_create_index(name, table, columns, descending, *unique)
             }
-            Statement::DropIndex { name, table } => self.exec_drop_index(name, table),
+            Statement::DropIndex { name, table } => self.exec_drop_index(name, table.as_deref()),
+            Statement::Reindex(name) => self.exec_reindex(name.as_deref()),
             Statement::CreateView { name, sql } => self.exec_create_view(name, sql),
             Statement::DropView(name) => self.exec_drop_view(name),
             Statement::Parameters(_) => Ok(QueryResult::default()),

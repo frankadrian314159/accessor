@@ -304,9 +304,48 @@ impl Database {
         Ok(QueryResult::default())
     }
 
-    pub(crate) fn exec_drop_index(&mut self, name: &str, table: &str) -> Result<QueryResult> {
-        let real = self.table_checked(table)?.name().to_string();
+    pub(crate) fn exec_drop_index(&mut self, name: &str, table: Option<&str>) -> Result<QueryResult> {
+        let real = match table {
+            Some(t) => self.table_checked(t)?.name().to_string(),
+            None => {
+                // Index names belong to a table; without one, the name must be enough to find it.
+                let owners: Vec<String> =
+                    self.tables.values().filter(|t| t.index_position(name).is_some()).map(|t| t.name().to_string()).collect();
+                match owners.as_slice() {
+                    [one] => one.clone(),
+                    [] => return Err(Error::catalog(format!("the index '{name}' does not exist"))),
+                    _ => {
+                        return Err(Error::catalog(format!(
+                            "more than one table has an index named '{name}' ({}): write DROP INDEX {name} ON table",
+                            owners.join(", ")
+                        )))
+                    }
+                }
+            }
+        };
         self.apply_all(vec![Op::DropIndex { table: real, name: name.to_string() }])?;
+        Ok(QueryResult::default())
+    }
+
+    /// `REINDEX`: builds the indexes of a table (or of all tables, or the table of one index) again from the rows.
+    pub(crate) fn exec_reindex(&mut self, name: Option<&str>) -> Result<QueryResult> {
+        let targets: Vec<String> = match name {
+            None => self.tables.keys().cloned().collect(),
+            Some(n) if self.table(n).is_some() => vec![crate::database::key(n)],
+            Some(n) => {
+                let owners: Vec<String> =
+                    self.tables.iter().filter(|(_, t)| t.index_position(n).is_some()).map(|(k, _)| k.clone()).collect();
+                if owners.is_empty() {
+                    return Err(Error::catalog(format!("there is no table or index named '{n}'")));
+                }
+                owners
+            }
+        };
+        for key in targets {
+            if let Some(t) = self.tables.get_mut(&key) {
+                t.rebuild_indexes()?;
+            }
+        }
         Ok(QueryResult::default())
     }
 

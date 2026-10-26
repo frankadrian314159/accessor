@@ -162,7 +162,7 @@ fn functions_and_operators() {
     assert_eq!(q("SELECT 5 IN (1, 2, 5)"), "Yes");
     assert_eq!(q("SELECT 'abc' LIKE 'a?c'"), "Yes");
     assert_eq!(q("SELECT Val('12.5abc')"), "12.5");
-    assert!(db.query("SELECT 1 / 0").is_err());
+    assert!(db.query("SELECT 1 / 0").unwrap().rows[0][0].is_null());
 }
 
 #[test]
@@ -753,12 +753,17 @@ fn calculated_expressions_are_checked() {
     bad(&mut db, "ALTER TABLE Line ADD COLUMN c CALCULATED AS (Qty) NOT NULL");
     bad(&mut db, "CREATE TABLE X (a INTEGER, b CALCULATED AS (c), c CALCULATED AS (a))"); // c comes later
     bad(&mut db, "CREATE TABLE X (a INTEGER, b CALCULATED AS (a), PRIMARY KEY (b))");
-    // Division by zero at write time fails the write and leaves nothing behind.
-    db.execute("ALTER TABLE Line ADD COLUMN Each CALCULATED AS (Total / Qty)").unwrap();
-    assert!(db.execute("UPDATE Line SET Qty = 0 WHERE Item = 'pen'").is_err());
+    // Dividing by zero gives NULL, so the write goes through and the calculated value is NULL.
+    db.execute("ALTER TABLE Line ADD COLUMN Each CALCULATED AS (Total DIV Qty)").unwrap();
+    db.execute("UPDATE Line SET Qty = 0 WHERE Item = 'pen'").unwrap();
+    assert!(db.query("SELECT Each FROM Line WHERE Item = 'pen'").unwrap().rows[0][0].is_null());
+    db.execute("UPDATE Line SET Qty = 3 WHERE Item = 'pen'").unwrap();
+    assert_eq!(one(&db, "SELECT Each FROM Line WHERE Item = 'pen'"), "$2.00");
+    // A value that cannot be computed is an error and leaves nothing behind...
+    assert!(db.execute("UPDATE Line SET Price = 1e300 * 1e300 WHERE Item = 'pen'").is_err());
     assert_eq!(one(&db, "SELECT Qty FROM Line WHERE Item = 'pen'"), "3");
     // ...and a bad expression change is rolled back as a whole.
-    assert!(db.execute("ALTER TABLE Line ALTER COLUMN Each CALCULATED AS (Total / (Qty - 3))").is_err());
+    assert!(db.execute("ALTER TABLE Line ALTER COLUMN Each CALCULATED AS (Total * CDbl(1e300) * CDbl(1e300))").is_err());
     assert_eq!(one(&db, "SELECT Each FROM Line WHERE Item = 'pen'"), "$2.00");
 }
 
@@ -880,16 +885,16 @@ fn decimal_arithmetic_is_exact() {
     assert_eq!(q(&db, "SELECT 0.1 + 0.2"), "0.3");
     assert_eq!(q(&db, "SELECT 0.1 + 0.2 = 0.3"), "Yes");
     assert_eq!(q(&db, "SELECT 1.1 * 1.1"), "1.21");
-    assert_eq!(q(&db, "SELECT 7 / 2"), "3.5");
-    assert_eq!(q(&db, "SELECT 6 / 3"), "2");
-    assert_eq!(q(&db, "SELECT 1 / 4"), "0.25");
-    assert_eq!(q(&db, "SELECT 1 / 3"), format!("0.{}", "3".repeat(50)));
+    assert_eq!(q(&db, "SELECT 7 DIV 2"), "3.5");
+    assert_eq!(q(&db, "SELECT 6 DIV 3"), "2");
+    assert_eq!(q(&db, "SELECT 1 DIV 4"), "0.25");
+    assert_eq!(q(&db, "SELECT 1 DIV 3"), format!("0.{}", "3".repeat(50)));
     assert_eq!(q(&db, "SELECT 7 \\ 2"), "3");
     assert_eq!(q(&db, "SELECT 7 MOD 4"), "3");
     assert_eq!(q(&db, "SELECT -7.5 + 0.5"), "-7");
     assert_eq!(q(&db, "SELECT 2 ^ -2"), "0.25");
     assert_eq!(q(&db, "SELECT 1.5 ^ 2"), "2.25");
-    assert!(db.query("SELECT 1 / 0").is_err());
+    assert!(db.query("SELECT 1 / 0").unwrap().rows[0][0].is_null());
     // A whole-valued result is an ordinary whole number again.
     assert_eq!(q(&db, "SELECT 0.5 * 4 = 2"), "Yes");
     assert_eq!(q(&db, "SELECT 1.0 = 1"), "Yes");
@@ -1047,8 +1052,8 @@ fn conversion_is_refused_where_it_would_break_something() {
 fn a_failed_conversion_changes_nothing() {
     let mut db = people();
     db.execute("INSERT INTO P (First, Last, Born, Age) VALUES ('Zero', 'Born', 0, 7)").unwrap();
-    // Division by zero for one record: no record may be touched, and Age keeps its values and type.
-    assert!(db.execute("ALTER TABLE P ALTER COLUMN Age CALCULATED AS (1000 / Born)").is_err());
+    // A value that cannot be computed for some record: no record may be touched, and Age keeps its values and type.
+    assert!(db.execute("ALTER TABLE P ALTER COLUMN Age CALCULATED AS (Born * CDbl(1e300) * CDbl(1e300))").is_err());
     assert!(!db.table("P").unwrap().schema().columns[5].is_calculated());
     assert_eq!(names(&db.query("SELECT Age FROM P ORDER BY ID").unwrap()), ["36", "41", "7"]);
     db.execute("UPDATE P SET Age = 50 WHERE ID = 3").unwrap(); // still an ordinary field
@@ -1181,11 +1186,11 @@ fn every_pair_of_types_adds_up() {
 #[test]
 fn division_power_and_functions_by_type() {
     let db = zoo();
-    assert_eq!(typed(&db, "SELECT i / 4 FROM Z"), "DECIMAL 1.5");
-    assert_eq!(typed(&db, "SELECT b / 4 FROM Z"), "DECIMAL 1.5");
-    assert_eq!(typed(&db, "SELECT m / 4 FROM Z"), "CURRENCY $1.50");
-    assert_eq!(typed(&db, "SELECT m / m FROM Z"), "DECIMAL 1");
-    assert_eq!(typed(&db, "SELECT r / 4 FROM Z"), "RATIONAL 3/2");
+    assert_eq!(typed(&db, "SELECT i DIV 4 FROM Z"), "DECIMAL 1.5");
+    assert_eq!(typed(&db, "SELECT b DIV 4 FROM Z"), "DECIMAL 1.5");
+    assert_eq!(typed(&db, "SELECT m DIV 4 FROM Z"), "CURRENCY $1.50");
+    assert_eq!(typed(&db, "SELECT m DIV m FROM Z"), "DECIMAL 1");
+    assert_eq!(typed(&db, "SELECT r DIV 4 FROM Z"), "RATIONAL 3/2");
     assert_eq!(typed(&db, "SELECT f / 4 FROM Z"), "FLOAT 1.5");
     assert_eq!(typed(&db, "SELECT d / 4 FROM Z"), "DOUBLE 1.5");
     assert_eq!(typed(&db, "SELECT i \\ 4 FROM Z"), "INTEGER 1");
@@ -1196,32 +1201,36 @@ fn division_power_and_functions_by_type() {
     assert_eq!(typed(&db, "SELECT c ^ 0.5 FROM Z").split(' ').next(), Some("DOUBLE"));
     assert_eq!(typed(&db, "SELECT -m FROM Z"), "CURRENCY -$6.00");
     assert_eq!(typed(&db, "SELECT Abs(-f) FROM Z"), "FLOAT 6");
-    assert_eq!(typed(&db, "SELECT Round(m / 7, 2) FROM Z"), "CURRENCY $0.86");
-    assert_eq!(typed(&db, "SELECT Round(r / 7, 2) FROM Z"), "RATIONAL 43/50");
+    assert_eq!(typed(&db, "SELECT Round(m DIV 7, 2) FROM Z"), "CURRENCY $0.86");
+    assert_eq!(typed(&db, "SELECT Round(r DIV 7, 2) FROM Z"), "RATIONAL 43/50");
     assert_eq!(typed(&db, "SELECT Int(-2.5)"), "DECIMAL -3");
-    assert_eq!(typed(&db, "SELECT Fix(CRat(-5) / 2)"), "BIGNUM -2");
+    assert_eq!(typed(&db, "SELECT Fix(CRat(-5) DIV 2)"), "BIGNUM -2");
     assert_eq!(typed(&db, "SELECT Sqr(f) FROM Z").split(' ').next(), Some("FLOAT"));
     assert_eq!(typed(&db, "SELECT Sgn(r) FROM Z"), "INTEGER 1");
     // Errors rather than infinities, NaNs or silent wrap-around.
-    for bad in ["SELECT d * 1e300 * 1e300 FROM Z", "SELECT f * CSng(1e30) * CSng(1e30) FROM Z", "SELECT 1 / (i - 6) FROM Z", "SELECT r / (r - 6) FROM Z", "SELECT d / (d - 6) FROM Z", "SELECT 0 ^ -1"] {
+    for bad in ["SELECT d * 1e300 * 1e300 FROM Z", "SELECT f * CSng(1e30) * CSng(1e30) FROM Z", ] {
         assert!(db.query(bad).is_err(), "{bad}");
+    }
+    // Dividing by zero, in any type, is NULL.
+    for null in ["SELECT 1 / (i - 6) FROM Z", "SELECT r / (r - 6) FROM Z", "SELECT d / (d - 6) FROM Z", "SELECT f / (f - 6) FROM Z", "SELECT m DIV (i - 6) FROM Z", "SELECT 0 ^ -1"] {
+        assert!(db.query(null).unwrap().rows[0][0].is_null(), "{null}");
     }
 }
 
 #[test]
 fn rationals_and_conversions() {
     let db = Database::in_memory();
-    assert_eq!(typed(&db, "SELECT CRat(1) / 3"), "RATIONAL 1/3");
-    assert_eq!(typed(&db, "SELECT CRat(1) / 3 + CRat(1) / 6"), "RATIONAL 1/2");
+    assert_eq!(typed(&db, "SELECT CRat(1) DIV 3"), "RATIONAL 1/3");
+    assert_eq!(typed(&db, "SELECT CRat(1) DIV 3 + CRat(1) DIV 6"), "RATIONAL 1/2");
     assert_eq!(typed(&db, "SELECT Rational(6, 8)"), "RATIONAL 3/4");
     assert_eq!(typed(&db, "SELECT Rational(1, -2)"), "RATIONAL -1/2");
     assert_eq!(typed(&db, "SELECT CRat('7/2')"), "RATIONAL 7/2");
     assert_eq!(typed(&db, "SELECT CRat(0.75)"), "RATIONAL 3/4");
     assert_eq!(typed(&db, "SELECT CRat(CDbl(0.1))"), "RATIONAL 1/10");
-    assert_eq!(typed(&db, "SELECT Numerator(CRat(6) / 4)"), "BIGNUM 3");
-    assert_eq!(typed(&db, "SELECT Denominator(CRat(6) / 4)"), "BIGNUM 2");
-    assert_eq!(typed(&db, "SELECT CDec(CRat(1) / 4)"), "DECIMAL 0.25");
-    assert_eq!(typed(&db, "SELECT CDbl(CRat(1) / 4)"), "DOUBLE 0.25");
+    assert_eq!(typed(&db, "SELECT Numerator(CRat(6) DIV 4)"), "BIGNUM 3");
+    assert_eq!(typed(&db, "SELECT Denominator(CRat(6) DIV 4)"), "BIGNUM 2");
+    assert_eq!(typed(&db, "SELECT CDec(CRat(1) DIV 4)"), "DECIMAL 0.25");
+    assert_eq!(typed(&db, "SELECT CDbl(CRat(1) DIV 4)"), "DOUBLE 0.25");
     assert!(db.query("SELECT Rational(1, 0)").is_err());
     assert!(db.query("SELECT CRat('1/0')").is_err());
     // The other conversions.
@@ -1241,14 +1250,14 @@ fn rationals_and_conversions() {
 fn comparison_is_exact_across_types() {
     let db = Database::in_memory();
     assert_eq!(q(&db, "SELECT 1 = 1.0"), "Yes");
-    assert_eq!(q(&db, "SELECT CRat(2) / 4 = 0.5"), "Yes");
+    assert_eq!(q(&db, "SELECT CRat(2) DIV 4 = 0.5"), "Yes");
     assert_eq!(q(&db, "SELECT CDbl(0.5) = 0.5"), "Yes");
     assert_eq!(q(&db, "SELECT CDbl(0.1) = 0.1"), "No");
     assert_eq!(q(&db, "SELECT CDec(CDbl(0.1)) = 0.1"), "Yes");
     assert_eq!(q(&db, "SELECT CSng(0.1) = CDbl(0.1)"), "No");
     assert_eq!(q(&db, "SELECT CRat(1) / 3 = 1 / 3"), "No"); // the decimal is rounded at 50 digits
-    assert_eq!(q(&db, "SELECT CRat(1) / 3 < 1 / 3"), "No");
-    assert_eq!(q(&db, "SELECT CRat(1) / 3 > 0.33333333333333333333333333333333333333333333333333"), "Yes");
+    assert_eq!(q(&db, "SELECT CRat(1) DIV 3 < 1 DIV 3"), "No");
+    assert_eq!(q(&db, "SELECT CRat(1) DIV 3 > 0.33333333333333333333333333333333333333333333333333"), "Yes");
     assert_eq!(q(&db, "SELECT 9223372036854775807 < 9223372036854775808"), "Yes");
     assert_eq!(q(&db, "SELECT 9223372036854775807 < CDbl(9223372036854775807)"), "Yes"); // the double rounds up to 2^63
 }
@@ -1264,7 +1273,7 @@ fn indexes_sorts_and_joins_mix_types() {
          INSERT INTO A VALUES (1, 'one'), (2, 'two'), (3, 'three');
          INSERT INTO B VALUES (1.0, 'b1'), (2.50, 'b2'), (3, 'b3');
          INSERT INTO C VALUES (1, 'c1'), (2.5, 'c2'), (3.0, 'c3');
-         INSERT INTO D VALUES (2/2, 'd1'), (7/2, 'd2'), (6/2, 'd3');
+         INSERT INTO D VALUES (2 DIV 2, 'd1'), (7 DIV 2, 'd2'), (6 DIV 2, 'd3');
          CREATE INDEX ib ON B (k); CREATE INDEX ic ON C (k)",
     )
     .unwrap();
@@ -1352,7 +1361,7 @@ fn foreign_keys_work_between_exact_number_types() {
 fn calculated_fields_have_typed_results() {
     let mut db = Database::in_memory();
     db.execute(
-        "CREATE TABLE T (a INTEGER, b CURRENCY, c RATIONAL, total CALCULATED AS (a * b), share CALCULATED AS (c / a));
+        "CREATE TABLE T (a INTEGER, b CURRENCY, c RATIONAL, total CALCULATED AS (a * b), share CALCULATED AS (c DIV a));
          INSERT INTO T (a, b, c) VALUES (3, 19.99, 1)",
     )
     .unwrap();
@@ -1429,7 +1438,7 @@ fn rollback_undoes_schema_changes_of_every_kind() {
     db.execute("INSERT INTO Extra VALUES (1, 'x')").unwrap();
     db.execute("CREATE INDEX by_qty ON Orders (Qty)").unwrap();
     db.execute("ALTER TABLE Orders ADD COLUMN Note TEXT").unwrap();
-    db.execute("ALTER TABLE Orders ADD COLUMN Tax CALCULATED AS (Total / 10)").unwrap();
+    db.execute("ALTER TABLE Orders ADD COLUMN Tax CALCULATED AS (Total DIV 10)").unwrap();
     db.execute("ALTER TABLE Orders ALTER COLUMN Note CALCULATED AS ('n' & Qty)").unwrap();
     db.execute("ALTER TABLE Orders ALTER COLUMN Qty DECIMAL").unwrap_err(); // refused: Total uses it
     db.execute("ALTER TABLE Orders RENAME COLUMN Price TO Cost").unwrap_err(); // refused: Total uses it
@@ -1860,7 +1869,7 @@ fn ddl_dml_additions() {
     assert_eq!(rows(&db, "SELECT K, V FROM T ORDER BY K"), vec![vec!["1", "one"], vec!["2", "TWO"], vec!["4", "four"]]);
     // A failing MERGE changes nothing.
     assert!(db
-        .execute("MERGE INTO T USING (VALUES (9, 'n'), (8, 'm')) AS s(k, v) ON T.K = s.k WHEN NOT MATCHED THEN INSERT (K, V) VALUES (s.k, s.k / 0)")
+        .execute("MERGE INTO T USING (VALUES (9, 'n'), (8, 'm')) AS s(k, v) ON T.K = s.k WHEN NOT MATCHED THEN INSERT (K, V) VALUES (s.k, s.k * CDbl(1e300) * CDbl(1e300))")
         .is_err());
     assert_eq!(rows(&db, "SELECT Count(*) FROM T"), vec![vec!["3"]]);
 
@@ -2310,7 +2319,7 @@ fn intervals() {
     assert_eq!(one("SELECT AGE(#2024-03-05#, #2021-01-10#)"), "3 years 1 month 24 days");
     assert_eq!(one("SELECT CAST('2 days' AS INTERVAL) + CAST('3 hours' AS INTERVAL)"), "2 days 03:00:00");
     assert!(db.query("SELECT INTERVAL 'soon'").is_err());
-    assert!(db.query("SELECT INTERVAL '1 day' / 0").is_err());
+    assert!(db.query("SELECT INTERVAL '1 day' / 0").unwrap().rows[0][0].is_null());
 
     // A column, aggregates and series.
     let mut db = db;
@@ -3889,4 +3898,178 @@ fn creating_a_unique_descending_index_checks_the_rows_that_are_there() {
     assert!(db.execute("CREATE UNIQUE INDEX u_ab ON u (a DESC, b ASC)").is_err());
     db.execute("DELETE FROM u WHERE a = 1 AND b = 1 AND a IS NOT NULL").unwrap();
     db.execute("CREATE UNIQUE INDEX u_ab ON u (a DESC, b ASC)").unwrap();
+}
+
+// ----- / and DIV ---------------------------------------------------------------------------------
+
+#[test]
+fn slash_truncates_whole_numbers_and_divides_the_rest_in_floating_point() {
+    let db = Database::in_memory();
+    let t = |sql: &str| {
+        let r = db.query(sql).unwrap();
+        format!("{} {}", r.rows[0][0].type_label(), r.rows[0][0])
+    };
+    // whole numbers: the fraction is dropped, toward zero (the SQLite, PostgreSQL and SQL Server result)
+    assert_eq!(t("SELECT 7 / 2"), "INTEGER 3");
+    assert_eq!(t("SELECT -7 / 2"), "INTEGER -3");
+    assert_eq!(t("SELECT 7 / -2"), "INTEGER -3");
+    assert_eq!(t("SELECT 1 / 3"), "INTEGER 0");
+    assert_eq!(t("SELECT 6 / 3"), "INTEGER 2");
+    assert_eq!(t("SELECT CBig(100000000000000000000) / 7"), "BIGNUM 14285714285714285714");
+    // anything else: floating point
+    assert_eq!(t("SELECT 7 / 2.0"), "DOUBLE 3.5");
+    assert_eq!(t("SELECT 1 / 3.0"), "DOUBLE 0.3333333333333333");
+    assert_eq!(t("SELECT 7 / CDbl(2)"), "DOUBLE 3.5");
+    assert_eq!(t("SELECT CSng(1) / 4"), "FLOAT 0.25");
+    assert_eq!(t("SELECT CCur(10) / 4"), "DOUBLE 2.5");
+    // division by zero is still an error
+    // division by zero is NULL, not an error
+    assert!(db.query("SELECT 1 / 0").unwrap().rows[0][0].is_null());
+    assert!(db.query("SELECT 1 / 0.0").unwrap().rows[0][0].is_null());
+}
+
+#[test]
+fn div_is_exact_division() {
+    let db = Database::in_memory();
+    let t = |sql: &str| {
+        let r = db.query(sql).unwrap();
+        format!("{} {}", r.rows[0][0].type_label(), r.rows[0][0])
+    };
+    assert_eq!(t("SELECT 7 DIV 2"), "DECIMAL 3.5");
+    assert_eq!(t("SELECT 6 DIV 3"), "DECIMAL 2");
+    assert_eq!(t("SELECT 1 DIV 3"), format!("DECIMAL 0.{}", "3".repeat(50)));
+    assert_eq!(t("SELECT 0.3 DIV 0.1"), "DECIMAL 3");
+    assert_eq!(t("SELECT CCur(10) DIV 4"), "CURRENCY $2.50");
+    assert_eq!(t("SELECT CRat(1) DIV 3"), "RATIONAL 1/3");
+    assert_eq!(t("SELECT 7 DIV 2.0"), "DECIMAL 3.5");
+    assert_eq!(t("SELECT CDbl(7) DIV 2"), "DOUBLE 3.5");
+    assert_eq!(t("SELECT INTERVAL '10 hours' DIV 4"), "INTERVAL 02:30:00");
+    // same precedence as * / \ MOD, left to right
+    assert_eq!(t("SELECT 2 + 9 DIV 2 * 2"), "DECIMAL 11");
+    assert_eq!(t("SELECT 9 DIV 2 / 2"), "DOUBLE 2.25");
+    assert!(db.query("SELECT 1 DIV 0").unwrap().rows[0][0].is_null());
+    // the whole-number divisions side by side
+    assert_eq!(t(r"SELECT 7 \ 2"), "INTEGER 3");
+    assert_eq!(t(r"SELECT 7.6 \ 2"), "INTEGER 4");
+    assert_eq!(t("SELECT 7 MOD 2"), "INTEGER 1");
+}
+
+#[test]
+fn div_is_a_reserved_word_and_averages_stay_exact() {
+    let mut db = Database::in_memory();
+    assert!(db.execute("CREATE TABLE d (div INTEGER)").is_err(), "DIV cannot be a bare name");
+    db.execute("CREATE TABLE d ([div] INTEGER, v DECIMAL)").unwrap();
+    db.execute("INSERT INTO d VALUES (7, 0.1), (2, 0.2), (3, 0.3)").unwrap();
+    assert_eq!(ids(&db, "SELECT [div] DIV 2 FROM d WHERE [div] = 7"), vec!["3.5"]);
+    // Avg and Sum are exact whatever / does
+    assert_eq!(ids(&db, "SELECT Avg(v) FROM d"), vec!["0.2"]);
+    assert_eq!(ids(&db, "SELECT Avg(v) * 3 FROM d"), vec!["0.6"]);
+    assert_eq!(ids(&db, "SELECT Avg([div]) FROM d"), vec!["4"]);
+}
+
+// ----- SQLite-compatible forms ---------------------------------------------------------------------
+
+#[test]
+fn dividing_by_zero_is_null() {
+    let db = Database::in_memory();
+    let null = |sql: &str| db.query(sql).unwrap().rows[0][0].is_null();
+    for sql in [
+        "SELECT 1 / 0", "SELECT 1 / 0.0", "SELECT 1 DIV 0", "SELECT Mod(7, 0)",
+        "SELECT CCur(5) / 0", "SELECT CRat(1) DIV 0", "SELECT INTERVAL '1 day' / 0", "SELECT 1 / (2 - 2)",
+    ] {
+        assert!(null(sql), "{sql}");
+    }
+    // so a row's other columns still come out, and a condition on the quotient simply does not hold
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE q (a INTEGER, b INTEGER); INSERT INTO q VALUES (6, 3), (5, 0), (4, 2)").unwrap();
+    assert_eq!(ids(&db, "SELECT a / b FROM q ORDER BY a"), vec!["2", "NULL", "2"].iter().map(|s| if *s == "NULL" { "".to_string() } else { s.to_string() }).collect::<Vec<_>>());
+    assert_eq!(ids(&db, "SELECT a FROM q WHERE a / b > 0 ORDER BY a"), vec!["4", "6"]);
+}
+
+#[test]
+fn all_is_allowed_in_an_aggregate() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE a (x INTEGER); INSERT INTO a VALUES (1), (2), (2), (NULL), (5)").unwrap();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    assert_eq!(one("SELECT COUNT(ALL x), SUM(ALL x), MIN(ALL x), MAX(ALL x) FROM a"), ["4", "10", "1", "5"]);
+    assert_eq!(one("SELECT COUNT(ALL x), COUNT(DISTINCT x), COUNT(x), COUNT(*) FROM a"), ["4", "3", "4", "5"]);
+    assert_eq!(one("SELECT AVG(ALL x) FROM a"), ["2.5"]);
+    assert_eq!(one("SELECT SUM(ALL x + 1) FROM a"), ["14"]);
+    assert_eq!(one("SELECT SELECT_ALL FROM (SELECT ALL MIN ( ALL x ) AS select_all FROM a) AS q"), ["1"]);
+}
+
+#[test]
+fn in_with_an_empty_list_or_subquery_is_false_whatever_the_left_side() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE e (a INTEGER); CREATE TABLE f (a INTEGER); INSERT INTO f VALUES (1), (NULL)").unwrap();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    // an empty list (SQLite and MySQL allow it)
+    assert_eq!(one("SELECT 1 IN (), 1 NOT IN (), NULL IN (), NULL NOT IN ()"), ["No", "Yes", "No", "Yes"]);
+    // an empty subquery: the standard says x = ANY (nothing) is false, even for NULL
+    assert_eq!(one("SELECT NULL IN (SELECT a FROM e), NULL NOT IN (SELECT a FROM e), 1 IN (SELECT a FROM e), 1 NOT IN (SELECT a FROM e)"), ["No", "Yes", "No", "Yes"]);
+    // not empty: unknown for NULL
+    // (NULL is shown as nothing)
+    assert_eq!(one("SELECT NULL IN (SELECT a FROM f)"), [""]);
+    assert_eq!(one("SELECT NULL NOT IN (SELECT a FROM f)"), [""]);
+    assert_eq!(one("SELECT 2 IN (SELECT a FROM f)"), [""]); // the NULL in the set
+    assert_eq!(one("SELECT 1 IN (SELECT a FROM f)"), ["Yes"]);
+    // correlated: the inner query is empty for some outer rows
+    db.execute("CREATE TABLE o (k INTEGER); INSERT INTO o VALUES (1), (2)").unwrap();
+    let r = db.query("SELECT k, NULL IN (SELECT a FROM f WHERE f.a = o.k) AS x, NULL NOT IN (SELECT a FROM f WHERE f.a = o.k) AS y FROM o ORDER BY k").unwrap();
+    let got: Vec<Vec<String>> = r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect();
+    assert_eq!(got, [["1", "", ""], ["2", "No", "Yes"]]);
+}
+
+#[test]
+fn hexadecimal_literals_are_text() {
+    let db = Database::in_memory();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one("SELECT x'48656c6c6f'"), "Hello");
+    assert_eq!(one("SELECT X'303132'"), "012");
+    assert_eq!(one("SELECT x''"), "");
+    assert_eq!(one("SELECT x'c3a9'"), "\u{e9}");
+    assert_eq!(one("SELECT LENGTH(x'303132')"), "3");
+    assert!(db.query("SELECT x'3'").is_err(), "an odd number of digits");
+    assert!(db.query("SELECT x'zz'").is_err(), "not hexadecimal");
+    assert!(db.query("SELECT x'ff'").is_err(), "not text: there is no BLOB type");
+    // x is still an ordinary name
+    assert!(db.query("SELECT x FROM (SELECT 1 AS x) AS t").is_ok());
+}
+
+#[test]
+fn a_trigger_without_a_timing_is_a_before_trigger() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+    db.execute("CREATE TRIGGER no_negatives INSERT ON t FOR EACH ROW WHEN NEW.a < 0 BEGIN RAISE 'negative'; END").unwrap();
+    assert!(db.execute("INSERT INTO t (a) VALUES (-1)").is_err());
+    db.execute("INSERT INTO t (a) VALUES (4)").unwrap();
+    assert_eq!(ids(&db, "SELECT COUNT(*) FROM t"), vec!["1"], "refused before the row was stored");
+    assert_eq!(ids(&db, "SELECT action_timing FROM information_schema.triggers"), vec!["BEFORE"]);
+    assert!(db.execute("CREATE TRIGGER nothing ON t BEGIN SELECT 1; END").is_err());
+}
+
+#[test]
+fn drop_index_can_leave_out_the_table_and_reindex_rebuilds() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE a (x INTEGER); CREATE TABLE b (y INTEGER)").unwrap();
+    db.execute("CREATE INDEX only_a ON a (x); CREATE INDEX both ON a (x); CREATE INDEX both ON b (y)").unwrap();
+    db.execute("INSERT INTO a VALUES (3), (1), (2); INSERT INTO b VALUES (9)").unwrap();
+    db.execute("DROP INDEX only_a").unwrap();
+    assert!(db.table("a").unwrap().index_defs().all(|d| d.name != "only_a"));
+    assert!(db.execute("DROP INDEX only_a").is_err(), "gone");
+    db.execute("DROP INDEX IF EXISTS only_a").unwrap();
+    let err = db.execute("DROP INDEX both").unwrap_err().to_string();
+    assert!(err.contains("ON table"), "{err}");
+    db.execute("DROP INDEX both ON b").unwrap();
+    db.execute("DROP INDEX both").unwrap(); // now only one table has it
+    assert_eq!(db.table("a").unwrap().index_defs().count(), 0);
+
+    db.execute("CREATE UNIQUE INDEX ux ON a (x); CREATE INDEX iy ON b (y)").unwrap();
+    for sql in ["REINDEX", "REINDEX a", "REINDEX ux", "REINDEX iy;"] {
+        db.execute(sql).unwrap();
+    }
+    assert!(db.execute("REINDEX nothing").is_err());
+    assert_eq!(ids(&db, "SELECT x FROM a WHERE x = 2"), vec!["2"]);
+    assert_eq!(ids(&db, "SELECT x FROM a ORDER BY x LIMIT 3"), vec!["1", "2", "3"]);
+    assert!(db.execute("INSERT INTO a VALUES (2)").is_err(), "the unique index still holds");
 }

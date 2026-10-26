@@ -106,6 +106,27 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 }
             };
             out.push(Token { tok, pos });
+        } else if (c == 'x' || c == 'X') && at(i + 1) == Some('\'') {
+            // X'303132': a literal written in hexadecimal. There is no BLOB type: the bytes must be text.
+            let mut hex = String::new();
+            i += 2;
+            loop {
+                match at(i) {
+                    None => return Err(Error::syntax("unterminated X'...' literal")),
+                    Some('\'') => break,
+                    Some(ch) if ch.is_ascii_hexdigit() => hex.push(ch),
+                    Some(ch) => return Err(Error::syntax(format!("'{ch}' is not a hexadecimal digit in an X'...' literal"))),
+                }
+                i += 1;
+            }
+            i += 1;
+            if hex.len() % 2 != 0 {
+                return Err(Error::syntax("an X'...' literal needs an even number of hexadecimal digits"));
+            }
+            let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|k| u8::from_str_radix(&hex[k..k + 2], 16).expect("hex digits")).collect();
+            let text = String::from_utf8(bytes)
+                .map_err(|_| Error::syntax("an X'...' literal is read as text, and these bytes are not valid UTF-8 (there is no BLOB type)"))?;
+            out.push(Token { tok: Tok::Str(text), pos });
         } else if is_ident_start(c) {
             let start = i;
             while at(i).is_some_and(is_ident_part) {

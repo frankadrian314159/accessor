@@ -188,6 +188,10 @@ impl BExpr {
             BExpr::InSet { expr, set, has_null, negated } => {
                 let v = expr.eval(row)?;
                 if v.is_null() {
+                    // Among nothing, a NULL is not found: `x IN (empty)` is false for every x.
+                    if set.is_empty() && !*has_null {
+                        return Ok(Cow::Owned(from_tri(negate_tri(Some(false), *negated))));
+                    }
                     return Ok(Cow::Owned(Value::Null));
                 }
                 let t = if set.contains(&*v) {
@@ -336,11 +340,14 @@ mod tests {
     fn evaluation_uses_the_numeric_tower() {
         assert_eq!(bin(BinOp::Add, Value::Int(1), Value::Int(2)), Value::Int(3));
         assert_eq!(bin(BinOp::Add, Value::Int(1), Value::Int(2)).type_label(), "INTEGER");
-        assert_eq!(bin(BinOp::Div, Value::Int(1), Value::Int(2)).to_string(), "0.5");
+        assert_eq!(bin(BinOp::Div, Value::Int(1), Value::Int(2)).to_string(), "0");
+        assert_eq!(bin(BinOp::ExactDiv, Value::Int(1), Value::Int(2)).to_string(), "0.5");
+        assert_eq!(bin(BinOp::Div, Value::Int(1), Value::Double(2.0)).to_string(), "0.5");
         assert!(bin(BinOp::Add, Value::Null, Value::Int(2)).is_null());
         assert!(BExpr::Bin(BinOp::Div, Box::new(BExpr::Lit(1.into())), Box::new(BExpr::Lit(0.into())))
             .eval(&[])
-            .is_err());
+            .unwrap()
+            .is_null(), "dividing by zero is NULL");
         let neg = BExpr::Neg(Box::new(BExpr::Lit(Value::Float(2.5)))).eval(&[]).unwrap().into_owned();
         assert_eq!((neg.type_label(), neg.to_string()), ("FLOAT", "-2.5".to_string()));
     }

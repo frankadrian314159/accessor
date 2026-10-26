@@ -714,7 +714,8 @@ impl Database {
                     CorrKind::In { expr, negated } => {
                         let lhs = expr.eval(row)?;
                         if lhs.is_null() {
-                            Value::Null
+                            // (nothing to be among: false, so NOT IN is true)
+                            if result.is_empty() { Value::Bool(*negated) } else { Value::Null }
                         } else {
                             let found = result.iter().any(|r| lhs.sql_cmp(&r[0]) == Some(Ordering::Equal));
                             let t = if found {

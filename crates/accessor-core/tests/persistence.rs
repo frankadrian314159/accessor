@@ -534,7 +534,7 @@ fn every_numeric_type_persists() {
         )
         .unwrap();
         let row = "(-9223372036854775808, 123456789012345678901234567890, CSng(0.1), 0.1 + 0.2e0, \
-                    -0.000000000000000000000000001, 19.99, CRat(-22) / 7)";
+                    -0.000000000000000000000000001, 19.99, CRat(-22) DIV 7)";
         db.execute(&format!("INSERT INTO z (i, b, f, d, c, m, r) VALUES {row}")).unwrap();
         db.checkpoint().unwrap();
         db.execute(&format!("INSERT INTO z (i, b, f, d, c, m, r) VALUES {row}")).unwrap(); // only in the log
@@ -545,7 +545,7 @@ fn every_numeric_type_persists() {
         assert_eq!(describe(&db, 1), expect, "snapshot, round {round}");
         assert_eq!(describe(&db, 2), expect, "log, round {round}");
         // The indexes were rebuilt in value order, whatever the types.
-        let hits = db.query("SELECT Count(*) FROM z WHERE r = CRat(-22) / 7").unwrap();
+        let hits = db.query("SELECT Count(*) FROM z WHERE r = CRat(-22) DIV 7").unwrap();
         assert_eq!(hits.rows[0][0].to_string(), "2");
         let hits = db.query("SELECT Count(*) FROM z WHERE d > 0.30000000000000003").unwrap();
         assert_eq!(hits.rows[0][0].to_string(), "2");

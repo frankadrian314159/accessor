@@ -11,7 +11,7 @@ const RESERVED: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER",
     "CROSS", "ON", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN", "UNION", "LIMIT", "OFFSET", "SET",
     "VALUES", "INTO", "DISTINCT", "TOP", "ASC", "DESC", "CASE", "WHEN", "THEN", "ELSE", "END", "EXISTS", "INSERT",
-    "UPDATE", "DELETE", "CREATE", "DROP", "TABLE", "INDEX", "VIEW", "MOD", "ALL", "NATURAL", "USING", "INTERSECT",
+    "UPDATE", "DELETE", "CREATE", "DROP", "TABLE", "INDEX", "VIEW", "MOD", "DIV", "ALL", "NATURAL", "USING", "INTERSECT",
     "EXCEPT", "FETCH", "PIVOT", "UNPIVOT",
 ];
 
@@ -563,6 +563,10 @@ impl<'a> Parser<'a> {
                 }
             };
             return Ok(Statement::SetTimeZone(name));
+        }
+        if self.eat_kw("REINDEX") {
+            let name = if matches!(self.peek(), Tok::Eof) || self.peek_sym(";") { None } else { Some(self.ident()?) };
+            return Ok(Statement::Reindex(name));
         }
         if self.eat_kw("TRUNCATE") {
             self.eat_kw("TABLE");
@@ -1121,6 +1125,8 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("INSTEAD") {
             self.expect_kw("OF")?;
             TriggerTiming::InsteadOf
+        } else if self.peek_kw("INSERT") || self.peek_kw("UPDATE") || self.peek_kw("DELETE") {
+            TriggerTiming::Before // as in SQLite, when the timing is left out
         } else {
             return Err(self.unexpected("BEFORE, AFTER or INSTEAD OF"));
         };
@@ -1790,11 +1796,8 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("INDEX") {
             self.if_exists_clause(false, guarded)?;
             let name = self.ident()?;
-            if self.eat_kw("ON") {
-                Ok(Statement::DropIndex { name, table: self.ident()? })
-            } else {
-                Err(self.unexpected("ON"))
-            }
+            let table = if self.eat_kw("ON") { Some(self.ident()?) } else { None };
+            Ok(Statement::DropIndex { name, table })
         } else {
             Err(self.unexpected("TABLE, VIEW, INDEX, SEQUENCE, FUNCTION, PROCEDURE, REPORT or TRIGGER"))
         }
@@ -2505,6 +2508,11 @@ impl<'a> Parser<'a> {
                 };
             } else if self.eat_kw("IN") {
                 self.expect_sym("(")?;
+                if self.eat_sym(")") {
+                    // `x IN ()`: nothing to be among, whatever x is (NULL included)
+                    left = Expr::Literal(Value::Bool(negated));
+                    continue;
+                }
                 if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
                     let q = self.select()?;
                     self.expect_sym(")")?;
@@ -2577,6 +2585,7 @@ impl<'a> Parser<'a> {
                 Tok::Sym("\\") => BinOp::IntDiv,
                 Tok::Sym("%") => BinOp::Mod,
                 Tok::Ident(s) if s.eq_ignore_ascii_case("MOD") => BinOp::Mod,
+                Tok::Ident(s) if s.eq_ignore_ascii_case("DIV") => BinOp::ExactDiv,
                 _ => break,
             };
             self.advance();
@@ -2898,6 +2907,9 @@ impl<'a> Parser<'a> {
             star = true;
         } else if !self.peek_sym(")") {
             distinct = self.eat_kw("DISTINCT");
+            if !distinct {
+                self.eat_kw("ALL"); // `Count(ALL x)`: the default, written out
+            }
             args.push(self.expr()?);
             while self.eat_sym(",") {
                 args.push(self.expr()?);

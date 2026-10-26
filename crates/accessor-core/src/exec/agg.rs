@@ -196,7 +196,7 @@ impl AggState {
             AggFn::Count => Value::Int(self.count),
             AggFn::Avg => {
                 match self.acc {
-                    Some(sum) if self.count > 0 => arith(BinOp::Div, &sum, &Value::Int(self.count)).unwrap_or(Value::Null),
+                    Some(sum) if self.count > 0 => arith(BinOp::ExactDiv, &sum, &Value::Int(self.count)).unwrap_or(Value::Null),
                     _ => Value::Null,
                 }
             }

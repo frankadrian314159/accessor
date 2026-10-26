@@ -14,10 +14,15 @@
 //!   `RATIONAL` if either operand is one, else `CURRENCY`, else `DECIMAL`, else
 //!   `BIGNUM`, else `INTEGER`. An `INTEGER` result that does not fit in 64 bits
 //!   becomes a `BIGNUM` instead of overflowing.
-//! * **`/`** is exact: `RATIONAL` if either operand is, `CURRENCY` for money
+//! * **`/`** divides whole numbers by dropping the fraction, toward zero, as SQLite, PostgreSQL
+//!   and SQL Server do (`7 / 2` is `3`, `-7 / 2` is `-3`; an `INTEGER`, or a `BIGNUM` if an
+//!   operand is one or the result does not fit). With any other operand (a `DECIMAL`,
+//!   `CURRENCY`, `RATIONAL`, `FLOAT` or `DOUBLE`) it is floating-point division: `7 / 2.0` is
+//!   the `DOUBLE` `3.5`, or a `FLOAT` if an operand is one.
+//! * **`DIV`** is exact division: `RATIONAL` if either operand is, `CURRENCY` for money
 //!   divided by a plain number, `DECIMAL` otherwise (including money divided by
-//!   money, and integers divided by integers: `7 / 2` is the decimal `3.5`, and
-//!   `1 / 3` is a decimal rounded at 50 digits; use `RATIONAL` for exact thirds).
+//!   money, and integers divided by integers: `7 DIV 2` is the decimal `3.5`, and
+//!   `1 DIV 3` is a decimal rounded at 50 digits; use `RATIONAL` for exact thirds).
 //! * **`\` and `Mod`** round their operands to whole numbers and give an
 //!   `INTEGER`, or a `BIGNUM` if an operand is one or the result does not fit.
 //! * **`^`** with a whole exponent is exact in the base's own type (a negative
@@ -40,7 +45,7 @@ fn overflow() -> Error {
 }
 
 fn division_by_zero() -> Error {
-    Error::runtime("Division by zero")
+    Error::runtime(DIVISION_BY_ZERO)
 }
 
 fn double(f: f64) -> Result<Value> {
@@ -204,6 +209,31 @@ fn add_sub_mul(op: BinOp, x: &Value, y: &Value) -> Result<Value> {
     })
 }
 
+/// `/`: whole numbers divide without the fraction (toward zero); anything else divides in floating point.
+/// `FLOAT` operands give a `FLOAT`; the rest is done in `DOUBLE`.
+fn slash_divide(x: &Value, y: &Value) -> Result<Value> {
+    if y.is_zero() {
+        return Err(division_by_zero());
+    }
+    if matches!(x, Value::Int(_) | Value::Big(_)) && matches!(y, Value::Int(_) | Value::Big(_)) {
+        if let (Value::Int(p), Value::Int(q)) = (x, y) {
+            if let Some(r) = p.checked_div(*q) {
+                return Ok(Value::Int(r));
+            }
+        }
+        let r = require_big(x)? / require_big(y)?;
+        let big_operand = matches!(x, Value::Big(_)) || matches!(y, Value::Big(_));
+        return Ok(if big_operand { Value::Big(r) } else { int_or_big(r) });
+    }
+    let (kx, ky) = (x.kind().ok_or_else(overflow)?, y.kind().ok_or_else(overflow)?);
+    Ok(match (kx, ky) {
+        (Kind::Double, _) | (_, Kind::Double) => double(require_f64(x)? / require_f64(y)?)?,
+        (Kind::Float, _) | (_, Kind::Float) => float(require_f32(x)? / require_f32(y)?)?,
+        _ => double(require_f64(x)? / require_f64(y)?)?,
+    })
+}
+
+/// `DIV`: exact division, in the exact type the operands call for.
 fn divide(x: &Value, y: &Value) -> Result<Value> {
     if y.is_zero() {
         return Err(division_by_zero());
@@ -337,7 +367,7 @@ fn interval_arith(op: BinOp, a: &Value, b: &Value) -> Result<Option<Value>> {
         (BinOp::Mul, Value::Interval(x), n) | (BinOp::Mul, n, Value::Interval(x)) if n.num().is_some() => {
             scale(x, &n.num().and_then(|n| n.as_decimal()).ok_or_else(overflow)?)?
         }
-        (BinOp::Div, Value::Interval(x), n) if n.num().is_some() => {
+        (BinOp::Div | BinOp::ExactDiv, Value::Interval(x), n) if n.num().is_some() => {
             let d = n.num().and_then(|n| n.as_decimal()).ok_or_else(overflow)?;
             let inverse = Decimal::from_i64(1).div(&d).ok_or_else(division_by_zero)?;
             scale(x, &inverse)?
@@ -370,8 +400,19 @@ fn operand(v: &Value) -> Result<Cow<'_, Value>> {
     v.num_lenient().ok_or_else(|| Error::type_err(format!("'{v}' is not a number")))
 }
 
-/// Binary arithmetic. Operands may be numbers, numeric text, Yes/No or dates.
+/// Binary arithmetic. Operands may be numbers, numeric text, Yes/No or dates. Dividing by zero (with `/`,
+/// `DIV`, `\`, `Mod` or dividing an interval) gives NULL, as it does in SQLite, MySQL and Access's query
+/// engine; the SQL standard would raise an error.
 pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
+    match arith_checked(op, a, b) {
+        Err(Error::Runtime(m)) if m == DIVISION_BY_ZERO => Ok(Value::Null),
+        other => other,
+    }
+}
+
+const DIVISION_BY_ZERO: &str = "Division by zero";
+
+fn arith_checked(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
     }
@@ -406,7 +447,8 @@ pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     let (x, y) = (operand(a)?, operand(b)?);
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul => add_sub_mul(op, &x, &y),
-        BinOp::Div => divide(&x, &y),
+        BinOp::Div => slash_divide(&x, &y),
+        BinOp::ExactDiv => divide(&x, &y),
         BinOp::IntDiv | BinOp::Mod => int_div_mod(op, &x, &y),
         BinOp::Pow => power(&x, &y),
         _ => unreachable!("not an arithmetic operator"),
@@ -548,28 +590,54 @@ mod tests {
     }
 
     #[test]
-    fn division_types() {
-        is(op(Div, &Value::Int(7), &Value::Int(2)), "DECIMAL", "3.5");
-        is(op(Div, &Value::Int(6), &Value::Int(3)), "DECIMAL", "2");
-        is(op(Div, &big("10"), &Value::Int(4)), "DECIMAL", "2.5");
-        is(op(Div, &dec("1"), &Value::Int(4)), "DECIMAL", "0.25");
-        is(op(Div, &cur("10"), &Value::Int(4)), "CURRENCY", "$2.50");
-        is(op(Div, &cur("10"), &cur("4")), "DECIMAL", "2.5");
-        is(op(Div, &Value::Int(10), &cur("4")), "DECIMAL", "2.5");
-        is(op(Div, &Value::Int(1), &rat(3, 1)), "RATIONAL", "1/3");
-        is(op(Div, &rat(1, 2), &dec("0.25")), "RATIONAL", "2");
-        is(op(Div, &Value::Double(1.0), &Value::Int(4)), "DOUBLE", "0.25");
-        is(op(Div, &Value::Float(1.0), &Value::Int(4)), "FLOAT", "0.25");
-        is(op(Div, &Value::Int(i64::MIN), &Value::Int(-1)), "DECIMAL", "9223372036854775808");
-        let third = op(Div, &Value::Int(1), &Value::Int(3)).to_string();
+    fn exact_division_types() {
+        is(op(ExactDiv, &Value::Int(7), &Value::Int(2)), "DECIMAL", "3.5");
+        is(op(ExactDiv, &Value::Int(6), &Value::Int(3)), "DECIMAL", "2");
+        is(op(ExactDiv, &big("10"), &Value::Int(4)), "DECIMAL", "2.5");
+        is(op(ExactDiv, &dec("1"), &Value::Int(4)), "DECIMAL", "0.25");
+        is(op(ExactDiv, &cur("10"), &Value::Int(4)), "CURRENCY", "$2.50");
+        is(op(ExactDiv, &cur("10"), &cur("4")), "DECIMAL", "2.5");
+        is(op(ExactDiv, &Value::Int(10), &cur("4")), "DECIMAL", "2.5");
+        is(op(ExactDiv, &Value::Int(1), &rat(3, 1)), "RATIONAL", "1/3");
+        is(op(ExactDiv, &rat(1, 2), &dec("0.25")), "RATIONAL", "2");
+        is(op(ExactDiv, &Value::Double(1.0), &Value::Int(4)), "DOUBLE", "0.25");
+        is(op(ExactDiv, &Value::Float(1.0), &Value::Int(4)), "FLOAT", "0.25");
+        is(op(ExactDiv, &Value::Int(i64::MIN), &Value::Int(-1)), "DECIMAL", "9223372036854775808");
+        let third = op(ExactDiv, &Value::Int(1), &Value::Int(3)).to_string();
         assert_eq!(third, format!("0.{}", "3".repeat(crate::decimal::DIV_DIGITS)));
         for zero in [Value::Int(0), big("0"), Value::Float(0.0), Value::Double(0.0), dec("0"), cur("0"), rat(0, 1)] {
             for (_, x) in one_of_each() {
-                assert!(arith(Div, &x, &zero).is_err(), "{x:?} / {zero:?}");
+                assert!(arith(ExactDiv, &x, &zero).unwrap().is_null(), "{x:?} DIV {zero:?}");
             }
         }
         // Zero divided by anything is zero, in the type the rules give.
-        is(op(Div, &Value::Int(0), &Value::Int(5)), "DECIMAL", "0");
+        is(op(ExactDiv, &Value::Int(0), &Value::Int(5)), "DECIMAL", "0");
+    }
+
+    #[test]
+    fn slash_divides_whole_numbers_without_a_fraction_and_the_rest_in_floating_point() {
+        // whole numbers: the fraction is dropped, toward zero, as in SQLite
+        is(op(Div, &Value::Int(7), &Value::Int(2)), "INTEGER", "3");
+        is(op(Div, &Value::Int(-7), &Value::Int(2)), "INTEGER", "-3");
+        is(op(Div, &Value::Int(7), &Value::Int(-2)), "INTEGER", "-3");
+        is(op(Div, &Value::Int(6), &Value::Int(3)), "INTEGER", "2");
+        is(op(Div, &Value::Int(1), &Value::Int(3)), "INTEGER", "0");
+        is(op(Div, &Value::Int(i64::MIN), &Value::Int(-1)), "BIGNUM", "9223372036854775808");
+        is(op(Div, &big("100000000000000000000"), &Value::Int(7)), "BIGNUM", "14285714285714285714");
+        is(op(Div, &big("10"), &Value::Int(4)), "BIGNUM", "2");
+        // anything else: floating point
+        is(op(Div, &Value::Int(7), &dec("2")), "DOUBLE", "3.5");
+        is(op(Div, &dec("1"), &Value::Int(4)), "DOUBLE", "0.25");
+        is(op(Div, &cur("10"), &Value::Int(4)), "DOUBLE", "2.5");
+        is(op(Div, &Value::Int(1), &rat(3, 1)), "DOUBLE", "0.3333333333333333");
+        is(op(Div, &Value::Double(1.0), &Value::Int(4)), "DOUBLE", "0.25");
+        is(op(Div, &Value::Float(1.0), &Value::Int(4)), "FLOAT", "0.25");
+        is(op(Div, &Value::Float(1.0), &Value::Double(4.0)), "DOUBLE", "0.25");
+        for zero in [Value::Int(0), big("0"), Value::Float(0.0), Value::Double(0.0), dec("0"), cur("0"), rat(0, 1)] {
+            for (_, x) in one_of_each() {
+                assert!(arith(Div, &x, &zero).unwrap().is_null(), "{x:?} / {zero:?}");
+            }
+        }
     }
 
     #[test]
@@ -584,8 +652,8 @@ mod tests {
         is(op(IntDiv, &dec("7.5"), &dec("2")), "INTEGER", "4");
         is(op(Mod, &dec("7.5"), &Value::Int(2)), "INTEGER", "0");
         is(op(IntDiv, &Value::Double(9.0), &rat(7, 2)), "INTEGER", "2");
-        assert!(arith(IntDiv, &Value::Int(1), &dec("0.2")).is_err());
-        assert!(arith(Mod, &Value::Int(1), &Value::Int(0)).is_err());
+        assert!(arith(IntDiv, &Value::Int(1), &dec("0.2")).unwrap().is_null()); // 0.2 rounds to 0
+        assert!(arith(Mod, &Value::Int(1), &Value::Int(0)).unwrap().is_null());
     }
 
     #[test]
@@ -605,7 +673,7 @@ mod tests {
         is(op(Pow, &Value::Int(9), &dec("0.5")), "DOUBLE", "3");
         is(op(Pow, &Value::Double(2.0), &Value::Int(10)), "DOUBLE", "1024");
         is(op(Pow, &Value::Float(2.0), &Value::Int(10)), "FLOAT", "1024");
-        assert!(arith(Pow, &Value::Int(0), &Value::Int(-1)).is_err());
+        assert!(arith(Pow, &Value::Int(0), &Value::Int(-1)).unwrap().is_null()); // 1 / 0
         assert!(arith(Pow, &Value::Int(-8), &dec("0.5")).is_err()); // NaN is not a result
     }
 
