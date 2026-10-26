@@ -82,6 +82,8 @@ pub struct Database {
     pub(crate) call_depth: std::sync::atomic::AtomicU32,
     /// While above zero (inside the body of a view), privileges are not checked.
     pub(crate) priv_suspended: std::sync::atomic::AtomicU32,
+    /// MySQL's `@name` user variables.
+    pub(crate) user_vars: BTreeMap<String, crate::value::Value>,
     /// Set while an `UPDATE ONLY` / `DELETE FROM ONLY` runs.
     pub(crate) only_dml: std::sync::atomic::AtomicBool,
     /// SQL text recently read, with the statements it came to.
@@ -136,6 +138,7 @@ impl Database {
             capture: None,
             call_depth: std::sync::atomic::AtomicU32::new(0),
             priv_suspended: std::sync::atomic::AtomicU32::new(0),
+            user_vars: BTreeMap::new(),
             only_dml: std::sync::atomic::AtomicBool::new(false),
             parse_cache: Mutex::new(HashMap::new()),
             prepared: BTreeMap::new(),

@@ -30,7 +30,7 @@ pub(crate) fn build_row(schema: &TableSchema, positions: &[usize], vals: Vec<Val
                 Value::Int(crate::sequence::next_value(seq)?)
             }
         } else {
-            c.default.clone().unwrap_or(Value::Null)
+            c.default_now().unwrap_or(Value::Null)
         });
     }
     for (&p, v) in positions.iter().zip(vals) {
@@ -242,7 +242,7 @@ impl Database {
                                 let c = &schema.columns[positions[k]];
                                 vals.push(match c.sequence_default() {
                                     Some(seq) => Value::Int(crate::sequence::next_value(seq)?),
-                                    None => c.default.clone().unwrap_or(Value::Null),
+                                    None => c.default_now().unwrap_or(Value::Null),
                                 });
                                 continue;
                             }

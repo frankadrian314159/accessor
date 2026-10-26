@@ -41,6 +41,8 @@ pub enum PgFn {
     Decode,
     Zero,
     Same,
+    /// A function that always gives the same text (`DATABASE()`, `VERSION()`, `CURRENT_USER()`).
+    Text(&'static str),
     JsonPathArray,
     JsonPathFirst,
     JsonPathExists,
@@ -72,6 +74,9 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "CONCAT_WS" => (ConcatWs, 2, usize::MAX),
         "REGEXP_INSTR" => (RegexpInstr, 2, 7),
         "WIDTH_BUCKET" => (WidthBucket, 4, 4),
+        "CURRENT_USER" | "USER" | "SESSION_USER" | "SYSTEM_USER" => (Text("root@localhost"), 0, 0),
+        "DATABASE" | "SCHEMA" => (Text("test"), 0, 0),
+        "VERSION" => (Text("8.0.40"), 0, 0),
         "JSONB_PATH_QUERY_ARRAY" | "JSONB_PATH_QUERY_ARRAY_TZ" => (JsonPathArray, 2, 4),
         "JSONB_PATH_QUERY_FIRST" | "JSONB_PATH_QUERY_FIRST_TZ" => (JsonPathFirst, 2, 4),
         "JSONB_PATH_EXISTS" | "JSONB_PATH_EXISTS_TZ" => (JsonPathExists, 2, 4),
@@ -233,6 +238,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 },
             }
         }
+        Text(s) => Value::text(s),
         Zero => Value::Int(0),
         Same => v(0).clone(),
         IsFinite => Value::Bool(true),

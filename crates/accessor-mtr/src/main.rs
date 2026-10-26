@@ -420,6 +420,8 @@ struct Runner<'a> {
     skip: &'a [(String, usize)],
     depth: usize,
     steps: usize,
+    /// Statements run per test, at most.
+    cap: usize,
 }
 
 fn subst(s: &str, vars: &HashMap<String, String>) -> String {
@@ -447,6 +449,22 @@ fn subst(s: &str, vars: &HashMap<String, String>) -> String {
         i += 1;
     }
     out
+}
+
+/// Does `s` still contain a `$name` of mysqltest outside quotes?
+fn has_unresolved(s: &str) -> bool {
+    let b: Vec<char> = s.chars().collect();
+    let mut quote: Option<char> = None;
+    for (i, c) in b.iter().enumerate() {
+        match quote {
+            Some(q) if *c == q => quote = None,
+            Some(_) => {}
+            None if matches!(c, '\'' | '"' | '`') => quote = Some(*c),
+            None if *c == '$' && b.get(i + 1).is_some_and(|n| n.is_alphabetic() || *n == '_' || *n == '{') => return true,
+            None => {}
+        }
+    }
+    false
 }
 
 fn skipped_include(path: &str) -> bool {
@@ -622,7 +640,7 @@ impl Runner<'_> {
     fn run(&mut self, units: &[Unit]) {
         let mut i = 0;
         while i < units.len() {
-            if self.steps > 200_000 {
+            if self.steps >= self.cap {
                 return;
             }
             match &units[i] {
@@ -685,13 +703,14 @@ impl Runner<'_> {
                         let n: i64 = self.vars.get(&var).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
                         self.vars.insert(var, (if name == "inc" { n + 1 } else { n - 1 }).to_string());
                     }
-                    "eval" => {
+                    "eval" | "query" | "send_eval" => {
                         let t = subst(rest, &self.vars);
-                        self.sql(&t, *line);
-                    }
-                    "query" | "send_eval" => {
-                        let t = subst(rest, &self.vars);
-                        self.sql(&t, *line);
+                        if has_unresolved(&t) {
+                            // a variable that some include would have set (a helper script this runner does not run)
+                            self.record(0, *line, "runner", "", "an unresolved $variable", &short(&t, 120));
+                        } else {
+                            self.sql(&t, *line);
+                        }
                     }
                     "echo" => {
                         let t = subst(rest, &self.vars);
@@ -745,7 +764,7 @@ fn compare_rows(sql: &str, want: &[Vec<String>], got: &QueryResult, sorted: bool
     ("ok".into(), String::new(), "compared".into())
 }
 
-fn run_test(root: &Path, name: &str, progress: Option<&Path>, skip: &[(String, usize)], results: &mut String) {
+fn run_test(root: &Path, name: &str, progress: Option<&Path>, skip: &[(String, usize)], cap: usize, results: &mut String) {
     let (Ok(t), Ok(r)) = (std::fs::read(root.join("t").join(format!("{name}.test"))), std::fs::read(root.join("r").join(format!("{name}.result")))) else { return };
     let test = String::from_utf8_lossy(&t).replace("\r\n", "\n");
     let out_text = String::from_utf8_lossy(&r).replace("\r\n", "\n");
@@ -773,6 +792,7 @@ fn run_test(root: &Path, name: &str, progress: Option<&Path>, skip: &[(String, u
         skip,
         depth: 0,
         steps: 0,
+        cap,
     };
     run.run(&units);
     run.flush();
@@ -785,6 +805,8 @@ fn test_names(root: &Path) -> Vec<String> {
             d.filter_map(|e| e.ok())
                 .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".test")).map(str::to_string))
                 .filter(|n| root.join("r").join(format!("{n}.result")).exists())
+                // the tests of mysqltest itself run shell commands and servers
+                .filter(|n| !n.starts_with("mysqltest"))
                 .collect()
         })
         .unwrap_or_default();
@@ -793,6 +815,7 @@ fn test_names(root: &Path) -> Vec<String> {
 }
 
 fn child(args: &[String]) {
+    let mut cap = 3000usize;
     let (mut root, mut results, mut progress, mut skip, mut only, mut from) = (PathBuf::new(), PathBuf::new(), None, Vec::new(), Vec::<String>::new(), String::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -801,6 +824,7 @@ fn child(args: &[String]) {
             "--results" => results = it.next().map(PathBuf::from).unwrap_or_default(),
             "--progress" => progress = it.next().map(PathBuf::from),
             "--from" => from = it.next().cloned().unwrap_or_default(),
+            "--cap" => cap = it.next().and_then(|v| v.parse().ok()).unwrap_or(3000),
             "--skip" => {
                 skip = it
                     .next()
@@ -823,7 +847,7 @@ fn child(args: &[String]) {
         if let Some(p) = &progress {
             let _ = std::fs::write(p, format!("{t}\t0"));
         }
-        run_test(&root, &t, progress.as_deref(), &skip, &mut data);
+        run_test(&root, &t, progress.as_deref(), &skip, cap, &mut data);
         let _ = std::fs::write(&results, &data);
     }
     let _ = std::fs::write(&results, &data);
@@ -858,6 +882,7 @@ fn main() {
         return;
     }
     let (mut root, mut report, mut timeout, mut memory_mb, mut only, mut stall) = (PathBuf::new(), PathBuf::from("mysql-report.md"), 3600u64, 2048usize, String::new(), 20u64);
+    let mut cap = 3000usize;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -867,6 +892,7 @@ fn main() {
             "--memory-mb" => memory_mb = it.next().and_then(|v| v.parse().ok()).expect("--memory-mb N"),
             "--only" => only = it.next().cloned().expect("--only a,b"),
             "--stall" => stall = it.next().and_then(|v| v.parse().ok()).expect("--stall SECONDS"),
+            "--cap" => cap = it.next().and_then(|v| v.parse().ok()).expect("--cap N"),
             _ => {}
         }
     }
@@ -888,6 +914,7 @@ fn main() {
         let _ = std::fs::write(&results, "");
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("--child").arg("--mysql").arg(&root).arg("--results").arg(&results).arg("--progress").arg(&progress);
+        cmd.arg("--cap").arg(cap.to_string());
         if !from.is_empty() {
             cmd.arg("--from").arg(&from);
         }
@@ -968,6 +995,8 @@ fn main() {
             (f.len() >= 4).then(|| Row { test: f[0], verdict: f[3], lead: f.get(4).copied().unwrap_or(""), class: f.get(5).copied().unwrap_or(""), detail: f.get(6).copied().unwrap_or("") })
         })
         .collect();
+    let skipped_by_runner = rows.iter().filter(|r| r.verdict == "runner").count();
+    let rows: Vec<Row> = rows.into_iter().filter(|r| r.verdict != "runner").collect();
     let mut verdicts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut per_test: BTreeMap<&str, BTreeMap<&str, usize>> = BTreeMap::new();
     for r in &rows {
@@ -977,7 +1006,7 @@ fn main() {
     let statements = rows.len();
     let mut md = String::new();
     let _ = writeln!(md, "# MySQL test suite against Accessor\n");
-    let _ = writeln!(md, "{} tests with statements, {statements} statements, run in {:.0}s.\n", per_test.len(), started.elapsed().as_secs_f64());
+    let _ = writeln!(md, "{} tests with statements, {statements} statements (at most {cap} per test; {skipped_by_runner} more left out because a variable of mysqltest could not be filled in), run in {:.0}s.\n", per_test.len(), started.elapsed().as_secs_f64());
     let _ = writeln!(md, "| Outcome | Statements | Share |\n| --- | ---: | ---: |");
     for (v, label) in [("ok", "both accepted (rows agree where shown)"), ("error", "both refused"), ("missing", "MySQL accepted, Accessor refused"), ("lenient", "MySQL refused, Accessor accepted"), ("value", "both accepted, different rows"), ("unaligned", "Accessor refused; MySQL's output not found to compare"), ("panic", "the engine panicked"), ("killer", "killed the process (skipped)")] {
         if let Some(n) = verdicts.get(v) {

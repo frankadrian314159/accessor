@@ -17,6 +17,7 @@ ASQL is the SQL dialect of Accessor. It is a subset of standard SQL with the hab
 | [routines.md](routines.md) | `CREATE FUNCTION` (expression functions) and `CREATE PROCEDURE` (variables, `IF`, `WHILE`), `CALL`; PostgreSQL-style `LANGUAGE sql` and PL/pgSQL |
 | [schemas-and-types.md](schemas-and-types.md) | `CREATE SCHEMA`, `CREATE DOMAIN`, `CREATE TYPE ... AS ENUM`, `CREATE EXTENSION` |
 | [roles-and-privileges.md](roles-and-privileges.md) | `CREATE ROLE`, `GRANT`, `REVOKE`, `SET ROLE` |
+| [mysql.md](mysql.md) | MySQL syntax read by the engine: backtick names, `@variables`, `CREATE TABLE` options and keys, `SHOW`, `PREPARE ... FROM`, `INSERT IGNORE`, `ON DUPLICATE KEY UPDATE` |
 | [inheritance-and-partitioning.md](inheritance-and-partitioning.md) | `INHERITS`, `PARTITION BY`, `PARTITION OF`, `ONLY` |
 | [reports.md](reports.md) | `CREATE REPORT`: grouped, totalled, paged output as text, HTML, Markdown, CSV or PDF |
 | [../optimizer/](../optimizer/README.md) | the query optimizer and `EXPLAIN` |

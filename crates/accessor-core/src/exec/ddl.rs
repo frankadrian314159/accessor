@@ -37,6 +37,7 @@ impl Database {
                 }
             }
             c.default = match &d.default {
+                Some(Value::Text(t)) if &**t == crate::schema::NOW_DEFAULT => d.default.clone(),
                 Some(v) => Some(
                     v.coerce_to(d.data_type)
                         .map_err(|e| Error::type_err(format!("default for '{}': {e}", d.name)))?,

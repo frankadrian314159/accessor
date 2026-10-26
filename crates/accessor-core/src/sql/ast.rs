@@ -505,6 +505,16 @@ pub enum Statement {
     Grant(Box<GrantDef>),
     /// `SET ROLE name` / `SET SESSION AUTHORIZATION name`; `None` is `NONE` / `DEFAULT`.
     SetRole(Option<String>),
+    /// `SET @name = expr` (MySQL's user variable).
+    SetVar { name: String, expr: Expr },
+    /// `SET name = expr` where the value is an expression to evaluate.
+    SetParameterExpr { name: String, expr: Expr },
+    /// `SELECT ... INTO @a, @b`.
+    SelectInto { select: Box<Select>, vars: Vec<String> },
+    /// MySQL's `SHOW ...`.
+    Show(Box<ShowStmt>),
+    /// `PREPARE name FROM 'text'` (or from a variable).
+    PrepareText { name: String, source: Expr },
     /// `ALTER TABLE t ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY`.
     SetRls { table: String, enable: Option<bool>, force: Option<bool> },
     /// Several statements run as one (`ALTER TABLE t ADD a, DROP b`).
@@ -598,4 +608,17 @@ pub struct TableExt {
     pub partition_by: Option<(String, Vec<String>)>,
     /// `(parent, bound)` of `PARTITION OF`; the bound is saved as JSON text.
     pub partition_of: Option<(String, String)>,
+}
+
+/// A `KEY` / `INDEX` of a table definition: name, columns, whether each is descending, and whether it is unique.
+pub type IndexSpec = (Option<String>, Vec<String>, Vec<bool>, bool);
+
+/// What a MySQL `SHOW` asks for. `what` is `tables`, `databases`, `columns`, `index`, `create table`, `variables`, ...
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ShowStmt {
+    pub what: String,
+    pub target: Option<String>,
+    pub like: Option<String>,
+    pub filter: Option<Expr>,
+    pub full: bool,
 }

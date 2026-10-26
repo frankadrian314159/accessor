@@ -304,7 +304,11 @@ impl DataType {
             | "UUID" | "BOX" | "POINT" | "POLYGON" | "PATH" | "CIRCLE" | "LINE" | "LSEG" | "XML" | "PG_LSN" | "TID" | "CID" | "VARBIT"
             | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE" | "INT4MULTIRANGE" | "INT8MULTIRANGE"
             | "NUMMULTIRANGE" | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "REFCURSOR" => (DataType::Text, false),
-            "XID" | "XID8" | "OID8" => (DataType::Integer, false),
+            "XID" | "XID8" | "OID8" | "MEDIUMINT" | "INT1" | "INT3" | "YEAR" => (DataType::Integer, false),
+            // MySQL's text and binary families are all text here
+            "TINYTEXT" | "MEDIUMTEXT" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BLOB" | "VARBINARY" | "BINARY" | "GEOMETRY" | "GEOMETRYCOLLECTION"
+            | "LINESTRING" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "ENUM" | "SET" => (DataType::Text, false),
+            "DEC" | "FIXED" => (DataType::Decimal, false),
             "TIMETZ" => (DataType::TimestampTz, false),
             "CALCULATED" => (DataType::Calculated, false),
             _ => return None,

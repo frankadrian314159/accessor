@@ -4953,3 +4953,65 @@ fn policies_that_read_each_other_are_an_error_not_a_loop() {
     let e = db.execute("SELECT * FROM s1").unwrap_err().to_string();
     assert!(e.contains("infinite recursion"), "{e}");
 }
+
+#[test]
+fn mysql_syntax() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE `t1` (
+           `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+           name varchar(20) CHARACTER SET utf8 COLLATE utf8_bin DEFAULT NULL COMMENT 'x',
+           kind enum('a','b') NOT NULL DEFAULT 'a',
+           created timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+           big bigint(20) unsigned zerofill,
+           PRIMARY KEY (`id`),
+           UNIQUE KEY uname (name(10)),
+           KEY k1 (kind, big DESC),
+           INDEX (created)
+         ) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='t'",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t1 (name, kind) VALUES ('x', 'b'), ('y', 'a')").unwrap();
+    assert!(db.execute("INSERT INTO t1 (name, kind) VALUES ('z', 'c')").is_err());
+    assert!(db.execute("INSERT INTO t1 (name) VALUES ('x')").is_err());
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT count(*) FROM `t1`"), "2");
+    // user and system variables
+    db.execute("SET @a = 5, @b := @a + 1").unwrap();
+    assert_eq!(one(&mut db, "SELECT @a * @b"), "30");
+    db.execute("SELECT count(*) INTO @n FROM t1").unwrap();
+    assert_eq!(one(&mut db, "SELECT @n"), "2");
+    db.execute("SET sql_mode = 'ANSI', SESSION sort_buffer_size = 32804; SET @@group_concat_max_len = 10 * 1024").unwrap();
+    assert_eq!(one(&mut db, "SELECT @@sql_mode"), "ANSI");
+    assert_eq!(one(&mut db, "SELECT @@session.group_concat_max_len"), "10240");
+    db.execute("SET NAMES utf8mb4; SET GLOBAL foreign_key_checks = 0; USE test; FLUSH TABLES; CHECK TABLE t1").unwrap();
+    // SHOW
+    assert_eq!(one(&mut db, "SHOW TABLES"), "t1");
+    assert_eq!(db.execute("SHOW TABLES LIKE 'x%'").unwrap().rows.len(), 0);
+    assert_eq!(db.execute("SHOW COLUMNS FROM t1").unwrap().rows.len(), 5);
+    assert_eq!(db.execute("DESCRIBE t1").unwrap().rows[0][0].to_string(), "id");
+    assert!(db.execute("SHOW INDEX FROM t1").unwrap().rows.len() >= 4);
+    assert!(one(&mut db, "SHOW CREATE TABLE t1").is_empty() == false);
+    assert!(db.execute("SHOW VARIABLES LIKE 'sql_mode'").unwrap().rows.len() == 1);
+    db.execute("SHOW WARNINGS; SHOW ENGINES; SHOW DATABASES; SHOW FULL TABLES; SHOW PROCESSLIST; SHOW STATUS LIKE 'Uptime'").unwrap();
+    assert_eq!(db.execute("SHOW TABLES WHERE Tables_in_test = 't1'").unwrap().rows.len(), 1);
+    // prepared statements
+    db.execute("PREPARE s FROM 'SELECT count(*) FROM t1 WHERE name = ?'").unwrap();
+    db.execute("SET @v = 'x'").unwrap();
+    assert_eq!(one(&mut db, "EXECUTE s USING @v"), "1");
+    db.execute("SET @q = 'SELECT 7'; PREPARE s2 FROM @q").unwrap();
+    assert_eq!(one(&mut db, "EXECUTE s2"), "7");
+    db.execute("DEALLOCATE PREPARE s2").unwrap();
+    // INSERT forms
+    db.execute("INSERT IGNORE INTO t1 (id, name) VALUES (1, 'dup')").unwrap();
+    db.execute("INSERT INTO t1 SET name = 'set', kind = 'b'").unwrap();
+    db.execute("INSERT INTO t1 (id, name) VALUES (1, 'q') ON DUPLICATE KEY UPDATE name = VALUES(name)").unwrap();
+    assert_eq!(one(&mut db, "SELECT name FROM t1 WHERE id = 1"), "q");
+    db.execute("REPLACE t1 (id, name) VALUES (2, 'r')").unwrap();
+    assert_eq!(one(&mut db, "SELECT name FROM t1 WHERE id = 2"), "r");
+    // ALTER and DROP
+    db.execute("ALTER TABLE t1 ENGINE=MyISAM, ADD COLUMN extra int AFTER name, ADD KEY (extra), CONVERT TO CHARACTER SET utf8mb4").unwrap();
+    db.execute("ALTER TABLE t1 ADD COLUMN (c1 int, c2 text), MODIFY extra bigint DEFAULT 0, CHANGE c1 c1x int, DROP KEY uname").unwrap();
+    db.execute("CREATE TABLE t2 LIKE t1; CREATE TABLE t3 (a int) SELECT 1 AS b; DROP TABLES t2, t3").unwrap();
+    db.execute("CREATE DATABASE IF NOT EXISTS d1; DROP DATABASE d1; SELECT CURRENT_USER(), DATABASE(), VERSION()").unwrap();
+}

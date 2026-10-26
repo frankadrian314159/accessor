@@ -414,6 +414,9 @@ impl<'a> Binder<'a> {
         Ok(match e {
             Expr::Literal(v) => BExpr::Lit(v.clone()),
             Expr::Param(name) => {
+                if let Some(v) = self.db.session_value(name) {
+                    return Ok(BExpr::Lit(v));
+                }
                 return Err(Error::runtime(format!(
                     "the parameter @{name} has no value; run the query with EXEC and supply one"
                 )))

@@ -19,7 +19,24 @@ pub struct Column {
 /// (`DEFAULT NEXT VALUE FOR s`): this prefix, then the sequence name.
 pub const SEQUENCE_DEFAULT: &str = "\u{1}nextval:";
 
+/// Text that stands in for the default `CURRENT_TIMESTAMP`: the column gets the time of the insert.
+pub const NOW_DEFAULT: &str = "\u{1}now";
+
 impl Column {
+    /// Is the default of this column the time of the insert?
+    pub fn now_default(&self) -> bool {
+        matches!(&self.default, Some(Value::Text(s)) if &**s == NOW_DEFAULT)
+    }
+
+    /// The default as a value for a new row (the time, for `CURRENT_TIMESTAMP`).
+    pub fn default_now(&self) -> Option<Value> {
+        if !self.now_default() {
+            return self.default.clone();
+        }
+        let t = crate::datetime::now();
+        Some(if self.data_type == DataType::TimestampTz { Value::TimestampTz(t) } else { Value::DateTime(t) })
+    }
+
     /// The sequence that fills this column when no value is given.
     pub fn sequence_default(&self) -> Option<&str> {
         match &self.default {

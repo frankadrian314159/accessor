@@ -65,6 +65,7 @@ fn dollar_tag(chars: &[(usize, char)], i: usize) -> Option<String> {
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     let chars: Vec<(usize, char)> = src.char_indices().collect();
     let mut out = Vec::new();
+    let mut question = 0usize;
     let mut i = 0;
     while i < chars.len() {
         let (pos, c) = chars[i];
@@ -190,6 +191,47 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             let end = chars.get(i).map_or(src.len(), |&(p, _)| p);
             out.push(Token { tok: Tok::Param(src[chars[start].0..end].to_string()), pos });
+        } else if c == '`' {
+            // MySQL's quoted identifier; `` inside stands for one backtick
+            let mut name = String::new();
+            i += 1;
+            loop {
+                match at(i) {
+                    None => return Err(Error::syntax("unterminated `identifier`")),
+                    Some('`') if at(i + 1) == Some('`') => {
+                        name.push('`');
+                        i += 1;
+                    }
+                    Some('`') => break,
+                    Some(ch) => name.push(ch),
+                }
+                i += 1;
+            }
+            i += 1;
+            out.push(Token { tok: Tok::Quoted(name), pos });
+        } else if c == '?' {
+            // a placeholder of a prepared statement: the first is ?1, the next ?2, ...
+            question += 1;
+            i += 1;
+            out.push(Token { tok: Tok::Param(format!("?{question}")), pos });
+        } else if c == '@' && at(i + 1) == Some('@') && at(i + 2).is_some_and(is_ident_start) {
+            // @@name, @@global.name, @@session.name: a system variable
+            i += 2;
+            let mut start = i;
+            while at(i).is_some_and(is_ident_part) {
+                i += 1;
+            }
+            let mut end = chars.get(i).map_or(src.len(), |&(p, _)| p);
+            let word = src[chars[start].0..end].to_ascii_lowercase();
+            if matches!(word.as_str(), "global" | "session" | "local" | "persist" | "persist_only") && at(i) == Some('.') {
+                i += 1;
+                start = i;
+                while at(i).is_some_and(is_ident_part) {
+                    i += 1;
+                }
+                end = chars.get(i).map_or(src.len(), |&(p, _)| p);
+            }
+            out.push(Token { tok: Tok::Param(format!("@@{}", &src[chars[start].0..end])), pos });
         } else if c == '[' {
             let mut name = String::new();
             i += 1;

@@ -4,6 +4,7 @@ pub use prepared::Prepared;
 pub mod agg;
 pub mod bind;
 mod budget;
+mod mysqlshow;
 mod catalog;
 pub(crate) mod pushdown;
 mod inherit;
@@ -213,6 +214,42 @@ impl Database {
             Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
             Statement::Grant(g) => self.exec_grant(g),
             Statement::Ignored(_) => Ok(QueryResult::default()),
+            Statement::SetVar { name, expr } => {
+                let v = self.eval_const(expr)?;
+                self.user_vars.insert(name.to_ascii_lowercase(), v);
+                Ok(QueryResult::default())
+            }
+            Statement::SetParameterExpr { name, expr } => {
+                let v = self.eval_const(expr)?;
+                let text = if v.is_null() { String::new() } else { v.to_string() };
+                self.set_parameter(name, Some(&text)).map(|()| QueryResult::default())
+            }
+            Statement::SelectInto { select, vars } => {
+                let res = self.run_select(select)?;
+                if res.rows.len() > 1 {
+                    return Err(Error::runtime("Result consisted of more than one row"));
+                }
+                if let Some(row) = res.rows.into_iter().next() {
+                    if row.len() != vars.len() {
+                        return Err(Error::runtime("The used SELECT statements have a different number of columns"));
+                    }
+                    for (v, value) in vars.iter().zip(row) {
+                        self.user_vars.insert(v.to_ascii_lowercase(), value);
+                    }
+                }
+                Ok(QueryResult::default())
+            }
+            Statement::Show(show) => self.exec_show(show),
+            Statement::PrepareText { name, source } => {
+                let text = self.eval_const(source)?;
+                let sql = text.to_string();
+                let mut statements = crate::sql::parse_script(&sql)?;
+                if statements.len() != 1 {
+                    return Err(Error::runtime("PREPARE takes exactly one statement"));
+                }
+                let statement = statements.remove(0);
+                self.exec_prepare(name, &statement)
+            }
             Statement::SetRls { table, enable, force } => self.exec_set_rls(table, *enable, *force),
             Statement::Batch(list) => self.atomically(|db| {
                 let mut last = QueryResult::default();

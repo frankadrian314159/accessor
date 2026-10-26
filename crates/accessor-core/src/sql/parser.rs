@@ -23,7 +23,7 @@ const RESERVED: &[&str] = &[
 
 /// Parses a script of one or more `;`-separated statements.
 pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0 };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new() };
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -60,7 +60,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0 };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new() };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -345,6 +345,8 @@ struct Parser<'a> {
     src: &'a str,
     toks: Vec<Token>,
     pos: usize,
+    /// The variables of a `SELECT ... INTO @a, @b` just read.
+    into_vars: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -891,6 +893,593 @@ impl<'a> Parser<'a> {
         Ok(bound.to_string())
     }
 
+    /// After `INTO` in a `SELECT`: `INTO @a, @b`.
+    fn select_into_tail(&mut self) -> Result<()> {
+        if self.peek_kw("INTO") && matches!(self.peek_at(1), Tok::Param(_)) {
+            self.advance();
+            loop {
+                match self.advance() {
+                    Tok::Param(n) => self.into_vars.push(n),
+                    _ => {
+                        self.pos -= 1;
+                        return Err(self.unexpected("a variable such as @name"));
+                    }
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Does an assignment of `SET` start `n` tokens ahead (`name =`, `@name :=`, `GLOBAL name =`, `@@name =`)?
+    fn starts_assignment(&self, n: usize) -> bool {
+        let scope = |t: &Tok| matches!(t, Tok::Ident(s) if matches!(s.to_ascii_uppercase().as_str(), "GLOBAL" | "SESSION" | "LOCAL" | "PERSIST" | "PERSIST_ONLY"));
+        let at = if scope(self.peek_at(n)) { n + 1 } else { n };
+        let mut k = at;
+        // name, or a dotted name
+        match self.peek_at(k) {
+            Tok::Param(_) | Tok::Ident(_) | Tok::Quoted(_) => k += 1,
+            _ => return false,
+        }
+        while matches!(self.peek_at(k), Tok::Sym(".")) && matches!(self.peek_at(k + 1), Tok::Ident(_) | Tok::Quoted(_)) {
+            k += 2;
+        }
+        matches!(self.peek_at(k), Tok::Sym("=") | Tok::Sym(":="))
+    }
+
+    /// Everything after `SET`: PostgreSQL and MySQL forms. Several assignments joined by commas are one batch.
+    fn set_statement(&mut self) -> Result<Statement> {
+        let mut out = Vec::new();
+        loop {
+            let mut local = false;
+            let mut scoped = false;
+            if self.eat_kw("LOCAL") {
+                local = true;
+                scoped = true;
+            } else if self.peek_kw("SESSION") && !self.peek_kw_at(1, "AUTHORIZATION") && !self.peek_kw_at(1, "CHARACTERISTICS") {
+                self.advance();
+                scoped = true;
+            } else if self.eat_kw("GLOBAL") || self.eat_kw("PERSIST") || self.eat_kw("PERSIST_ONLY") {
+                scoped = true;
+            }
+            let _ = scoped;
+            if out.is_empty() {
+                if self.peek_kw("ROLE") || self.peek_kw("AUTHORIZATION") || (self.peek_kw("SESSION") && self.peek_kw_at(1, "AUTHORIZATION")) {
+                    self.eat_kw("SESSION");
+                    self.advance();
+                    return Ok(Statement::SetRole(if self.eat_kw("NONE") || self.eat_kw("DEFAULT") { None } else { Some(self.role_name()?) }));
+                }
+                if self.peek_kw("TRANSACTION") || self.peek_kw("CHARACTERISTICS") || (self.peek_kw("SESSION") && self.peek_kw_at(1, "CHARACTERISTICS")) {
+                    // `SET TRANSACTION ISOLATION LEVEL ...`, `SET SESSION CHARACTERISTICS AS ...`: there is one isolation level
+                    self.eat_kw("SESSION");
+                    let what = self.ident()?.to_ascii_lowercase();
+                    while !matches!(self.peek(), Tok::Eof) && !self.peek_sym(";") {
+                        self.advance();
+                    }
+                    return Ok(Statement::SetParameter { name: what, value: Some(String::new()), local });
+                }
+                if self.peek_kw("NAMES") || (self.peek_kw("CHARACTER") && self.peek_kw_at(1, "SET")) || self.peek_kw("CHARSET") {
+                    // SET NAMES utf8 COLLATE x, SET CHARACTER SET x: text is always UTF-8 here
+                    return Ok(self.ignore_rest("SET NAMES"));
+                }
+            }
+            match self.peek().clone() {
+                Tok::Param(p) if !p.starts_with("@@") => {
+                    // a user variable
+                    self.advance();
+                    if !self.eat_sym(":=") {
+                        self.expect_sym("=")?;
+                    }
+                    let expr = self.expr()?;
+                    out.push(Statement::SetVar { name: p, expr });
+                }
+                _ => {
+                    let name = match self.peek().clone() {
+                        Tok::Param(p) => {
+                            self.advance();
+                            p[2..].to_ascii_lowercase()
+                        }
+                        _ => self.parameter_name()?,
+                    };
+                    if !self.eat_kw("TO") && !self.eat_sym(":=") {
+                        self.expect_sym("=")?;
+                    }
+                    if self.eat_kw("DEFAULT") {
+                        out.push(Statement::SetParameter { name, value: None, local });
+                    } else {
+                        // plain words and numbers are kept as they are; anything more is an expression to evaluate
+                        let save = self.pos;
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut simple = true;
+                        loop {
+                            let negative = self.eat_sym("-");
+                            let part = match self.advance() {
+                                Tok::Str(s) | Tok::Ident(s) | Tok::Quoted(s) => s,
+                                Tok::Int(i) => i.to_string(),
+                                Tok::Dec(d) => d.to_string(),
+                                Tok::Float(f) => f.to_string(),
+                                _ => {
+                                    simple = false;
+                                    break;
+                                }
+                            };
+                            parts.push(if negative { format!("-{part}") } else { part });
+                            if self.peek_sym(",") && !self.starts_assignment(1) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                        let ends = self.at_eof() || self.peek_sym(";") || self.peek_sym(",");
+                        if simple && ends {
+                            out.push(Statement::SetParameter { name, value: Some(parts.join(", ")), local });
+                        } else {
+                            self.pos = save;
+                            let expr = self.expr()?;
+                            out.push(Statement::SetParameterExpr { name, expr });
+                        }
+                    }
+                }
+            }
+            if self.peek_sym(",") && self.starts_assignment(1) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(if out.len() == 1 { out.remove(0) } else { Statement::Batch(out) })
+    }
+
+    /// MySQL statements that are not SQL of the standard: `SHOW`, `USE`, `DESCRIBE`, `PREPARE ... FROM`,
+    /// `EXECUTE ... USING`, and the maintenance commands.
+    fn mysql_statement(&mut self) -> Result<Option<Statement>> {
+        if self.peek_kw("USE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            return Ok(Some(self.ignore_rest("USE")));
+        }
+        for w in ["FLUSH", "OPTIMIZE", "REPAIR", "PURGE", "KILL", "CHANGE", "XA", "INSTALL", "UNINSTALL", "BINLOG", "CACHE", "LOAD", "SIGNAL", "RESIGNAL", "GET", "HELP"] {
+            if self.peek_kw(w) && !(w == "LOAD" && !self.peek_kw_at(1, "INDEX") && !self.peek_kw_at(1, "DATA")) && !(w == "GET" && !self.peek_kw_at(1, "DIAGNOSTICS")) {
+                return Ok(Some(self.ignore_rest(w)));
+            }
+        }
+        if self.peek_kw("CHECK") && self.peek_kw_at(1, "TABLE") {
+            return Ok(Some(self.ignore_rest("CHECK TABLE")));
+        }
+        if self.peek_kw("CALL") && matches!(self.peek_at(1), Tok::Ident(s) if s.eq_ignore_ascii_case("mtr")) {
+            return Ok(Some(self.ignore_rest("CALL")));
+        }
+        if (self.peek_kw("DESCRIBE") || self.peek_kw("DESC")) && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            self.advance();
+            let target = Some(self.table_ident()?);
+            let mut show = ShowStmt { what: "columns".into(), target, ..ShowStmt::default() };
+            if let Tok::Ident(_) | Tok::Quoted(_) | Tok::Str(_) = self.peek() {
+                // DESCRIBE t col / 'pattern': a column to show
+                if !self.at_eof() && !self.peek_sym(";") {
+                    show.like = Some(match self.advance() {
+                        Tok::Ident(s) | Tok::Quoted(s) | Tok::Str(s) => s,
+                        _ => String::new(),
+                    });
+                }
+            }
+            return Ok(Some(Statement::Show(Box::new(show))));
+        }
+        if self.peek_kw("PREPARE") && self.peek_kw_at(2, "FROM") {
+            self.advance();
+            let name = self.ident()?;
+            self.advance();
+            let source = self.expr()?;
+            return Ok(Some(Statement::PrepareText { name, source }));
+        }
+        if self.peek_kw("EXECUTE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && self.peek_kw_at(2, "USING") {
+            self.advance();
+            let name = self.ident()?;
+            self.advance();
+            let mut args = Vec::new();
+            loop {
+                let e = self.expr()?;
+                args.push((Some(format!("?{}", args.len() + 1)), e));
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            return Ok(Some(Statement::Exec { name, args }));
+        }
+        if self.peek_kw("SHOW") {
+            return self.show_statement();
+        }
+        Ok(None)
+    }
+
+    /// MySQL's `SHOW ...`; `None` (nothing consumed) for the PostgreSQL forms `SHOW name`, `SHOW ALL`.
+    fn show_statement(&mut self) -> Result<Option<Statement>> {
+        let save = self.pos;
+        self.advance();
+        // GLOBAL / SESSION before VARIABLES and STATUS
+        if self.peek_kw("GLOBAL") || self.peek_kw("SESSION") || self.peek_kw("LOCAL") {
+            if self.peek_kw_at(1, "VARIABLES") || self.peek_kw_at(1, "STATUS") {
+                self.advance();
+            }
+        }
+        let full = self.eat_kw("FULL");
+        let mut show = ShowStmt { full, ..ShowStmt::default() };
+        let word = match self.peek().clone() {
+            Tok::Ident(w) => w.to_ascii_uppercase(),
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        let simple = match word.as_str() {
+            "TABLES" => "tables",
+            "DATABASES" | "SCHEMAS" => "databases",
+            "COLUMNS" | "FIELDS" => "columns",
+            "INDEX" | "INDEXES" | "KEYS" => "index",
+            "VARIABLES" => "variables",
+            "STATUS" => "status",
+            "WARNINGS" => "warnings",
+            "ERRORS" => "errors",
+            "ENGINES" => "engines",
+            "COLLATION" => "collation",
+            "CHARSET" => "character set",
+            "PROCESSLIST" | "GRANTS" | "PRIVILEGES" | "PLUGINS" | "TRIGGERS" | "EVENTS" | "PROFILES" | "PROFILE" | "REPLICAS" | "REPLICA" | "SLAVE" | "MASTER" | "BINARY" | "BINLOG"
+            | "RELAYLOG" | "OPEN" | "FUNCTION" | "PROCEDURE" | "ENGINE" | "STORAGE" | "COUNT" | "PARSE_TREE" => "other",
+            "CHARACTER" if self.peek_kw_at(1, "SET") => "character set",
+            "TABLE" if self.peek_kw_at(1, "STATUS") => "table status",
+            "CREATE" => "create",
+            _ => {
+                self.pos = save;
+                return Ok(None);
+            }
+        };
+        show.what = simple.to_string();
+        match simple {
+            "other" => {
+                let w = word.to_ascii_lowercase();
+                while !self.at_eof() && !self.peek_sym(";") {
+                    self.advance();
+                }
+                show.what = format!("other {w}");
+            }
+            "create" => {
+                self.advance();
+                let kind = self.role_name()?.to_ascii_lowercase();
+                show.what = format!("create {kind}");
+                show.target = Some(self.table_ident()?);
+            }
+            "character set" => {
+                self.advance();
+                if word == "CHARACTER" {
+                    self.advance();
+                }
+                self.show_filters(&mut show)?;
+            }
+            "table status" => {
+                self.advance();
+                self.advance();
+                self.show_from(&mut show)?;
+                self.show_filters(&mut show)?;
+            }
+            "columns" | "index" => {
+                self.advance();
+                if !self.eat_kw("FROM") && !self.eat_kw("IN") {
+                    return Err(self.unexpected("FROM"));
+                }
+                let t = self.table_ident()?;
+                show.target = Some(t);
+                self.show_from(&mut show)?;
+                self.show_filters(&mut show)?;
+            }
+            "warnings" | "errors" => {
+                self.advance();
+                if self.eat_kw("LIMIT") {
+                    self.usize_literal()?;
+                    if self.eat_sym(",") {
+                        self.usize_literal()?;
+                    }
+                }
+            }
+            _ => {
+                self.advance();
+                if simple == "tables" || simple == "databases" {
+                    self.show_from(&mut show)?;
+                }
+                self.show_filters(&mut show)?;
+            }
+        }
+        Ok(Some(Statement::Show(Box::new(show))))
+    }
+
+    /// `FROM db` / `IN db`: a schema, which qualifies the table asked about.
+    fn show_from(&mut self, show: &mut ShowStmt) -> Result<()> {
+        if self.eat_kw("FROM") || self.eat_kw("IN") {
+            let db = self.ident()?;
+            if !db.eq_ignore_ascii_case("test") && !db.eq_ignore_ascii_case("public") {
+                match &mut show.target {
+                    Some(t) if !t.contains('.') => *t = format!("{db}.{t}"),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn show_filters(&mut self, show: &mut ShowStmt) -> Result<()> {
+        if self.eat_kw("LIKE") {
+            match self.advance() {
+                Tok::Str(s) => show.like = Some(s),
+                _ => {
+                    self.pos -= 1;
+                    return Err(self.unexpected("a pattern in quotes"));
+                }
+            }
+        } else if self.eat_kw("WHERE") {
+            show.filter = Some(self.expr()?);
+        }
+        Ok(())
+    }
+
+    /// A default that is not a constant (`CURRENT_TIMESTAMP`, `NOW()`, `(expression)`) is read and not applied.
+    fn skip_default_expr(&mut self) -> Result<()> {
+        if self.peek_sym("(") {
+            return self.skip_parens();
+        }
+        self.advance();
+        if self.peek_sym("(") {
+            self.skip_parens()?;
+        }
+        Ok(())
+    }
+
+    /// `(col [(length)] [ASC | DESC], ...)` of a key.
+    fn key_columns(&mut self) -> Result<(Vec<String>, Vec<bool>)> {
+        self.expect_sym("(")?;
+        let (mut cols, mut desc) = (Vec::new(), Vec::new());
+        loop {
+            if self.peek_sym("(") {
+                return Err(Error::syntax("an index on an expression is not supported; index the column"));
+            }
+            cols.push(self.ident()?);
+            if self.peek_sym("(") {
+                self.skip_parens()?; // a prefix length
+            }
+            desc.push(self.index_direction());
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        Ok((cols, desc))
+    }
+
+    /// Is the next table element a key (`KEY`, `INDEX`, `UNIQUE ...`, `PRIMARY KEY`, `FULLTEXT`, `CONSTRAINT n PRIMARY KEY`)?
+    fn is_key_element(&self) -> bool {
+        let mut k = 0;
+        if self.peek_kw("CONSTRAINT") {
+            k = 1;
+            if !(self.peek_kw_at(1, "PRIMARY") || self.peek_kw_at(1, "UNIQUE") || self.peek_kw_at(1, "FOREIGN") || self.peek_kw_at(1, "CHECK")) {
+                k = 2;
+            }
+        }
+        (self.peek_kw_at(k, "PRIMARY") && self.peek_kw_at(k + 1, "KEY"))
+            || self.peek_kw_at(k, "UNIQUE")
+            || ((self.peek_kw_at(k, "KEY") || self.peek_kw_at(k, "INDEX")) && !matches!(self.peek_at(k + 1), Tok::Sym(",") | Tok::Sym(")")) && k == 0)
+            || ((self.peek_kw_at(k, "FULLTEXT") || self.peek_kw_at(k, "SPATIAL")) && (self.peek_kw_at(k + 1, "KEY") || self.peek_kw_at(k + 1, "INDEX")))
+    }
+
+    fn key_element(&mut self, primary_key: &mut Vec<String>, uniques: &mut Vec<Vec<String>>, indexes: &mut Vec<IndexSpec>) -> Result<()> {
+        if self.eat_kw("CONSTRAINT") && !(self.peek_kw("PRIMARY") || self.peek_kw("UNIQUE")) {
+            self.ident()?;
+        }
+        let primary = self.eat_kw("PRIMARY");
+        let unique = !primary && self.eat_kw("UNIQUE");
+        if !primary && !unique {
+            self.eat_kw("FULLTEXT");
+            self.eat_kw("SPATIAL");
+        }
+        if !self.eat_kw("KEY") {
+            self.eat_kw("INDEX");
+        }
+        let name = if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && !self.peek_kw("USING") { Some(self.ident()?) } else { None };
+        if self.eat_kw("USING") {
+            self.ident()?;
+        }
+        let (cols, desc) = self.key_columns()?;
+        // USING BTREE, COMMENT 'x', KEY_BLOCK_SIZE = n, VISIBLE, WITH PARSER p
+        while self.eat_kw("USING") || self.eat_kw("COMMENT") || self.eat_kw("KEY_BLOCK_SIZE") || self.eat_kw("VISIBLE") || self.eat_kw("INVISIBLE") || (self.peek_kw("WITH") && self.peek_kw_at(1, "PARSER") && self.eat_kw("WITH") && self.eat_kw("PARSER")) {
+            self.eat_sym("=");
+            if !matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")) {
+                self.advance();
+            }
+        }
+        if primary {
+            *primary_key = cols;
+        } else if unique {
+            if name.is_some() || desc.iter().any(|d| *d) {
+                indexes.push((name, cols, desc, true));
+            } else {
+                uniques.push(cols);
+            }
+        } else {
+            indexes.push((name, cols, desc, false));
+        }
+        Ok(())
+    }
+
+    /// One MySQL table option after `)`: `ENGINE = InnoDB`, `DEFAULT CHARSET = utf8mb4`, `AUTO_INCREMENT = 5`, ...
+    fn table_option(&mut self) -> Result<bool> {
+        let Tok::Ident(w) = self.peek().clone() else { return Ok(false) };
+        let up = w.to_ascii_uppercase();
+        const OPTIONS: [&str; 33] = [
+            "ENGINE", "CHARSET", "CHARACTER", "COLLATE", "AUTO_INCREMENT", "COMMENT", "ROW_FORMAT", "KEY_BLOCK_SIZE", "MAX_ROWS", "MIN_ROWS", "PACK_KEYS",
+            "CHECKSUM", "TABLE_CHECKSUM", "DELAY_KEY_WRITE", "STATS_AUTO_RECALC", "STATS_PERSISTENT", "STATS_SAMPLE_PAGES", "INSERT_METHOD", "UNION",
+            "CONNECTION", "PASSWORD", "COMPRESSION", "ENCRYPTION", "SECONDARY_ENGINE", "SECONDARY_ENGINE_ATTRIBUTE", "ENGINE_ATTRIBUTE", "STORAGE", "DEFAULT",
+            "DATA", "INDEX", "AVG_ROW_LENGTH", "AUTOEXTEND_SIZE", "START",
+        ];
+        if !OPTIONS.contains(&up.as_str()) {
+            return Ok(false);
+        }
+        if up == "DEFAULT" {
+            self.advance();
+            return Ok(true);
+        }
+        if (up == "DATA" || up == "INDEX") && !self.peek_kw_at(1, "DIRECTORY") {
+            return Ok(false);
+        }
+        if up == "START" {
+            return Ok(false);
+        }
+        self.advance();
+        if up == "CHARACTER" {
+            self.expect_kw("SET")?;
+        }
+        if up == "DATA" || up == "INDEX" {
+            self.advance(); // DIRECTORY
+        }
+        self.eat_sym("=");
+        if self.peek_sym("(") {
+            self.skip_parens()?;
+        } else {
+            self.advance();
+        }
+        Ok(true)
+    }
+
+    /// The MySQL forms of `ALTER TABLE` actions; `None` (nothing consumed) when it is not one of them.
+    fn mysql_alter_action(&mut self, table: &str) -> Result<Option<Statement>> {
+        let table = table.to_string();
+        // table options and maintenance: read and ignored
+        const IGNORED: [&str; 31] = [
+            "ENGINE", "CONVERT", "CHARACTER", "CHARSET", "COLLATE", "AUTO_INCREMENT", "COMMENT", "ROW_FORMAT", "ALGORITHM", "LOCK", "KEY_BLOCK_SIZE",
+            "STATS_AUTO_RECALC", "STATS_PERSISTENT", "STATS_SAMPLE_PAGES", "PACK_KEYS", "CHECKSUM", "MAX_ROWS", "MIN_ROWS", "DELAY_KEY_WRITE", "ORDER",
+            "WITH", "WITHOUT", "ANALYZE", "OPTIMIZE", "REBUILD", "REORGANIZE", "EXCHANGE", "DISCARD", "IMPORT", "COALESCE", "REMOVE",
+        ];
+        let first = match self.peek() {
+            Tok::Ident(w) => w.to_ascii_uppercase(),
+            _ => return Ok(None),
+        };
+        let ignored = IGNORED.contains(&first.as_str()) || (first == "DEFAULT" && (self.peek_kw_at(1, "CHARACTER") || self.peek_kw_at(1, "CHARSET") || self.peek_kw_at(1, "COLLATE")));
+        if ignored {
+            let mut depth = 0;
+            while !self.at_eof() && !self.peek_sym(";") && !(depth == 0 && self.peek_sym(",")) {
+                match self.advance() {
+                    Tok::Sym("(") => depth += 1,
+                    Tok::Sym(")") => depth -= 1,
+                    _ => {}
+                }
+            }
+            return Ok(Some(Statement::Ignored("ALTER TABLE".into())));
+        }
+        let position = |p: &mut Self| {
+            // FIRST | AFTER column
+            if p.eat_kw("FIRST") {
+            } else if p.eat_kw("AFTER") {
+                let _ = p.ident();
+            }
+        };
+        if self.peek_kw("ADD") {
+            // ADD [COLUMN] (def, def, ...)
+            let k = if self.peek_kw_at(1, "COLUMN") { 2 } else { 1 };
+            if matches!(self.peek_at(k), Tok::Sym("(")) {
+                self.advance();
+                if k == 2 {
+                    self.advance();
+                }
+                self.advance();
+                let mut all = Vec::new();
+                loop {
+                    all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::AddColumn(self.column_def()?) });
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                return Ok(Some(Statement::Batch(all)));
+            }
+            // ADD [CONSTRAINT [n]] PRIMARY KEY | UNIQUE [KEY] | [FULLTEXT | SPATIAL] KEY | INDEX
+            let mut look = 1;
+            if self.peek_kw_at(1, "CONSTRAINT") {
+                look = if self.peek_kw_at(2, "PRIMARY") || self.peek_kw_at(2, "UNIQUE") { 2 } else { 3 };
+            }
+            let is_key = self.peek_kw_at(look, "PRIMARY") && self.peek_kw_at(look + 1, "KEY")
+                || self.peek_kw_at(look, "UNIQUE")
+                || self.peek_kw_at(look, "KEY")
+                || self.peek_kw_at(look, "INDEX")
+                || self.peek_kw_at(look, "FULLTEXT")
+                || self.peek_kw_at(look, "SPATIAL");
+            if is_key {
+                self.advance();
+                let (mut pk, mut uniques, mut indexes) = (Vec::new(), Vec::new(), Vec::new());
+                let primary = self.peek_kw("PRIMARY") || (self.peek_kw("CONSTRAINT") && (self.peek_kw_at(1, "PRIMARY") || self.peek_kw_at(2, "PRIMARY")));
+                let unique = self.peek_kw("UNIQUE") || (self.peek_kw("CONSTRAINT") && (self.peek_kw_at(1, "UNIQUE") || self.peek_kw_at(2, "UNIQUE")));
+                let before = self.pos;
+                self.key_element(&mut pk, &mut uniques, &mut indexes)?;
+                let _ = before;
+                let (name, columns, descending, is_unique) = if primary {
+                    (Some(format!("{}_pkey", table.replace('.', "_"))), pk.clone(), Vec::new(), true)
+                } else if let Some(u) = uniques.pop() {
+                    (None, u, Vec::new(), true)
+                } else if let Some((n, c, d, u)) = indexes.pop() {
+                    (n, c, d, u)
+                } else {
+                    return Err(Error::syntax("expected a key definition"));
+                };
+                let _ = unique;
+                let name = name.unwrap_or_else(|| format!("{}_{}_idx", table.replace('.', "_"), columns.join("_")));
+                return Ok(Some(Statement::CreateIndex { name, table, columns, descending, unique: is_unique }));
+            }
+        }
+        if self.peek_kw("DROP") && (self.peek_kw_at(1, "KEY") || self.peek_kw_at(1, "INDEX") || (self.peek_kw_at(1, "PRIMARY") && self.peek_kw_at(2, "KEY"))) {
+            self.advance();
+            if self.eat_kw("PRIMARY") {
+                self.advance();
+                return Ok(Some(Statement::DropIndex { name: format!("{}_pkey", table.replace('.', "_")), table: Some(table) }));
+            }
+            self.advance();
+            let name = self.ident()?;
+            return Ok(Some(Statement::DropIndex { name, table: Some(table) }));
+        }
+        if self.peek_kw("DROP") && self.peek_kw_at(1, "FOREIGN") && self.peek_kw_at(2, "KEY") {
+            self.advance();
+            self.advance();
+            self.advance();
+            return Ok(Some(Statement::AlterTable { table, action: AlterAction::DropConstraint(self.ident()?) }));
+        }
+        if self.peek_kw("MODIFY") || self.peek_kw("CHANGE") {
+            let change = self.peek_kw("CHANGE");
+            self.advance();
+            self.eat_kw("COLUMN");
+            let old = self.ident()?;
+            let mut def = self.column_def_after_name(change, &old)?;
+            position(self);
+            let mut all = Vec::new();
+            if change && !def.name.eq_ignore_ascii_case(&old) {
+                all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::RenameColumn { from: old.clone(), to: def.name.clone() } });
+            }
+            def.name = if change { def.name } else { old };
+            all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::AlterColumn { name: def.name.clone(), data_type: def.data_type } });
+            all.push(Statement::AlterTable { table, action: AlterAction::SetNotNull { name: def.name.clone(), not_null: def.not_null } });
+            return Ok(Some(Statement::Batch(all)));
+        }
+        if self.peek_kw("RENAME") && !self.peek_kw_at(1, "COLUMN") && !self.peek_kw_at(1, "KEY") && !self.peek_kw_at(1, "INDEX") && !self.peek_kw_at(1, "TO") {
+            self.advance();
+            self.eat_kw("AS");
+            return Ok(Some(Statement::AlterTable { table, action: AlterAction::RenameTable(self.ident()?) }));
+        }
+        Ok(None)
+    }
+
+    /// The definition of a column after its name has been read (for `MODIFY`, and `CHANGE` which names it again).
+    fn column_def_after_name(&mut self, change: bool, old: &str) -> Result<ColumnDef> {
+        if change {
+            return self.column_def();
+        }
+        // `MODIFY name type ...`: put the name back in front by reading as a definition of `old`
+        let at = self.pos;
+        self.toks.insert(at, Token { tok: Tok::Quoted(old.to_string()), pos: self.toks[at].pos });
+        self.column_def()
+    }
+
     fn peek_is_alias(&self) -> bool {
         match self.peek() {
             Tok::Quoted(_) => true,
@@ -945,6 +1534,34 @@ impl<'a> Parser<'a> {
             };
             st = Statement::Upsert { insert: Box::new(st), conflict: Conflict { target, action } };
         }
+        if matches!(st, Statement::Insert { .. }) && self.peek_kw("ON") && self.peek_kw_at(1, "DUPLICATE") {
+            // ON DUPLICATE KEY UPDATE a = VALUES(a) + 1: ON CONFLICT DO UPDATE, VALUES(a) being the new row's a
+            self.advance();
+            self.advance();
+            self.expect_kw("KEY")?;
+            self.expect_kw("UPDATE")?;
+            let mut sets = Vec::new();
+            loop {
+                let col = self.column_name()?;
+                self.expect_sym("=")?;
+                let mut e = self.expr()?;
+                let _ = crate::sql::walk::walk_expr(&mut e, &mut |x| {
+                    if let Expr::Function { name, args, .. } = x {
+                        if name.eq_ignore_ascii_case("VALUES") {
+                            if let [Expr::Column { name: c, .. }] = args.as_slice() {
+                                *x = Expr::Column { table: Some("EXCLUDED".into()), name: c.clone() };
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+                sets.push((col, e));
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            st = Statement::Upsert { insert: Box::new(st), conflict: Conflict { target: Vec::new(), action: ConflictAction::Update { sets, filter: None } } };
+        }
         if self.peek_kw("RETURNING")
             && matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_) | Statement::Upsert { .. })
         {
@@ -969,11 +1586,29 @@ impl<'a> Parser<'a> {
             }
         }
         if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_kw("TRANSFORM") || self.peek_sym("(") {
-            return Ok(Statement::Select(self.select()?));
+            self.into_vars.clear();
+            let select = self.select()?;
+            self.select_into_tail()?;
+            if !self.into_vars.is_empty() {
+                return Ok(Statement::SelectInto { select: Box::new(select), vars: std::mem::take(&mut self.into_vars) });
+            }
+            return Ok(Statement::Select(select));
         }
         if self.eat_kw("INSERT") {
+            // MySQL: INSERT [LOW_PRIORITY | DELAYED | HIGH_PRIORITY] [IGNORE] [INTO]
+            let mut ignore = false;
+            loop {
+                if self.eat_kw("LOW_PRIORITY") || self.eat_kw("DELAYED") || self.eat_kw("HIGH_PRIORITY") {
+                } else if self.eat_kw("IGNORE") {
+                    ignore = true;
+                } else {
+                    break;
+                }
+            }
             // SQLite spellings: INSERT OR REPLACE / INSERT OR IGNORE.
-            let action = if self.eat_kw("OR") {
+            let action = if ignore {
+                Some(ConflictAction::Nothing)
+            } else if self.eat_kw("OR") {
                 if self.eat_kw("REPLACE") {
                     Some(ConflictAction::Replace)
                 } else {
@@ -989,7 +1624,7 @@ impl<'a> Parser<'a> {
                 None => st,
             });
         }
-        if self.peek_kw("REPLACE") && self.peek_kw_at(1, "INTO") {
+        if self.peek_kw("REPLACE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
             self.advance();
             let st = self.insert()?;
             return Ok(Statement::Upsert { insert: Box::new(st), conflict: Conflict { target: Vec::new(), action: ConflictAction::Replace } });
@@ -1048,52 +1683,12 @@ impl<'a> Parser<'a> {
             let sel = Box::new(self.select()?);
             return Ok(if analyze { Statement::ExplainAnalyze(sel) } else { Statement::Explain(sel) });
         }
-        if self.peek_kw("SET") && !self.peek_kw_at(1, "TIME") && !self.peek_kw_at(1, "TIMEZONE") && !self.peek_kw_at(1, "CONSTRAINTS") && !matches!(self.peek_at(1), Tok::Param(_)) {
+        if self.peek_kw("SET") && !self.peek_kw_at(1, "TIME") && !self.peek_kw_at(1, "TIMEZONE") && !self.peek_kw_at(1, "CONSTRAINTS") {
             self.advance();
-            let local = self.eat_kw("LOCAL");
-            if !local {
-                self.eat_kw("SESSION");
-            }
-            if self.peek_kw("ROLE") || self.peek_kw("AUTHORIZATION") || (self.peek_kw("SESSION") && self.peek_kw_at(1, "AUTHORIZATION")) {
-                self.eat_kw("SESSION");
-                self.advance();
-                return Ok(Statement::SetRole(if self.eat_kw("NONE") || self.eat_kw("DEFAULT") { None } else { Some(self.role_name()?) }));
-            }
-            if self.peek_kw("TRANSACTION") || self.peek_kw("CHARACTERISTICS") {
-                // `SET TRANSACTION ISOLATION LEVEL ...`, `SET SESSION CHARACTERISTICS AS ...`, `SET ROLE x`: there is one
-                // user and one isolation level, so these are read and ignored
-                let what = self.ident()?.to_ascii_lowercase();
-                while !matches!(self.peek(), Tok::Eof) && !self.peek_sym(";") {
-                    self.advance();
-                }
-                return Ok(Statement::SetParameter { name: what, value: Some(String::new()), local });
-            }
-            let name = self.parameter_name()?;
-            if !self.eat_kw("TO") {
-                self.expect_sym("=")?;
-            }
-            if self.eat_kw("DEFAULT") {
-                return Ok(Statement::SetParameter { name, value: None, local });
-            }
-            let mut parts: Vec<String> = Vec::new();
-            loop {
-                let negative = self.eat_sym("-");
-                let part = match self.advance() {
-                    Tok::Str(s) | Tok::Ident(s) | Tok::Quoted(s) => s,
-                    Tok::Int(i) => i.to_string(),
-                    Tok::Dec(d) => d.to_string(),
-                    Tok::Float(f) => f.to_string(),
-                    _ => {
-                        self.pos = self.pos.saturating_sub(1);
-                        return Err(self.unexpected("a value for the parameter"));
-                    }
-                };
-                parts.push(if negative { format!("-{part}") } else { part });
-                if !self.eat_sym(",") {
-                    break;
-                }
-            }
-            return Ok(Statement::SetParameter { name, value: Some(parts.join(", ")), local });
+            return self.set_statement();
+        }
+        if let Some(st) = self.mysql_statement()? {
+            return Ok(st);
         }
         if self.eat_kw("RESET") {
             if self.eat_kw("SESSION") {
@@ -1353,8 +1948,25 @@ impl<'a> Parser<'a> {
     }
 
     fn insert(&mut self) -> Result<Statement> {
-        self.expect_kw("INTO")?;
+        self.eat_kw("INTO");
         let table = self.table_ident()?;
+        if self.peek_kw("PARTITION") && matches!(self.peek_at(1), Tok::Sym("(")) {
+            self.advance();
+            self.skip_parens()?;
+        }
+        if self.eat_kw("SET") {
+            // INSERT INTO t SET a = 1, b = 2
+            let (mut cols, mut row) = (Vec::new(), Vec::new());
+            loop {
+                cols.push(self.column_name()?);
+                self.expect_sym("=")?;
+                row.push(self.values_item()?);
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            return Ok(Statement::Insert { table, columns: Some(cols), source: InsertSource::Values(vec![row]) });
+        }
         let mut columns = None;
         if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") && !self.peek_kw_at(1, "WITH") {
             self.advance();
@@ -2171,8 +2783,19 @@ impl<'a> Parser<'a> {
         if self.peek_kw("PARTITION") && self.peek_kw_at(1, "OF") {
             return self.create_partition(name);
         }
-        if self.peek_kw("AS") {
+        if self.peek_kw("LIKE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            // CREATE TABLE t LIKE other
             self.advance();
+            let other = self.table_ident()?;
+            let create = Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() };
+            return Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: vec![other], partition_by: None, partition_of: None })));
+        }
+        if self.peek_kw("AS") || self.peek_kw("SELECT") || ((self.peek_kw("IGNORE") || self.peek_kw("REPLACE")) && self.peek_kw_at(1, "SELECT")) {
+            if !self.peek_kw("SELECT") && !self.peek_kw("IGNORE") && !self.peek_kw("REPLACE") {
+                self.advance();
+            } else if !self.peek_kw("SELECT") {
+                self.advance();
+            }
             let query = Box::new(self.select()?);
             let mut with_data = true;
             if self.eat_kw("WITH") {
@@ -2182,7 +2805,8 @@ impl<'a> Parser<'a> {
             return Ok(Statement::CreateTableAs { name, query, with_data });
         }
         self.pos = save;
-        let (st, likes) = self.create_table_core()?;
+        let (st, likes, indexes) = self.create_table_core()?;
+        let mut trailing_select: Option<Box<Select>> = None;
         let mut parents = Vec::new();
         let mut partition_by = None;
         loop {
@@ -2201,6 +2825,13 @@ impl<'a> Parser<'a> {
                 self.skip_parens()?;
             } else if self.eat_kw("TABLESPACE") || self.eat_kw("USING") {
                 self.ident()?;
+            } else if self.table_option()? {
+            } else if self.peek_kw("SELECT") || (self.peek_kw("AS") && self.peek_kw_at(1, "SELECT")) {
+                // CREATE TABLE t (cols) SELECT ...: the rows of the query go in after the table is made
+                self.eat_kw("AS");
+                trailing_select = Some(Box::new(self.select()?));
+                break;
+            } else if self.eat_sym(",") {
             } else if self.peek_kw("ON") && self.peek_kw_at(1, "COMMIT") {
                 while !self.at_eof() && !self.peek_sym(";") {
                     self.advance();
@@ -2209,10 +2840,28 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        if parents.is_empty() && partition_by.is_none() && likes.is_empty() {
-            return Ok(st);
+        let table_name = match &st {
+            Statement::CreateTable { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        let main = if parents.is_empty() && partition_by.is_none() && likes.is_empty() {
+            st
+        } else {
+            Statement::CreateTableExt(Box::new(TableExt { create: st, parents, likes, partition_by, partition_of: None }))
+        };
+        if indexes.is_empty() && trailing_select.is_none() {
+            return Ok(main);
         }
-        Ok(Statement::CreateTableExt(Box::new(TableExt { create: st, parents, likes, partition_by, partition_of: None })))
+        // KEY / INDEX in the table definition: indexes made after the table
+        let mut all = vec![main];
+        if let Some(q) = trailing_select {
+            all.push(Statement::Insert { table: table_name.clone(), columns: None, source: InsertSource::Select(q) });
+        }
+        for (n, cols, descending, unique) in indexes {
+            let name = n.unwrap_or_else(|| format!("{}_{}_idx", table_name.replace('.', "_"), cols.join("_")));
+            all.push(Statement::CreateIndex { name, table: table_name.clone(), columns: cols, descending, unique });
+        }
+        Ok(Statement::Batch(all))
     }
 
     fn skip_parens(&mut self) -> Result<()> {
@@ -2317,13 +2966,14 @@ impl<'a> Parser<'a> {
         Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: Vec::new(), partition_by, partition_of: Some((parent, bound.to_string())) })))
     }
 
-    fn create_table_core(&mut self) -> Result<(Statement, Vec<String>)> {
+    fn create_table_core(&mut self) -> Result<(Statement, Vec<String>, Vec<IndexSpec>)> {
         let name = self.table_ident()?;
         self.expect_sym("(")?;
         if self.eat_sym(")") {
             // a table with no columns of its own (all of them inherited)
-            return Ok((Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() }, Vec::new()));
+            return Ok((Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() }, Vec::new(), Vec::new()));
         }
+        let mut indexes: Vec<IndexSpec> = Vec::new();
         let mut likes = Vec::new();
         let mut columns = Vec::new();
         let mut primary_key = Vec::new();
@@ -2342,19 +2992,10 @@ impl<'a> Parser<'a> {
                 while !self.at_eof() && !self.peek_sym(",") && !self.peek_sym(")") {
                     self.advance(); // INCLUDING ALL, EXCLUDING DEFAULTS, ...
                 }
+            } else if self.is_key_element() {
+                self.key_element(&mut primary_key, &mut uniques, &mut indexes)?;
             } else if self.peek_kw("FOREIGN") || self.peek_kw("CONSTRAINT") {
                 foreign_keys.push(self.table_foreign_key()?);
-            } else if self.peek_kw("PRIMARY") {
-                self.advance();
-                self.expect_kw("KEY")?;
-                self.expect_sym("(")?;
-                primary_key = self.ident_list()?;
-                self.expect_sym(")")?;
-            } else if self.peek_kw("UNIQUE") && matches!(self.peek_at(1), Tok::Sym("(")) {
-                self.advance();
-                self.advance();
-                uniques.push(self.ident_list()?);
-                self.expect_sym(")")?;
             } else {
                 columns.push(self.column_def()?);
             }
@@ -2368,7 +3009,7 @@ impl<'a> Parser<'a> {
                 checks.push((None, text));
             }
         }
-        Ok((Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks }, likes))
+        Ok((Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks }, likes, indexes))
     }
 
     /// `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES ...`
@@ -2515,6 +3156,26 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         let type_name = self.type_name()?;
         let user = crate::sql::usertypes::lookup(&type_name);
+        // ENUM('a', 'b') and SET('a', 'b'): text that must be one of the labels
+        let mut labels: Option<Vec<String>> = None;
+        if (type_name.eq_ignore_ascii_case("ENUM") || type_name.eq_ignore_ascii_case("SET")) && self.peek_sym("(") {
+            self.advance();
+            let mut l = Vec::new();
+            loop {
+                match self.advance() {
+                    Tok::Str(s) => l.push(s),
+                    _ => {
+                        self.pos -= 1;
+                        return Err(self.unexpected("a label in quotes"));
+                    }
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.expect_sym(")")?;
+            labels = Some(l).filter(|_| type_name.eq_ignore_ascii_case("ENUM"));
+        }
         let (data_type, autonumber) = match &user {
             Some(u) => DataType::from_sql_name(&u.base).ok_or_else(|| Error::syntax(format!("unknown data type '{}'", u.base)))?,
             None => DataType::from_sql_name(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?,
@@ -2529,6 +3190,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
+        while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") {}
         let mut def = ColumnDef {
             name,
             data_type,
@@ -2541,6 +3203,10 @@ impl<'a> Parser<'a> {
             expression,
             check: None,
         };
+        if let Some(l) = labels {
+            let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();
+            def.check = Some(format!("{} IN ({})", def.name, list.join(", ")));
+        }
         if let Some(u) = user {
             // a domain or an enum: its base type, and what it requires of the column
             def.not_null = u.not_null;
@@ -2591,13 +3257,45 @@ impl<'a> Parser<'a> {
                 self.expect_kw("KEY")?;
                 def.primary_key = true;
             } else if self.eat_kw("UNIQUE") {
+                self.eat_kw("KEY");
                 def.unique = true;
+            } else if self.peek_kw("KEY") {
+                self.advance();
+                def.primary_key = true;
+            } else if self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("VISIBLE") || self.eat_kw("INVISIBLE") {
+            } else if self.eat_kw("CHARACTER") {
+                self.expect_kw("SET")?;
+                self.advance();
+            } else if self.eat_kw("CHARSET") || self.eat_kw("COLLATE") || self.eat_kw("STORAGE") || self.eat_kw("COLUMN_FORMAT") {
+                self.advance();
+            } else if self.eat_kw("COMMENT") {
+                self.advance();
+            } else if self.peek_kw("ON") && self.peek_kw_at(1, "UPDATE") {
+                // ON UPDATE CURRENT_TIMESTAMP: not done by the engine
+                self.advance();
+                self.advance();
+                self.skip_default_expr()?;
+            } else if self.eat_kw("AUTO_INCREMENT") {
+                def.autonumber = true;
             } else if self.eat_kw("REFERENCES") {
                 def.references = Some(self.references_clause(None, vec![def.name.clone()])?);
             } else if self.eat_kw("AUTOINCREMENT") || self.eat_kw("IDENTITY") {
                 def.autonumber = true;
             } else if self.eat_kw("DEFAULT") {
-                def.default = Some(self.default_value()?);
+                let save = self.pos;
+                match self.default_value() {
+                    Ok(v) => def.default = Some(v),
+                    Err(_) => {
+                        // DEFAULT CURRENT_TIMESTAMP is the time of the insert; other expressions are read and not applied
+                        self.pos = save;
+                        let now = matches!(self.peek(), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(), "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE"))
+                            && matches!(def.data_type, DataType::DateTime | DataType::TimestampTz);
+                        self.skip_default_expr()?;
+                        if now {
+                            def.default = Some(Value::text(crate::schema::NOW_DEFAULT));
+                        }
+                    }
+                }
             } else {
                 break;
             }
@@ -2729,6 +3427,9 @@ impl<'a> Parser<'a> {
                 return Ok(Statement::SetRls { table, enable, force });
             }
         }
+        if let Some(st) = self.mysql_alter_action(&table)? {
+            return Ok(st);
+        }
         // properties of a server table that mean nothing here
         if self.peek_kw("ENABLE") || self.peek_kw("DISABLE") || self.peek_kw("FORCE") || self.peek_kw("NO") && self.peek_kw_at(1, "FORCE")
             || self.peek_kw("OWNER") || self.peek_kw("REPLICA") || self.peek_kw("CLUSTER") || self.peek_kw("SET") && !self.peek_kw_at(1, "DATA") && !self.peek_kw_at(1, "DEFAULT")
@@ -2768,7 +3469,13 @@ impl<'a> Parser<'a> {
                 AlterAction::AddForeignKey(self.table_foreign_key()?)
             } else {
                 self.eat_kw("COLUMN");
-                AlterAction::AddColumn(self.column_def()?)
+                let def = self.column_def()?;
+                // MySQL: FIRST | AFTER column
+                if self.eat_kw("FIRST") {
+                } else if self.eat_kw("AFTER") {
+                    self.ident()?;
+                }
+                AlterAction::AddColumn(def)
             }
         } else if self.eat_kw("DROP") {
             if self.eat_kw("CONSTRAINT") {
@@ -2886,7 +3593,8 @@ impl<'a> Parser<'a> {
         if let Some(st) = self.drop_catalog_object(guarded)? {
             return Ok(st);
         }
-        if self.eat_kw("TABLE") {
+        self.eat_kw("TEMPORARY");
+        if self.eat_kw("TABLE") || self.eat_kw("TABLES") {
             self.if_exists_clause(false, guarded)?;
             let mut names = vec![self.table_ident()?];
             while self.eat_sym(",") {
@@ -3108,6 +3816,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.select_into_tail()?;
         if self.eat_kw("FROM") {
             sel.from = Some(self.from_clause()?);
         }
@@ -3870,6 +4579,17 @@ impl<'a> Parser<'a> {
             }
             Tok::Quoted(_) => self.column_ref(),
             Tok::Ident(name) => {
+                // VALUES(col) in ON DUPLICATE KEY UPDATE
+                if name.eq_ignore_ascii_case("VALUES") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                    self.advance();
+                    self.advance();
+                    let mut args = vec![self.expr()?];
+                    while self.eat_sym(",") {
+                        args.push(self.expr()?);
+                    }
+                    self.expect_sym(")")?;
+                    return Ok(Expr::Function { name: "VALUES".into(), args, distinct: false, star: false });
+                }
                 // pg_catalog.lower(x), public.f(x): the schema of a function is left off
                 if matches!(self.peek_at(1), Tok::Sym(".")) && matches!(self.peek_at(2), Tok::Ident(_)) && matches!(self.peek_at(3), Tok::Sym("("))
                     && (name.eq_ignore_ascii_case("pg_catalog") || name.eq_ignore_ascii_case("public"))
