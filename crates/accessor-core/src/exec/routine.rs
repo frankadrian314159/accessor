@@ -175,6 +175,27 @@ impl Database {
     }
 
     /// `CALL name (args)` for a stored procedure, or `None` if there is no such procedure.
+    /// A stored function or procedure of any kind.
+    pub(crate) fn routine_def(&self, name: &str) -> Option<Arc<RoutineDef>> {
+        self.routines.get(&key(name)).cloned()
+    }
+
+    /// Runs a trigger function's block with `vars` as its variables; gives what it returned and the variables as they ended.
+    pub(crate) fn run_trigger_block(&mut self, def: &RoutineDef, vars: HashMap<String, Value>) -> Result<(Option<Value>, HashMap<String, Value>)> {
+        let RoutineBody::Block(body) = &def.body else {
+            return Err(Error::catalog(format!("'{}' is not a trigger function", def.name)));
+        };
+        if self.call_depth.load(Ordering::Relaxed) >= MAX_CALLS {
+            return Err(Error::runtime("trigger functions are nested too deeply"));
+        }
+        let mut frame = Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0 };
+        self.call_depth.fetch_add(1, Ordering::Relaxed);
+        let outcome = self.run_block(body, &mut frame);
+        self.call_depth.fetch_sub(1, Ordering::Relaxed);
+        outcome?;
+        Ok((frame.returned, frame.vars))
+    }
+
     pub(crate) fn call_procedure(&mut self, name: &str, args: &[(Option<String>, Expr)]) -> Result<Option<QueryResult>> {
         self.call_routine(name, args, false)
     }

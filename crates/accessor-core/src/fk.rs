@@ -112,7 +112,14 @@ impl Database {
         }
         let fired = self.trigger_context(&op);
         if let Some(f) = &fired {
-            self.fire_triggers(TriggerTiming::Before, f, ops, undo, queue, refs, depth)?;
+            match self.fire_triggers(TriggerTiming::Before, f, ops, undo, queue, refs, depth)? {
+                super::trigger::Fire::Skip => return Ok(()),
+                super::trigger::Fire::Replace(new_row) => match &mut op {
+                    Op::Insert { row, .. } | Op::Update { row, .. } => *row = new_row,
+                    _ => {}
+                },
+                super::trigger::Fire::Go => {}
+            }
         }
         let inverse = self.apply(&op)?;
         let change = match (&op, &inverse) {
@@ -132,7 +139,7 @@ impl Database {
         undo.extend(inverse);
         ops.push(op);
         if let Some(f) = &fired {
-            self.fire_triggers(TriggerTiming::After, f, ops, undo, queue, refs, depth)?;
+            let _ = self.fire_triggers(TriggerTiming::After, f, ops, undo, queue, refs, depth)?;
         }
         Ok(())
     }

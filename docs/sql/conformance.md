@@ -87,7 +87,7 @@ These parts of the standard are not available. Using one gives a syntax error or
 ### Routines, triggers and administration
 
 * The rest of SQL/PSM: `REPEAT`, `ITERATE`, cursors, condition handlers (`DECLARE ... HANDLER`), `INOUT` parameters, table functions (`RETURNS TABLE`), overloading, `SIGNAL`/`RESIGNAL`, external routines. `RAISE` stops a procedure. Functions with statement bodies exist only in the PostgreSQL form (`LANGUAGE plpgsql`), which also has `LOOP`, `FOR i IN a..b` and `CASE` statements ([routines.md](routines.md#postgresql-style-functions-and-procedures)).
-* Triggers: `REFERENCING OLD/NEW TABLE` transition tables, `INSTEAD OF` on tables, statement triggers that fire when no row changed, `SET NEW.col = ...` in `BEFORE` triggers, procedural trigger bodies.
+* Triggers: `REFERENCING OLD/NEW TABLE` transition tables, trigger functions on `INSTEAD OF`, `INSTEAD OF` on tables, statement triggers that fire when no row changed, `SET NEW.col = ...` in `BEFORE` triggers, procedural trigger bodies.
 * Privileges are limited to the table rights `SELECT`, `INSERT`, `UPDATE` and `DELETE`, checked for the role chosen with `SET ROLE` ([roles-and-privileges.md](roles-and-privileges.md)); there are no owners, no `WITH GRANT OPTION`, no row-level security; `SET TRANSACTION` isolation levels are read and ignored.
 * The other parts of the standard: client interface (SQL/CLI), foreign data (SQL/MED), Java routines (SQL/JRT), XML (SQL/XML), multidimensional arrays (SQL/MDA), property graphs (SQL/PGQ).
 

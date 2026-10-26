@@ -198,6 +198,8 @@ impl Database {
             }
             Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
             Statement::Grant(g) => self.exec_grant(g),
+            Statement::Ignored(_) => Ok(QueryResult::default()),
+            Statement::CreateTableAs { name, query, with_data } => self.exec_create_table_as(name, query, *with_data),
             Statement::CreateTableExt(ext) => self.exec_create_table_ext(ext),
             Statement::DropTables { names, cascade, if_exists } => self.exec_drop_tables(names, *cascade, *if_exists),
             Statement::Only(inner) => {

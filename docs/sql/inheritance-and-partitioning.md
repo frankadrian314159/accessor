@@ -47,9 +47,20 @@ A partitioned table is a parent that is expected to hold no rows of its own. A p
 * A hash partition's number comes from this engine's own hash, so rows land in different partitions than in PostgreSQL.
 * `CREATE TABLE ... (LIKE ...)`, `ATTACH PARTITION` and `DETACH PARTITION` are not available.
 
+## Partition pruning
+
+When the optimizer is on, a query on a partitioned table reads only the partitions that can hold a matching row. It looks at the `WHERE` of the query, takes the parts joined by `AND` that compare the partition key with a constant (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN (...)`), and leaves out each partition whose bound excludes all of them:
+
+```sql
+EXPLAIN SELECT * FROM measurements WHERE taken >= '2025-03-01';
+-- scan measurements: 2 of 3 tables (the others cannot hold a matching row)
+```
+
+Range partitions are pruned by all of those comparisons, list partitions by them against their values, hash partitions by `=` and `IN`. A `DEFAULT` partition is never left out. It applies to `SELECT` and, with the same rule, to the partitions an `UPDATE` or `DELETE` visits. Not pruned: conditions joined by `OR`, conditions on a column other than the key, a key of several columns (only single-column keys are pruned), expressions (`WHERE taken + 1 > ...`), and values that come from another table in a join or from a parameter. The literal is converted to the type of the key first (`'2025-03-01'` to a date). `SET optimizer TO off` reads everything.
+
 ## What is not done
 
-* **No partition pruning.** A query reads every partition and then filters, so a `WHERE taken = '2024-03-01'` costs the same as a full scan of all of them. The partitions are ordinary tables with ordinary [indexes](../optimizer/access-paths.md), but the plan does not yet choose among them by the bound.
+* **Partition pruning is limited** (see above). Whatever is read is gathered into a computed row set first, so the conditions of the query are not pushed into the member tables and **their indexes are not used**; query a partition by its own name for that.
 * A row is not moved when an `UPDATE` changes its key to another partition's range; it stays where it is.
 * A primary key or unique index applies within one table, not across the family.
 * `tableoid` and `pg_inherits` do not exist.

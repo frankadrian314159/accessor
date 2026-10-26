@@ -398,5 +398,12 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
 <set-role>        ::= SET [ SESSION ] ROLE ( <role> | NONE ) | SET SESSION AUTHORIZATION ( <role> | DEFAULT )
 ```
 
+```bnf
+<create-table-as> ::= CREATE [ TEMP | TEMPORARY | UNLOGGED ] TABLE [ IF NOT EXISTS ] <table-name> AS <query> [ WITH [ NO ] DATA ]
+<trigger-body>     ::= BEGIN <trigger-statement> ; { <trigger-statement> ; } END | EXECUTE ( FUNCTION | PROCEDURE ) <identifier> '(' ... ')'
+```
+
+`INSERT ... VALUES` takes `DEFAULT` for an item. `a ~ b`, `a ~* b`, `a !~ b` and `a !~* b` are regular-expression matches (`REGEXP_LIKE`), and a prefix `@` is the absolute value (`@ -5`, but not `@x`, which is a parameter). `VACUUM`, `ANALYZE`, `LOCK`, `COMMENT ON`, `CHECKPOINT`, `DISCARD`, `CLUSTER`, `LISTEN`, `UNLISTEN` and `NOTIFY` are read to the end of the statement and ignored. `CREATE TEMP | UNLOGGED TABLE` makes an ordinary table.
+
 `UPDATE ONLY <table>` and `DELETE FROM ONLY <table>` leave out the tables that inherit from it; so does `FROM ONLY <table>`.
 `CREATE FUNCTION` and `CREATE PROCEDURE` also take the PostgreSQL form described in [routines.md](routines.md#postgresql-style-functions-and-procedures).

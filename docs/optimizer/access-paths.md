@@ -4,7 +4,7 @@ An *access path* is the way rows of one table are found. The choices are a full 
 
 ## Inheritance and partitions
 
-A table that other tables inherit from, or a partitioned table, is read as the union of the table and its descendants, each projected on the parent's columns, and *then* filtered: its rows are gathered into a computed row set first, so the conditions of the query are not pushed into the member tables and **their indexes are not used**. There is no partition pruning, for the same reason. Query a partition by its own name (or `FROM ONLY parent`) to get its indexes. See [inheritance-and-partitioning.md](../sql/inheritance-and-partitioning.md).
+A table that other tables inherit from, or a partitioned table, is read as the union of the table and its descendants, each projected on the parent's columns, and *then* filtered: its rows are gathered into a computed row set first, so the conditions of the query are not pushed into the member tables and **their indexes are not used**. Partitions that the `WHERE` rules out are left out of that row set ([partition pruning](../sql/inheritance-and-partitioning.md#partition-pruning)), and `EXPLAIN` says how many were read. Query a partition by its own name (or `FROM ONLY parent`) to get its indexes. See [inheritance-and-partitioning.md](../sql/inheritance-and-partitioning.md).
 
 ## Choosing an index
 

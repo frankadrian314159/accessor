@@ -378,6 +378,8 @@ pub struct RoutineDef {
     pub params: Vec<RoutineParam>,
     pub returns: Option<DataType>,
     pub body: RoutineBody,
+    /// `RETURNS trigger`: for `CREATE TRIGGER ... EXECUTE FUNCTION`.
+    pub trigger: bool,
     pub sql: String,
 }
 
@@ -424,6 +426,8 @@ pub struct TriggerDef {
     pub table: String,
     pub when: Option<Expr>,
     pub body: Vec<Statement>,
+    /// `EXECUTE FUNCTION f()`: the body is that PL/pgSQL trigger function, and `body` is empty.
+    pub function: Option<String>,
     pub sql: String,
 }
 
@@ -496,6 +500,10 @@ pub enum Statement {
     Grant(Box<GrantDef>),
     /// `SET ROLE name` / `SET SESSION AUTHORIZATION name`; `None` is `NONE` / `DEFAULT`.
     SetRole(Option<String>),
+    /// `CREATE TABLE name AS query [WITH [NO] DATA]`.
+    CreateTableAs { name: String, query: Box<Select>, with_data: bool },
+    /// A command that is read and does nothing (`VACUUM`, `ANALYZE`, `COMMENT ON`, `LOCK`, ...).
+    Ignored(String),
     /// `CREATE TABLE` with `INHERITS`, `PARTITION BY` or `PARTITION OF`.
     CreateTableExt(Box<TableExt>),
     /// `DROP TABLE a, b [CASCADE]`.

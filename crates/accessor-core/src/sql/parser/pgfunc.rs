@@ -32,6 +32,8 @@ use crate::value::{DataType, Value};
 struct Names {
     all: Vec<String>,
     params: Vec<String>,
+    /// In a trigger function, `NEW.x` and `OLD.x` are variables named `new.x` and `old.x`.
+    trigger: bool,
 }
 
 impl Names {
@@ -56,6 +58,12 @@ impl Names {
 
     fn node(&self, x: &mut Expr) {
         match x {
+            Expr::Column { table: Some(t), name } if self.trigger && (t.eq_ignore_ascii_case("new") || t.eq_ignore_ascii_case("old")) => {
+                *x = Expr::Param(format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase()));
+            }
+            Expr::Column { table: None, name } if self.trigger && (name.eq_ignore_ascii_case("new") || name.eq_ignore_ascii_case("old")) => {
+                *x = Expr::Param(name.to_ascii_lowercase());
+            }
             Expr::Column { table: None, name } if self.has(name) => *x = Expr::Param(name.clone()),
             Expr::Param(n) if n.starts_with('$') => {
                 if let Some(p) = n[1..].parse::<usize>().ok().and_then(|i| self.params.get(i.wrapping_sub(1))) {
@@ -149,11 +157,14 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(")")?;
         let mut returns: Option<DataType> = None;
+        let mut is_trigger = false;
         if self.eat_kw("RETURNS") {
             if self.peek_kw("TABLE") || self.peek_kw("SETOF") {
                 return Err(Error::syntax("functions that return a set of rows are not supported; return a value, or write a query"));
-            } else if self.peek_kw("TRIGGER") || self.peek_kw("EVENT_TRIGGER") {
-                return Err(Error::syntax("trigger functions are not supported; write the trigger body in CREATE TRIGGER ... BEGIN ... END"));
+            } else if self.peek_kw("EVENT_TRIGGER") {
+                return Err(Error::syntax("event triggers are not supported"));
+            } else if self.eat_kw("TRIGGER") {
+                is_trigger = true;
             } else if self.peek_kw("VOID") {
                 self.advance();
             } else {
@@ -229,16 +240,25 @@ impl<'a> Parser<'a> {
         let sql = self.src[start..end].trim().to_string();
         let language = language.ok_or_else(|| Error::syntax("a function needs LANGUAGE sql or LANGUAGE plpgsql"))?;
         let body = body.ok_or_else(|| Error::syntax("a function needs its body: AS $$ ... $$"))?;
-        let names = Names {
+        let mut names = Names {
             all: params.iter().map(|p| p.name.clone()).collect(),
             params: params.iter().map(|p| p.name.clone()).collect(),
+            trigger: is_trigger,
         };
+        if is_trigger {
+            if language != "plpgsql" {
+                return Err(Error::syntax("a trigger function is written in plpgsql"));
+            }
+            for v in ["tg_op", "tg_name", "tg_when", "tg_level", "tg_table_name", "tg_relname", "tg_table_schema", "tg_nargs"] {
+                names.all.push(v.to_string());
+            }
+        }
         let routine_body = match language.as_str() {
             "sql" => sql_body(&body, &names, returns.is_some())?,
             "plpgsql" => plpgsql_body(&body, names, returns.is_some())?,
             other => return Err(Error::syntax(format!("the language '{other}' is not available (use sql or plpgsql)"))),
         };
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, trigger: is_trigger, sql })))
     }
 
     /// `DROP FUNCTION name (argument types)`: the types are read and ignored (functions are known by name).
@@ -478,6 +498,21 @@ impl<'a> Parser<'a> {
         if self.peek_kw("EXECUTE") || self.peek_kw("OPEN") || self.peek_kw("FETCH") || self.peek_kw("CLOSE") || self.peek_kw("GET") {
             return Err(Error::syntax("EXECUTE, cursors and GET DIAGNOSTICS are not supported"));
         }
+        // NEW.col := expr (a trigger function changing the row)
+        if names.trigger
+            && (self.peek_kw("NEW") || self.peek_kw("OLD"))
+            && self.peek_sym_at(1, ".")
+            && matches!(self.peek_at(2), Tok::Ident(_) | Tok::Quoted(_))
+            && (self.peek_sym_at(3, ":=") || self.peek_sym_at(3, "="))
+        {
+            let which = self.ident()?.to_ascii_lowercase();
+            self.advance();
+            let col = self.ident()?.to_ascii_lowercase();
+            self.advance();
+            let value = self.pl_expr(names)?;
+            out.push(ProcStmt::Set { name: format!("{which}.{col}"), value });
+            return self.end_stmt();
+        }
         // an assignment: name := expr
         if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && (self.peek_sym_at(1, ":=") || self.peek_sym_at(1, "=")) {
             let name = self.ident()?;
@@ -653,6 +688,7 @@ fn sql_body(body: &str, names: &Names, value: bool) -> Result<RoutineBody> {
 fn plpgsql_body(body: &str, mut names: Names, value: bool) -> Result<RoutineBody> {
     let mut p = Parser { src: body, toks: lex(body)?, pos: 0 };
     let block = p.pl_block(&mut names)?;
+    let value = value && !names.trigger;
     while p.eat_sym(";") {}
     if !p.at_eof() {
         return Err(p.unexpected("the end of the function body"));

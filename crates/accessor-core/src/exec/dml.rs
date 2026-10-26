@@ -179,7 +179,7 @@ impl Database {
         filter: Option<&Expr>,
     ) -> Result<QueryResult> {
         let mut ops = Vec::new();
-        for member in self.dml_members(table) {
+        for member in self.dml_members(table, filter) {
             ops.extend(self.plan_update(&member, assignments, filter)?);
         }
         let n = ops.len();
@@ -189,7 +189,7 @@ impl Database {
 
     pub(crate) fn exec_delete(&mut self, table: &str, filter: Option<&Expr>) -> Result<QueryResult> {
         let mut ops = Vec::new();
-        for member in self.dml_members(table) {
+        for member in self.dml_members(table, filter) {
             ops.extend(self.plan_delete(&member, filter)?);
         }
         let n = ops.len();
@@ -227,7 +227,16 @@ impl Database {
                             )));
                         }
                         let mut vals = Vec::with_capacity(r.len());
-                        for e in r {
+                        for (k, e) in r.iter().enumerate() {
+                            if matches!(e, Expr::Param(p) if p == crate::sql::parser::DEFAULT_MARK) {
+                                // DEFAULT: what the column would get if it were left out
+                                let c = &schema.columns[positions[k]];
+                                vals.push(match c.sequence_default() {
+                                    Some(seq) => Value::Int(crate::sequence::next_value(seq)?),
+                                    None => c.default.clone().unwrap_or(Value::Null),
+                                });
+                                continue;
+                            }
                             vals.push(binder.bind(e)?.eval(&[])?.into_owned());
                         }
                         out.push(vals);

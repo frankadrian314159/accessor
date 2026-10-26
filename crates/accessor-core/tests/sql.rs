@@ -4527,7 +4527,7 @@ fn plpgsql_functions_and_procedures() {
     db.execute("CALL note('hello')").unwrap();
     assert_eq!(one(&mut db, "SELECT msg FROM log"), "hello");
     assert!(db.execute("CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; EXCEPTION WHEN others THEN RETURN 2; END $$ LANGUAGE plpgsql").is_err());
-    assert!(db.execute("CREATE FUNCTION g() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql").is_err());
+    assert!(db.execute("CREATE FUNCTION g() RETURNS SETOF int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql").is_err());
 }
 
 #[test]
@@ -4595,4 +4595,103 @@ fn drop_table_lists_and_cascade() {
     assert!(db.query("SELECT * FROM vb").is_err());
     db.execute("INSERT INTO b VALUES (1)").unwrap();
     db.execute("DROP TABLE b, nope").unwrap_err();
+}
+
+#[test]
+fn postgres_conveniences() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE s (a int, b text DEFAULT 'x'); INSERT INTO s VALUES (1, 'p'), (2, DEFAULT), (DEFAULT, 'q')").unwrap();
+    let one = |db: &Database, sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&db, "SELECT b FROM s WHERE a = 2"), "x");
+    assert_eq!(one(&db, "SELECT count(*) FROM s WHERE a IS NULL"), "1");
+    db.execute("CREATE TABLE c AS SELECT a, b FROM s WHERE a IS NOT NULL").unwrap();
+    assert_eq!(one(&db, "SELECT count(*) FROM c"), "2");
+    db.execute("CREATE TEMP TABLE e AS SELECT * FROM s WITH NO DATA; CREATE UNLOGGED TABLE u (z int)").unwrap();
+    assert_eq!(one(&db, "SELECT count(*) FROM e"), "0");
+    db.execute("CREATE TABLE parent (id int); CREATE TABLE kid () INHERITS (parent)").unwrap();
+    assert_eq!(db.query("SELECT * FROM kid").unwrap().columns, vec!["id"]);
+    assert_eq!(one(&db, "SELECT 'abc' ~ 'b'"), "Yes");
+    assert_eq!(one(&db, "SELECT 'abc' ~* 'B'"), "Yes");
+    assert_eq!(one(&db, "SELECT 'abc' !~ 'z'"), "Yes");
+    assert_eq!(one(&db, "SELECT @ -5"), "5");
+    db.execute("VACUUM; VACUUM FULL s; ANALYZE s; COMMENT ON TABLE s IS 'x'; LOCK TABLE s IN ACCESS SHARE MODE").unwrap();
+}
+
+#[test]
+fn trigger_functions() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id int, name text, stamp text); CREATE TABLE audit (op text, id int)").unwrap();
+    db.execute(
+        "CREATE FUNCTION fill() RETURNS trigger AS $$
+         BEGIN
+           IF NEW.name IS NULL THEN NEW.name := 'anon'; END IF;
+           NEW.stamp := TG_OP || ':' || TG_WHEN;
+           RETURN NEW;
+         END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute("CREATE TRIGGER t_fill BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION fill()").unwrap();
+    db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'bob', NULL)").unwrap();
+    let r = db.query("SELECT name, stamp FROM t ORDER BY id").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "anon");
+    assert_eq!(r.rows[0][1].to_string(), "INSERT:BEFORE");
+    assert_eq!(r.rows[1][0].to_string(), "bob");
+    db.execute("UPDATE t SET name = NULL WHERE id = 2").unwrap();
+    let r = db.query("SELECT name, stamp FROM t WHERE id = 2").unwrap();
+    assert_eq!((r.rows[0][0].to_string(), r.rows[0][1].to_string()), ("anon".into(), "UPDATE:BEFORE".into()));
+
+    db.execute("CREATE FUNCTION log_it() RETURNS trigger AS $$ BEGIN INSERT INTO audit VALUES (TG_OP, OLD.id); RETURN NULL; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("CREATE TRIGGER t_del AFTER DELETE ON t FOR EACH ROW EXECUTE PROCEDURE log_it()").unwrap();
+    db.execute("DELETE FROM t WHERE id = 1").unwrap();
+    assert_eq!(db.query("SELECT op, id FROM audit").unwrap().rows[0][0].to_string(), "DELETE");
+
+    db.execute("CREATE FUNCTION no_odd() RETURNS trigger AS $$ BEGIN IF NEW.id % 2 = 1 THEN RETURN NULL; END IF; RETURN NEW; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("CREATE TABLE ev (id int); CREATE TRIGGER ev_t BEFORE INSERT ON ev FOR EACH ROW EXECUTE FUNCTION no_odd()").unwrap();
+    db.execute("INSERT INTO ev VALUES (1), (2), (3), (4)").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM ev").unwrap().rows[0][0].to_string(), "2");
+
+    db.execute("CREATE FUNCTION nope() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'no way: %', NEW.id; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("CREATE TABLE r (id int); CREATE TRIGGER r_t BEFORE INSERT ON r FOR EACH ROW EXECUTE FUNCTION nope()").unwrap();
+    let e = db.execute("INSERT INTO r VALUES (7)").unwrap_err().to_string();
+    assert!(e.contains("no way: 7"), "{e}");
+}
+
+#[test]
+fn partitions_are_pruned_by_the_where_clause() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE m (d int, v int) PARTITION BY RANGE (d);
+         CREATE TABLE m1 PARTITION OF m FOR VALUES FROM (0) TO (10);
+         CREATE TABLE m2 PARTITION OF m FOR VALUES FROM (10) TO (20);
+         CREATE TABLE m3 PARTITION OF m FOR VALUES FROM (20) TO (MAXVALUE);
+         INSERT INTO m VALUES (1, 1), (12, 2), (25, 3), (30, 4);
+         CREATE TABLE l (k text) PARTITION BY LIST (k);
+         CREATE TABLE la PARTITION OF l FOR VALUES IN ('a', 'b');
+         CREATE TABLE lc PARTITION OF l FOR VALUES IN ('c');
+         INSERT INTO l VALUES ('a'), ('c')",
+    )
+    .unwrap();
+    let plan = |db: &Database, sql: &str| -> String {
+        db.query(&format!("EXPLAIN {sql}")).unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n")
+    };
+    assert!(plan(&db, "SELECT * FROM m WHERE d = 12").contains("2 of 4 tables"), "{}", plan(&db, "SELECT * FROM m WHERE d = 12"));
+    assert!(plan(&db, "SELECT * FROM m WHERE d >= 20").contains("2 of 4 tables"));
+    assert!(plan(&db, "SELECT * FROM m WHERE d < 10").contains("2 of 4 tables"));
+    assert!(plan(&db, "SELECT * FROM m WHERE d BETWEEN 5 AND 12 AND v > 0").contains("3 of 4 tables"));
+    assert!(plan(&db, "SELECT * FROM m x WHERE x.d IN (1, 25)").contains("3 of 4 tables"));
+    assert!(!plan(&db, "SELECT * FROM m WHERE v = 2").contains("of 4 tables"));
+    assert!(!plan(&db, "SELECT * FROM m WHERE d = 1 OR d = 25").contains("of 4 tables"));
+    assert!(plan(&db, "SELECT * FROM l WHERE k = 'c'").contains("2 of 3 tables"));
+    let n = |db: &Database, sql: &str| db.query(sql).unwrap().rows.len();
+    assert_eq!(n(&db, "SELECT * FROM m WHERE d = 12"), 1);
+    assert_eq!(n(&db, "SELECT * FROM m WHERE d >= 12"), 3);
+    assert_eq!(n(&db, "SELECT * FROM m WHERE d IN (1, 30)"), 2);
+    assert_eq!(n(&db, "SELECT * FROM l WHERE k = 'c'"), 1);
+    db.execute("DELETE FROM m WHERE d = 25").unwrap();
+    db.execute("UPDATE m SET v = 0 WHERE d < 10").unwrap();
+    assert_eq!(n(&db, "SELECT * FROM m"), 3);
+    db.execute("SET optimizer TO off").unwrap();
+    assert!(!plan(&db, "SELECT * FROM m WHERE d = 12").contains("of 4 tables"));
+    assert_eq!(n(&db, "SELECT * FROM m WHERE d = 12"), 1);
 }

@@ -28,6 +28,15 @@ use crate::value::{DataType, Row, Value};
 pub(crate) const MAX_DEPTH: usize = 16;
 
 /// The row operation a trigger is reacting to.
+/// What the BEFORE triggers of a row decided.
+pub(crate) enum Fire {
+    Go,
+    /// A trigger function changed the row.
+    Replace(Row),
+    /// A trigger function returned NULL: the operation is not done.
+    Skip,
+}
+
 pub(crate) struct Fired {
     table: String,
     event: TriggerEvent,
@@ -92,7 +101,7 @@ impl Database {
         queue: &mut VecDeque<Applied>,
         refs: &RefMap,
         depth: usize,
-    ) -> Result<()> {
+    ) -> Result<Fire> {
         let matching: Vec<Arc<TriggerDef>> = self
             .triggers
             .values()
@@ -102,17 +111,29 @@ impl Database {
             .cloned()
             .collect();
         if matching.is_empty() {
-            return Ok(());
+            return Ok(Fire::Go);
         }
         let schema = self.table_checked(&fired.table)?.schema().clone();
-        let ctx = RowContext { schema: &schema, old: fired.old.as_ref(), new: fired.new.as_ref() };
+        let mut current = fired.new.clone();
+        let mut changed = false;
         for trigger in matching {
-            if fired.event == TriggerEvent::Update && !update_of_hit(&trigger, &schema, fired.old.as_ref(), fired.new.as_ref()) {
+            if fired.event == TriggerEvent::Update && !update_of_hit(&trigger, &schema, fired.old.as_ref(), current.as_ref()) {
                 continue;
             }
-            self.run_trigger(&trigger, &ctx, ops, undo, queue, refs, depth)?;
+            let ctx = RowContext { schema: &schema, old: fired.old.as_ref(), new: current.as_ref() };
+            match self.run_trigger(&trigger, &ctx, ops, undo, queue, refs, depth, timing)? {
+                Fire::Go => {}
+                Fire::Skip => return Ok(Fire::Skip),
+                Fire::Replace(row) => {
+                    current = Some(row);
+                    changed = true;
+                }
+            }
         }
-        Ok(())
+        Ok(match (changed, current) {
+            (true, Some(row)) => Fire::Replace(row),
+            _ => Fire::Go,
+        })
     }
 
     /// Runs one trigger's body (after its `WHEN` condition) against the rows in `ctx`.
@@ -126,13 +147,17 @@ impl Database {
         queue: &mut VecDeque<Applied>,
         refs: &RefMap,
         depth: usize,
-    ) -> Result<()> {
+        timing: TriggerTiming,
+    ) -> Result<Fire> {
         if let Some(when) = &trigger.when {
             let mut when = when.clone();
             ctx.bind_expr(&mut when)?;
             if !self.eval_condition(&when)? {
-                return Ok(());
+                return Ok(Fire::Go);
             }
+        }
+        if let Some(function) = &trigger.function {
+            return self.run_trigger_function(trigger, function, ctx, timing);
         }
         for stmt in &trigger.body {
             let mut stmt = stmt.clone();
@@ -157,7 +182,66 @@ impl Database {
                 self.apply_tracked(op, ops, undo, queue, refs, depth + 1)?;
             }
         }
-        Ok(())
+        Ok(Fire::Go)
+    }
+
+    /// Runs a PL/pgSQL trigger function for the rows in `ctx`. `NEW.col`/`OLD.col` are its variables; whatever it
+    /// assigns to `NEW.col` goes into the row, and `RETURN NULL` in a BEFORE trigger drops the operation.
+    fn run_trigger_function(&mut self, trigger: &TriggerDef, function: &str, ctx: &RowContext, timing: TriggerTiming) -> Result<Fire> {
+        let def = self
+            .function_def(function)
+            .or_else(|| self.routine_def(function))
+            .filter(|d| d.trigger)
+            .ok_or_else(|| Error::catalog(format!("the trigger function '{function}' does not exist")))?;
+        let mut vars: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        let event = if ctx.new.is_some() && ctx.old.is_some() {
+            "UPDATE"
+        } else if ctx.new.is_some() {
+            "INSERT"
+        } else if ctx.old.is_some() {
+            "DELETE"
+        } else {
+            trigger.events.first().map_or("", |e| match e {
+                TriggerEvent::Insert => "INSERT",
+                TriggerEvent::Update => "UPDATE",
+                TriggerEvent::Delete => "DELETE",
+            })
+        };
+        let text = |s: &str| Value::text(s);
+        vars.insert("tg_op".into(), text(event));
+        vars.insert("tg_name".into(), text(&trigger.name));
+        vars.insert("tg_when".into(), text(match timing { TriggerTiming::Before => "BEFORE", TriggerTiming::After => "AFTER", TriggerTiming::InsteadOf => "INSTEAD OF" }));
+        vars.insert("tg_level".into(), text(if trigger.each_statement { "STATEMENT" } else { "ROW" }));
+        vars.insert("tg_table_name".into(), text(&ctx.schema.name));
+        vars.insert("tg_relname".into(), text(&ctx.schema.name));
+        vars.insert("tg_table_schema".into(), text("public"));
+        vars.insert("tg_nargs".into(), Value::Int(0));
+        vars.insert("new".into(), text("NEW"));
+        vars.insert("old".into(), text("OLD"));
+        for (i, c) in ctx.schema.columns.iter().enumerate() {
+            let name = c.name.to_ascii_lowercase();
+            vars.insert(format!("new.{name}"), ctx.new.map_or(Value::Null, |r| r[i].clone()));
+            vars.insert(format!("old.{name}"), ctx.old.map_or(Value::Null, |r| r[i].clone()));
+        }
+        let (returned, after) = self.run_trigger_block(&def, vars)?;
+        if timing != TriggerTiming::Before || trigger.each_statement {
+            return Ok(Fire::Go);
+        }
+        if matches!(returned, Some(Value::Null)) || (returned.is_none() && false) {
+            return Ok(Fire::Skip);
+        }
+        let Some(new) = ctx.new else { return Ok(Fire::Go) };
+        let mut row = new.clone();
+        let mut changed = false;
+        for (i, c) in ctx.schema.columns.iter().enumerate() {
+            if let Some(v) = after.get(&format!("new.{}", c.name.to_ascii_lowercase())) {
+                if *v != row[i] {
+                    row[i] = v.clone();
+                    changed = true;
+                }
+            }
+        }
+        Ok(if changed { Fire::Replace(row) } else { Fire::Go })
     }
 
     // ----- statement triggers ------------------------------------------------------
@@ -206,7 +290,7 @@ impl Database {
         let schema = self.table_checked(table)?.schema().clone();
         let ctx = RowContext { schema: &schema, old: None, new: None };
         for trigger in matching {
-            self.run_trigger(&trigger, &ctx, ops, undo, queue, refs, 0)?;
+            self.run_trigger(&trigger, &ctx, ops, undo, queue, refs, 0, timing)?;
         }
         Ok(())
     }

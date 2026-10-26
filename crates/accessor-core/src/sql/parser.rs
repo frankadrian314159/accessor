@@ -10,6 +10,9 @@ use crate::schema::RefAction;
 use crate::sequence::SequenceOptions;
 use crate::value::{DataType, Value};
 
+/// Stands for `DEFAULT` in a `VALUES` row until the insert is planned.
+pub(crate) const DEFAULT_MARK: &str = "\u{1}default";
+
 const RESERVED: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "HAVING", "ORDER", "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "OUTER",
     "CROSS", "ON", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN", "UNION", "LIMIT", "OFFSET", "SET",
@@ -820,6 +823,8 @@ impl<'a> Parser<'a> {
             Tok::Quoted(_) => true,
             // `FROM t WINDOW w AS (...)`: WINDOW starts a clause here, not an alias.
             Tok::Ident(s) if s.eq_ignore_ascii_case("WINDOW") && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_kw_at(2, "AS") => false,
+            // `CREATE TABLE t AS SELECT ... FROM s WITH NO DATA`
+            Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && self.peek_kw_at(1, "NO") => false,
             Tok::Ident(s) => !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)),
             _ => false,
         }
@@ -881,6 +886,15 @@ impl<'a> Parser<'a> {
     }
 
     fn statement_inner(&mut self) -> Result<Statement> {
+        for word in ["VACUUM", "ANALYZE", "ANALYSE", "LOCK", "COMMENT", "CHECKPOINT", "DISCARD", "CLUSTER", "LISTEN", "UNLISTEN", "NOTIFY", "SECURITY"] {
+            if self.peek_kw(word) {
+                // maintenance commands for a server: there is nothing to do, so they are read and ignored
+                while !self.at_eof() && !self.peek_sym(";") {
+                    self.advance();
+                }
+                return Ok(Statement::Ignored(word.to_string()));
+            }
+        }
         if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_kw("TRANSFORM") || self.peek_sym("(") {
             return Ok(Statement::Select(self.select()?));
         }
@@ -1137,6 +1151,15 @@ impl<'a> Parser<'a> {
         Err(self.unexpected("a statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, EXEC, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE)"))
     }
 
+    /// An item of a `VALUES` row: an expression, or `DEFAULT` (the column's default).
+    fn values_item(&mut self) -> Result<Expr> {
+        if self.peek_kw("DEFAULT") && matches!(self.peek_at(1), Tok::Sym(",") | Tok::Sym(")")) {
+            self.advance();
+            return Ok(Expr::Param(DEFAULT_MARK.to_string()));
+        }
+        self.expr()
+    }
+
     fn insert(&mut self) -> Result<Statement> {
         self.expect_kw("INTO")?;
         let table = self.table_ident()?;
@@ -1154,9 +1177,9 @@ impl<'a> Parser<'a> {
             let mut rows = Vec::new();
             loop {
                 self.expect_sym("(")?;
-                let mut row = vec![self.expr()?];
+                let mut row = vec![self.values_item()?];
                 while self.eat_sym(",") {
-                    row.push(self.expr()?);
+                    row.push(self.values_item()?);
                 }
                 self.expect_sym(")")?;
                 rows.push(row);
@@ -1517,7 +1540,7 @@ impl<'a> Parser<'a> {
             (RoutineBody::Block(b), self.toks[self.pos - 1].pos + "END".len())
         };
         let sql = self.src[start..end].trim().to_string();
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, sql })))
     }
 
     /// A data type written as a name (`INTEGER`, `VARCHAR(20)`, `DOUBLE PRECISION`, ...).
@@ -1670,6 +1693,9 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("ON")?;
         let table = self.table_ident()?;
+        if self.eat_kw("REFERENCING") {
+            return Err(Error::syntax("REFERENCING (transition tables) is not supported"));
+        }
         let mut each_statement = false;
         if self.eat_kw("FOR") {
             self.expect_kw("EACH")?;
@@ -1683,6 +1709,17 @@ impl<'a> Parser<'a> {
             return Err(Error::syntax("an INSTEAD OF trigger works on each row"));
         }
         let when = if self.eat_kw("WHEN") { Some(self.expr()?) } else { None };
+        if self.eat_kw("EXECUTE") {
+            // EXECUTE FUNCTION f(args): the body is a PL/pgSQL trigger function
+            if !self.eat_kw("FUNCTION") {
+                self.expect_kw("PROCEDURE")?;
+            }
+            let function = Some(self.table_ident()?);
+            self.skip_parens()?;
+            let end = self.toks[self.pos].pos;
+            let sql = self.src[start..end].to_string();
+            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), function, sql })));
+        }
         self.expect_kw("BEGIN")?;
         let mut body = Vec::new();
         loop {
@@ -1710,7 +1747,7 @@ impl<'a> Parser<'a> {
         }
         let end = self.toks[self.pos - 1].pos + "END".len();
         let sql = self.src[start..end].to_string();
-        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, sql })))
+        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, function: None, sql })))
     }
 
     fn create(&mut self) -> Result<Statement> {
@@ -1757,6 +1794,12 @@ impl<'a> Parser<'a> {
     }
 
     fn create_object(&mut self, guarded: &mut bool, create_pos: usize) -> Result<Statement> {
+        // temporary and unlogged tables are ordinary tables here
+        while (self.peek_kw("TEMP") || self.peek_kw("TEMPORARY") || self.peek_kw("UNLOGGED") || self.peek_kw("GLOBAL") || self.peek_kw("LOCAL"))
+            && (self.peek_kw_at(1, "TABLE") || self.peek_kw_at(1, "VIEW") || self.peek_kw_at(1, "TEMP") || self.peek_kw_at(1, "TEMPORARY") || self.peek_kw_at(1, "SEQUENCE"))
+        {
+            self.advance();
+        }
         let unique = self.eat_kw("UNIQUE");
         if !unique && self.eat_kw("TRIGGER") {
             return self.trigger(create_pos);
@@ -1877,6 +1920,16 @@ impl<'a> Parser<'a> {
         let name = self.table_ident()?;
         if self.peek_kw("PARTITION") && self.peek_kw_at(1, "OF") {
             return self.create_partition(name);
+        }
+        if self.peek_kw("AS") {
+            self.advance();
+            let query = Box::new(self.select()?);
+            let mut with_data = true;
+            if self.eat_kw("WITH") {
+                with_data = !self.eat_kw("NO");
+                self.expect_kw("DATA")?;
+            }
+            return Ok(Statement::CreateTableAs { name, query, with_data });
         }
         self.pos = save;
         let st = self.create_table_core()?;
@@ -2017,6 +2070,10 @@ impl<'a> Parser<'a> {
     fn create_table_core(&mut self) -> Result<Statement> {
         let name = self.table_ident()?;
         self.expect_sym("(")?;
+        if self.eat_sym(")") {
+            // a table with no columns of its own (all of them inherited)
+            return Ok(Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() });
+        }
         let mut columns = Vec::new();
         let mut primary_key = Vec::new();
         let mut uniques = Vec::new();
@@ -3137,6 +3194,18 @@ impl<'a> Parser<'a> {
                 Tok::Sym(">=") => Some(BinOp::Ge),
                 _ => None,
             };
+            if let Tok::Sym(s @ ("~" | "~*" | "!~" | "!~*")) = self.peek().clone() {
+                // PostgreSQL's regular-expression match: ~ (case-sensitive), ~* (ignoring case), and their negations
+                self.advance();
+                let right = self.concat()?;
+                let mut args = vec![left, right];
+                if s.ends_with('*') {
+                    args.push(Expr::Literal(Value::text("i")));
+                }
+                let m = Expr::Function { name: "REGEXP_LIKE".into(), args, distinct: false, star: false };
+                left = if s.starts_with('!') { Expr::Not(Box::new(m)) } else { m };
+                continue;
+            }
             if let Some(op) = op {
                 self.advance();
                 if (self.peek_kw("ANY") || self.peek_kw("SOME") || self.peek_kw("ALL")) && matches!(self.peek_at(1), Tok::Sym("(")) {
@@ -3302,6 +3371,11 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr> {
+        if self.eat_sym("@") {
+            // PostgreSQL's prefix absolute value: @ -5
+            let inner = self.unary()?;
+            return Ok(Expr::Function { name: "ABS".into(), args: vec![inner], distinct: false, star: false });
+        }
         if self.eat_sym("-") {
             let inner = self.unary()?;
             return Ok(match inner {

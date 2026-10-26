@@ -30,7 +30,7 @@ use super::select::{Source, SourceData};
 use super::QueryResult;
 use crate::database::{key, Database};
 use crate::error::{Error, Result};
-use crate::sql::ast::{ColumnDef, Statement, TableExt};
+use crate::sql::ast::{BinOp, ColumnDef, Expr, Statement, TableExt};
 use crate::storage::Op;
 use crate::value::{Row, Value};
 
@@ -54,6 +54,75 @@ pub(crate) struct BoundText {
 pub(crate) struct PartKey {
     pub method: String,
     pub columns: Vec<String>,
+}
+
+thread_local! {
+    /// The `WHERE` of the query being planned, for choosing partitions.
+    static PRUNE_HINT: std::cell::RefCell<Option<Expr>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets the condition that partitions are chosen by until the guard is dropped, which puts the earlier one back.
+pub(crate) struct PruneGuard(Option<Expr>);
+
+pub(crate) fn prune_guard(filter: Option<Expr>) -> PruneGuard {
+    PruneGuard(PRUNE_HINT.with(|h| std::mem::replace(&mut *h.borrow_mut(), filter)))
+}
+
+impl Drop for PruneGuard {
+    fn drop(&mut self) {
+        let earlier = self.0.take();
+        PRUNE_HINT.with(|h| *h.borrow_mut() = earlier);
+    }
+}
+
+/// What a query WHERE says of one column: comparisons with values, or a set of values.
+enum Fact {
+    Cmp(BinOp, Value),
+    OneOf(Vec<Value>),
+}
+
+fn flip(op: BinOp) -> BinOp {
+    match op {
+        BinOp::Lt => BinOp::Gt,
+        BinOp::Le => BinOp::Ge,
+        BinOp::Gt => BinOp::Lt,
+        BinOp::Ge => BinOp::Le,
+        other => other,
+    }
+}
+
+/// The facts the conjunction `e` states about column `column` of the table called `names`.
+fn facts(e: &Expr, column: &str, names: &[&str], out: &mut Vec<Fact>) {
+    let is_col = |x: &Expr| {
+        matches!(x, Expr::Column { table, name }
+            if name.eq_ignore_ascii_case(column) && table.as_ref().is_none_or(|t| names.iter().any(|n| n.eq_ignore_ascii_case(t))))
+    };
+    match e {
+        Expr::Binary { op: BinOp::And, left, right } => {
+            facts(left, column, names, out);
+            facts(right, column, names, out);
+        }
+        Expr::Binary { op: op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), left, right } => match (&**left, &**right) {
+            (l, Expr::Literal(v)) if is_col(l) && !v.is_null() => out.push(Fact::Cmp(*op, v.clone())),
+            (Expr::Literal(v), r) if is_col(r) && !v.is_null() => out.push(Fact::Cmp(flip(*op), v.clone())),
+            _ => {}
+        },
+        Expr::Between { expr, low, high, negated: false } if is_col(expr) => {
+            if let (Expr::Literal(a), Expr::Literal(b)) = (&**low, &**high) {
+                if !a.is_null() && !b.is_null() {
+                    out.push(Fact::Cmp(BinOp::Ge, a.clone()));
+                    out.push(Fact::Cmp(BinOp::Le, b.clone()));
+                }
+            }
+        }
+        Expr::InList { expr, list, negated: false } if is_col(expr) => {
+            let vals: Vec<Value> = list.iter().filter_map(|x| if let Expr::Literal(v) = x { Some(v.clone()) } else { None }).collect();
+            if vals.len() == list.len() && vals.iter().all(|v| !v.is_null()) {
+                out.push(Fact::OneOf(vals));
+            }
+        }
+        _ => {}
+    }
 }
 
 enum Edge {
@@ -86,6 +155,36 @@ fn tuple_cmp(keys: &[Value], edges: &[Edge]) -> Ordering {
         }
     }
     Ordering::Equal
+}
+
+/// Can a row with key `v` compared as `op` lie in the partition with this bound?
+fn may_match(bound: &Bound, op: BinOp, v: &Value) -> bool {
+    match bound {
+        Bound::Range { from, to } if from.len() == 1 && to.len() == 1 => match op {
+            BinOp::Eq => edge_cmp(v, &from[0]) != Ordering::Less && edge_cmp(v, &to[0]) == Ordering::Less,
+            BinOp::Lt => edge_cmp(v, &from[0]) == Ordering::Greater,
+            BinOp::Le => edge_cmp(v, &from[0]) != Ordering::Less,
+            BinOp::Gt | BinOp::Ge => edge_cmp(v, &to[0]) == Ordering::Less,
+            _ => true,
+        },
+        Bound::List(vs) => {
+            vs.iter().any(|x| match op {
+                BinOp::Eq => x.sql_cmp(v) == Some(Ordering::Equal),
+                BinOp::Lt => x.sql_cmp(v) == Some(Ordering::Less),
+                BinOp::Le => matches!(x.sql_cmp(v), Some(Ordering::Less | Ordering::Equal)),
+                BinOp::Gt => x.sql_cmp(v) == Some(Ordering::Greater),
+                BinOp::Ge => matches!(x.sql_cmp(v), Some(Ordering::Greater | Ordering::Equal)),
+                _ => true,
+            }) || vs.iter().any(Value::is_null)
+        }
+        Bound::Hash { modulus, remainder } if op == BinOp::Eq => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            v.hash(&mut h);
+            *modulus == 0 || h.finish() % modulus == *remainder
+        }
+        _ => true,
+    }
 }
 
 impl Database {
@@ -225,6 +324,51 @@ impl Database {
         Ok(())
     }
 
+    /// `CREATE TABLE name AS query`: the columns take the names of the query's, and the type of their first value.
+    pub(crate) fn exec_create_table_as(&mut self, name: &str, query: &crate::sql::ast::Select, with_data: bool) -> Result<QueryResult> {
+        let mut probe = query.clone();
+        let res = self.run_select(&mut probe)?;
+        let columns: Vec<ColumnDef> = res
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ColumnDef {
+                name: c.clone(),
+                data_type: res.rows.iter().find_map(|r| r[i].data_type()).unwrap_or(crate::value::DataType::Text),
+                not_null: false,
+                primary_key: false,
+                unique: false,
+                autonumber: false,
+                default: None,
+                references: None,
+                expression: None,
+                check: None,
+            })
+            .collect();
+        let create = Statement::CreateTable {
+            name: name.to_string(),
+            columns,
+            primary_key: Vec::new(),
+            uniques: Vec::new(),
+            foreign_keys: Vec::new(),
+            checks: Vec::new(),
+        };
+        let count = res.rows.len();
+        let rows = res.rows;
+        self.atomically(|db| {
+            db.execute_statement(&create)?;
+            if with_data && !rows.is_empty() {
+                let lits = rows.into_iter().map(|r| r.into_iter().map(crate::sql::ast::Expr::Literal).collect()).collect();
+                db.execute_statement(&Statement::Insert {
+                    table: name.to_string(),
+                    columns: None,
+                    source: crate::sql::ast::InsertSource::Values(lits),
+                })?;
+            }
+            Ok(QueryResult::affected(if with_data { count } else { 0 }))
+        })
+    }
+
     /// `DROP TABLE a, b [CASCADE]`.
     pub(crate) fn exec_drop_tables(&mut self, names: &[String], cascade: bool, if_exists: bool) -> Result<QueryResult> {
         for n in names {
@@ -298,8 +442,12 @@ impl Database {
     }
 
     /// The rows of `table` and of its descendants, in the columns of `table`.
-    pub(crate) fn family_source(&self, table: &str, alias: String) -> Result<Source<'_>> {
-        let members = self.family(table);
+    pub(crate) fn family_source(&self, table: &str, alias: String, depth: u32) -> Result<Source<'_>> {
+        let hint = PRUNE_HINT.with(|h| h.borrow().clone());
+        let (members, total) = self.pruned_family(table, hint.as_ref(), &[table, &alias]);
+        if members.len() < total {
+            self.note(depth, || format!("scan {table}: {} of {total} tables (the others cannot hold a matching row)", members.len()));
+        }
         let parent = self.table_checked(&members[0])?;
         let names: Vec<String> = parent.schema().columns.iter().map(|c| c.name.clone()).collect();
         let mut rows: Vec<Row> = Vec::new();
@@ -314,12 +462,72 @@ impl Database {
         Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names })
     }
 
-    pub(crate) fn dml_members(&self, table: &str) -> Vec<String> {
+    pub(crate) fn dml_members(&self, table: &str, filter: Option<&Expr>) -> Vec<String> {
         if self.only_dml.load(AtomicOrdering::Relaxed) || !self.has_children(table) {
             vec![table.to_string()]
         } else {
-            self.family(table)
+            self.pruned_family(table, filter, &[table]).0
         }
+    }
+
+    /// The table and its descendants, leaving out the partitions that `filter` cannot take a row from; with the
+    /// number of tables there would have been. Only the first column of a partition key is looked at, and only
+    /// comparisons with constants, `BETWEEN` and `IN`, joined by `AND`.
+    pub(crate) fn pruned_family(&self, table: &str, filter: Option<&Expr>, names: &[&str]) -> (Vec<String>, usize) {
+        let all = self.family(table);
+        let total = all.len();
+        let Some(filter) = filter.filter(|_| self.optimizer_enabled()) else { return (all, total) };
+        let mut out = Vec::new();
+        self.prune_walk(table, filter, names, &mut out);
+        (out, total)
+    }
+
+    fn prune_walk(&self, table: &str, filter: &Expr, names: &[&str], out: &mut Vec<String>) {
+        out.push(self.table(table).map(|t| t.name().to_string()).unwrap_or_else(|| table.to_string()));
+        let bounds = match self.part_key(table) {
+            Some(pk) if pk.columns.len() == 1 => self.bounds_of(table).ok().map(|b| (pk, b)),
+            _ => None,
+        };
+        for child in self.children_of(table) {
+            let keep = match &bounds {
+                Some((pk, bs)) => match bs.iter().find(|(c, _)| *c == child) {
+                    Some((_, b)) => self.bound_may_match(table, &pk.columns[0], b, filter, names),
+                    None => true,
+                },
+                None => true,
+            };
+            if keep {
+                self.prune_walk(&child, filter, names, out);
+            }
+        }
+    }
+
+    fn bound_may_match(&self, table: &str, column: &str, bound: &Bound, filter: &Expr, names: &[&str]) -> bool {
+        let mut fs = Vec::new();
+        facts(filter, column, names, &mut fs);
+        let Some(col_type) = self.table(table).and_then(|t| t.schema().column_index(column).map(|i| t.schema().columns[i].data_type)) else {
+            return true;
+        };
+        let coerce = |v: &Value| v.coerce_to(col_type).ok();
+        for f in &fs {
+            let ok = match f {
+                Fact::Cmp(op, v) => match coerce(v) {
+                    Some(v) => may_match(bound, *op, &v),
+                    None => true,
+                },
+                Fact::OneOf(vs) => {
+                    let cs: Option<Vec<Value>> = vs.iter().map(coerce).collect();
+                    match cs {
+                        Some(cs) => cs.iter().any(|v| may_match(bound, BinOp::Eq, v)),
+                        None => true,
+                    }
+                }
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
     }
 
     fn bounds_of(&self, parent: &str) -> Result<Vec<(String, Bound)>> {

@@ -81,7 +81,7 @@ impl Database {
                     return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
                 if !*only && self.table(name).is_some() && self.has_children(name) {
-                    return self.family_source(name, alias);
+                    return self.family_source(name, alias, depth);
                 }
                 if let Some(t) = self.table(name) {
                     self.require_privilege(name, "select")?;
@@ -416,6 +416,7 @@ impl Database {
         }
 
         // 1. Resolve sources and build the name scope.
+        let _hint = super::inherit::prune_guard(sel.filter.clone());
         let mut sources = Vec::new();
         let mut scope = Scope::default();
         if let Some(from) = &sel.from {

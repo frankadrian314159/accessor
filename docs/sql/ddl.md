@@ -137,6 +137,14 @@ Inside a transaction, a deferred relationship may be broken for a while, so rows
 
 A deferrable relationship that gives no action behaves as `NO ACTION`; one without a `DEFERRABLE` clause behaves as `RESTRICT`. `RESTRICT` is always checked at once, and so are the actions that change rows (`CASCADE`, `SET NULL`, `SET DEFAULT`): only the check that a row has its parent, and the refusal of `NO ACTION`, wait. Only foreign keys can be deferred; `UNIQUE`, `PRIMARY KEY` and `CHECK` are always immediate.
 
+### CREATE TABLE AS
+
+```sql
+CREATE [TEMP | UNLOGGED] TABLE name AS query [WITH [NO] DATA];
+```
+
+Makes a table from the result of a query. The columns take the query's column names and, as their type, the type of the first non-null value in each (`TEXT` if there is none). Nothing but the columns and the rows is copied: no keys, indexes or defaults. `WITH NO DATA` makes the empty table. `TEMP`, `TEMPORARY` and `UNLOGGED` are accepted and make an ordinary table. `INSERT ... VALUES (1, DEFAULT)` uses a column's default for that item, and a table may have no columns of its own (`CREATE TABLE child () INHERITS (parent)`).
+
 ## CREATE INDEX
 
 ```sql

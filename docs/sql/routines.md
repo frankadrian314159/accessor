@@ -144,4 +144,21 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays and records, set-returning functions (`RETURNS TABLE`, `SETOF`), trigger functions (`RETURNS trigger`; write the body in `CREATE TRIGGER ... BEGIN ... END` instead), and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays and records, set-returning functions (`RETURNS TABLE`, `SETOF`), event triggers, and every language except `sql` and `plpgsql`.
+
+### Trigger functions
+
+```sql
+CREATE FUNCTION stamp() RETURNS trigger AS $$
+BEGIN
+  IF NEW.name IS NULL THEN NEW.name := 'anon'; END IF;
+  NEW.changed := TG_OP || ' ' || TG_TABLE_NAME;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER t_stamp BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION stamp();
+```
+
+A function that `RETURNS trigger` is run by `CREATE TRIGGER ... EXECUTE FUNCTION f()` (or `EXECUTE PROCEDURE`), with `WHEN`, `UPDATE OF`, `FOR EACH ROW` / `FOR EACH STATEMENT` and `BEFORE`/`AFTER` as for any [trigger](queries-and-triggers.md). Inside it, `NEW.col` and `OLD.col` are the row, `NEW.col := value` changes the row a `BEFORE` trigger lets through, and `TG_OP` (`'INSERT'`, `'UPDATE'`, `'DELETE'`), `TG_WHEN`, `TG_LEVEL`, `TG_NAME`, `TG_TABLE_NAME` and `TG_RELNAME` are set. `RETURN NULL` in a `BEFORE` row trigger drops that row's operation; any other `RETURN` lets it through (the value returned is not looked at: changes are made by assigning to `NEW`). The result of an `AFTER` trigger is ignored. `RAISE EXCEPTION` stops the statement and undoes it.
+
+Not available: `INSTEAD OF` triggers that call a function, `REFERENCING` (transition tables), trigger arguments (`TG_ARGV`), `TG_TABLE_SCHEMA` other than `'public'`, and `CREATE CONSTRAINT TRIGGER`. A trigger function is looked up when the trigger fires, so it can be created after the trigger. Statements inside the function run as statements of their own: if a later statement of the outer command fails, what they did is undone only when the whole command ran in a transaction.
