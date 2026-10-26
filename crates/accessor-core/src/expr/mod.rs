@@ -5,6 +5,7 @@ pub mod format;
 pub(crate) mod extra;
 pub mod func;
 pub mod like;
+pub mod pgfuncs;
 
 use std::borrow::Cow;
 use std::collections::HashSet;

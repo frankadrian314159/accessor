@@ -531,9 +531,39 @@ impl<'a> Binder<'a> {
                 if *distinct || *star {
                     return Err(Error::runtime(format!("{name} does not accept DISTINCT or *")));
                 }
+                // pg_get_viewdef('name'): the text of a saved query, known when the statement is read
+                if name.eq_ignore_ascii_case("PG_GET_VIEWDEF") {
+                    return match args.first() {
+                        Some(Expr::Literal(Value::Text(v))) => match self.db.view_sql(v) {
+                            Some(sql) => Ok(BExpr::Lit(Value::text(sql))),
+                            None => Err(Error::catalog(format!("the saved query '{v}' does not exist"))),
+                        },
+                        _ => Err(Error::runtime("pg_get_viewdef needs the name of a saved query in quotes")),
+                    };
+                }
                 let Some((f, min, max)) = ScalarFn::lookup(name) else {
                     // A stored function: its body, with the arguments in place of the parameters.
-                    let def = self.db.function_def(name).ok_or_else(|| Error::catalog(format!("unknown function '{name}'")))?;
+                    let Some(def) = self.db.function_def(name) else {
+                        // `float8(x)`, `int4(x)`, `name(x)`: a type name used as a function is a cast
+                        if args.len() == 1 {
+                            if let Some((ty, auto)) = crate::value::DataType::from_sql_name(name) {
+                                if !auto && ty != crate::value::DataType::Calculated {
+                                    let cast = Expr::Function {
+                                        name: match ty {
+                                            crate::value::DataType::Integer => "CAST_INTEGER".to_string(),
+                                            crate::value::DataType::Bignum => "CAST_BIGNUM".to_string(),
+                                            other => crate::sql::parser::cast_function(other).expect("not CALCULATED").to_string(),
+                                        },
+                                        args: args.clone(),
+                                        distinct: false,
+                                        star: false,
+                                    };
+                                    return self.bind(&cast);
+                                }
+                            }
+                        }
+                        return Err(Error::catalog(format!("unknown function '{name}'")));
+                    };
                     if self.inlining >= super::routine::MAX_INLINE {
                         return Err(Error::runtime(format!("the function '{name}' calls itself (or functions nest too deeply)")));
                     }

@@ -24,6 +24,7 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | [sequence.md](sequence.md) | `NEXTVAL`, `CURRVAL`, `LASTVAL`, `SETVAL` |
 | [json.md](json.md) | `JSON_VALUE`, `JSON_EXTRACT`, `JSON_SET`, `JSON_OBJECT`, `JSON_ARRAYAGG`, `->`, `->>`, and the rest |
 | [format.md](format.md) | `Format` with its number, date and text patterns |
+| [postgresql.md](postgresql.md) | `to_char`, `to_date`, `to_timestamp`, `to_number`, `date_trunc`, `make_date`, `make_timestamp`, `make_timestamptz`, `pg_typeof`, `pg_input_is_valid`, `scale`, `concat_ws`, `regexp_instr`, `asinh`, `acosh`, `atanh`, `has_*_privilege`, and type names used as functions |
 
 ## Alphabetical list
 

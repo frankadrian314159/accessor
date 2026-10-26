@@ -4269,3 +4269,83 @@ fn grouping_works_without_grouping_sets_and_count_needs_a_star() {
     let e = db.query("SELECT COUNT() OVER () FROM g").unwrap_err().to_string();
     assert!(e.contains("count(*)"), "{e}");
 }
+
+// ----- PostgreSQL functions ---------------------------------------------------------------------------
+
+#[test]
+fn postgresql_functions() {
+    let db = Database::in_memory();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one("SELECT pg_input_is_valid('true', 'bool')"), "Yes");
+    assert_eq!(one("SELECT pg_input_is_valid('maybe', 'boolean')"), "No");
+    assert_eq!(one("SELECT pg_input_is_valid('12', 'int4')"), "Yes");
+    assert_eq!(one("SELECT pg_input_is_valid('x12', 'int4')"), "No");
+    assert!(db.query("SELECT pg_input_is_valid('1', 'nosuchtype')").is_err());
+    assert_eq!(one("SELECT pg_typeof('x')"), "text");
+    assert_eq!(one("SELECT pg_typeof(1.5)"), "numeric");
+    assert_eq!(one("SELECT pg_typeof(1.5e0)"), "double precision");
+    assert_eq!(one("SELECT scale(12.345)"), "3");
+    assert_eq!(one("SELECT scale(7)"), "0");
+    assert_eq!(one("SELECT trim_scale(1.500)"), "1.5");
+    assert_eq!(one("SELECT round(asinh(1) * 1000)"), "881");
+    assert_eq!(one("SELECT concat_ws('-', 'a', NULL, 'b')"), "a-b");
+    assert_eq!(one("SELECT concat_ws(NULL, 'a', 'b') IS NULL"), "Yes");
+    assert_eq!(one("SELECT regexp_instr('abcdefghi', 'd.f')"), "4");
+    assert_eq!(one("SELECT regexp_instr('abcdefghi', 'd.f', 1, 1, 1)"), "7");
+    assert_eq!(one("SELECT regexp_instr('abc', 'x')"), "0");
+    assert_eq!(one("SELECT has_table_privilege('someone', 'atable', 'select')"), "Yes");
+    assert_eq!(one("SELECT has_schema_privilege('someone', 'public', 'usage')"), "Yes");
+    assert!(db.query("SELECT has_table_privilege(NULL, 'atable', 'select')").unwrap().rows[0][0].is_null());
+    // a type name used as a function is a cast
+    assert_eq!(one("SELECT float8(5) / 2"), "2.5");
+    assert_eq!(one("SELECT int4(2.7)"), "2");
+    assert_eq!(one("SELECT text(42) || 'x'"), "42x");
+}
+
+#[test]
+fn dates_built_truncated_and_formatted() {
+    let db = Database::in_memory();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one("SELECT make_date(2024, 3, 15)"), "2024-03-15");
+    assert_eq!(one("SELECT make_timestamp(2024, 3, 15, 10, 20, 30)"), "2024-03-15 10:20:30");
+    assert!(db.query("SELECT make_date(2024, 13, 1)").is_err());
+    assert_eq!(one("SELECT date_trunc('month', timestamp '2024-03-15 10:20:30')"), "2024-03-01");
+    assert_eq!(one("SELECT date_trunc('hour', timestamp '2024-03-15 10:20:30')"), "2024-03-15 10:00:00");
+    assert_eq!(one("SELECT date_trunc('week', timestamp '2024-03-15 10:20:30')"), "2024-03-11");
+    assert_eq!(one("SELECT date_trunc('quarter', timestamp '2024-08-15 10:20:30')"), "2024-07-01");
+    assert_eq!(one("SELECT date_trunc('decade', timestamp '2024-08-15 10:20:30')"), "2020-01-01");
+    assert_eq!(one("SELECT date_trunc('century', timestamp '2024-08-15 10:20:30')"), "2001-01-01");
+    assert!(db.query("SELECT date_trunc('fortnight', timestamp '2024-08-15 10:20:30')").is_err());
+    assert_eq!(one("SELECT to_char(timestamp '2024-03-01 15:04:05', 'YYYY-MM-DD HH24:MI:SS')"), "2024-03-01 15:04:05");
+    assert_eq!(one("SELECT to_char(timestamp '2024-03-01 15:04:05', 'Dy Mon DD, HH12:MI PM')"), "Fri Mar 01, 03:04 PM");
+    assert_eq!(one("SELECT to_char(date '2024-03-01', 'FMMM/FMDD/YY')"), "3/1/24");
+    assert_eq!(one("SELECT to_char(date '2024-03-01', 'DDD D Q')"), "061 6 1");
+    assert_eq!(one("SELECT to_char(date '2024-03-01', 'Month')"), "March    ");
+    assert_eq!(one("SELECT to_char(date '2024-03-01', 'FMMonth \"of\" YYYY')"), "March of 2024");
+    assert_eq!(one("SELECT to_date('20100309', 'YYYYMMDD')"), "2010-03-09");
+    assert_eq!(one("SELECT to_date('March 5, 2024', 'Month DD, YYYY')"), "2024-03-05");
+    assert_eq!(one("SELECT to_timestamp('2024-03-01 10:30:00', 'YYYY-MM-DD HH24:MI:SS')"), "2024-03-01 10:30:00+00:00");
+    assert_eq!(one("SELECT to_timestamp('03:04 PM', 'HH12:MI PM')"), "0001-01-01 15:04:00+00:00");
+    assert_eq!(one("SELECT to_timestamp(86400)"), "1970-01-02 00:00:00+00:00");
+    assert!(db.query("SELECT to_date('2024-13-45', 'YYYY-MM-DD')").is_err());
+    assert!(db.query("SELECT to_date('abc', 'YYYY')").is_err());
+}
+
+#[test]
+fn numbers_formatted_and_read_with_patterns() {
+    let db = Database::in_memory();
+    let one = |sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one("SELECT to_char(12345.678, '99999.99')"), " 12345.68");
+    assert_eq!(one("SELECT to_char(5, '999')"), "   5");
+    assert_eq!(one("SELECT to_char(-5, '999')"), "  -5");
+    assert_eq!(one("SELECT to_char(7, '000')"), " 007");
+    assert_eq!(one("SELECT to_char(1234567, '9,999,999')"), " 1,234,567");
+    assert_eq!(one("SELECT to_char(0.5, 'FM0.99')"), "0.5");
+    assert_eq!(one("SELECT to_char(-12.5, '999D9PR')"), "<12.5>");
+    assert_eq!(one("SELECT to_char(2, '9V999999999')"), " 2000000000");
+    assert_eq!(one("SELECT to_char(12345, '999')"), " ####");
+    assert_eq!(one("SELECT to_char(1.5, '9.9') || '|'"), " 1.5|");
+    assert_eq!(one("SELECT to_number('-34,338,492', '99G999G999')"), "-34338492");
+    assert_eq!(one("SELECT to_number('12.5', '99.9')"), "12.5");
+    assert!(db.query("SELECT to_number('abc', '999')").is_err());
+}

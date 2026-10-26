@@ -17,6 +17,8 @@ use crate::value::{num_cmp, DataType, Value};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScalarFn {
+    /// The functions of `pgfuncs.rs`.
+    Pg(super::pgfuncs::PgFn),
     Iif,
     Nz,
     IsNull,
@@ -165,6 +167,9 @@ impl ScalarFn {
     pub fn lookup(name: &str) -> Option<(ScalarFn, usize, usize)> {
         use ScalarFn::*;
         let up = name.to_ascii_uppercase();
+        if let Some((f, min, max)) = super::pgfuncs::lookup(&up) {
+            return Some((Pg(f), min, max));
+        }
         Some(match up.as_str() {
             "IIF" => (Iif, 3, 3),
             "NZ" => (Nz, 1, 2),
@@ -280,13 +285,13 @@ impl ScalarFn {
             "JSON_ARRAY" => (JsonArray, 0, usize::MAX),
             "JSON_OBJECT" => (JsonObject, 0, usize::MAX),
             "JSON_LENGTH" | "JSON_ARRAY_LENGTH" => (JsonLength, 1, 2),
-            "JSON_TYPE" => (JsonType, 1, 2),
+            "JSON_TYPE" | "JSON_TYPEOF" | "JSONB_TYPEOF" => (JsonType, 1, 2),
             "JSON_KEYS" => (JsonKeys, 1, 2),
             "JSON_SET" => (JsonSet, 3, 3),
             "JSON_REMOVE" => (JsonRemove, 2, 2),
             "JSON_MERGE_PATCH" | "JSON_MERGE" => (JsonMergePatch, 2, 2),
             "JSON_CONTAINS" => (JsonContains, 2, 2),
-            "TO_JSON" => (ToJson, 1, 1),
+            "TO_JSON" | "TO_JSONB" => (ToJson, 1, 1),
             "JSON" | "JSON_PARSE" => (JsonParse, 1, 1),
             _ => return None,
         })
@@ -295,6 +300,9 @@ impl ScalarFn {
     /// Functions that tolerate (and may transform) `Null` arguments; all
     /// others yield `Null` as soon as any argument is `Null`.
     fn handles_null(self) -> bool {
+        if let ScalarFn::Pg(p) = self {
+            return p.handles_null();
+        }
         matches!(
             self,
             ScalarFn::Nz
@@ -664,6 +672,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         }
         CStr => Value::text(&v0.unwrap().to_string()),
         // Conversions to each numeric type.
+        Pg(p) => super::pgfuncs::call(p, &vals)?,
         CInt => v0.unwrap().coerce_to(DataType::Integer)?,
         CastInt => truncated(v0.unwrap())?.coerce_to(DataType::Integer)?,
         CastBig => truncated(v0.unwrap())?.coerce_to(DataType::Bignum)?,
