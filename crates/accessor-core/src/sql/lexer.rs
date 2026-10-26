@@ -33,8 +33,8 @@ pub struct Token {
     pub pos: usize,
 }
 
-const SYMBOLS: [&str; 32] = [
-    "@?", "@@", "!~*", "~*", "!~", "~", "@", "->>", "->", "::", ":=", "..", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "=", "<", ">", "%",
+const SYMBOLS: [&str; 35] = [
+    "@?", "@@", "<<", ">>", "!~*", "~*", "!~", "~", "@", "->>", "->", "::", ":=", ":", "..", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "=", "<", ">", "%",
 ];
 
 fn is_ident_start(c: char) -> bool {
@@ -85,6 +85,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 return Err(Error::syntax("unterminated /* comment"));
             }
             i += 2;
+        } else if c == '0' && matches!(at(i + 1), Some('x')) && at(i + 2).is_some_and(|d| d.is_ascii_hexdigit()) {
+            // 0x7FFF: a number written in hexadecimal
+            i += 2;
+            let start = i;
+            while at(i).is_some_and(|d| d.is_ascii_hexdigit()) {
+                i += 1;
+            }
+            let digits: String = chars[start..i].iter().map(|&(_, ch)| ch).collect();
+            let tok = match i64::from_str_radix(&digits, 16) {
+                Ok(v) => Tok::Int(v),
+                Err(_) => Tok::Big(BigInt::parse_bytes(digits.as_bytes(), 16).ok_or_else(|| Error::syntax("bad hexadecimal number"))?),
+            };
+            out.push(Token { tok, pos });
         } else if c.is_ascii_digit() || (c == '.' && at(i + 1).is_some_and(|d| d.is_ascii_digit())) {
             let start = i;
             let mut has_point = false;

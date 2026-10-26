@@ -4,6 +4,7 @@ pub use prepared::Prepared;
 pub mod agg;
 pub mod bind;
 mod budget;
+mod multi;
 mod mysqlshow;
 mod catalog;
 pub(crate) mod pushdown;
@@ -214,6 +215,8 @@ impl Database {
             Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
             Statement::Grant(g) => self.exec_grant(g),
             Statement::Ignored(_) => Ok(QueryResult::default()),
+            Statement::DeleteMulti { target, from, filter } => self.exec_delete_multi(target, from, filter.as_ref()),
+            Statement::UpdateMulti { from, assignments, filter } => self.exec_update_multi(from, assignments, filter.as_ref()),
             Statement::SetVar { name, expr } => {
                 let v = self.eval_const(expr)?;
                 self.user_vars.insert(name.to_ascii_lowercase(), v);
@@ -307,6 +310,8 @@ impl Database {
             Statement::CreateSequence { name, options } => self.exec_create_sequence(name, options),
             Statement::AlterSequence { name, options } => self.exec_alter_sequence(name, options),
             Statement::DropSequence(name) => self.exec_drop_sequence(name),
+            // as in MySQL and PostgreSQL, ending a transaction that is not there does nothing
+            Statement::Commit | Statement::Rollback if !self.in_transaction() => Ok(QueryResult::default()),
             Statement::Begin => self.begin().map(|_| QueryResult::default()),
             Statement::Commit => self.commit().map(|_| QueryResult::default()),
             Statement::Rollback => self.rollback().map(|_| QueryResult::default()),

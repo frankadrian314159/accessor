@@ -701,3 +701,378 @@ fn plpgsql_body(body: &str, mut names: Names, value: bool) -> Result<RoutineBody
     }
     Ok(RoutineBody::Block(block))
 }
+
+// ---- MySQL stored routines and triggers ----
+
+const BODY_START: [&str; 24] = [
+    "BEGIN", "RETURN", "INSERT", "UPDATE", "DELETE", "SELECT", "SET", "CALL", "IF", "WHILE", "REPEAT", "LOOP", "CASE", "DECLARE", "REPLACE", "WITH", "TRUNCATE",
+    "DROP", "CREATE", "ALTER", "SIGNAL", "EXPLAIN", "LOCK", "UNLOCK",
+];
+
+impl<'a> Parser<'a> {
+    /// At the name after `CREATE FUNCTION | PROCEDURE`: MySQL's form has no `AS` between the parameters and the body.
+    pub(super) fn looks_like_mysql_routine(&self) -> bool {
+        let mut i = self.pos;
+        while i < self.toks.len() && i < self.pos + 6 && !matches!(self.toks[i].tok, Tok::Sym("(")) {
+            i += 1;
+        }
+        if matches!(self.toks.get(i + 1).map(|t| &t.tok), Some(Tok::Param(_))) || self.toks.get(i).is_none_or(|t| !matches!(t.tok, Tok::Sym("("))) {
+            return false;
+        }
+        let mut depth = 0;
+        let mut j = i;
+        loop {
+            match self.toks.get(j).map(|t| &t.tok) {
+                Some(Tok::Sym("(")) => depth += 1,
+                Some(Tok::Sym(")")) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                Some(Tok::Eof) | None => return false,
+                _ => {}
+            }
+            j += 1;
+        }
+        while let Some(t) = self.toks.get(j) {
+            match &t.tok {
+                Tok::Eof => return false,
+                Tok::Ident(w) => {
+                    let up = w.to_ascii_uppercase();
+                    if up == "AS" || up == "LANGUAGE" && matches!(self.toks.get(j + 1).map(|t| &t.tok), Some(Tok::Ident(l)) if !l.eq_ignore_ascii_case("SQL")) {
+                        return false;
+                    }
+                    if BODY_START.contains(&up.as_str()) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        false
+    }
+
+    fn skip_charset(&mut self) {
+        loop {
+            if self.eat_kw("CHARSET") || self.eat_kw("COLLATE") {
+                self.advance();
+            } else if self.peek_kw("CHARACTER") && self.peek_kw_at(1, "SET") {
+                self.advance();
+                self.advance();
+                self.advance();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// `CREATE PROCEDURE name ([IN] p type, ...) characteristics body` and `CREATE FUNCTION ... RETURNS type ... body`.
+    pub(super) fn mysql_routine(&mut self, function: bool, start: usize) -> Result<Statement> {
+        let name = self.table_ident()?;
+        self.expect_sym("(")?;
+        let mut params: Vec<RoutineParam> = Vec::new();
+        if !self.peek_sym(")") {
+            loop {
+                self.eat_kw("IN");
+                if self.peek_kw("OUT") || self.peek_kw("INOUT") {
+                    return Err(Error::syntax("OUT and INOUT parameters are not supported"));
+                }
+                let pname = self.ident()?;
+                let ty = self.pg_type()?;
+                self.skip_charset();
+                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None });
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_sym(")")?;
+        let mut returns = None;
+        if function {
+            self.expect_kw("RETURNS")?;
+            returns = Some(self.pg_type()?);
+            self.skip_charset();
+        }
+        // characteristics
+        loop {
+            if self.eat_kw("DETERMINISTIC") || self.eat_kw("LANGUAGE") && self.eat_kw("SQL") {
+            } else if self.peek_kw("NOT") && self.peek_kw_at(1, "DETERMINISTIC") {
+                self.advance();
+                self.advance();
+            } else if (self.peek_kw("NO") || self.peek_kw("CONTAINS")) && self.peek_kw_at(1, "SQL") {
+                self.advance();
+                self.advance();
+            } else if (self.peek_kw("READS") || self.peek_kw("MODIFIES")) && self.peek_kw_at(1, "SQL") {
+                self.advance();
+                self.advance();
+                self.expect_kw("DATA")?;
+            } else if self.peek_kw("SQL") && self.peek_kw_at(1, "SECURITY") {
+                self.advance();
+                self.advance();
+                self.advance();
+            } else if self.eat_kw("COMMENT") {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false };
+        let stmts = self.my_body(&mut names)?;
+        let end = self.toks[self.pos].pos;
+        let sql = self.src[start..end].trim().to_string();
+        let body = match stmts.as_slice() {
+            [ProcStmt::Return(Some(e))] if function => RoutineBody::Expr(e.clone()),
+            _ => RoutineBody::Block(stmts),
+        };
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, sql })))
+    }
+
+    /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
+    /// are variables.
+    pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true };
+        let body = self.my_body(&mut names)?;
+        fn check(list: &[ProcStmt]) -> Result<()> {
+            for s in list {
+                match s {
+                    ProcStmt::Sql(Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Select(_) | Statement::SelectInto { .. } | Statement::Raise(_) | Statement::SetVar { .. } | Statement::Upsert { .. } | Statement::Exec { .. } | Statement::Batch(_)) => {}
+                    ProcStmt::Sql(_) => return Err(Error::syntax("a trigger body may contain only INSERT, UPDATE, DELETE, SELECT, SET and CALL statements")),
+                    ProcStmt::If { branches, otherwise } => {
+                        for (_, b) in branches {
+                            check(b)?;
+                        }
+                        check(otherwise)?;
+                    }
+                    ProcStmt::While { body, .. } => check(body)?,
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        check(&body)?;
+        if body.is_empty() {
+            return Err(Error::syntax("a trigger needs at least one statement"));
+        }
+        Ok(body)
+    }
+
+    fn my_body(&mut self, names: &mut Names) -> Result<Vec<ProcStmt>> {
+        let mut out = Vec::new();
+        if self.peek_kw("BEGIN") || (matches!(self.peek(), Tok::Ident(_)) && self.peek_sym_at(1, ":") && self.peek_kw_at(2, "BEGIN")) {
+            self.my_block(names, &mut out)?;
+        } else {
+            self.my_stmt(names, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn my_block(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>) -> Result<()> {
+        if matches!(self.peek(), Tok::Ident(_)) && self.peek_sym_at(1, ":") {
+            self.advance();
+            self.advance();
+        }
+        self.expect_kw("BEGIN")?;
+        self.eat_kw("ATOMIC");
+        let inner = self.my_stmts(names, &["END"])?;
+        out.extend(inner);
+        self.expect_kw("END")?;
+        // an end label
+        if matches!(self.peek(), Tok::Ident(w) if !matches!(w.to_ascii_uppercase().as_str(), "ELSE" | "ELSEIF" | "UNTIL" | "WHEN")) && !self.peek_sym(";") {
+            self.advance();
+        }
+        Ok(())
+    }
+
+    fn my_stmts(&mut self, names: &mut Names, stops: &[&str]) -> Result<Vec<ProcStmt>> {
+        let mut out = Vec::new();
+        loop {
+            while self.eat_sym(";") {}
+            if self.at_eof() {
+                return Err(self.unexpected(stops[0]));
+            }
+            if stops.iter().any(|s| self.peek_kw(s)) {
+                return Ok(out);
+            }
+            self.my_stmt(names, &mut out)?;
+        }
+    }
+
+    fn my_end(&mut self) -> Result<()> {
+        if self.eat_sym(";") || self.at_eof() || ["END", "ELSE", "ELSEIF", "UNTIL", "WHEN"].iter().any(|w| self.peek_kw(w)) {
+            Ok(())
+        } else {
+            Err(self.unexpected("';'"))
+        }
+    }
+
+    fn my_stmt(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>) -> Result<()> {
+        // a label: `lbl: LOOP`
+        if matches!(self.peek(), Tok::Ident(_)) && self.peek_sym_at(1, ":") && !self.peek_kw("BEGIN") {
+            self.advance();
+            self.advance();
+        }
+        if self.peek_kw("BEGIN") {
+            return self.my_block(names, out).and_then(|()| self.my_end());
+        }
+        if self.eat_kw("DECLARE") {
+            if self.peek_kw("CONTINUE") || self.peek_kw("EXIT") || self.peek_kw("UNDO") {
+                return Err(Error::syntax("condition handlers (DECLARE ... HANDLER) are not supported"));
+            }
+            let mut vars = vec![self.ident()?];
+            while self.eat_sym(",") {
+                vars.push(self.ident()?);
+            }
+            if self.peek_kw("CURSOR") || self.peek_kw("CONDITION") {
+                return Err(Error::syntax("cursors and named conditions are not supported"));
+            }
+            let ty = self.pg_type()?;
+            self.skip_charset();
+            let init = if self.eat_kw("DEFAULT") { Some(self.pl_expr(names)?) } else { None };
+            for v in vars {
+                names.all.push(v.clone());
+                out.push(ProcStmt::Declare { name: v, data_type: Some(ty), init: init.clone() });
+            }
+            return self.my_end();
+        }
+        if self.peek_kw("SET") {
+            // SET var = expr, NEW.col = expr; anything else (`SET @x`, `SET sql_mode`) is a statement
+            let declared = |s: &Self, k: usize| -> bool {
+                match s.peek_at(k) {
+                    Tok::Ident(n) | Tok::Quoted(n) => {
+                        let assigned = s.peek_sym_at(k + 1, "=") || s.peek_sym_at(k + 1, ":=");
+                        let member = s.peek_sym_at(k + 1, ".") && matches!(s.peek_at(k + 2), Tok::Ident(_)) && (s.peek_sym_at(k + 3, "=") || s.peek_sym_at(k + 3, ":="));
+                        (assigned && names.has(n)) || (member && names.trigger && (n.eq_ignore_ascii_case("new") || n.eq_ignore_ascii_case("old")))
+                    }
+                    _ => false,
+                }
+            };
+            if declared(self, 1) {
+                self.advance();
+                loop {
+                    let first = self.ident()?;
+                    let target = if self.eat_sym(".") { format!("{}.{}", first.to_ascii_lowercase(), self.ident()?.to_ascii_lowercase()) } else { first };
+                    if !self.eat_sym(":=") {
+                        self.expect_sym("=")?;
+                    }
+                    let value = self.pl_expr(names)?;
+                    out.push(ProcStmt::Set { name: target, value });
+                    if self.peek_sym(",") && declared(self, 1) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                return self.my_end();
+            }
+        }
+        if self.eat_kw("IF") {
+            let mut branches = Vec::new();
+            let cond = self.pl_expr(names)?;
+            self.expect_kw("THEN")?;
+            branches.push((cond, self.my_stmts(names, &["ELSEIF", "ELSE", "END"])?));
+            let mut otherwise = Vec::new();
+            loop {
+                if self.eat_kw("ELSEIF") {
+                    let cond = self.pl_expr(names)?;
+                    self.expect_kw("THEN")?;
+                    branches.push((cond, self.my_stmts(names, &["ELSEIF", "ELSE", "END"])?));
+                } else if self.eat_kw("ELSE") {
+                    otherwise = self.my_stmts(names, &["END"])?;
+                } else {
+                    break;
+                }
+            }
+            self.expect_kw("END")?;
+            self.expect_kw("IF")?;
+            out.push(ProcStmt::If { branches, otherwise });
+            return self.my_end();
+        }
+        if self.eat_kw("WHILE") {
+            let cond = self.pl_expr(names)?;
+            self.expect_kw("DO")?;
+            let body = self.my_stmts(names, &["END"])?;
+            self.expect_kw("END")?;
+            self.expect_kw("WHILE")?;
+            if matches!(self.peek(), Tok::Ident(_)) && !self.peek_sym(";") {
+                self.advance();
+            }
+            out.push(ProcStmt::While { cond, body });
+            return self.my_end();
+        }
+        if self.eat_kw("REPEAT") {
+            let mut body = self.my_stmts(names, &["UNTIL"])?;
+            self.expect_kw("UNTIL")?;
+            let cond = self.pl_expr(names)?;
+            self.expect_kw("END")?;
+            self.expect_kw("REPEAT")?;
+            body.push(ProcStmt::If { branches: vec![(cond, vec![ProcStmt::Leave])], otherwise: Vec::new() });
+            out.push(ProcStmt::While { cond: lit_true(), body });
+            return self.my_end();
+        }
+        if self.eat_kw("LOOP") {
+            let body = self.my_stmts(names, &["END"])?;
+            self.expect_kw("END")?;
+            self.expect_kw("LOOP")?;
+            out.push(ProcStmt::While { cond: lit_true(), body });
+            return self.my_end();
+        }
+        if self.eat_kw("LEAVE") {
+            if matches!(self.peek(), Tok::Ident(_)) {
+                self.advance();
+            }
+            out.push(ProcStmt::Leave);
+            return self.my_end();
+        }
+        if self.peek_kw("ITERATE") || self.peek_kw("OPEN") || self.peek_kw("FETCH") || self.peek_kw("CLOSE") {
+            return Err(Error::syntax("ITERATE and cursors are not supported"));
+        }
+        if self.eat_kw("RETURN") {
+            let value = if self.peek_sym(";") || self.at_eof() || self.peek_kw("END") { None } else { Some(self.pl_expr(names)?) };
+            out.push(ProcStmt::Return(value));
+            return self.my_end();
+        }
+        if self.eat_kw("CASE") {
+            let subject = if self.peek_kw("WHEN") { None } else { Some(self.pl_expr(names)?) };
+            let mut branches = Vec::new();
+            while self.eat_kw("WHEN") {
+                let v = self.pl_expr(names)?;
+                let cond = match &subject {
+                    Some(s) => Expr::Binary { op: BinOp::Eq, left: Box::new(s.clone()), right: Box::new(v) },
+                    None => v,
+                };
+                self.expect_kw("THEN")?;
+                branches.push((cond, self.my_stmts(names, &["WHEN", "ELSE", "END"])?));
+            }
+            let otherwise = if self.eat_kw("ELSE") { self.my_stmts(names, &["END"])? } else { Vec::new() };
+            self.expect_kw("END")?;
+            self.expect_kw("CASE")?;
+            out.push(ProcStmt::If { branches, otherwise });
+            return self.my_end();
+        }
+        if self.peek_kw("SELECT") {
+            if let Some((into_at, targets, after)) = self.find_into() {
+                self.toks.drain(into_at..after);
+                let sel = self.select()?;
+                for (k, target) in targets.iter().enumerate() {
+                    if !names.has(target) {
+                        return Err(Error::syntax(format!("'{target}' is not a declared variable or parameter")));
+                    }
+                    let mut one = sel.clone();
+                    let item = sel.items.get(k).cloned().ok_or_else(|| Error::syntax("SELECT INTO has more variables than columns"))?;
+                    one.items = vec![item];
+                    let mut sub = Expr::Subquery(Box::new(one));
+                    names.expr(&mut sub)?;
+                    out.push(ProcStmt::Set { name: target.clone(), value: sub });
+                }
+                return self.my_end();
+            }
+        }
+        let mut st = self.statement()?;
+        names.statement(&mut st)?;
+        out.push(ProcStmt::Sql(st));
+        self.my_end()
+    }
+}

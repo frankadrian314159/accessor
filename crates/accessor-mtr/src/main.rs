@@ -185,6 +185,12 @@ fn split_test(src: &str) -> Vec<Unit> {
                 None => {
                     if ch == '\'' || ch == '"' || ch == '`' {
                         quote = Some(ch);
+                    } else if ch == '#' && at_line_start(k, &b) {
+                        // a comment line inside a statement
+                        while k < b.len() && b[k] != '\n' {
+                            k += 1;
+                        }
+                        continue;
                     } else if ch == '/' && b.get(k + 1) == Some(&'*') {
                         // a comment inside a statement is kept
                         while k < b.len() && !(b[k] == '*' && b.get(k + 1) == Some(&'/')) {

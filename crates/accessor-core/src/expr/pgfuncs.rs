@@ -41,6 +41,8 @@ pub enum PgFn {
     Decode,
     Zero,
     Same,
+    /// One of the functions of MySQL ([`super::myfuncs`]).
+    My(super::myfuncs::MyFn),
     /// A function that always gives the same text (`DATABASE()`, `VERSION()`, `CURRENT_USER()`).
     Text(&'static str),
     JsonPathArray,
@@ -85,14 +87,17 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "DECODE" => (Decode, 2, 2),
         "PG_RELATION_SIZE" | "PG_TOTAL_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" => (Zero, 1, 2),
         "TO_REGCLASS" | "TO_REGTYPE" | "TO_REGPROC" | "TO_REGROLE" | "TO_REGNAMESPACE" | "TO_REGPROCEDURE" | "TO_REGOPER" | "TO_REGDATABASE" => (Same, 1, 1),
-        _ => return None,
+        _ => return super::myfuncs::lookup(name).map(|(m, a, b)| (My(m), a, b)),
     })
 }
 
 impl PgFn {
     /// Functions that get their NULL arguments instead of answering NULL themselves.
     pub fn handles_null(self) -> bool {
-        matches!(self, PgFn::ConcatWs | PgFn::TypeOf | PgFn::Nothing)
+        match self {
+            PgFn::My(m) => m.handles_null(),
+            _ => matches!(self, PgFn::ConcatWs | PgFn::TypeOf | PgFn::Nothing),
+        }
     }
 }
 
@@ -238,6 +243,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 },
             }
         }
+        My(m) => return super::myfuncs::call(m, vals),
         Text(s) => Value::text(s),
         Zero => Value::Int(0),
         Same => v(0).clone(),

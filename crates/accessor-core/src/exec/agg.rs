@@ -38,7 +38,7 @@ impl AggFn {
             "LAST" => AggFn::Last,
             "ANY_VALUE" => AggFn::First,
             "STRING_AGG" | "LISTAGG" | "GROUP_CONCAT" => AggFn::StringAgg,
-            "STDDEV_POP" => AggFn::StddevPop,
+            "STDDEV_POP" | "STD" => AggFn::StddevPop,
             "STDDEV" | "STDDEV_SAMP" => AggFn::StddevSamp,
             "VAR_POP" => AggFn::VarPop,
             "VARIANCE" | "VAR_SAMP" => AggFn::VarSamp,

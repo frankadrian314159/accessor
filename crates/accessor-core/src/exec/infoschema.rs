@@ -11,7 +11,33 @@ use crate::sql::ast::{TriggerEvent, TriggerTiming};
 use crate::value::{Row, Value};
 
 /// The views of the schema, for the error message.
-const VIEWS: &str = "TABLES, COLUMNS, VIEWS, TABLE_CONSTRAINTS, KEY_COLUMN_USAGE, REFERENTIAL_CONSTRAINTS, INDEXES, ROUTINES, PARAMETERS, SEQUENCES, TRIGGERS, REPORTS";
+const VIEWS: &str = "TABLES, COLUMNS, VIEWS, TABLE_CONSTRAINTS, KEY_COLUMN_USAGE, REFERENTIAL_CONSTRAINTS, INDEXES, ROUTINES, PARAMETERS, SEQUENCES, TRIGGERS, REPORTS, SCHEMATA, STATISTICS, CHARACTER_SETS, COLLATIONS, ENGINES, PARTITIONS, CHECK_CONSTRAINTS, PROCESSLIST and the empty MySQL views (COLUMN_STATISTICS, USER_PRIVILEGES, EVENTS, ...)";
+
+/// Views of MySQL that describe a server: columns, and no rows.
+const EMPTY_VIEWS: [(&str, &[&str]); 22] = [
+    ("processlist", &["id", "user", "host", "db", "command", "time", "state", "info"]),
+    ("column_statistics", &["schema_name", "table_name", "column_name", "histogram"]),
+    ("user_privileges", &["grantee", "table_catalog", "privilege_type", "is_grantable"]),
+    ("schema_privileges", &["grantee", "table_catalog", "table_schema", "privilege_type", "is_grantable"]),
+    ("table_privileges", &["grantee", "table_catalog", "table_schema", "table_name", "privilege_type", "is_grantable"]),
+    ("column_privileges", &["grantee", "table_catalog", "table_schema", "table_name", "column_name", "privilege_type", "is_grantable"]),
+    ("events", &["event_catalog", "event_schema", "event_name", "definer", "event_body", "status"]),
+    ("optimizer_trace", &["query", "trace", "missing_bytes_beyond_max_mem_size", "insufficient_privileges"]),
+    ("resource_groups", &["resource_group_name", "resource_group_type", "resource_group_enabled", "vcpu_ids", "thread_priority"]),
+    ("files", &["file_id", "file_name", "file_type", "tablespace_name"]),
+    ("tablespaces", &["tablespace_name", "engine", "tablespace_type"]),
+    ("plugins", &["plugin_name", "plugin_version", "plugin_status", "plugin_type"]),
+    ("view_table_usage", &["view_catalog", "view_schema", "view_name", "table_catalog", "table_schema", "table_name"]),
+    ("view_routine_usage", &["table_catalog", "table_schema", "table_name", "specific_catalog", "specific_schema", "specific_name"]),
+    ("columns_extensions", &["table_schema", "table_name", "column_name", "engine_attribute", "secondary_engine_attribute"]),
+    ("tables_extensions", &["table_schema", "table_name", "engine_attribute", "secondary_engine_attribute"]),
+    ("table_constraints_extensions", &["constraint_schema", "constraint_name", "table_name", "engine_attribute"]),
+    ("libraries", &["library_schema", "library_name", "library_definition"]),
+    ("routine_libraries", &["routine_schema", "routine_name", "library_name"]),
+    ("keywords", &["word", "reserved"]),
+    ("innodb_tables", &["table_id", "name", "flag", "n_cols"]),
+    ("innodb_trx", &["trx_id", "trx_state", "trx_started"]),
+];
 
 fn t(s: &str) -> Value {
     Value::text(s)
@@ -19,6 +45,11 @@ fn t(s: &str) -> Value {
 
 fn yes_no(b: bool) -> Value {
     t(if b { "YES" } else { "NO" })
+}
+
+/// The schema part of a table name (`test` for a plain one).
+fn schema_of(name: &str) -> &str {
+    name.split_once('.').map_or("test", |(s, _)| s)
 }
 
 fn names(list: &[&str]) -> Vec<String> {
@@ -36,12 +67,12 @@ impl Database {
         let cols = match view.to_ascii_lowercase().as_str() {
             "tables" => {
                 for tb in self.tables.values() {
-                    rows.push(vec![t(tb.name()), t("BASE TABLE"), Value::Int(tb.len() as i64)]);
+                    rows.push(vec![t(tb.name()), t("BASE TABLE"), Value::Int(tb.len() as i64), t("def"), t(schema_of(tb.name())), t("InnoDB")]);
                 }
                 for (name, _) in self.views.values() {
-                    rows.push(vec![t(name), t("VIEW"), Value::Null]);
+                    rows.push(vec![t(name), t("VIEW"), Value::Null, t("def"), t(schema_of(name)), Value::Null]);
                 }
-                names(&["table_name", "table_type", "row_count"])
+                names(&["table_name", "table_type", "row_count", "table_catalog", "table_schema", "engine"])
             }
             "columns" => {
                 for tb in self.tables.values() {
@@ -63,6 +94,13 @@ impl Database {
                             Value::Bool(c.primary_key),
                             Value::Bool(c.autonumber),
                             opt(c.expression().map(str::to_string)),
+                            t("def"),
+                            t(schema_of(tb.name())),
+                            t(super::mysqlshow::mysql_type(c.data_type)),
+                            t(if c.primary_key { "PRI" } else { "" }),
+                            t(if c.autonumber { "auto_increment" } else { "" }),
+                            if c.data_type == crate::value::DataType::Text { t("utf8mb4") } else { Value::Null },
+                            if c.data_type == crate::value::DataType::Text { t("utf8mb4_0900_ai_ci") } else { Value::Null },
                         ]);
                     }
                 }
@@ -89,11 +127,18 @@ impl Database {
                                 Value::Bool(false),
                                 Value::Bool(false),
                                 Value::Null,
+                                t("def"),
+                                t(schema_of(name)),
+                                Value::Null,
+                                t(""),
+                                t(""),
+                                Value::Null,
+                                Value::Null,
                             ]);
                         }
                     }
                 }
-                names(&["table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default", "is_primary_key", "is_autonumber", "calculated_expression"])
+                names(&["table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default", "is_primary_key", "is_autonumber", "calculated_expression", "table_catalog", "table_schema", "column_type", "column_key", "extra", "character_set_name", "collation_name"])
             }
             "views" => {
                 for (name, sql) in self.views.values() {
@@ -240,6 +285,66 @@ impl Database {
                     rows.push(vec![t(&r.name), t(&r.sql)]);
                 }
                 names(&["report_name", "report_definition"])
+            }
+            "schemata" => {
+                let mut dbs: Vec<String> = ["information_schema", "mysql", "performance_schema", "sys", "test"].iter().map(|s| s.to_string()).collect();
+                dbs.extend(self.catalog.keys().filter(|(k, _)| k == "schema").map(|(_, n)| n.clone()));
+                dbs.sort();
+                for d in dbs {
+                    rows.push(vec![t("def"), t(&d), t("utf8mb4"), t("utf8mb4_0900_ai_ci"), Value::Null]);
+                }
+                names(&["catalog_name", "schema_name", "default_character_set_name", "default_collation_name", "sql_path"])
+            }
+            "statistics" => {
+                for tb in self.tables.values() {
+                    let schema = tb.schema();
+                    for d in &schema.indexes {
+                        for (seq, &c) in d.columns.iter().enumerate() {
+                            rows.push(vec![
+                                t("def"),
+                                t(schema_of(tb.name())),
+                                t(tb.name()),
+                                Value::Int(i64::from(!d.unique)),
+                                t(schema_of(tb.name())),
+                                t(if d.name == "PrimaryKey" { "PRIMARY" } else { &d.name }),
+                                Value::Int(seq as i64 + 1),
+                                t(&schema.columns[c].name),
+                                t("A"),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                t(if schema.columns[c].not_null { "" } else { "YES" }),
+                                t("BTREE"),
+                            ]);
+                        }
+                    }
+                }
+                names(&["table_catalog", "table_schema", "table_name", "non_unique", "index_schema", "index_name", "seq_in_index", "column_name", "collation", "cardinality", "sub_part", "packed", "nullable", "index_type"])
+            }
+            "character_sets" => {
+                for (cs, desc, coll, len) in [("binary", "Binary pseudo charset", "binary", 1), ("latin1", "cp1252 West European", "latin1_swedish_ci", 1), ("utf8mb3", "UTF-8 Unicode", "utf8mb3_general_ci", 3), ("utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", 4)] {
+                    rows.push(vec![t(cs), t(coll), t(desc), Value::Int(len)]);
+                }
+                names(&["character_set_name", "default_collate_name", "description", "maxlen"])
+            }
+            "collations" => {
+                rows.push(vec![t("utf8mb4_0900_ai_ci"), t("utf8mb4"), Value::Int(255), t("Yes"), t("Yes"), Value::Int(0)]);
+                names(&["collation_name", "character_set_name", "id", "is_default", "is_compiled", "sortlen"])
+            }
+            "engines" => {
+                rows.push(vec![t("InnoDB"), t("DEFAULT"), t("Supports transactions, row-level locking, and foreign keys"), t("YES"), t("YES"), t("YES")]);
+                names(&["engine", "support", "comment", "transactions", "xa", "savepoints"])
+            }
+            "partitions" => {
+                for tb in self.tables.values() {
+                    rows.push(vec![t("def"), t(schema_of(tb.name())), t(tb.name()), Value::Null, Value::Null, Value::Null, Value::Int(tb.len() as i64)]);
+                }
+                names(&["table_catalog", "table_schema", "table_name", "partition_name", "partition_method", "partition_expression", "table_rows"])
+            }
+            "check_constraints" => names(&["constraint_catalog", "constraint_schema", "constraint_name", "check_clause"]),
+            other if EMPTY_VIEWS.iter().any(|(n, _)| *n == other) => {
+                let (_, cols) = EMPTY_VIEWS.iter().find(|(n, _)| *n == other).expect("checked");
+                names(cols)
             }
             other => {
                 return Err(Error::catalog(format!("INFORMATION_SCHEMA has no view '{other}' (it has {VIEWS})")));

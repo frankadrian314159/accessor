@@ -25,6 +25,7 @@ Unless a function's page says otherwise, a function returns NULL when any of its
 | [json.md](json.md) | `JSON_VALUE`, `JSON_EXTRACT`, `JSON_SET`, `JSON_OBJECT`, `JSON_ARRAYAGG`, `->`, `->>`, and the rest |
 | [format.md](format.md) | `Format` with its number, date and text patterns |
 | [postgresql.md](postgresql.md) | `to_char`, `to_date`, `to_timestamp`, `to_number`, `date_trunc`, `make_date`, `make_timestamp`, `make_timestamptz`, `pg_typeof`, `pg_input_is_valid`, `scale`, `concat_ws`, `regexp_instr`, `asinh`, `acosh`, `atanh`, `has_*_privilege`, and type names used as functions |
+| [mysql.md](mysql.md) | `IF`, `IFNULL`, `HEX`, `UNHEX`, `ASCII`, `LOCATE`, `FIELD`, `ELT`, `FIND_IN_SET`, `STR_TO_DATE`, `DATE_FORMAT`, `UNIX_TIMESTAMP`, `FROM_UNIXTIME`, `MD5`, `SHA2`, `UUID`, `INET_ATON`, `SOUNDEX`, `SUBSTRING_INDEX`, and the ones with nothing to do here (`SLEEP`, `GET_LOCK`, `CONNECTION_ID`) |
 
 ## Alphabetical list
 

@@ -78,8 +78,49 @@ The placeholders are numbered in the order they are written. (`PREPARE name AS s
 
 ## Functions and commands that do nothing
 
-`CURRENT_USER()`, `USER()` and `SESSION_USER()` are `root@localhost`; `DATABASE()` and `SCHEMA()` are `test`; `VERSION()` is `8.0.40`. `FLUSH ...`, `OPTIMIZE`, `REPAIR`, `CHECK TABLE`, `PURGE`, `KILL`, `CHANGE`, `XA`, `LOAD INDEX`, `SIGNAL`, `RESIGNAL`, `GET DIAGNOSTICS`, `HELP`, `INSTALL`, `UNINSTALL`, `BINLOG`, `CACHE INDEX` and `CALL mtr.add_suppression(...)` are read to the end of the statement and ignored.
+`CURRENT_USER()`, `USER()` and `SESSION_USER()` are `root@localhost`; `DATABASE()` and `SCHEMA()` are `test`; `VERSION()` is `8.0.40`; the other MySQL functions are in [mysql.md](../functions/mysql.md). `FLUSH ...`, `OPTIMIZE`, `REPAIR`, `CHECK TABLE`, `PURGE`, `KILL`, `CHANGE`, `XA`, `LOAD INDEX`, `SIGNAL`, `RESIGNAL`, `GET DIAGNOSTICS`, `HELP`, `INSTALL`, `UNINSTALL`, `BINLOG`, `CACHE INDEX` and `CALL mtr.add_suppression(...)` are read to the end of the statement and ignored.
+
+## Multi-table DELETE and UPDATE
+
+```sql
+DELETE a FROM t1 AS a, t2 AS b WHERE a.k = b.k;       -- or DELETE FROM a USING t1 AS a, t2 AS b WHERE ...
+UPDATE t1, t2 SET t1.v = t1.v + t2.w WHERE t1.k = t2.k;
+UPDATE t1 JOIN t2 ON t1.k = t2.k SET t1.v = 0 WHERE t2.w > 200;
+```
+
+The rows of the named table that the join reaches are deleted or changed; the other tables are only read. They are run as the single-table statement they amount to (`DELETE ... WHERE EXISTS (join)`, each new value a sub-query over the join), so two rows of the target that are equal in every column are treated alike. One table may be changed at a time (`DELETE t1, t2 FROM ...` and `UPDATE ... SET t1.a = .., t2.b = ..` are refused), and `ORDER BY` and `LIMIT` in these statements are not available.
+
+## Stored procedures, functions and triggers
+
+```sql
+CREATE PROCEDURE sp(IN a INT, b INT) DETERMINISTIC BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < a DO SET i = i + 1; END WHILE;
+  IF i > 3 THEN INSERT INTO log VALUES ('big'); ELSEIF i > 1 THEN INSERT INTO log VALUES ('mid'); END IF;
+END;
+CREATE PROCEDURE one() INSERT INTO t VALUES (1);
+CREATE FUNCTION f(a INT) RETURNS INT DETERMINISTIC RETURN IFNULL(a, 666);
+CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW SET NEW.d = NEW.id * 2;
+CREATE TRIGGER trg2 BEFORE UPDATE ON t FOR EACH ROW BEGIN
+  IF NEW.d IS NULL THEN SET NEW.d = 0; END IF;
+  INSERT INTO log VALUES (CONCAT('upd ', OLD.id));
+END;
+```
+
+The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `SET`, `IF` / `ELSEIF`, `WHILE ... DO`, `REPEAT ... UNTIL`, `LOOP` and `LEAVE`, `CASE`, `RETURN`, `SELECT ... INTO var`, and ordinary SQL statements; the characteristics (`DETERMINISTIC`, `NO SQL`, `READS SQL DATA`, `SQL SECURITY ...`, `COMMENT`) and `DEFINER = ...` are read and ignored. A name in the body that is a parameter or variable means that variable even if a column has the same name. In a trigger, `SET NEW.col = ...` changes the row a `BEFORE` trigger lets through. Procedures are run with `CALL`; a function whose body has statements is run like the [PL/pgSQL functions](routines.md#postgresql-style-functions-and-procedures) (with arguments known before the statement runs). Not available: `OUT` and `INOUT` parameters, cursors, `DECLARE ... HANDLER`, `ITERATE`, `SIGNAL`, events (`CREATE EVENT`), and a `FOLLOWS`/`PRECEDES` order of triggers (read and ignored).
+
+## Dates and intervals
+
+`DATE_ADD(d, INTERVAL n unit)`, `DATE_SUB`, `ADDDATE`, `SUBDATE` and `d + INTERVAL n unit` / `d - INTERVAL n unit` add to a date; the units are `MICROSECOND` (ignored), `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`. A time with a fraction of a second (`'12:00:00.567'`) is read with the fraction dropped, and the zero date `0000-00-00` is read as `0001-01-01`. `CAST(x AS SIGNED | UNSIGNED)` and `CONVERT(x, type)` convert; `CONVERT(x USING charset)` is `x`.
+
+## Catalog views
+
+`INFORMATION_SCHEMA` has the standard columns beside the engine's own: `TABLES` and `COLUMNS` add `TABLE_CATALOG`, `TABLE_SCHEMA`, `ENGINE`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA`, `CHARACTER_SET_NAME` and `COLLATION_NAME`, and these views are added: `SCHEMATA`, `STATISTICS` (the indexes), `CHARACTER_SETS`, `COLLATIONS`, `ENGINES`, `PARTITIONS`, `CHECK_CONSTRAINTS`, and, with the right columns and no rows, `PROCESSLIST`, `COLUMN_STATISTICS`, `USER_PRIVILEGES`, `SCHEMA_PRIVILEGES`, `TABLE_PRIVILEGES`, `COLUMN_PRIVILEGES`, `EVENTS`, `OPTIMIZER_TRACE`, `RESOURCE_GROUPS`, `FILES`, `TABLESPACES`, `PLUGINS`, `VIEW_TABLE_USAGE`, `KEYWORDS` and a few more. See [information-schema.md](information-schema.md).
+
+## Accounts and the rest that is read and ignored
+
+`CREATE USER 'u'@'host' IDENTIFIED BY ...`, `ALTER USER`, `DROP USER`, `SET PASSWORD` and `GRANT` / `REVOKE` in MySQL's forms (`ON *.*`, `ON db.*`, a user with a host, privileges of two words such as `REPLICATION SLAVE`) are read and **ignored**: there are no accounts, and a connection is not a user. `CREATE USER name` with no host and only PostgreSQL's options is a [role](roles-and-privileges.md). `ALTER SCHEMA`/`ALTER DATABASE`, `RESET PERSIST`, `RESET MASTER`, `CHECK TABLE[S]`, `EXPLAIN FORMAT=...` (the plan is always the text plan) and `DROP PREPARE` are accepted. `COMMIT` and `ROLLBACK` with no transaction do nothing. `0x41FF` is a number, `_utf8mb4 'x'` is `'x'`, `a << b` and `a >> b` shift (bitwise `|`, `^` and `~` are not available: `&` and `|` join text), and `CONV(n, from, to)` converts between bases. A column may be `BINARY`, `ASCII` or `UNICODE` (ignored).
 
 ## Not available
 
-Stored routines with MySQL's `DELIMITER` bodies and cursors, `HANDLER`, the effect of `LOCK TABLES`, `CREATE USER 'u'@'host'` and `GRANT` for such users, `performance_schema` and most of `information_schema`, multi-table `UPDATE` and `DELETE`, `LIMIT offset, count` in `UPDATE` and `DELETE`, `EXPLAIN FORMAT=`, optimizer hints, `GROUP BY ... WITH ROLLUP`, full-text search (`MATCH ... AGAINST`), spatial functions, and the MySQL date and string functions that are not in [the function reference](../functions/README.md).
+`CREATE USER 'u'@'host'` and `GRANT` for such users, `HANDLER`, the effect of `LOCK TABLES` (it is read and ignored, like `UNLOCK TABLES`), `performance_schema`, `ORDER BY`/`LIMIT` in `UPDATE` and `DELETE`, `EXPLAIN FORMAT=`, optimizer hints other than as comments, `GROUP BY ... WITH ROLLUP`, full-text search (`MATCH ... AGAINST`), spatial functions (`ST_*`), `LAST_INSERT_ID()`, `FOUND_ROWS()`, and the MySQL functions that are not in [the MySQL functions](../functions/mysql.md) or the [function reference](../functions/README.md).

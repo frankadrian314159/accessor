@@ -32,7 +32,7 @@ fn like(pattern: &str, s: &str) -> bool {
     go(&p, &t)
 }
 
-fn mysql_type(t: DataType) -> &'static str {
+pub(crate) fn mysql_type(t: DataType) -> &'static str {
     match t {
         DataType::Integer => "int",
         DataType::Bignum => "decimal(65,0)",

@@ -148,6 +148,9 @@ pub enum ScalarFn {
 impl ScalarFn {
     /// Functions whose value changes from call to call, so they are never folded into a constant.
     pub fn is_volatile(self) -> bool {
+        if let ScalarFn::Pg(super::pgfuncs::PgFn::My(m)) = self {
+            return m.is_volatile();
+        }
         matches!(
             self,
             ScalarFn::Now
@@ -171,7 +174,8 @@ impl ScalarFn {
             return Some((Pg(f), min, max));
         }
         Some(match up.as_str() {
-            "IIF" => (Iif, 3, 3),
+            "IIF" | "IF" => (Iif, 3, 3),
+            "IFNULL" => (Coalesce, 2, 2),
             "NZ" => (Nz, 1, 2),
             "ISNULL" => (IsNull, 1, 1),
             "COALESCE" => (Coalesce, 1, usize::MAX),

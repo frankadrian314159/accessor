@@ -5015,3 +5015,143 @@ fn mysql_syntax() {
     db.execute("CREATE TABLE t2 LIKE t1; CREATE TABLE t3 (a int) SELECT 1 AS b; DROP TABLES t2, t3").unwrap();
     db.execute("CREATE DATABASE IF NOT EXISTS d1; DROP DATABASE d1; SELECT CURRENT_USER(), DATABASE(), VERSION()").unwrap();
 }
+
+#[test]
+fn mysql_functions_and_forms() {
+    let mut db = Database::in_memory();
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT HEX('abc'), HEX(255)"), "616263");
+    assert_eq!(one(&mut db, "SELECT UNHEX('616263')"), "abc");
+    assert_eq!(one(&mut db, "SELECT ASCII('A') + LOCATE('b', 'abc') + FIELD('b', 'a', 'b') + FIND_IN_SET('c', 'a,b,c')"), "72");
+    assert_eq!(one(&mut db, "SELECT CONCAT('[', SPACE(2), ']') & ELT(2, 'x', 'y')"), "[  ]y");
+    assert_eq!(one(&mut db, "SELECT IFNULL(NULL, 5) + IF(1 > 0, 1, 2)"), "6");
+    assert_eq!(one(&mut db, "SELECT DATE_FORMAT(STR_TO_DATE('03/07/2020 14:05', '%d/%m/%Y %H:%i'), '%Y-%m-%d %T %b %W')"), "2020-07-03 14:05:00 Jul Friday");
+    assert_eq!(one(&mut db, "SELECT UNIX_TIMESTAMP('1970-01-02 00:00:00')"), "86400");
+    assert_eq!(one(&mut db, "SELECT FROM_UNIXTIME(86400, '%Y-%m-%d')"), "1970-01-02");
+    assert_eq!(one(&mut db, "SELECT MD5('abc')"), "900150983cd24fb0d6963f7d28e17f72");
+    assert_eq!(one(&mut db, "SELECT SHA2('abc', 256)"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(one(&mut db, "SELECT SOUNDEX('Robert')"), "R163");
+    assert_eq!(one(&mut db, "SELECT INET_ATON('10.0.5.9') + IS_IPV4('1.2.3.4') + LENGTH(UUID())"), "167773486");
+    assert_eq!(one(&mut db, "SELECT SUBSTRING_INDEX('a.b.c', '.', 2)"), "a.b");
+    assert_eq!(one(&mut db, "SELECT CONVERT('12', SIGNED) + CAST('3' AS UNSIGNED)"), "15");
+    assert_eq!(one(&mut db, "SELECT CONVERT('x' USING utf8)"), "x");
+    assert_eq!(one(&mut db, "SELECT DATE_ADD('2024-01-31', INTERVAL 1 MONTH)"), "2024-02-29");
+    assert_eq!(one(&mut db, "SELECT '2024-03-05 10:00:00' - INTERVAL 2 HOUR"), "2024-03-05 08:00:00");
+    assert_eq!(one(&mut db, "SELECT DATE_SUB('2024-03-05', INTERVAL 1 DAY)"), "2024-03-04");
+    assert_eq!(one(&mut db, "SELECT MONTHNAME('2024-03-05') & DAYNAME('2024-03-05')"), "MarchTuesday");
+
+    db.execute("CREATE TABLE t (id int PRIMARY KEY AUTO_INCREMENT, a int DEFAULT 7, b text)").unwrap();
+    db.execute("INSERT INTO t VALUES (); INSERT INTO t () VALUES ()").unwrap_err();
+    db.execute("INSERT INTO t VALUES ()").unwrap();
+    assert_eq!(one(&mut db, "SELECT a FROM t"), "7");
+    db.execute("LOCK TABLES t WRITE; UNLOCK TABLES").unwrap();
+}
+
+#[test]
+fn mysql_multi_table_delete_and_update() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE t1 (k int, v int); CREATE TABLE t2 (k int, w int);
+         INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (3, 31);
+         INSERT INTO t2 VALUES (1, 100), (3, 300), (9, 900)",
+    )
+    .unwrap();
+    let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    db.execute("UPDATE t1, t2 SET t1.v = t1.v + t2.w WHERE t1.k = t2.k").unwrap();
+    assert_eq!(n(&mut db, "SELECT sum(v) FROM t1"), "791");
+    db.execute("UPDATE t1 JOIN t2 ON t1.k = t2.k SET t1.v = 0 WHERE t2.w > 200").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM t1 WHERE v = 0"), "2");
+    db.execute("DELETE t1 FROM t1, t2 WHERE t1.k = t2.k AND t2.w = 100").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM t1"), "3");
+    db.execute("DELETE FROM a USING t1 AS a, t2 AS b WHERE a.k = b.k").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM t1"), "1");
+    db.execute("DELETE a FROM t2 AS a, t2 AS b WHERE a.k = b.k AND a.w < b.w").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM t2"), "3");
+}
+
+#[test]
+fn mysql_routines_and_triggers() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t2 (d int); CREATE TABLE log (m text)").unwrap();
+    let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    db.execute("CREATE PROCEDURE sp1() INSERT INTO t2(d) VALUES(10)").unwrap();
+    db.execute("CALL sp1()").unwrap();
+    assert_eq!(n(&mut db, "SELECT d FROM t2"), "10");
+    db.execute(
+        "CREATE PROCEDURE sp2(IN a INT, b INT) DETERMINISTIC BEGIN
+           DECLARE i INT DEFAULT 0;
+           DECLARE total INT DEFAULT 0;
+           WHILE i < a DO
+             SET i = i + 1;
+             SET total = total + b;
+           END WHILE;
+           IF total > 100 THEN INSERT INTO log VALUES ('big'); ELSEIF total > 10 THEN INSERT INTO log VALUES ('mid'); ELSE INSERT INTO log VALUES ('small'); END IF;
+           INSERT INTO t2 VALUES (total);
+         END",
+    )
+    .unwrap();
+    db.execute("CALL sp2(5, 3)").unwrap();
+    assert_eq!(n(&mut db, "SELECT m FROM log"), "mid");
+    assert_eq!(n(&mut db, "SELECT max(d) FROM t2"), "15");
+    db.execute("CREATE FUNCTION f(a INTEGER) RETURNS INTEGER DETERMINISTIC RETURN IFNULL(a, 666)").unwrap();
+    assert_eq!(n(&mut db, "SELECT f(NULL) + f(1)"), "667");
+    db.execute(
+        "CREATE FUNCTION fact(n INT) RETURNS INT NO SQL BEGIN
+           DECLARE r INT DEFAULT 1;
+           WHILE n > 1 DO SET r = r * n; SET n = n - 1; END WHILE;
+           RETURN r;
+         END",
+    )
+    .unwrap();
+    assert_eq!(n(&mut db, "SELECT fact(5)"), "120");
+    // triggers: a single statement, SET NEW.col, BEGIN ... END
+    db.execute("CREATE TABLE t3 (id int, d int, e text)").unwrap();
+    db.execute("CREATE TRIGGER trg1 BEFORE INSERT ON t3 FOR EACH ROW SET NEW.d = NEW.id * 2").unwrap();
+    db.execute(
+        "CREATE TRIGGER trg2 BEFORE UPDATE ON t3 FOR EACH ROW BEGIN
+           IF NEW.d IS NULL THEN SET NEW.d = 0; END IF;
+           SET NEW.e = CONCAT('u', NEW.id);
+           INSERT INTO log VALUES (CONCAT('upd ', OLD.id));
+         END",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t3 (id) VALUES (4), (5)").unwrap();
+    assert_eq!(n(&mut db, "SELECT sum(d) FROM t3"), "18");
+    db.execute("UPDATE t3 SET d = NULL WHERE id = 4").unwrap();
+    assert_eq!(n(&mut db, "SELECT e FROM t3 WHERE id = 4"), "u4");
+    assert_eq!(n(&mut db, "SELECT d FROM t3 WHERE id = 4"), "0");
+    assert_eq!(n(&mut db, "SELECT count(*) FROM log WHERE m = 'upd 4'"), "1");
+    db.execute("DROP TRIGGER trg1").unwrap();
+    db.execute("DROP PROCEDURE sp1; DROP FUNCTION f").unwrap();
+}
+
+#[test]
+fn mysql_information_schema_views() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE SCHEMA d1; CREATE TABLE t (a int PRIMARY KEY, b text); CREATE INDEX tb ON t (b)").unwrap();
+    let rows = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows.len();
+    assert!(rows(&mut db, "SELECT schema_name FROM information_schema.schemata") >= 6);
+    assert_eq!(rows(&mut db, "SELECT * FROM information_schema.statistics WHERE table_name = 't'"), 2);
+    assert_eq!(rows(&mut db, "SELECT * FROM information_schema.tables WHERE table_schema = 'test' AND table_name = 't'"), 1);
+    assert_eq!(rows(&mut db, "SELECT column_type FROM information_schema.columns WHERE table_name = 't' AND column_key = 'PRI'"), 1);
+    assert_eq!(rows(&mut db, "SELECT * FROM information_schema.processlist"), 0);
+    assert!(rows(&mut db, "SELECT * FROM information_schema.character_sets") >= 1);
+}
+
+#[test]
+fn mysql_accounts_hex_numbers_and_leniency() {
+    let mut db = Database::in_memory();
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    db.execute("CREATE USER IF NOT EXISTS 'root'@'127.0.0.1' IDENTIFIED BY 'x'; CREATE USER u1; GRANT SELECT, INSERT ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION").unwrap();
+    db.execute("GRANT REPLICATION SLAVE ON *.* TO plug_user; GRANT ALL ON db1.* TO 'x'@'%'; REVOKE ALL PRIVILEGES ON *.* FROM 'x'@'%'; DROP USER 'x'@'%'; DROP USER u1").unwrap();
+    db.execute("ALTER USER 'root'@'localhost' IDENTIFIED BY 'y'; ALTER SCHEMA test COLLATE utf8mb4_0900_ai_ci; RESET PERSIST; CHECK TABLES nothing").unwrap();
+    assert_eq!(one(&mut db, "SELECT 1 << 3, CONV('ff', 16, 10)").as_str(), "8");
+    assert_eq!(one(&mut db, "SELECT CAST(0x10 AS UNSIGNED) + 0xff"), "271");
+    assert_eq!(one(&mut db, "SELECT _utf8mb4 'x' = 'x'"), "Yes");
+    db.execute("COMMIT; ROLLBACK; BEGIN; COMMIT").unwrap();
+    db.execute("CREATE TABLE t (a varchar(10) binary, b char(5) ASCII, FULLTEXT (a))").unwrap();
+    assert_eq!(db.execute("EXPLAIN FORMAT=tree SELECT * FROM t").unwrap().columns, vec!["plan"]);
+    db.execute("PREPARE p FROM 'SELECT 1'; DROP PREPARE p").unwrap();
+    assert_eq!(one(&mut db, "SELECT CAST('2001-01-01 00:00:00.12' AS DATETIME)"), "2001-01-01");
+    assert_eq!(one(&mut db, "SELECT CAST('0000-00-00' AS DATETIME)"), "0001-01-01");
+}

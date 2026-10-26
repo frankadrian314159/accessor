@@ -164,6 +164,18 @@ impl Database {
                 return Ok(Fire::Go);
             }
         }
+        if !trigger.block.is_empty() {
+            let def = crate::sql::ast::RoutineDef {
+                name: trigger.name.clone(),
+                function: true,
+                params: Vec::new(),
+                returns: None,
+                body: crate::sql::ast::RoutineBody::Block(trigger.block.clone()),
+                trigger: true,
+                sql: String::new(),
+            };
+            return self.run_trigger_def(trigger, &def, ctx, timing);
+        }
         let instead = trigger.function.as_deref() == Some(crate::sql::ast::INSTEAD_MARK);
         if let (Some(function), false) = (&trigger.function, instead) {
             return self.run_trigger_function(trigger, function, ctx, timing);
@@ -202,6 +214,11 @@ impl Database {
             .or_else(|| self.routine_def(function))
             .filter(|d| d.trigger)
             .ok_or_else(|| Error::catalog(format!("the trigger function '{function}' does not exist")))?;
+        self.run_trigger_def(trigger, &def, ctx, timing)
+    }
+
+    /// Runs the body of a trigger function (or of a MySQL trigger) for the rows in `ctx`.
+    fn run_trigger_def(&mut self, trigger: &TriggerDef, def: &crate::sql::ast::RoutineDef, ctx: &RowContext, timing: TriggerTiming) -> Result<Fire> {
         let mut vars: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
         let event = if ctx.new.is_some() && ctx.old.is_some() {
             "UPDATE"
@@ -232,7 +249,7 @@ impl Database {
             vars.insert(format!("new.{name}"), ctx.new.map_or(Value::Null, |r| r[i].clone()));
             vars.insert(format!("old.{name}"), ctx.old.map_or(Value::Null, |r| r[i].clone()));
         }
-        let (returned, after) = self.run_trigger_block(&def, vars)?;
+        let (returned, after) = self.run_trigger_block(def, vars)?;
         if timing != TriggerTiming::Before || trigger.each_statement {
             return Ok(Fire::Go);
         }

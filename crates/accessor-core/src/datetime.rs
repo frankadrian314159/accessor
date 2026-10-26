@@ -114,6 +114,10 @@ pub fn parse(input: &str) -> Option<i64> {
     };
     let nums: Vec<&str> = date_part.split(['-', '/']).collect();
     if nums.len() != 3 {
+        // a time of day alone ('12:30:00.5', MySQL's TIME) is on the first day of the epoch
+        if s.contains(':') && !s.contains(['-', '/']) {
+            return parse(&format!("1970-01-01 {s}"));
+        }
         return None;
     }
     let a: i64 = nums[0].parse().ok()?;
@@ -137,7 +141,8 @@ pub fn parse(input: &str) -> Option<i64> {
         let mut it = clock.split(':');
         h = it.next()?.trim().parse().ok()?;
         mi = it.next().map_or(Some(0), |v| v.trim().parse().ok())?;
-        sec = it.next().map_or(Some(0), |v| v.trim().parse().ok())?;
+        // a fraction of a second (MySQL's '00:00:00.567') is dropped
+        sec = it.next().map_or(Some(0), |v| v.trim().split('.').next().and_then(|w| w.parse().ok()))?;
         if it.next().is_some() {
             return None;
         }
@@ -146,6 +151,10 @@ pub fn parse(input: &str) -> Option<i64> {
             Some(false) if h == 12 => h = 0,
             _ => {}
         }
+    }
+    // MySQL's zero date, 0000-00-00, is the earliest date here
+    if y == 0 && mo == 0 && d == 0 {
+        return from_components(1, 1, 1, h, mi, sec);
     }
     from_components(y, mo, d, h, mi, sec)
 }

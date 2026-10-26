@@ -429,6 +429,8 @@ pub struct TriggerDef {
     pub table: String,
     pub when: Option<Expr>,
     pub body: Vec<Statement>,
+    /// A MySQL trigger body, with `SET NEW.col = ...`: run like a trigger function. Then `body` is empty.
+    pub block: Vec<ProcStmt>,
     /// `EXECUTE FUNCTION f()`: the body is that PL/pgSQL trigger function, and `body` is empty.
     pub function: Option<String>,
     pub sql: String,
@@ -521,6 +523,10 @@ pub enum Statement {
     Batch(Vec<Statement>),
     /// `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...` (a bound), or `DETACH PARTITION child` (`None`).
     AttachPartition { parent: String, child: String, bound: Option<String> },
+    /// `DELETE t1 FROM t1, t2 WHERE ...` and `DELETE FROM t1 USING t1, t2 WHERE ...`: the target is the name or alias of one of the tables.
+    DeleteMulti { target: String, from: From, filter: Option<Expr> },
+    /// `UPDATE t1, t2 SET t1.a = t2.b WHERE ...`.
+    UpdateMulti { from: From, assignments: Vec<(Option<String>, String, Expr)>, filter: Option<Expr> },
     /// `CREATE TABLE name AS query [WITH [NO] DATA]`.
     CreateTableAs { name: String, query: Box<Select>, with_data: bool },
     /// A command that is read and does nothing (`VACUUM`, `ANALYZE`, `COMMENT ON`, `LOCK`, ...).

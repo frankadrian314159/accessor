@@ -45,3 +45,7 @@ WHERE t.table_type = 'BASE TABLE'
 ## The optimizer
 
 Each view is a small table computed when the query runs, and is treated like a derived table: its row count is known exactly, and it can be joined in any order. It has no indexes.
+
+## MySQL's views
+
+`TABLES` and `COLUMNS` also give `TABLE_CATALOG`, `TABLE_SCHEMA`, `ENGINE` (and, for columns, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA`, `CHARACTER_SET_NAME`, `COLLATION_NAME`) after their own columns. `SCHEMATA` lists the schemas, `STATISTICS` the indexes (one row for each column of each), `CHARACTER_SETS`, `COLLATIONS` and `ENGINES` the one engine and four character sets, `PARTITIONS` one row for each table, and `PROCESSLIST`, `COLUMN_STATISTICS`, the `*_PRIVILEGES` views, `EVENTS`, `OPTIMIZER_TRACE`, `RESOURCE_GROUPS`, `FILES`, `TABLESPACES`, `PLUGINS`, `VIEW_TABLE_USAGE`, `KEYWORDS`, `CHECK_CONSTRAINTS` and some others are there with their columns and no rows. See [mysql.md](mysql.md).

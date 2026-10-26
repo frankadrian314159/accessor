@@ -38,6 +38,32 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
     Ok(out)
 }
 
+fn is_interval_unit(u: &str) -> bool {
+    matches!(u.to_ascii_uppercase().as_str(), "MICROSECOND" | "SECOND" | "MINUTE" | "HOUR" | "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR")
+}
+
+/// `date + INTERVAL n unit` (or `-`) as `DATEADD`.
+fn interval_add(date: Expr, interval: Expr, subtract: bool) -> Expr {
+    let Expr::Function { mut args, .. } = interval else { return date };
+    let unit = match args.pop() {
+        Some(Expr::Literal(Value::Text(u))) => u.to_ascii_uppercase(),
+        _ => "DAY".to_string(),
+    };
+    let n = args.pop().unwrap_or(Expr::Literal(Value::Int(0)));
+    let n = if subtract { Expr::Neg(Box::new(n)) } else { n };
+    let code = match unit.as_str() {
+        "SECOND" | "MICROSECOND" => "s",
+        "MINUTE" => "n",
+        "HOUR" => "h",
+        "WEEK" => "ww",
+        "MONTH" => "m",
+        "QUARTER" => "q",
+        "YEAR" => "yyyy",
+        _ => "d",
+    };
+    Expr::Function { name: "DATEADD".into(), args: vec![Expr::Literal(Value::text(code)), n, date], distinct: false, star: false }
+}
+
 /// The conversion function that `CAST(x AS ty)` stands for.
 pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
     Some(match ty {
@@ -456,10 +482,30 @@ impl<'a> Parser<'a> {
     }
 
     /// A role name: any word, even a reserved one such as `CURRENT_USER`.
+    /// Is the account statement ahead MySQL's: a `user@host`, or one of its options (`IDENTIFIED`, `REQUIRE`, ...)?
+    fn mysql_account_ahead(&self) -> bool {
+        let mut i = self.pos;
+        while let Some(t) = self.toks.get(i) {
+            match &t.tok {
+                Tok::Sym(";") | Tok::Eof => return false,
+                Tok::Sym("@") | Tok::Param(_) => return true,
+                Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(), "IDENTIFIED" | "REQUIRE" | "ACCOUNT" | "ATTRIBUTE" | "REUSE" | "RETAIN" | "FAILED_LOGIN_ATTEMPTS" | "PASSWORD_LOCK_TIME" | "CURRENT_USER") => return true,
+                _ => i += 1,
+            }
+        }
+        false
+    }
+
     fn role_name(&mut self) -> Result<String> {
         match self.peek().clone() {
             Tok::Ident(s) | Tok::Quoted(s) | Tok::Str(s) => {
                 self.advance();
+                // the host of 'user'@'host'
+                if self.eat_sym("@") {
+                    self.advance();
+                } else if matches!(self.peek(), Tok::Param(_)) {
+                    self.advance();
+                }
                 Ok(s)
             }
             _ => Err(self.unexpected("a role name")),
@@ -590,12 +636,20 @@ impl<'a> Parser<'a> {
             self.expect_kw("FOR")?;
         }
         let mut privileges: Vec<String> = Vec::new();
+        let mut mysql_form = false;
         loop {
             let Tok::Ident(word) = self.peek().clone() else {
                 return Err(self.unexpected("a privilege"));
             };
             self.advance();
-            let w = word.to_ascii_lowercase();
+            let mut w = word.to_ascii_lowercase();
+            // MySQL: privileges of two words (REPLICATION SLAVE, CREATE TEMPORARY TABLES, ...)
+            while matches!(self.peek(), Tok::Ident(n) if !n.eq_ignore_ascii_case("ON") && !n.eq_ignore_ascii_case("TO") && !n.eq_ignore_ascii_case("FROM") && !n.eq_ignore_ascii_case("PRIVILEGES")) {
+                let Tok::Ident(n) = self.advance() else { break };
+                w.push(' ');
+                w.push_str(&n.to_ascii_lowercase());
+                mysql_form = true;
+            }
             if w == "all" {
                 self.eat_kw("PRIVILEGES");
             }
@@ -617,6 +671,13 @@ impl<'a> Parser<'a> {
                 self.expect_kw("IN")?;
                 self.expect_kw("SCHEMA")?;
                 (format!("all_{kind}"), self.ident_list()?)
+            } else if self.peek_sym("*") || (matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && matches!(self.peek_at(1), Tok::Sym(".")) && matches!(self.peek_at(2), Tok::Sym("*"))) {
+                // GRANT ... ON *.* / db.*: MySQL's levels
+                while !self.peek_kw("TO") && !self.peek_kw("FROM") && !self.at_eof() {
+                    self.advance();
+                }
+                mysql_form = true;
+                ("other".to_string(), vec!["*".to_string()])
             } else {
                 let mut kind = "table".to_string();
                 if let Tok::Ident(w) = self.peek().clone() {
@@ -652,6 +713,9 @@ impl<'a> Parser<'a> {
         let mut grantees = Vec::new();
         loop {
             self.eat_kw("GROUP");
+            if matches!(self.peek_at(1), Tok::Sym("@") | Tok::Param(_)) {
+                mysql_form = true;
+            }
             grantees.push(self.role_name()?);
             if !self.eat_sym(",") {
                 break;
@@ -675,6 +739,10 @@ impl<'a> Parser<'a> {
             }
         }
         let membership = object_kind.is_empty();
+        if mysql_form {
+            // accounts and their privileges are not kept
+            return Ok(Statement::Ignored("GRANT".into()));
+        }
         Ok(Statement::Grant(Box::new(GrantDef {
             revoke,
             privileges: if membership { Vec::new() } else { privileges.clone() },
@@ -711,6 +779,10 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             return Ok(Some(change("extension", name, String::new())));
+        }
+        if (self.peek_kw("USER") || self.peek_kw("ROLE")) && self.mysql_account_ahead() {
+            // a MySQL account ('u'@'host', IDENTIFIED BY ...): accounts are not kept
+            return Ok(Some(self.ignore_rest("CREATE USER")));
         }
         if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
             self.advance();
@@ -802,6 +874,8 @@ impl<'a> Parser<'a> {
             "type"
         } else if self.eat_kw("EXTENSION") {
             "extension"
+        } else if (self.peek_kw("USER") || self.peek_kw("ROLE")) && self.mysql_account_ahead() {
+            return Ok(Some(self.ignore_rest("DROP USER")));
         } else if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
             self.advance();
             "role"
@@ -1043,7 +1117,7 @@ impl<'a> Parser<'a> {
                 return Ok(Some(self.ignore_rest(w)));
             }
         }
-        if self.peek_kw("CHECK") && self.peek_kw_at(1, "TABLE") {
+        if self.peek_kw("CHECK") && (self.peek_kw_at(1, "TABLE") || self.peek_kw_at(1, "TABLES")) {
             return Ok(Some(self.ignore_rest("CHECK TABLE")));
         }
         if self.peek_kw("CALL") && matches!(self.peek_at(1), Tok::Ident(s) if s.eq_ignore_ascii_case("mtr")) {
@@ -1264,7 +1338,7 @@ impl<'a> Parser<'a> {
         (self.peek_kw_at(k, "PRIMARY") && self.peek_kw_at(k + 1, "KEY"))
             || self.peek_kw_at(k, "UNIQUE")
             || ((self.peek_kw_at(k, "KEY") || self.peek_kw_at(k, "INDEX")) && !matches!(self.peek_at(k + 1), Tok::Sym(",") | Tok::Sym(")")) && k == 0)
-            || ((self.peek_kw_at(k, "FULLTEXT") || self.peek_kw_at(k, "SPATIAL")) && (self.peek_kw_at(k + 1, "KEY") || self.peek_kw_at(k + 1, "INDEX")))
+            || ((self.peek_kw_at(k, "FULLTEXT") || self.peek_kw_at(k, "SPATIAL")) && (self.peek_kw_at(k + 1, "KEY") || self.peek_kw_at(k + 1, "INDEX") || matches!(self.peek_at(k + 1), Tok::Sym("("))))
     }
 
     fn key_element(&mut self, primary_key: &mut Vec<String>, uniques: &mut Vec<Vec<String>>, indexes: &mut Vec<IndexSpec>) -> Result<()> {
@@ -1576,7 +1650,7 @@ impl<'a> Parser<'a> {
     }
 
     fn statement_inner(&mut self) -> Result<Statement> {
-        for word in ["VACUUM", "ANALYZE", "ANALYSE", "LOCK", "COMMENT", "CHECKPOINT", "DISCARD", "CLUSTER", "LISTEN", "UNLISTEN", "NOTIFY", "SECURITY"] {
+        for word in ["VACUUM", "ANALYZE", "ANALYSE", "LOCK", "UNLOCK", "COMMENT", "CHECKPOINT", "DISCARD", "CLUSTER", "LISTEN", "UNLISTEN", "NOTIFY", "SECURITY"] {
             if self.peek_kw(word) {
                 // maintenance commands for a server: there is nothing to do, so they are read and ignored
                 while !self.at_eof() && !self.peek_sym(";") {
@@ -1642,6 +1716,15 @@ impl<'a> Parser<'a> {
             // written for other systems run); a statement that is not a query is described and not run.
             let mut analyze = self.eat_kw("ANALYZE") || self.eat_kw("ANALYSE");
             self.eat_kw("VERBOSE");
+            if self.peek_kw("FORMAT") && matches!(self.peek_at(1), Tok::Sym("=")) {
+                // EXPLAIN FORMAT=TREE | JSON | TRADITIONAL: the plan is always the text one
+                self.advance();
+                self.advance();
+                self.advance();
+                if self.eat_kw("FOR") {
+                    return Ok(self.ignore_rest("EXPLAIN"));
+                }
+            }
             if self.peek_sym("(") {
                 self.advance();
                 loop {
@@ -1689,6 +1772,9 @@ impl<'a> Parser<'a> {
         }
         if let Some(st) = self.mysql_statement()? {
             return Ok(st);
+        }
+        if self.peek_kw("RESET") && (self.peek_kw_at(1, "PERSIST") || self.peek_kw_at(1, "MASTER") || self.peek_kw_at(1, "SLAVE") || self.peek_kw_at(1, "REPLICA") || self.peek_kw_at(1, "QUERY")) {
+            return Ok(self.ignore_rest("RESET"));
         }
         if self.eat_kw("RESET") {
             if self.eat_kw("SESSION") {
@@ -1783,6 +1869,11 @@ impl<'a> Parser<'a> {
             self.expect_kw("AS")?;
             let statement = Box::new(self.statement()?);
             return Ok(Statement::Prepare { name, statement });
+        }
+        if self.peek_kw("DROP") && self.peek_kw_at(1, "PREPARE") {
+            self.advance();
+            self.advance();
+            return Ok(Statement::Deallocate(self.ident()?));
         }
         if self.eat_kw("DEALLOCATE") {
             self.eat_kw("PREPARE");
@@ -1890,6 +1981,7 @@ impl<'a> Parser<'a> {
             table,
             when,
             body,
+            block: Vec::new(),
             function: instead.then(|| INSTEAD_MARK.to_string()),
             sql,
         })))
@@ -1981,8 +2073,8 @@ impl<'a> Parser<'a> {
             let mut rows = Vec::new();
             loop {
                 self.expect_sym("(")?;
-                let mut row = vec![self.values_item()?];
-                while self.eat_sym(",") {
+                let mut row = if self.peek_sym(")") { Vec::new() } else { vec![self.values_item()?] };
+                while !row.is_empty() && self.eat_sym(",") {
                     row.push(self.values_item()?);
                 }
                 self.expect_sym(")")?;
@@ -1991,7 +2083,12 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            InsertSource::Values(rows)
+            if rows.len() == 1 && rows[0].is_empty() {
+                // MySQL: INSERT INTO t VALUES ()
+                InsertSource::DefaultValues
+            } else {
+                InsertSource::Values(rows)
+            }
         } else if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_sym("(") {
             InsertSource::Select(Box::new(self.select()?))
         } else {
@@ -2007,6 +2104,31 @@ impl<'a> Parser<'a> {
     }
 
     fn update_inner(&mut self) -> Result<Statement> {
+        while self.eat_kw("LOW_PRIORITY") || self.eat_kw("IGNORE") {}
+        // UPDATE t1, t2 SET ... / UPDATE t1 JOIN t2 ON ... SET ...: several tables
+        {
+            let save = self.pos;
+            let multi = match self.from_clause() {
+                Ok(from) if self.peek_kw("SET") && (!from.joins.is_empty() || !matches!(&from.first, TableFactor::Named { alias: None, .. } | TableFactor::Named { .. })) => Some(from),
+                _ => None,
+            };
+            if let Some(from) = multi {
+                self.expect_kw("SET")?;
+                let mut assignments = Vec::new();
+                loop {
+                    let first = self.ident()?;
+                    let (qualifier, column) = if self.eat_sym(".") { (Some(first), self.ident()?) } else { (None, first) };
+                    self.expect_sym("=")?;
+                    assignments.push((qualifier, column, self.expr()?));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+                return Ok(Statement::UpdateMulti { from, assignments, filter });
+            }
+            self.pos = save;
+        }
         let table = self.table_ident()?;
         let alias = self.target_alias()?;
         self.expect_kw("SET")?;
@@ -2110,8 +2232,41 @@ impl<'a> Parser<'a> {
     }
 
     fn delete(&mut self) -> Result<Statement> {
+        while self.eat_kw("LOW_PRIORITY") || self.eat_kw("QUICK") || self.eat_kw("IGNORE") {}
+        if !self.peek_kw("FROM") && !self.peek_sym("*") && matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) {
+            // DELETE t1[, t2] FROM table_references [WHERE ...]
+            let mut targets = Vec::new();
+            loop {
+                targets.push(self.ident()?);
+                if self.eat_sym(".") {
+                    self.expect_sym("*")?;
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.expect_kw("FROM")?;
+            let from = self.from_clause()?;
+            let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+            if targets.len() != 1 {
+                return Err(Error::syntax("DELETE from several tables at once is not supported"));
+            }
+            return Ok(Statement::DeleteMulti { target: targets.remove(0), from, filter });
+        }
         self.eat_sym("*");
         self.expect_kw("FROM")?;
+        // DELETE FROM t1 USING t1, t2 WHERE ...
+        if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) {
+            let save = self.pos;
+            let target = self.ident()?;
+            if self.peek_kw("USING") {
+                self.advance();
+                let from = self.from_clause()?;
+                let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+                return Ok(Statement::DeleteMulti { target, from, filter });
+            }
+            self.pos = save;
+        }
         let only = self.peek_kw("ONLY") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && self.eat_kw("ONLY");
         let st = self.delete_inner()?;
         Ok(if only { Statement::Only(Box::new(st)) } else { st })
@@ -2522,8 +2677,28 @@ impl<'a> Parser<'a> {
             self.skip_parens()?;
             let end = self.toks[self.pos].pos;
             let sql = self.src[start..end].to_string();
-            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), function, sql })));
+            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), block: Vec::new(), function, sql })));
         }
+        if self.peek_kw("FOLLOWS") || self.peek_kw("PRECEDES") {
+            self.advance();
+            self.advance();
+        }
+        let save = self.pos;
+        let asql = if self.peek_kw("BEGIN") { self.asql_trigger_body().ok() } else { None };
+        let Some(body) = asql else {
+            // MySQL's body: one statement, or BEGIN ... END with SET NEW.col = ...
+            self.pos = save;
+            let block = self.mysql_trigger_body()?;
+            let end = self.toks[self.pos].pos;
+            let sql = self.src[start..end].trim().to_string();
+            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), block, function: None, sql })));
+        };
+        let end = self.toks[self.pos - 1].pos + "END".len();
+        let sql = self.src[start..end].to_string();
+        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, block: Vec::new(), function: None, sql })))
+    }
+
+    fn asql_trigger_body(&mut self) -> Result<Vec<Statement>> {
         self.expect_kw("BEGIN")?;
         let mut body = Vec::new();
         loop {
@@ -2549,9 +2724,7 @@ impl<'a> Parser<'a> {
         if body.is_empty() {
             return Err(Error::syntax("a trigger needs at least one statement"));
         }
-        let end = self.toks[self.pos - 1].pos + "END".len();
-        let sql = self.src[start..end].to_string();
-        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, function: None, sql })))
+        Ok(body)
     }
 
     fn create(&mut self) -> Result<Statement> {
@@ -2598,6 +2771,28 @@ impl<'a> Parser<'a> {
     }
 
     fn create_object(&mut self, guarded: &mut bool, create_pos: usize) -> Result<Statement> {
+        // CREATE [DEFINER = user] [ALGORITHM = x] [SQL SECURITY x] TRIGGER | PROCEDURE | FUNCTION | VIEW | EVENT
+        while (self.peek_kw("DEFINER") || self.peek_kw("ALGORITHM")) && matches!(self.peek_at(1), Tok::Sym("=")) || (self.peek_kw("SQL") && self.peek_kw_at(1, "SECURITY")) {
+            if self.peek_kw("SQL") {
+                self.advance();
+                self.advance();
+                self.advance();
+            } else {
+                self.advance();
+                self.advance();
+                // user@host: a word or string, an @, a word or string; or CURRENT_USER[()]
+                self.advance();
+                if self.eat_sym("(") {
+                    self.eat_sym(")");
+                }
+                if matches!(self.peek(), Tok::Param(_) | Tok::Sym("@")) {
+                    self.advance();
+                    if !matches!(self.peek(), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(), "TRIGGER" | "PROCEDURE" | "FUNCTION" | "VIEW" | "EVENT" | "SQL" | "ALGORITHM" | "DEFINER")) {
+                        self.advance();
+                    }
+                }
+            }
+        }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("CREATE"));
         }
@@ -2649,6 +2844,9 @@ impl<'a> Parser<'a> {
             let function = self.peek_kw("FUNCTION");
             self.advance();
             self.if_exists_clause(true, guarded)?;
+            if self.looks_like_mysql_routine() {
+                return self.mysql_routine(function, create_pos);
+            }
             if self.looks_like_pg_routine() {
                 return self.pg_routine(function, create_pos);
             }
@@ -3190,7 +3388,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
-        while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") {}
+        while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {}
         let mut def = ColumnDef {
             name,
             data_type,
@@ -3262,7 +3460,7 @@ impl<'a> Parser<'a> {
             } else if self.peek_kw("KEY") {
                 self.advance();
                 def.primary_key = true;
-            } else if self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("VISIBLE") || self.eat_kw("INVISIBLE") {
+            } else if self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("VISIBLE") || self.eat_kw("INVISIBLE") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {
             } else if self.eat_kw("CHARACTER") {
                 self.expect_kw("SET")?;
                 self.advance();
@@ -3374,6 +3572,9 @@ impl<'a> Parser<'a> {
     }
 
     fn alter(&mut self) -> Result<Statement> {
+        if self.peek_kw("SCHEMA") || self.peek_kw("DATABASE") || ((self.peek_kw("USER") || self.peek_kw("ROLE")) && self.mysql_account_ahead()) {
+            return Ok(self.ignore_rest("ALTER"));
+        }
         if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
             return self.alter_role();
         }
@@ -3563,6 +3764,9 @@ impl<'a> Parser<'a> {
     }
 
     fn drop_object(&mut self, guarded: &mut bool) -> Result<Statement> {
+        if self.eat_kw("PREPARE") {
+            return Ok(Statement::Deallocate(self.ident()?));
+        }
         if self.eat_kw("POLICY") {
             self.if_exists_clause(false, guarded)?;
             let name = self.ident()?;
@@ -4446,6 +4650,12 @@ impl<'a> Parser<'a> {
     fn additive(&mut self) -> Result<Expr> {
         let mut left = self.multiplicative()?;
         loop {
+            if matches!(self.peek(), Tok::Sym("<<") | Tok::Sym(">>")) {
+                let name = if matches!(self.advance(), Tok::Sym("<<")) { "BIT_SHL" } else { "BIT_SHR" };
+                let right = self.multiplicative()?;
+                left = Expr::Function { name: name.into(), args: vec![left, right], distinct: false, star: false };
+                continue;
+            }
             let op = match self.peek() {
                 Tok::Sym("+") => BinOp::Add,
                 Tok::Sym("-") => BinOp::Sub,
@@ -4453,7 +4663,14 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let right = self.multiplicative()?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            let is_iv = |e: &Expr| matches!(e, Expr::Function { name, .. } if name == "__INTERVAL");
+            left = if is_iv(&right) {
+                interval_add(left, right, op == BinOp::Sub)
+            } else if is_iv(&left) && op == BinOp::Add {
+                interval_add(right, left, false)
+            } else {
+                Expr::Binary { op, left: Box::new(left), right: Box::new(right) }
+            };
         }
         Ok(left)
     }
@@ -4579,6 +4796,24 @@ impl<'a> Parser<'a> {
             }
             Tok::Quoted(_) => self.column_ref(),
             Tok::Ident(name) => {
+                // _utf8mb4 'text', _binary 0x41: a character set introducer, which does nothing here
+                if name.starts_with('_') && name.len() > 1 && matches!(self.peek_at(1), Tok::Str(_) | Tok::Int(_) | Tok::Big(_)) {
+                    self.advance();
+                    return self.primary();
+                }
+                // INTERVAL 5 DAY (MySQL): a span for date arithmetic
+                if name.eq_ignore_ascii_case("INTERVAL") && !matches!(self.peek_at(1), Tok::Sym(_)) {
+                    // INTERVAL '5' DAY and the other quoted forms are the standard's typed literal
+                    if !matches!(self.peek_at(1), Tok::Str(_)) {
+                        self.advance();
+                        let n = self.additive()?;
+                        let unit = self.ident_or_keyword()?.to_ascii_uppercase();
+                        if !is_interval_unit(&unit) {
+                            return Err(Error::syntax(format!("'{unit}' is not a unit of time")));
+                        }
+                        return Ok(Expr::Function { name: "__INTERVAL".into(), args: vec![n, Expr::Literal(Value::text(&unit))], distinct: false, star: false });
+                    }
+                }
                 // VALUES(col) in ON DUPLICATE KEY UPDATE
                 if name.eq_ignore_ascii_case("VALUES") && matches!(self.peek_at(1), Tok::Sym("(")) {
                     self.advance();
@@ -4827,6 +5062,22 @@ impl<'a> Parser<'a> {
     }
 
     fn function_call(&mut self, name: String) -> Result<Expr> {
+        if name.eq_ignore_ascii_case("CONVERT") {
+            // CONVERT(x, type) is CAST(x AS type); CONVERT(x USING charset) is x
+            let first = self.expr()?;
+            if self.eat_kw("USING") {
+                self.advance();
+                self.expect_sym(")")?;
+                return Ok(first);
+            }
+            if self.eat_sym(",") {
+                let c = self.type_cast(first)?;
+                self.expect_sym(")")?;
+                return Ok(c);
+            }
+            self.expect_sym(")")?;
+            return Ok(first);
+        }
         let mut args = Vec::new();
         let mut distinct = false;
         let mut star = false;
@@ -4843,7 +5094,23 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_sym(")")?;
-        Ok(Expr::Function { name: name.to_ascii_uppercase(), args, distinct, star })
+        let up = name.to_ascii_uppercase();
+        if matches!(up.as_str(), "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE") && args.len() == 2 {
+            if let Expr::Function { name: n, .. } = &args[1] {
+                if n == "__INTERVAL" {
+                    let iv = args.pop().expect("two arguments");
+                    let date = args.pop().expect("two arguments");
+                    return Ok(interval_add(date, iv, up.starts_with("DATE_SUB") || up == "SUBDATE"));
+                }
+            }
+            if matches!(up.as_str(), "ADDDATE" | "SUBDATE") {
+                // ADDDATE(d, days)
+                let days = args.pop().expect("two arguments");
+                let date = args.pop().expect("two arguments");
+                return Ok(interval_add(date, Expr::Function { name: "__INTERVAL".into(), args: vec![days, Expr::Literal(Value::text("DAY"))], distinct: false, star: false }, up == "SUBDATE"));
+            }
+        }
+        Ok(Expr::Function { name: up, args, distinct, star })
     }
 
     /// A keyword or identifier used as a plain word (field names of EXTRACT).
@@ -4890,6 +5157,13 @@ impl<'a> Parser<'a> {
             "BINARY" => {
                 self.eat_kw("LARGE");
                 self.eat_kw("VARYING");
+            }
+            "SIGNED" | "UNSIGNED" => {
+                // CAST(x AS SIGNED [INTEGER])
+                if !self.eat_kw("INTEGER") {
+                    self.eat_kw("INT");
+                }
+                return Ok("INTEGER".into());
             }
             "TIMESTAMP" | "TIME" => {
                 let with = self.eat_kw("WITH");
