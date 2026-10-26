@@ -19,7 +19,7 @@ The rest of this page is an overview of Accessor: what it is, its features, its 
 
 A small embedded database written in Rust, in the spirit of Microsoft Access. It gives you a SQL engine you can link into a program, a command-line shell, and a desktop application with datasheets, forms, a table designer and a query editor.
 
-- Rust workspace, three crates
+- Rust workspace, five crates, a C interface and a JDBC driver
 - Exact numbers of any size
 - Transactions that include schema changes
 - Crash-safe write-ahead log
@@ -245,6 +245,7 @@ Besides the indexes that back keys and unique fields, you can create your own on
 ```sql
 CREATE INDEX ByPrice ON Product (Price);
 CREATE UNIQUE INDEX ByName ON Product (Name);
+CREATE INDEX ByRegionTotal ON Orders (Region, Total DESC);   -- columns may be ASC (the default) or DESC
 DROP INDEX ByPrice ON Product;
 ```
 
@@ -843,13 +844,18 @@ The library is synchronous. `Database` is `Send` and `Sync` (a test keeps it so)
 
 ### Architecture
 
-Accessor is a Cargo workspace of three crates, about twenty thousand lines of Rust in all, with about 180 tests alongside.
+Accessor is a Cargo workspace of five crates, about 35,600 lines of Rust in all (counting the tests that live beside the code), with 305 Rust tests alongside; the JDBC driver adds about 7,000 lines of Java.
 
 | Crate | Lines | What it is |
 | --- | --- | --- |
-| `accessor-core` | 16,300 | The engine: types, SQL, storage, durability. A library with no user interface and few dependencies (`serde` and `num-bigint` are the notable ones). |
-| `accessor-cli` | 400 | The shell, a thin loop around the library. |
-| `accessor-gui` | 3,200 | The desktop application, on `egui`/`eframe`. It uses the library's public API only, as any other program would. |
+| `accessor-core` | 23,600 in `src`, 5,600 in `tests` | The engine: types, SQL, storage, durability, concurrency. A library with no user interface and few dependencies (`serde` and `num-bigint` are the notable ones). |
+| `accessor-cli` | 500 | The shell, a thin loop around the library. |
+| `accessor-gui` | 3,250 | The desktop application, on `egui`/`eframe`. It uses the library's public API only, as any other program would. |
+| `accessor-capi` | 1,030, plus 430 of fuzz targets | The C interface (`accessor.h`, generated), with 670 lines of C tests. |
+| `accessor-slt` | 600 | A runner for SQLite's *sqllogictest* files (see [extern/testing.md](extern/testing.md#sqllogictest)). |
+| `jdbc/` (Java, not a crate) | 7,000 (2,800 of it generated stubs), plus 800 of tests | The JDBC driver, over the C interface. |
+
+(Counted with `wc -l` over the source files, blank lines and comments included.)
 
 ```text
   Desktop app            Shell                Your Rust program
@@ -925,7 +931,7 @@ Changes are applied immediately inside a transaction, so reads see them, and for
 
 #### File format and compatibility
 
-The format is versioned (currently 5) and every earlier version is still readable: versions 1 and 2 are older layouts, and the short-lived single `NUMBER` type of an intermediate build is read as `DECIMAL`. Old files are upgraded by rewriting them on first open. The on-disk enumerations keep their original variant order, with the new types appended, so that a file never changes meaning.
+The format is versioned (currently 6) and every earlier version is still readable: versions 1 and 2 are older layouts, and the short-lived single `NUMBER` type of an intermediate build is read as `DECIMAL`. Version 6 added descending index columns. Old files are upgraded by rewriting them on first open. The on-disk enumerations keep their original variant order, with the new types appended, so that a file never changes meaning.
 
 #### Concurrency
 
@@ -933,7 +939,7 @@ A `Database` used directly has one writer at a time: the mutating API takes `&mu
 
 #### Testing
 
-About 180 automated tests run in a few seconds: unit tests for the number types, the date calendar and the pattern matcher; around 80 SQL tests covering each feature through the public API; 25 persistence tests that close, reopen, truncate and corrupt files, and replay logs; and tests that drive the desktop application headlessly, feeding it pointer events and reading back what it drew, so that transaction dialogs and the datasheet are exercised without a screen.
+The 305 Rust tests run in a few seconds: 82 unit tests in the engine (the number types, the date calendar, the pattern matcher, the parser), 129 SQL tests covering each feature through the public API, 37 persistence tests that close, reopen, truncate and corrupt files, replay logs and test the file lock, 23 tests of overlapping transactions (snapshots, conflicts, deadlocks, recovery, two stress tests), 8 of connections shared between threads, 3 that keep `Database` `Send` and `Sync`, 3 documentation examples, and 18 that drive the desktop application headlessly, feeding it pointer events and reading back what it drew, so that transaction dialogs and the datasheet are exercised without a screen. Outside `cargo test` there are 1,256 checks in the C test suite (run plainly, under Valgrind and under AddressSanitizer), 23 groups in the JDBC driver's own suite, and tests of the driver from plain Java (43 checks), next.jdbc and HoneySQL (46 assertions) and Common Lisp (72 checks); see [extern/testing.md](extern/testing.md). The whole Rust suite is also run with every database in version mode (`ACCESSOR_FORCE_MVCC=1`).
 
 ### The query optimizer
 
@@ -987,7 +993,7 @@ The optimizer's guesses are made from the tables as they are, and nothing about 
 
 `.optimizer off` in the shell, or `db.set_optimizer(false)`, runs queries exactly as written: joins in the written order, conditions applied after the joins, no ordered index reads or count shortcut. The answers are the same, only slower, which is how it is tested: a test builds data with NULLs, ties and several index shapes, runs nearly forty query shapes with the optimizer on and off, and requires identical answers and identical row order.
 
-It has limits. Outer joins are not reordered; more than 63 tables in a `FROM` are joined as written; sub-queries, views and common table expressions are planned on their own, so a condition on a derived table is not pushed inside it; the join search is greedy, not exhaustive; and plans are not cached (the parsed SQL is, and statements can be prepared). The usual cure for a slow query is an index on the filtered or joined column, then a look at the plan. The [tuning guide](optimizer/tuning.md) lists the symptoms and remedies, and the rest of the [optimizer reference](optimizer/README.md) goes into each decision in detail.
+It has limits. Outer joins are not reordered; more than 128 tables in a `FROM` are joined as written; sub-queries, views and common table expressions are planned on their own, so a condition on a derived table is not pushed inside it; the join search is greedy, not exhaustive; and plans are not cached (the parsed SQL is, and statements can be prepared). The usual cure for a slow query is an index on the filtered or joined column, then a look at the plan. The [tuning guide](optimizer/tuning.md) lists the symptoms and remedies, and the rest of the [optimizer reference](optimizer/README.md) goes into each decision in detail.
 
 ### Performance
 

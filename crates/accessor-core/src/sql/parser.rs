@@ -794,6 +794,16 @@ impl<'a> Parser<'a> {
         Ok(st)
     }
 
+    /// An optional `ASC` or `DESC` after an index column: true for `DESC`.
+    fn index_direction(&mut self) -> bool {
+        if self.eat_kw("DESC") {
+            true
+        } else {
+            self.eat_kw("ASC");
+            false
+        }
+    }
+
     fn ident_list(&mut self) -> Result<Vec<String>> {
         let mut v = vec![self.ident()?];
         while self.eat_sym(",") {
@@ -1257,9 +1267,14 @@ impl<'a> Parser<'a> {
             self.expect_kw("ON")?;
             let table = self.ident()?;
             self.expect_sym("(")?;
-            let columns = self.ident_list()?;
+            let mut columns = vec![self.ident()?];
+            let mut descending = vec![self.index_direction()];
+            while self.eat_sym(",") {
+                columns.push(self.ident()?);
+                descending.push(self.index_direction());
+            }
             self.expect_sym(")")?;
-            return Ok(Statement::CreateIndex { name, table, columns, unique });
+            return Ok(Statement::CreateIndex { name, table, columns, descending, unique });
         }
         if !unique && (self.eat_kw("VIEW") || self.eat_kw("QUERY")) {
             self.if_exists_clause(true, guarded)?;

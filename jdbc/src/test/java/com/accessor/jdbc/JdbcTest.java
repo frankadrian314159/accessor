@@ -237,6 +237,8 @@ public final class JdbcTest {
                     check(r.first() && r.isFirst(), "first");
                     fails("07009", () -> r.getInt(2), "a column that does not exist");
                     fails("42S22", () -> r.findColumn("nope"), "a label that does not exist");
+                    // (bad SQL given to prepareStatement is an SQL exception, not a crash, and the connection goes on)
+                    fails("42000", () -> c.prepareStatement("SELEC ?"), "a syntax error when preparing");
                 }
                 try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("SELECT n FROM r")) {
                     fails("24000", r::last, "scrolling a forward-only result set");

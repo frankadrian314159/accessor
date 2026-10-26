@@ -189,8 +189,8 @@ impl Database {
             Statement::Merge(def) => self.exec_merge(def),
             Statement::DropTable(name) => self.exec_drop_table(name),
             Statement::AlterTable { table, action } => self.exec_alter_table(table, action),
-            Statement::CreateIndex { name, table, columns, unique } => {
-                self.exec_create_index(name, table, columns, *unique)
+            Statement::CreateIndex { name, table, columns, descending, unique } => {
+                self.exec_create_index(name, table, columns, descending, *unique)
             }
             Statement::DropIndex { name, table } => self.exec_drop_index(name, table),
             Statement::CreateView { name, sql } => self.exec_create_view(name, sql),

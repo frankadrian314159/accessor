@@ -63,20 +63,16 @@ impl Database {
         }
         let pk: Vec<usize> = (0..schema.columns.len()).filter(|&i| schema.columns[i].primary_key).collect();
         if !pk.is_empty() {
-            schema.indexes.push(IndexDef { name: "PrimaryKey".into(), columns: pk, unique: true });
+            schema.indexes.push(IndexDef::new("PrimaryKey", pk, true));
         }
         for (i, d) in defs.iter().enumerate() {
             if d.unique {
-                schema.indexes.push(IndexDef {
-                    name: format!("{name}_{}_unique", d.name),
-                    columns: vec![i],
-                    unique: true,
-                });
+                schema.indexes.push(IndexDef::new(format!("{name}_{}_unique", d.name), vec![i], true));
             }
         }
         for cols in uniques {
             let positions = cols.iter().map(|c| position(&schema, c)).collect::<Result<Vec<_>>>()?;
-            schema.indexes.push(IndexDef { name: format!("{name}_{}_unique", cols.join("_")), columns: positions, unique: true });
+            schema.indexes.push(IndexDef::new(format!("{name}_{}_unique", cols.join("_")), positions, true));
         }
 
         let fk_defs = defs.iter().filter_map(|d| d.references.as_ref()).chain(foreign_keys);
@@ -276,7 +272,7 @@ impl Database {
         }
         let name = def.name.clone().unwrap_or_else(|| format!("fk_{}_{}", child.name, def.columns.join("_")));
         let index = (!child.indexes.iter().any(|ix| same_set(&ix.columns, &columns)))
-            .then(|| IndexDef { name: format!("{name}_index"), columns: columns.clone(), unique: false });
+            .then(|| IndexDef::new(format!("{name}_index"), columns.clone(), false));
         let fk = ForeignKey {
             name,
             columns,
@@ -290,7 +286,7 @@ impl Database {
         Ok((fk, index))
     }
 
-    pub(crate) fn exec_create_index(&mut self, name: &str, table: &str, columns: &[String], unique: bool) -> Result<QueryResult> {
+    pub(crate) fn exec_create_index(&mut self, name: &str, table: &str, columns: &[String], descending: &[bool], unique: bool) -> Result<QueryResult> {
         let t = self.table_checked(table)?;
         let positions = columns
             .iter()
@@ -302,7 +298,7 @@ impl Database {
             .collect::<Result<Vec<_>>>()?;
         let op = Op::CreateIndex {
             table: t.name().to_string(),
-            def: IndexDef { name: name.to_string(), columns: positions, unique },
+            def: IndexDef::new(name, positions, unique).with_order(descending.to_vec()),
         };
         self.apply_all(vec![op])?;
         Ok(QueryResult::default())

@@ -3713,3 +3713,180 @@ fn information_schema_describes_the_catalog() {
     db.execute("ALTER TABLE Customers ADD COLUMN Extra INTEGER").unwrap();
     assert_eq!(rows(&db, "SELECT Count(*) FROM information_schema.columns WHERE table_name = 'Customers'"), [["5"]]);
 }
+
+/// A chain of `n` one-row tables, each joined to the next, written in chain order with a condition on the
+/// last: the best order starts from the last table and walks back, so the optimizer reorders it. The tables
+/// have one row each so that the test cannot run away if the optimizer does not take the query: without
+/// it the conditions are applied after all the joins, and more rows would mean a Cartesian product.
+fn chain_query(db: &mut Database, n: usize) -> String {
+    for i in 1..=n {
+        if db.table(&format!("c{i}")).is_none() {
+            db.execute(&format!("CREATE TABLE c{i} (a INTEGER PRIMARY KEY, b INTEGER)")).unwrap();
+            db.execute(&format!("INSERT INTO c{i} VALUES (1, 1)")).unwrap();
+        }
+    }
+    let from: Vec<String> = (1..=n).map(|i| format!("c{i}")).collect();
+    let mut conds: Vec<String> = (1..n).map(|i| format!("c{i}.b = c{}.a", i + 1)).collect();
+    conds.push(format!("c{n}.a = 1"));
+    format!("FROM {} WHERE {}", from.join(", "), conds.join(" AND "))
+}
+
+fn plan_of(db: &Database, q: &str) -> String {
+    let plan = db.query(&format!("EXPLAIN SELECT c1.a {q}")).unwrap();
+    plan.rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("
+")
+}
+
+#[test]
+fn the_optimizer_orders_joins_of_up_to_128_tables() {
+    let mut db = Database::in_memory();
+    for n in [2, 63, 64, 100, 128] {
+        let q = chain_query(&mut db, n);
+        let r = db.query(&format!("SELECT COUNT(*) {q}")).unwrap();
+        assert_eq!(r.rows, vec![vec![Value::Int(1)]], "{n} tables: the answer");
+        let plan = plan_of(&db, &q);
+        assert!(plan.contains("index nested-loop"), "{n} tables should have been joined by the optimizer's methods:
+{plan}");
+    }
+}
+
+#[test]
+fn a_join_of_more_than_128_tables_is_run_as_written_and_still_right() {
+    let mut db = Database::in_memory();
+    let q = chain_query(&mut db, 129);
+    let r = db.query(&format!("SELECT COUNT(*) {q}")).unwrap();
+    assert_eq!(r.rows, vec![vec![Value::Int(1)]]);
+    let plan = plan_of(&db, &q);
+    assert!(plan.contains("nested loop") && !plan.contains("index nested-loop"), "129 tables are beyond the optimizer:
+{plan}");
+}
+
+// ----- ascending and descending index columns ---------------------------------------------------
+
+fn ordered_db() -> Database {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT)").unwrap();
+    // a few hundred rows with plenty of ties and some NULLs
+    let mut x: u64 = 12345;
+    let mut rows = Vec::new();
+    for id in 0..400 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let a = if (x >> 40) % 11 == 0 { "NULL".to_string() } else { ((x >> 33) % 7).to_string() };
+        let b = if (x >> 45) % 13 == 0 { "NULL".to_string() } else { ((x >> 20) % 9).to_string() };
+        rows.push(format!("({id}, {a}, {b}, 's{}')", (x >> 50) % 5));
+    }
+    db.execute(&format!("INSERT INTO r VALUES {}", rows.join(", "))).unwrap();
+    db
+}
+
+fn ids(db: &Database, sql: &str) -> Vec<String> {
+    db.query(sql).unwrap().rows.iter().map(|r| r[0].to_string()).collect()
+}
+
+#[test]
+fn indexes_can_be_declared_ascending_and_descending() {
+    let mut db = ordered_db();
+    db.execute("CREATE INDEX r_ab ON r (a ASC, b DESC)").unwrap();
+    db.execute("CREATE UNIQUE INDEX r_s_id ON r (s DESC, id DESC)").unwrap();
+    let defs: Vec<(String, Vec<bool>)> = db.table("r").unwrap().index_defs().map(|d| (d.name.clone(), d.descending.clone())).collect();
+    assert!(defs.contains(&("r_ab".to_string(), vec![false, true])), "{defs:?}");
+    assert!(defs.contains(&("r_s_id".to_string(), vec![true, true])), "{defs:?}");
+    // ASC is just the default spelled out, and the keyword is not a column name
+    db.execute("CREATE INDEX r_b ON r (b ASC)").unwrap();
+    assert!(db.table("r").unwrap().index_defs().any(|d| d.name == "r_b" && d.descending.is_empty()));
+    assert!(db.execute("CREATE INDEX bad ON r (a SIDEWAYS)").is_err());
+}
+
+#[test]
+fn every_order_by_gives_the_same_rows_with_and_without_an_index() {
+    let mut db = ordered_db();
+    db.execute("CREATE INDEX r_ab ON r (a ASC, b DESC)").unwrap();
+    db.execute("CREATE INDEX r_ba ON r (b DESC, a DESC)").unwrap();
+    db.execute("CREATE INDEX r_s ON r (s DESC)").unwrap();
+    db.execute("CREATE INDEX r_plain ON r (a, b)").unwrap();
+    let mut served = 0;
+    for order in [
+        "a", "a DESC", "a, b", "a, b DESC", "a DESC, b", "a DESC, b DESC", "b DESC, a DESC", "b, a", "b DESC", "b",
+        "s DESC", "s", "a NULLS LAST", "a DESC NULLS FIRST", "a, b NULLS FIRST",
+    ] {
+        for filter in ["", "WHERE a = 3", "WHERE b > 2", "WHERE s = 's1'"] {
+            for limit in ["", "LIMIT 7", "LIMIT 60 OFFSET 5"] {
+                // ties: finish with the key so that the order is total and comparable
+                let sql = format!("SELECT id FROM r {filter} ORDER BY {order}, id {limit}");
+                db.set_optimizer(true);
+                let with = ids(&db, &sql);
+                db.set_optimizer(false);
+                let without = ids(&db, &sql);
+                assert_eq!(with, without, "{sql}");
+                // the same order without the tie-break, only checked as a sequence of sort keys
+                let key_sql = |opt: bool, db: &mut Database| {
+                    db.set_optimizer(opt);
+                    let cols = order.split(',').map(|c| c.split_whitespace().next().unwrap().to_string()).collect::<Vec<_>>().join(", ");
+                    db.query(&format!("SELECT {cols} FROM r {filter} ORDER BY {order} {limit}")).unwrap().rows
+                };
+                assert_eq!(key_sql(true, &mut db), key_sql(false, &mut db), "keys of {order} {filter} {limit}");
+            }
+        }
+        db.set_optimizer(true);
+        let plan = db.query(&format!("EXPLAIN SELECT id FROM r ORDER BY {order} LIMIT 5")).unwrap();
+        if plan.rows.iter().any(|r| r[0].to_string().contains("satisfied by index")) {
+            served += 1;
+        }
+    }
+    assert!(served >= 8, "indexes should serve most of these orders, served {served}");
+}
+
+#[test]
+fn a_mixed_direction_order_is_served_by_an_index_of_the_same_directions_only() {
+    let mut db = ordered_db();
+    let plan = |db: &Database, order: &str| -> String {
+        db.query(&format!("EXPLAIN SELECT id FROM r ORDER BY {order} LIMIT 5")).unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n")
+    };
+    db.execute("CREATE INDEX r_plain ON r (a, b)").unwrap();
+    assert!(!plan(&db, "a, b DESC").contains("satisfied by index"), "an ascending index cannot give a mixed order");
+    assert!(plan(&db, "a, b").contains("satisfied by index r_plain"));
+    assert!(plan(&db, "a DESC, b DESC").contains("satisfied by index r_plain"), "walked backwards");
+    db.execute("CREATE INDEX r_mixed ON r (a ASC, b DESC)").unwrap();
+    let p = plan(&db, "a, b DESC");
+    assert!(p.contains("satisfied by index r_mixed") && p.contains("mixed directions"), "{p}");
+    let p = plan(&db, "a DESC, b");
+    assert!(p.contains("satisfied by index r_mixed"), "the opposite of the index, walked backwards: {p}");
+    assert!(!plan(&db, "a DESC, b DESC LIMIT 5").is_empty());
+}
+
+#[test]
+fn lookups_ranges_and_unique_keys_work_through_a_descending_index() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE d (k INTEGER, t TEXT)").unwrap();
+    db.execute("CREATE UNIQUE INDEX d_k ON d (k DESC)").unwrap();
+    db.execute("INSERT INTO d VALUES (5, 'five'), (1, 'one'), (9, 'nine'), (3, 'three'), (7, 'seven'), (NULL, 'none')").unwrap();
+    assert!(db.execute("INSERT INTO d VALUES (9, 'again')").is_err(), "the unique key holds");
+    assert_eq!(ids(&db, "SELECT t FROM d WHERE k = 7"), vec!["seven"]);
+    fn sorted(db: &Database, sql: &str) -> Vec<String> {
+        let mut v = ids(db, sql);
+        v.sort();
+        v
+    }
+    assert_eq!(sorted(&db, "SELECT t FROM d WHERE k > 3"), vec!["five", "nine", "seven"]);
+    assert_eq!(sorted(&db, "SELECT t FROM d WHERE k >= 3 AND k < 9"), vec!["five", "seven", "three"]);
+    assert_eq!(sorted(&db, "SELECT t FROM d WHERE k BETWEEN 1 AND 5"), vec!["five", "one", "three"]);
+    assert_eq!(sorted(&db, "SELECT t FROM d WHERE k <= 1"), vec!["one"]);
+    assert_eq!(sorted(&db, "SELECT t FROM d WHERE k IS NULL"), vec!["none"]);
+    // a change of key moves the entry
+    db.execute("UPDATE d SET k = 4 WHERE k = 9").unwrap();
+    assert_eq!(sorted(&db, "SELECT t FROM d WHERE k = 4"), vec!["nine"]);
+    assert!(db.execute("UPDATE d SET k = 4 WHERE k = 7").is_err());
+    db.execute("DELETE FROM d WHERE k = 4").unwrap();
+    assert_eq!(ids(&db, "SELECT t FROM d WHERE k = 4").len(), 0);
+    assert_eq!(ids(&db, "SELECT t FROM d ORDER BY k DESC LIMIT 2"), vec!["seven", "five"]);
+    assert_eq!(ids(&db, "SELECT t FROM d ORDER BY k LIMIT 2"), vec!["none", "one"]);
+}
+
+#[test]
+fn creating_a_unique_descending_index_checks_the_rows_that_are_there() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE u (a INTEGER, b INTEGER); INSERT INTO u VALUES (1, 1), (1, 1)").unwrap();
+    assert!(db.execute("CREATE UNIQUE INDEX u_ab ON u (a DESC, b ASC)").is_err());
+    db.execute("DELETE FROM u WHERE a = 1 AND b = 1 AND a IS NOT NULL").unwrap();
+    db.execute("CREATE UNIQUE INDEX u_ab ON u (a DESC, b ASC)").unwrap();
+}

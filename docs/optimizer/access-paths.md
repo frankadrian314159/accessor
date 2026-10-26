@@ -38,10 +38,10 @@ The optimizer does this when **all** of these hold:
 
 * the query reads one table, with no joins, no `GROUP BY` or aggregates, no `DISTINCT`, no window functions;
 * it has a row limit: `LIMIT`, `TOP`, or `FETCH FIRST` (an `OFFSET` is added to the number of rows needed);
-* every `ORDER BY` item is a plain column of the table (written directly, or as an alias or position that refers to one), and all go in the same direction, all ascending or all descending;
-* some index starts with exactly those columns, in that order, optionally after columns the query fixes with equalities.
+* every `ORDER BY` item is a plain column of the table (written directly, or as an alias or position that refers to one);
+* some index starts with exactly those columns, in that order, optionally after columns the query fixes with equalities, and **its directions fit**: each index column is declared `ASC` or `DESC` ([CREATE INDEX](../sql/ddl.md#create-index)), and the directions the query asks for must be the same as the index's, or every one of them the opposite (then the index is read backwards). An ordinary index, all ascending, therefore serves `ORDER BY a, b` and `ORDER BY a DESC, b DESC`; for `ORDER BY a, b DESC` you need an index declared `(a, b DESC)` (which also serves `ORDER BY a DESC, b`).
 
-Then the index is read in order (backwards for `DESC`), each row is checked against the conditions, and the read stops as soon as enough rows have qualified.
+Then the index is read in order (backwards when the query asks for the opposite of the index), each row is checked against the conditions, and the read stops as soon as enough rows have qualified.
 
 ```sql
 CREATE INDEX byTotal ON Orders (Total);
@@ -53,7 +53,7 @@ SELECT * FROM Orders WHERE CustID = 7 ORDER BY Placed LIMIT 3;   -- equality, th
 
 **The answer is the same as sorting.** Rows that tie on the sort columns come out in the order they would after a stable sort, that is, by when they were stored, in both directions. NULLs come first when ascending and last when descending, as in a sort.
 
-**NULLS FIRST / NULLS LAST** are honoured. For a single sort column the index still serves them: an index holds NULLs together at one end, so with `ORDER BY x NULLS LAST` the rows with a value are read first and the NULL rows last (and `DESC NULLS FIRST` reads the NULLs first). With several sort columns, an index is used only if the NULLs are where the index naturally puts them (first when ascending, last when descending).
+**NULLS FIRST / NULLS LAST** are honoured. For a single sort column the index still serves them: an index holds NULLs together at one end, so with `ORDER BY x NULLS LAST` the rows with a value are read first and the NULL rows last (and `DESC NULLS FIRST` reads the NULLs first). With several sort columns, an index is used only if the NULLs are where the index naturally puts them (first when ascending, last when descending), and an index with a `DESC` column is used only for that natural placement.
 
 ### When it chooses not to
 

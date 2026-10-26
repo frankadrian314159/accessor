@@ -21,7 +21,7 @@ The rows are worked out from the catalog each time they are read, so they are al
 | `TABLE_CONSTRAINTS` | each primary key, unique index and foreign key | `constraint_name`, `table_name`, `constraint_type` (`PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`) |
 | `KEY_COLUMN_USAGE` | each column of each of those | `constraint_name`, `table_name`, `column_name`, `ordinal_position`, `referenced_table`, `referenced_column` (foreign keys) |
 | `REFERENTIAL_CONSTRAINTS` | each foreign key | `constraint_name`, `table_name`, `referenced_table`, `update_rule`, `delete_rule`, `is_deferrable`, `initially_deferred` |
-| `INDEXES` | each column of each index | `table_name`, `index_name`, `column_name`, `ordinal_position`, `is_unique` |
+| `INDEXES` | each column of each index | `table_name`, `index_name`, `column_name`, `ordinal_position`, `is_unique`, `is_descending` |
 | `ROUTINES` | each stored function and procedure | `routine_name`, `routine_type` (`FUNCTION`/`PROCEDURE`), `data_type` (the `RETURNS` type), `routine_definition` |
 | `PARAMETERS` | each parameter of each routine | `routine_name`, `parameter_name`, `ordinal_position`, `data_type`, `has_default` |
 | `SEQUENCES` | each sequence | `sequence_name`, `start_value`, `increment`, `minimum_value`, `maximum_value`, `cycle_option`, `last_value` |

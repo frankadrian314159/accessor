@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use super::agg::{AggFn, AggSpec, AggState};
 use super::bind::{contains_agg, Binder, CorrKind, CorrSpec, GroupCtx, Scope, ScopeCol};
-use super::optimizer::{choose_order, estimate, nullable, source_mask, Pred, MAX_SOURCES};
+use super::optimizer::{choose_order, estimate, nullable, source_mask, Pred, SourceMask, MAX_SOURCES, bit};
 use super::window::{self, GCORR_BASE, MASK_COL, WIN_BASE};
 use super::QueryResult;
 use crate::database::Database;
 use crate::error::{Error, Result};
 use crate::expr::BExpr;
+use crate::schema::IndexDef;
 use crate::sql::ast::*;
 use crate::storage::{RowId, Table};
 use crate::value::{DataType, Row, Value};
@@ -961,7 +962,7 @@ impl Database {
         // First source.
         let first = order[0];
         let mut rows = self.scan_source(&sources[first], &pre[first], depth, est[first])?;
-        let mut placed: u64 = 1 << first;
+        let mut placed: SourceMask = bit(first);
         let mut width = sources[first].ncols();
         if reorder {
             // Conditions that read no table at all.
@@ -978,7 +979,7 @@ impl Database {
 
         for (step, &s) in order.iter().enumerate().skip(1) {
             let right = &sources[s];
-            placed |= 1 << s;
+            placed |= bit(s);
             let (kind, on) = if reorder {
                 let ready: Vec<BExpr> = preds
                     .iter_mut()
@@ -1259,51 +1260,55 @@ impl Database {
                 _ => return Ok(None),
             }
         }
-        let desc = sel.order_by[0].desc;
-        if sel.order_by.iter().any(|o| o.desc != desc) || need == 0 {
+        if need == 0 {
             return Ok(None);
         }
         let k = cols.len();
-        // NULLs sit first in an index; where the query wants them elsewhere that is
-        // handled for a single sort column, and otherwise the index is not used.
+        // The direction each sort column wants. An index serves them if they are its own directions or
+        // all the opposite (it is walked backwards); an index of only ascending columns serves the
+        // all-ascending and all-descending orders.
+        let want: Vec<bool> = sel.order_by.iter().map(|o| o.desc).collect();
+        let desc = want[0];
+        let uniform = want.iter().all(|d| *d == desc);
+        // NULLs sit where the direction puts them (first when ascending) unless the query says otherwise.
+        let natural = sel.order_by.iter().all(|o| o.nulls_first.is_none_or(|n| n == !o.desc));
         let natural_first = !desc;
         let nulls_first = sel.order_by[0].nulls_first.unwrap_or(natural_first);
-        if sel.order_by.iter().any(|o| o.nulls_first.unwrap_or(natural_first) != nulls_first) {
-            return Ok(None);
-        }
-        if k > 1 && nulls_first != natural_first {
+        if !natural && (!uniform || k > 1 || sel.order_by.iter().any(|o| o.nulls_first.unwrap_or(natural_first) != nulls_first)) {
+            // (placing NULLs against the grain is handled for a single sort column of a plain index)
             return Ok(None);
         }
         let conj: Vec<&BExpr> = filter.map(split_and).unwrap_or_default();
         let defs: Vec<_> = t.index_defs().collect();
+        let usable = |d: &IndexDef, start: usize| {
+            d.columns.len() >= start + k && d.columns[start..start + k] == cols[..] && index_walk(d, start, &want).is_some() && (natural || !d.has_desc())
+        };
         // Which index and key prefix give the order?
         let (idx, prefix): (usize, Vec<Value>) = match choose_access(t, &conj) {
-            Access::Prefix { idx, key }
-                if defs[idx].columns.len() >= key.len() + k && defs[idx].columns[key.len()..key.len() + k] == cols[..] =>
-            {
-                (idx, key)
-            }
+            Access::Prefix { idx, key } if usable(defs[idx], key.len()) => (idx, key),
             Access::Prefix { idx, key } => {
                 // A selective lookup followed by a small sort beats walking an index.
                 if t.index_prefix(idx, &key).take(2048).count() < 2048 {
                     return Ok(None);
                 }
-                match defs.iter().position(|d| d.columns.len() >= k && d.columns[..k] == cols[..]) {
+                match defs.iter().position(|d| usable(d, 0)) {
                     Some(i) => (i, Vec::new()),
                     None => return Ok(None),
                 }
             }
             Access::Range { .. } => return Ok(None),
-            Access::Full => match defs.iter().position(|d| d.columns.len() >= k && d.columns[..k] == cols[..]) {
+            Access::Full => match defs.iter().position(|d| usable(d, 0)) {
                 Some(i) => (i, Vec::new()),
                 None => return Ok(None),
             },
         };
+        // Walked backwards when the query asks for the opposite of what the index holds.
+        let backwards = index_walk(defs[idx], prefix.len(), &want).unwrap_or(false);
         self.note(depth, || {
             format!(
                 "order by satisfied by index {} ({}{}), stopping after {need} rows: no sort",
                 defs[idx].name,
-                if desc { "descending" } else { "ascending" },
+                if !uniform { "mixed directions" } else if desc { "descending" } else { "ascending" },
                 if nulls_first == natural_first { "" } else if nulls_first { ", NULLs first" } else { ", NULLs last" }
             )
         });
@@ -1311,8 +1316,8 @@ impl Database {
         let null_at = |id: RowId| t.get(id).is_some_and(|r| r[cols[0]].is_null());
         // Ids in the order wanted. The natural index order already puts NULLs where the
         // query wants them unless it asked for the other end.
-        let ids: Box<dyn Iterator<Item = RowId> + '_> = if nulls_first == natural_first {
-            t.index_ordered(idx, &prefix, prefix.len() + k, desc)
+        let ids: Box<dyn Iterator<Item = RowId> + '_> = if natural {
+            t.index_ordered(idx, &prefix, prefix.len() + k, backwards)
         } else if !desc {
             // ascending, NULLs last: everything but the leading NULLs, then those
             let rest = t.index_ordered(idx, &prefix, prefix.len() + k, false).skip_while(move |&id| null_at(id));
@@ -1614,6 +1619,18 @@ pub(crate) fn matching_ids(table: &Table, conj: &[&BExpr], filter: Option<&BExpr
         ids.push(id);
     }
     Ok(ids)
+}
+
+/// How an index delivers the order `want` for its key columns from position `start` (`true`: descending):
+/// `Some(false)` read forwards, `Some(true)` read backwards, `None` not at all.
+fn index_walk(def: &IndexDef, start: usize, want: &[bool]) -> Option<bool> {
+    if want.iter().enumerate().all(|(j, &w)| def.is_desc(start + j) == w) {
+        Some(false)
+    } else if want.iter().enumerate().all(|(j, &w)| def.is_desc(start + j) != w) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>, limit: Option<usize>) -> Result<Vec<Row>> {

@@ -65,7 +65,10 @@ final class AccessorPreparedStatement extends UnsupportedPreparedStatement {
 
     @Override
     void releaseNative() {
-        stmt.close();
+        // (null when preparing failed: the constructor cleans up after itself)
+        if (stmt != null) {
+            stmt.close();
+        }
     }
 
     // ----- parameters --------------------------------------------------------------------------

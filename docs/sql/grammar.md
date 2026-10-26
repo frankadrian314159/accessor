@@ -243,7 +243,8 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
                  | TIMESTAMPTZ | ( TIMESTAMP | TIME ) WITH TIME ZONE
                  | INTERVAL | JSON | JSONB
 
-<create-index> ::= CREATE [ UNIQUE ] INDEX [ IF NOT EXISTS ] <identifier> ON <identifier> '(' <identifier-list> ')'
+<create-index> ::= CREATE [ UNIQUE ] INDEX [ IF NOT EXISTS ] <identifier> ON <identifier> '(' <index-column> { ',' <index-column> } ')'
+<index-column> ::= <identifier> [ ASC | DESC ]
 
 <create-view>  ::= CREATE [ OR REPLACE ] ( VIEW | QUERY ) [ IF NOT EXISTS ] <identifier>
                    [ '(' ( <parameter-decl> { ',' <parameter-decl> } | <identifier-list> ) ')' ]    (* parameters, or column names *)

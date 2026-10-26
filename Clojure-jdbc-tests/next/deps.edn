@@ -1,0 +1,10 @@
+{:paths ["test"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        com.github.seancorfield/next.jdbc {:mvn/version "1.4.72"}
+        ;; Accessor's driver: the jar holds the driver and the native library.
+        ;; Build it with  (cd ../../jdbc && ./build.sh --jar)
+        accessor/jdbc {:local/root "../../jdbc/build/accessor-jdbc.jar"}}
+ :aliases
+ {:test {;; the driver calls the native library through the foreign-function API (Java 22 or later)
+         :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+         :main-opts ["-m" "accessor.next-test"]}}}

@@ -97,3 +97,26 @@ These parts of the standard are not available. Using one gives a syntax error or
 * `CALCULATED` columns, parameterised saved queries with `EXEC`, `RAISE` in triggers, `SELECT` in trigger bodies, `LASTVAL`/`SETVAL`.
 * `RETURNING` on `INSERT`, `UPDATE`, `DELETE` and `MERGE`, `PREPARE`/`EXEC`, [reports](reports.md) (`CREATE REPORT`), `LASTVAL`/`SETVAL`.
 * `EXPLAIN` and the [query optimizer](../optimizer/README.md).
+
+## Differences found by sqllogictest
+
+Running SQLite's [sqllogictest](../extern/testing.md#sqllogictest) over `select1`–`select5`, `evidence/` and `index/` (2.07 million records, 99.89% passing) leaves 2,288 failures. They fall into a few groups.
+
+**ASQL differs on purpose** (these are the same as in the table above, not bugs):
+
+* **`/` is exact division.** `7 / 2` is `3.5`, not `3`, and `SELECT DISTINCT 52 / col` returns more rows as a result. Use `\` (integer division) or `Int(...)` for SQLite's behavior. Accounts for the "wrong values" in `index/random` (42 of the 44 examples shown).
+* **Division by zero is an error,** not NULL.
+* **Simple views can be updated** (`DELETE FROM view`, `UPDATE view`); SQLite refuses.
+* **Text compares without regard to case,** and double quotes make text.
+
+**Missing, and fit to add:**
+
+* **`ALL` inside an aggregate:** `AVG(ALL x)`, `MIN(ALL x)`, `SUM(ALL x)`. This is standard SQL and `ALL` is the default; it is one syntax error that accounts for 2,090 of the 2,288 failures.
+* **`IN ()` with an empty list** (not standard SQL, but accepted by SQLite, MySQL and others) and `x'303132'` blob literals.
+* **`DROP INDEX name`** without `ON table` (SQLite's form). Index names are per table here, so the table is needed unless the name is unique.
+* **Triggers without a timing:** `CREATE TRIGGER t UPDATE ON t BEGIN ... END` (SQLite defaults to `BEFORE`). The `DROP TRIGGER` failures in the suite follow from the triggers that could not be created.
+* **`REINDEX`.**
+
+**Bugs:**
+
+* **`NULL IN (subquery)` over an empty subquery.** The standard says FALSE (and `NOT IN` TRUE), because `x = ANY (empty set)` is false whatever `x` is. Accessor returns NULL. `evidence/in1.test` lines 97 and 108.

@@ -4,7 +4,7 @@ The C interface is the one place where the engine's memory safety rests on a cal
 
 ## The C tests
 
-`crates/accessor-capi/tests/c/test_accessor.c` is a C program of about 1,300 checks that exercises every function: all value types, prepared statements with every kind of bind, the error code of every class of failure, text that is empty, has a NUL, is a megabyte, is not UTF-8, NULL handles passed to every function, a closed connection, a database file locked by another **process** (a second copy of the program is started to try), a file that is not a database, reports as PDF, eight threads sharing one connection, a hundred thousand rows, and fifty connections opened and closed.
+`crates/accessor-capi/tests/c/test_accessor.c` is a C program of 1,256 checks that exercises every function: all value types, prepared statements with every kind of bind, the error code of every class of failure, text that is empty, has a NUL, is a megabyte, is not UTF-8, NULL handles passed to every function, a closed connection, a database file locked by another **process** (a second copy of the program is started to try), a file that is not a database, reports as PDF, eight threads sharing one connection, a hundred thousand rows, and fifty connections opened and closed.
 
 ```
 crates/accessor-capi/tests/c/run-c-tests.sh [plain] [valgrind] [asan]
@@ -40,3 +40,26 @@ crates/accessor-capi/fuzz/run-fuzz.sh [seconds per target] [target ...]
 ## The JDBC driver
 
 `jdbc/src/test/java/com/accessor/jdbc/JdbcTest.java` runs 23 groups of tests against the real native library (`jdbc/build.sh`): types in and out, exactness of decimals, NULLs, scrolling, every bind type, placeholders in odd places, batches that fail, generated keys, error states, transactions and savepoints, closed objects, metadata, files and locking, reports, unsupported features, strange text, many connections, several threads, and a result of 50,000 rows. The jar is also run on its own, loading the library from inside itself.
+
+## sqllogictest
+
+`crates/accessor-slt` runs SQLite's [sqllogictest](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki) files (about 7.4 million records in `select1`–`select5`, `evidence/`, `index/` and `random/`; get them from `https://github.com/gregrahn/sqllogictest`) against the engine:
+
+```
+cargo build --release -p accessor-slt
+target/release/accessor-slt --jobs 8 --memory-mb 1500 --timeout 600 --quiet  PATH-TO/sqllogictest/test/index
+```
+
+* Every file gets a fresh in-memory database. `skipif`/`onlyif` treat Accessor as a database called `accessor`, so the lines meant for SQLite are skipped and the others run.
+* **Each file runs in a child process** with a hard memory limit (a Windows job object; elsewhere use `ulimit -v`) and a time limit, up to `--jobs` at a time, so that a query that tries to use all the memory cannot take the machine down. A record that kills its process is reported as a `KILLER` with its file and line, and the file is run again without it. (A 64-table join once did exactly this; see [the optimizer's limit](../optimizer/join-order.md#when-reordering-applies).)
+* The runner checks itself: a file with one value changed fails, and a record that is made to run out of memory is found.
+* The order values are printed in, the rounding of reals (three places) and the `rowsort`/`valuesort`/hash forms are those of the original runner.
+
+Results on this build (the `random/` folder has not been run in full; of the two files tried, `random/select/slt_good_0` passed 98.3% and `random/aggregates/slt_good_0` 94.6%):
+
+| Part | Records | Passed |
+| --- | --- | --- |
+| `select1`–`select5` | 10,706 | **100%** |
+| `evidence/` and `index/` (226 files) | 2,058,631 | 2,056,343 (**99.89%**), 0 killed, 0 panics |
+
+On a machine with 12 cores, `evidence/` and `index/` took 18.5 minutes at 8 files at a time; a file of 10,000 records takes 20–50 seconds, so the whole suite one file at a time would be about 4.5 hours. The failures, and what they say about ASQL, are in [the conformance page](../sql/conformance.md#differences-found-by-sqllogictest).

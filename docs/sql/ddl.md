@@ -140,11 +140,13 @@ A deferrable relationship that gives no action behaves as `NO ACTION`; one witho
 ## CREATE INDEX
 
 ```sql
-CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column [, ...]);
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column [ASC | DESC] [, ...]);
 DROP INDEX [IF EXISTS] name ON table;
 ```
 
 Indexes speed up equality and range conditions and joins on their columns, and the optimiser uses them without being told. A unique index also enforces uniqueness. Index names are per table.
+
+**Ascending and descending columns.** Each column of an index runs from low to high (`ASC`, the default) or from high to low (`DESC`). It makes no difference to lookups, ranges, joins or uniqueness. It matters to `ORDER BY ... LIMIT`: an index serves a sort when its columns are the sort columns, in order, and the directions are the index's own or all the opposite (the index is read backwards). So an index on `(Region, Total DESC)` serves `ORDER BY Region, Total DESC` and `ORDER BY Region DESC, Total`, and stops reading after the rows asked for, whereas an index on `(Region, Total)` can serve only `ORDER BY Region, Total` and `ORDER BY Region DESC, Total DESC`; the mixed order needs a sort. See [access paths](../optimizer/access-paths.md#order-by-with-a-limit). NULLs sort as low values: first in an ascending column and last in a descending one, which is where `ORDER BY` puts them too. The directions are shown by `.indexes` in the shell and by `INFORMATION_SCHEMA.INDEXES` (`is_descending`), and are kept in the file (format version 6).
 
 ## ALTER TABLE
 

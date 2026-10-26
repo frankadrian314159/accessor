@@ -12,7 +12,7 @@ For inner and cross joins any order is allowed, so the optimizer picks one.
 | --- | --- |
 | only `INNER JOIN`, `JOIN`, `CROSS JOIN`, comma joins, `USING` and `NATURAL` joins | chosen by the optimizer |
 | any `LEFT`, `RIGHT` or `FULL` join | as written |
-| more than 63 tables | as written |
+| more than 128 tables | as written (and without the optimizer's pushdown, so the conditions are applied after all the joins: keep such queries small) |
 | the optimizer switched off | as written |
 
 Outer joins are left alone because moving a table across an outer join can change which rows are padded with NULLs.

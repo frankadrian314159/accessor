@@ -101,7 +101,7 @@ or `db.set_optimizer(false)` in Rust. Joins then run in the written order, with 
 ## Limits of the optimizer
 
 * **Outer joins are not reordered** and conditions are not pushed to their nullable side.
-* **More than 63 tables** in one `FROM` are joined as written.
+* **More than 128 tables** in one `FROM` are joined as written, with every condition applied after the last join: unless the tables are tiny, split the query.
 * **Sub-queries, views and CTEs are planned separately,** except that a derived table or view that is a plain selection of columns of one table is merged ([subqueries.md](subqueries.md#derived-tables-and-views-read-as-their-table)). Any other derived table is computed in full before it is joined, and a condition like `WHERE d.x = 5` over it filters after it is built; put the condition inside the derived table when you can.
 * **The estimates** ([estimates.md](estimates.md)) are exact for indexed conditions and use histograms and common-value counts for the rest. They do not know that columns are related, a sample can miss a rare value, and derived tables have no statistics.
 * **The join order search is greedy**: it picks the best next table at each step and does not try every order, so on a query with many tables it can miss the best order, though it rarely picks a bad one.

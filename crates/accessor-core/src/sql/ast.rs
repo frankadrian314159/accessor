@@ -440,7 +440,8 @@ pub enum Statement {
     },
     DropTable(String),
     AlterTable { table: String, action: AlterAction },
-    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool },
+    /// `descending[i]` is true for a column written `DESC`.
+    CreateIndex { name: String, table: String, columns: Vec<String>, descending: Vec<bool>, unique: bool },
     DropIndex { name: String, table: String },
     CreateView { name: String, sql: String },
     DropView(String),

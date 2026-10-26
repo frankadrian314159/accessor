@@ -53,12 +53,68 @@ impl Column {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct IndexDef {
     pub name: String,
     /// Column positions, in key order.
     pub columns: Vec<usize>,
     pub unique: bool,
+    /// Which key columns run from high to low (`DESC`). Empty, or shorter than `columns`, means ascending.
+    pub descending: Vec<bool>,
+}
+
+impl IndexDef {
+    /// An index whose columns are all ascending.
+    pub fn new(name: impl Into<String>, columns: Vec<usize>, unique: bool) -> Self {
+        IndexDef { name: name.into(), columns, unique, descending: Vec::new() }
+    }
+
+    /// The same index with the given directions (`true`: descending), one per column.
+    pub fn with_order(mut self, descending: Vec<bool>) -> Self {
+        self.descending = if descending.iter().any(|d| *d) { descending } else { Vec::new() };
+        self
+    }
+
+    /// Does key column `i` run from high to low?
+    pub fn is_desc(&self, i: usize) -> bool {
+        self.descending.get(i).copied().unwrap_or(false)
+    }
+
+    /// Is any key column descending?
+    pub fn has_desc(&self) -> bool {
+        self.descending.iter().any(|d| *d)
+    }
+}
+
+/// How an index is stored in files and logs: as it always was, with the top bit of a column number
+/// marking a descending column. (An index that is all ascending is written exactly as before.)
+const DESC_FLAG: usize = 1 << 31;
+
+#[derive(Serialize, Deserialize)]
+struct IndexWire {
+    name: String,
+    columns: Vec<usize>,
+    unique: bool,
+}
+
+impl Serialize for IndexDef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        IndexWire {
+            name: self.name.clone(),
+            columns: self.columns.iter().enumerate().map(|(i, &c)| if self.is_desc(i) { c | DESC_FLAG } else { c }).collect(),
+            unique: self.unique,
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for IndexDef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let w = IndexWire::deserialize(d)?;
+        let descending: Vec<bool> = w.columns.iter().map(|c| c & DESC_FLAG != 0).collect();
+        let columns = w.columns.iter().map(|c| c & !DESC_FLAG).collect();
+        Ok(IndexDef { name: w.name, columns, unique: w.unique, descending: Vec::new() }.with_order(descending))
+    }
 }
 
 /// What happens to referencing rows when the referenced row is deleted or

@@ -1,0 +1,15 @@
+[package]
+name = "accessor-slt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runs SQLite's sqllogictest files against Accessor"
+publish = false
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }
+md5 = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

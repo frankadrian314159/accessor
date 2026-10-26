@@ -163,11 +163,12 @@ impl Database {
                                 t(&tb.schema().columns[c].name),
                                 Value::Int(k as i64 + 1),
                                 Value::Bool(ix.unique),
+                                Value::Bool(ix.is_desc(k)),
                             ]);
                         }
                     }
                 }
-                names(&["table_name", "index_name", "column_name", "ordinal_position", "is_unique"])
+                names(&["table_name", "index_name", "column_name", "ordinal_position", "is_unique", "is_descending"])
             }
             "routines" => {
                 for r in self.routines.values() {

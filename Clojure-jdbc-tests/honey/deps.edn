@@ -1,0 +1,10 @@
+{:paths ["test"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.0"}
+        com.github.seancorfield/next.jdbc {:mvn/version "1.4.72"}
+        com.github.seancorfield/honeysql {:mvn/version "2.8.85"}
+        ;; Accessor's driver: the jar holds the driver and the native library.
+        ;; Build it with  (cd ../../jdbc && ./build.sh --jar)
+        accessor/jdbc {:local/root "../../jdbc/build/accessor-jdbc.jar"}}
+ :aliases
+ {:test {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+         :main-opts ["-m" "accessor.honey-test"]}}}

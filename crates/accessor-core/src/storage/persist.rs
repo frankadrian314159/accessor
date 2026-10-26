@@ -24,15 +24,17 @@ use crate::value::Row;
 
 const SNAP_MAGIC: &[u8; 4] = b"ACDB";
 const WAL_MAGIC: &[u8; 4] = b"ACWL";
-/// Current file format. Version 1 predates foreign keys; it is still read and
-/// is rewritten as version 2 on open.
-const VERSION: u32 = 5;
+/// Current file format. Version 6 adds descending index columns (a flag on the column number, so a file
+/// without any is laid out as version 5 was). Older versions are still read, and are rewritten as the
+/// current one on open; version 1 predates foreign keys.
+const VERSION: u32 = 6;
 /// The version of the file format this build writes (older versions are still read).
 pub const FILE_FORMAT_VERSION: u32 = VERSION;
 const V1: u32 = 1;
 const V2: u32 = 2;
 const V3: u32 = 3;
 const V4: u32 = 4;
+const V5: u32 = 5;
 const WAL_HEADER_LEN: u64 = 16;
 const SNAP_HEADER_LEN: usize = 28;
 /// Frames larger than this are treated as corruption rather than allocated.
@@ -160,7 +162,7 @@ impl Persistence {
             let bytes = fs::read(&wal_path)?;
             if bytes.len() >= WAL_HEADER_LEN as usize && &bytes[..4] == WAL_MAGIC {
                 let version = u32_at(&bytes, 4);
-                if !matches!(version, V1 | V2 | V3 | V4 | VERSION) {
+                if !matches!(version, V1 | V2 | V3 | V4 | V5 | VERSION) {
                     return Err(Error::Corrupt("unsupported WAL version".into()));
                 }
                 let wal_legacy = version == V1;
@@ -326,7 +328,7 @@ fn read_snapshot(path: &Path) -> Result<Loaded> {
         return Err(Error::Corrupt("not an Accessor database file".into()));
     }
     let version = u32_at(&bytes, 4);
-    if !matches!(version, V1 | V2 | V3 | V4 | VERSION) {
+    if !matches!(version, V1 | V2 | V3 | V4 | V5 | VERSION) {
         return Err(Error::Corrupt("unsupported database version".into()));
     }
     let epoch = u64_at(&bytes, 8);

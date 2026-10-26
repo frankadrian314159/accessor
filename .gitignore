@@ -10,3 +10,8 @@
 # Build and fuzz output
 jdbc/build/
 *.adb-lock
+
+# Clojure tool caches
+.cpcache/
+.clj-kondo/.cache/
+hs_err_pid*.log

@@ -205,7 +205,12 @@ impl Shell {
             ".indexes" => match self.db.table(rest) {
                 Some(t) => {
                     for ix in t.index_defs() {
-                        let cols: Vec<_> = ix.columns.iter().map(|&c| t.schema().columns[c].name.as_str()).collect();
+                        let cols: Vec<String> = ix
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &c)| format!("{}{}", t.schema().columns[c].name, if ix.is_desc(i) { " DESC" } else { "" }))
+                            .collect();
                         println!("{}{}  ({})", if ix.unique { "UNIQUE " } else { "" }, ix.name, cols.join(", "));
                     }
                 }

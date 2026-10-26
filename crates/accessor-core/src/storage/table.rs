@@ -18,12 +18,50 @@ struct Index {
     def: IndexDef,
     /// An entry for every key any version of a row has, until the version is cleaned away: a search
     /// finds candidates, and the version a reader can see is checked to have the key.
-    tree: BTreeSet<(Vec<Value>, RowId)>,
+    tree: BTreeSet<(Vec<Cell>, RowId)>,
+}
+
+/// One value of an index key. In a descending column the order is reversed, so the tree runs in the
+/// order the index was declared in, and walking it gives `ORDER BY a ASC, b DESC` without a sort.
+#[derive(Clone, Debug)]
+struct Cell {
+    v: Value,
+    desc: bool,
+}
+
+impl PartialEq for Cell {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+
+impl Eq for Cell {}
+
+impl PartialOrd for Cell {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Cell {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let o = self.v.cmp(&other.v);
+        if self.desc {
+            o.reverse()
+        } else {
+            o
+        }
+    }
 }
 
 impl Index {
-    fn key(&self, row: &[Value]) -> Vec<Value> {
-        self.def.columns.iter().map(|&c| row[c].clone()).collect()
+    fn key(&self, row: &[Value]) -> Vec<Cell> {
+        self.def.columns.iter().enumerate().map(|(i, &c)| Cell { v: row[c].clone(), desc: self.def.is_desc(i) }).collect()
+    }
+
+    /// The leading part of a key, from values.
+    fn cells(&self, values: &[Value]) -> Vec<Cell> {
+        values.iter().enumerate().map(|(i, v)| Cell { v: v.clone(), desc: self.def.is_desc(i) }).collect()
     }
 }
 
@@ -191,7 +229,7 @@ impl Table {
 
     /// Removes from the indexes the keys that only the versions in `gone` had.
     fn forget_keys(&mut self, id: RowId, gone: &[Row]) {
-        let mut doomed: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut doomed: Vec<(usize, Vec<Cell>)> = Vec::new();
         {
             let kept: Vec<&Row> = self.rows.get(id as usize).and_then(Option::as_ref).map_or_else(Vec::new, |h| h.chain().map(|v| &v.row).collect());
             for (pos, ix) in self.indexes.iter().enumerate() {
@@ -238,8 +276,8 @@ impl Table {
 
     /// Fails if another row holds `key` in unique index `ix` (`except` is the row being changed). With
     /// versions the answer can be "it depends on how another transaction ends": that is `Busy`.
-    fn check_unique(&self, ix: &Index, key: &[Value], except: Option<RowId>) -> Result<()> {
-        if !ix.def.unique || key.iter().any(Value::is_null) {
+    fn check_unique(&self, ix: &Index, key: &[Cell], except: Option<RowId>) -> Result<()> {
+        if !ix.def.unique || key.iter().any(|c| c.v.is_null()) {
             return Ok(());
         }
         let view = mvcc::view();
@@ -309,7 +347,7 @@ impl Table {
         if self.rows.get(slot).is_some_and(Option::is_some) {
             return Err(Error::Corrupt(format!("row id {id} already occupied in '{}'", self.schema.name)));
         }
-        let keys: Vec<Vec<Value>> = self.indexes.iter().map(|ix| ix.key(&row)).collect();
+        let keys: Vec<Vec<Cell>> = self.indexes.iter().map(|ix| ix.key(&row)).collect();
         for (ix, key) in self.indexes.iter().zip(&keys) {
             self.check_unique(ix, key, None)?;
         }
@@ -541,12 +579,12 @@ impl Table {
             return Err(Error::catalog("index references an unknown column"));
         }
         let mut ix = Index { def: def.clone(), tree: BTreeSet::new() };
-        let mut seen: BTreeSet<Vec<Value>> = BTreeSet::new();
+        let mut seen: BTreeSet<Vec<Cell>> = BTreeSet::new();
         for (id, slot) in self.rows.iter().enumerate() {
             let Some(head) = slot else { continue };
             for (age, v) in head.chain().enumerate() {
                 let key = ix.key(&v.row);
-                let counts = age == 0 && v.end == INF && ix.def.unique && !key.iter().any(Value::is_null);
+                let counts = age == 0 && v.end == INF && ix.def.unique && !key.iter().any(|c| c.v.is_null());
                 if counts && !seen.insert(key.clone()) {
                     return Err(Error::constraint(format!(
                         "cannot create unique index '{}': duplicate values exist",
@@ -782,13 +820,13 @@ impl Table {
         // The keys changed type with their values: build the indexes again from every version.
         for pos in 0..converted.indexes.len() {
             let mut tree = BTreeSet::new();
-            let mut seen: BTreeSet<Vec<Value>> = BTreeSet::new();
+            let mut seen: BTreeSet<Vec<Cell>> = BTreeSet::new();
             for (id, slot) in converted.rows.iter().enumerate() {
                 let Some(head) = slot else { continue };
                 for (age, v) in head.chain().enumerate() {
                     let ix = &converted.indexes[pos];
                     let key = ix.key(&v.row);
-                    if age == 0 && v.end == INF && ix.def.unique && !key.iter().any(Value::is_null) && !seen.insert(key.clone()) {
+                    if age == 0 && v.end == INF && ix.def.unique && !key.iter().any(|c| c.v.is_null()) && !seen.insert(key.clone()) {
                         return Err(converted.dup_error(ix));
                     }
                     tree.insert((key, id as RowId));
@@ -902,14 +940,14 @@ impl Table {
 
     /// Is row `id`, as the caller sees it, one that has `key` in index `idx`? (The index also holds the
     /// keys of versions the caller cannot see.)
-    fn has_key(&self, idx: usize, key: &[Value], id: RowId) -> bool {
+    fn has_key(&self, idx: usize, key: &[Cell], id: RowId) -> bool {
         let cols = &self.indexes[idx].def.columns;
-        self.visible(id).is_some_and(|v| cols.iter().zip(key).all(|(&c, k)| v.row[c] == *k))
+        self.visible(id).is_some_and(|v| cols.iter().zip(key).all(|(&c, k)| v.row[c] == k.v))
     }
 
     /// Row ids whose index key starts with `prefix`.
     pub fn index_prefix(&self, idx: usize, prefix: &[Value]) -> impl Iterator<Item = RowId> + '_ {
-        let p = prefix.to_vec();
+        let p = self.indexes[idx].cells(prefix);
         let start = (p.clone(), 0);
         self.indexes[idx]
             .tree
@@ -923,7 +961,7 @@ impl Table {
     /// empty). Records whose first `tie_len` key values are equal keep ascending row-id
     /// order even when `desc` reverses the rest, so the result matches a stable sort.
     pub fn index_ordered(&self, idx: usize, prefix: &[Value], tie_len: usize, desc: bool) -> Box<dyn Iterator<Item = RowId> + '_> {
-        let p = prefix.to_vec();
+        let p = self.indexes[idx].cells(prefix);
         let tree = &self.indexes[idx].tree;
         let range = tree
             .range((p.clone(), 0)..)
@@ -932,11 +970,11 @@ impl Table {
         if !desc {
             return Box::new(range.map(|(_, id)| *id));
         }
-        let entries: Vec<(&[Value], RowId)> = range.map(|(k, id)| (&k[..], *id)).collect();
+        let entries: Vec<(&[Cell], RowId)> = range.map(|(k, id)| (&k[..], *id)).collect();
         let mut ids = Vec::with_capacity(entries.len());
         let mut end = entries.len();
         while end > 0 {
-            let tie = |e: &(&[Value], RowId)| e.0[..tie_len.min(e.0.len())].to_vec();
+            let tie = |e: &(&[Cell], RowId)| e.0[..tie_len.min(e.0.len())].to_vec();
             let key = tie(&entries[end - 1]);
             let mut start = end - 1;
             while start > 0 && tie(&entries[start - 1]) == key {
@@ -950,25 +988,29 @@ impl Table {
         Box::new(ids.into_iter())
     }
 
-    /// Row ids ordered by the first column of index `idx`, within bounds.
-    /// `Null` keys never qualify.
+    /// Row ids of the rows whose first index column is within bounds, in the order of the index (low to
+    /// high, or high to low if that column is descending). `Null` keys never qualify.
     pub fn index_range(&self, idx: usize, lo: Bound<Value>, hi: Bound<Value>) -> impl Iterator<Item = RowId> + '_ {
-        let start = match &lo {
-            Bound::Included(v) | Bound::Excluded(v) => (vec![v.clone()], 0),
+        let desc = self.indexes[idx].def.is_desc(0);
+        // The tree starts at the end of the range it reaches first.
+        let (first, last) = if desc { (hi, lo) } else { (lo, hi) };
+        let start = match &first {
+            Bound::Included(v) | Bound::Excluded(v) => (vec![Cell { v: v.clone(), desc }], 0),
             Bound::Unbounded => (Vec::new(), 0),
         };
         self.indexes[idx]
             .tree
             .range(start..)
-            .skip_while(move |(k, _)| match &lo {
-                Bound::Unbounded => k[0].is_null(),
+            .skip_while(move |(k, _)| match &first {
+                // NULLs sort lowest: first in an ascending column, last in a descending one.
+                Bound::Unbounded => !desc && k[0].v.is_null(),
                 Bound::Included(_) => false,
-                Bound::Excluded(v) => k[0] == *v,
+                Bound::Excluded(v) => k[0].v == *v,
             })
-            .take_while(move |(k, _)| match &hi {
-                Bound::Unbounded => true,
-                Bound::Included(v) => k[0] <= *v,
-                Bound::Excluded(v) => k[0] < *v,
+            .take_while(move |(k, _)| match &last {
+                Bound::Unbounded => !(desc && k[0].v.is_null()),
+                Bound::Included(v) => if desc { k[0].v >= *v } else { k[0].v <= *v },
+                Bound::Excluded(v) => if desc { k[0].v > *v } else { k[0].v < *v },
             })
             .filter(move |(k, id)| self.has_key(idx, k, *id))
             .map(|(_, id)| *id)
@@ -994,10 +1036,10 @@ impl Table {
                         .iter()
                         .map(|c| key[cols.iter().position(|x| x == c).expect("same column set")].clone())
                         .collect();
-                    let p = probe.clone();
+                    let p = self.indexes[pos].cells(&probe);
                     self.indexes[pos]
                         .tree
-                        .range((probe, 0)..)
+                        .range((p.clone(), 0)..)
                         .take_while(move |(k, _)| k.len() >= p.len() && k[..p.len()] == p[..])
                         .map(|(_, id)| *id)
                         .collect()
@@ -1049,7 +1091,7 @@ mod tests {
         Table::new(TableSchema {
             name: "t".into(),
             columns: vec![id, Column::new("name", DataType::Text)],
-            indexes: vec![IndexDef { name: "PrimaryKey".into(), columns: vec![0], unique: true }],
+            indexes: vec![IndexDef::new("PrimaryKey", vec![0], true)],
             foreign_keys: Vec::new(),
         })
     }

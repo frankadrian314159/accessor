@@ -32,7 +32,17 @@ use crate::storage::Table;
 use crate::value::Value;
 
 /// More sources than this are joined in the order written, without pushdown.
-pub(crate) const MAX_SOURCES: usize = 63;
+/// Which of a query's sources (tables, subqueries, ...) a condition reads: one bit each.
+pub(crate) type SourceMask = u128;
+
+/// The bit for source `s` (none for a source beyond the mask: a query that long is not optimized, and the
+/// bits are not used).
+pub(crate) fn bit(s: usize) -> SourceMask {
+    u32::try_from(s).ok().and_then(|s| (1 as SourceMask).checked_shl(s)).unwrap_or(0)
+}
+
+/// The most sources in one `FROM` clause that the optimizer will order; more are joined as written.
+pub(crate) const MAX_SOURCES: usize = SourceMask::BITS as usize;
 
 /// Where `EXPLAIN` collects its notes. `None` outside an `EXPLAIN`.
 #[derive(Default)]
@@ -70,15 +80,15 @@ impl Database {
 pub(crate) struct Pred {
     pub expr: BExpr,
     /// Bit `s` is set when the condition reads source `s`.
-    pub mask: u64,
+    pub mask: SourceMask,
     /// Whether it came from `WHERE` (as opposed to a join's `ON`).
     pub from_where: bool,
     pub used: bool,
 }
 
 /// The sources an expression reads, given where each source's columns start.
-pub(crate) fn source_mask(e: &BExpr, offs: &[usize]) -> u64 {
-    let mut m = 0u64;
+pub(crate) fn source_mask(e: &BExpr, offs: &[usize]) -> SourceMask {
+    let mut m: SourceMask = 0;
     e.visit_cols(&mut |c| {
         let s = offs.partition_point(|&o| o <= c).saturating_sub(1);
         m |= 1 << s;
@@ -294,8 +304,8 @@ enum Reach {
 /// `(this source's column, another source's column)` for each equality of two plain columns.
 type JoinPairs = Vec<(usize, usize)>;
 
-fn reach(source: &Source<'_>, s: usize, placed: u64, preds: &[Pred], offs: &[usize]) -> (Reach, JoinPairs) {
-    let me = 1u64 << s;
+fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs: &[usize]) -> (Reach, JoinPairs) {
+    let me: SourceMask = 1 << s;
     let mut cols: Vec<usize> = Vec::new();
     let mut pairs: JoinPairs = Vec::new();
     let mut linked = false;
@@ -365,7 +375,7 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
         .min_by(|&a, &b| est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)))
         .expect("at least one source");
     let mut order = vec![start];
-    let mut placed = 1u64 << start;
+    let mut placed: SourceMask = 1 << start;
     let mut current = est[start];
     while order.len() < m {
         let mut best: Option<(usize, f64, f64)> = None; // (source, result rows, work)

@@ -938,3 +938,75 @@ fn different_databases_do_not_lock_each_other() {
     let b = Database::open(dir.path().join("b.adb")).unwrap();
     assert!(a.is_persistent() && b.is_persistent());
 }
+
+// ----- descending index columns -------------------------------------------------------------------
+
+fn directions(db: &Database, table: &str) -> Vec<(String, Vec<bool>)> {
+    db.table(table).unwrap().index_defs().map(|d| (d.name.clone(), (0..d.columns.len()).map(|i| d.is_desc(i)).collect())).collect()
+}
+
+fn ordered_ids(db: &Database, order: &str) -> Vec<String> {
+    db.query(&format!("SELECT id FROM t ORDER BY {order}")).unwrap().rows.iter().map(|r| r[0].to_string()).collect()
+}
+
+#[test]
+fn index_directions_survive_a_snapshot_and_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("d.adb");
+    let want = vec![("PrimaryKey".to_string(), vec![false]), ("t_ab".to_string(), vec![false, true]), ("t_b".to_string(), vec![true])];
+    let expected;
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1, 5), (2, 1, 9), (3, 2, 1), (4, 2, 7), (5, NULL, 3)").unwrap();
+        db.execute("CREATE INDEX t_ab ON t (a ASC, b DESC)").unwrap();
+        db.checkpoint().unwrap();
+        // this one is only in the write-ahead log
+        db.execute("CREATE UNIQUE INDEX t_b ON t (b DESC)").unwrap();
+        db.execute("INSERT INTO t VALUES (6, 3, 4)").unwrap();
+        expected = ordered_ids(&db, "a, b DESC");
+        assert_eq!(directions(&db, "t"), want);
+        db.simulate_crash();
+    }
+    // recovered from the log
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(directions(&db, "t"), want, "after recovery");
+    assert_eq!(ordered_ids(&db, "a, b DESC"), expected);
+    assert!(db.execute("INSERT INTO t VALUES (7, 9, 9)").is_err(), "the unique descending index still holds");
+    assert_eq!(count(&db, "t"), 6);
+    db.checkpoint().unwrap();
+    drop(db);
+    // read back from a snapshot
+    let db = Database::open(&path).unwrap();
+    assert_eq!(directions(&db, "t"), want, "after a snapshot");
+    assert_eq!(ordered_ids(&db, "a, b DESC"), expected);
+    assert_eq!(ordered_ids(&db, "b DESC").len(), 6);
+}
+
+#[test]
+fn a_file_with_no_descending_index_is_still_a_version_5_file_inside() {
+    // Version 6 only adds a flag on column numbers: an all-ascending file differs from version 5 in its header.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER); CREATE INDEX t_a ON t (a)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        db.checkpoint().unwrap();
+    }
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 6);
+    bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let mut wal = std::fs::read(wal_path(&path)).unwrap();
+    wal[4..8].copy_from_slice(&5u32.to_le_bytes());
+    std::fs::write(wal_path(&path), &wal).unwrap();
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(count(&db, "t"), 2, "a version 5 file opens");
+    db.execute("CREATE INDEX t_ad ON t (a DESC)").unwrap();
+    drop(db);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 6, "and is written as version 6");
+    let db = Database::open(&path).unwrap();
+    assert_eq!(directions(&db, "t").last().unwrap().1, vec![true]);
+}
