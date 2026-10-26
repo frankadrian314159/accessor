@@ -115,6 +115,8 @@ The first form tests conditions; the second compares one value with each `WHEN` 
 
 `CAST(expr AS type)` converts a value to one of the [data types](ddl.md#data-types). Sizes are ignored except the scale of a decimal: `CAST(x AS DECIMAL(10, 2))` rounds to two places (halves go to the even digit). A value that cannot be converted is an error. A NULL stays NULL.
 
+`expr::type` is PostgreSQL's way of writing `CAST(expr AS type)`: `'42'::int4`, `price::text`, `'2024-03-01'::date`, `1.9::int` (which is 1: a cast to an integer drops the fraction). It binds tighter than any operator, so `-5::int` is `-(5::int)` and `a + b::text` casts only `b`; chain them as `'1'::int::float8`. The type may have a size, `numeric(10, 2)`, which rounds a decimal; array types (`int[]`) are not available.
+
 ## Other standard forms
 
 | Form | Same as |

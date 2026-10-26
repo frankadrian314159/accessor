@@ -486,6 +486,14 @@ pub enum Statement {
     SetConstraints { names: Option<Vec<String>>, deferred: bool },
     /// `EXPLAIN query`: run the query and report how it was planned.
     Explain(Box<Select>),
+    /// `EXPLAIN` of a statement that is not a query: described, not run.
+    ExplainOther(Box<Statement>),
+    /// `SET [SESSION | LOCAL] name { TO | = } value [, ...]`; `None` is `DEFAULT`.
+    SetParameter { name: String, value: Option<String>, local: bool },
+    /// `RESET name` / `RESET ALL` (`None`).
+    ResetParameter(Option<String>),
+    /// `SHOW name` / `SHOW ALL` (`None`).
+    ShowParameter(Option<String>),
     /// `DROP ... IF EXISTS` (`missing_ok`) or `CREATE ... IF NOT EXISTS`.
     Guarded { missing_ok: bool, stmt: Box<Statement> },
     Merge(Box<MergeDef>),

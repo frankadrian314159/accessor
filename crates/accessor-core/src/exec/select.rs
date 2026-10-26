@@ -497,7 +497,7 @@ impl Database {
         // Hidden columns follow the row: the grouping mask (grouped queries),
         // sub-query values, then window function results.
         let mask_pos = group.as_ref().map_or(0, |g| g.exprs.len() + g.aggs.len());
-        let has_mask = group.is_some() && !sel.group_sets.is_empty();
+        let has_mask = group.is_some() && (!sel.group_sets.is_empty() || binder.grouping_used);
         let extra_base = match &group {
             Some(_) => mask_pos + usize::from(has_mask),
             None => scope.cols.len() + corr.len(),
@@ -575,7 +575,7 @@ impl Database {
         // 5. Grouping.
         if let Some(g) = group {
             self.note(depth, || format!("group {} rows{}", rows.len(), if sel.group_sets.is_empty() { String::new() } else { format!(" into {} grouping set(s)", sel.group_sets.len()) }));
-            rows = aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets)?;
+            rows = aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets, has_mask)?;
             if !gcorr.is_empty() {
                 rows = self.add_corr_columns(rows, &gcorr, depth)?;
             }
@@ -1899,9 +1899,10 @@ fn join_step(
 // Grouping
 // ---------------------------------------------------------------------------
 
-fn aggregate(rows: Vec<Row>, group_exprs: &[BExpr], aggs: &[AggSpec], sets: &[Vec<usize>]) -> Result<Vec<Row>> {
+fn aggregate(rows: Vec<Row>, group_exprs: &[BExpr], aggs: &[AggSpec], sets: &[Vec<usize>], mask_wanted: bool) -> Result<Vec<Row>> {
     if sets.is_empty() {
-        return aggregate_set(&rows, group_exprs, aggs, None, None);
+        // (a plain GROUP BY has one set, with nothing rolled up: the mask is 0, if GROUPING() asks for it)
+        return aggregate_set(&rows, group_exprs, aggs, None, mask_wanted.then_some(0));
     }
     if group_exprs.len() > 62 {
         return Err(Error::runtime("too many GROUP BY expressions for grouping sets"));

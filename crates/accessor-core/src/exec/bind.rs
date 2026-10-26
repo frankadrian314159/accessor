@@ -96,6 +96,8 @@ pub struct Binder<'a> {
     pub wins: Vec<WinSpecB>,
     /// The `WINDOW` clause of the select being bound.
     pub windows: Vec<(String, crate::sql::ast::WindowSpec)>,
+    /// Whether a `GROUPING(...)` call was bound: grouped rows then carry the grouping mask.
+    pub grouping_used: bool,
 }
 
 /// Rewrites the outer columns that `q` reads (those of `outer`) into parameters, and
@@ -313,7 +315,7 @@ pub fn contains_agg(e: &Expr) -> bool {
 
 impl<'a> Binder<'a> {
     pub fn new(db: &'a Database, scope: &'a Scope, depth: u32) -> Self {
-        Binder { db, scope, group: None, depth, allow_corr: false, inlining: 0, corr: Vec::new(), gcorr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new() }
+        Binder { db, scope, group: None, depth, allow_corr: false, inlining: 0, corr: Vec::new(), gcorr: Vec::new(), allow_win: false, wins: Vec::new(), windows: Vec::new(), grouping_used: false }
     }
 
     pub fn bind(&mut self, e: &Expr) -> Result<BExpr> {
@@ -513,6 +515,7 @@ impl<'a> Binder<'a> {
                 let bound: Result<Vec<BExpr>> = args.iter().map(|a| self.bind(a)).collect();
                 self.group = saved;
                 let g = self.group.as_ref().expect("group mode");
+                self.grouping_used = true;
                 let mut call = vec![BExpr::Col(MASK_COL)];
                 for b in bound? {
                     let i = g
@@ -571,6 +574,9 @@ impl<'a> Binder<'a> {
             .ok_or_else(|| Error::catalog(format!("'{name}' cannot be used as a window function")))?;
         let (min, max) = wf.arity();
         let given = if *star { 0 } else { args.len() };
+        if wf == WinFn::Agg(AggFn::Count) && !*star && args.is_empty() {
+            return Err(Error::runtime("count(*) must be used to call a parameterless aggregate function"));
+        }
         if given < min || given > max || (*star && wf != WinFn::Agg(AggFn::Count)) {
             return Err(Error::runtime(format!("wrong number of arguments for window function {name}")));
         }

@@ -7,6 +7,7 @@ mod check;
 mod ddl;
 mod merge;
 mod seq;
+mod settings;
 mod routine;
 mod reports;
 mod infoschema;
@@ -178,6 +179,10 @@ impl Database {
             }
             Statement::Truncate(table) => self.exec_delete(table, None),
             Statement::Explain(sel) => self.run_explain(sel),
+            Statement::ExplainOther(inner) => Ok(explain_other(inner)),
+            Statement::SetParameter { name, value, .. } => self.set_parameter(name, value.as_deref()).map(|()| QueryResult::default()),
+            Statement::ResetParameter(name) => self.reset_parameter(name.as_deref()).map(|()| QueryResult::default()),
+            Statement::ShowParameter(name) => self.show_parameter(name.as_deref()),
             Statement::Guarded { missing_ok, stmt } => match self.execute_statement(stmt) {
                 Err(Error::Catalog(m))
                     if (*missing_ok && m.contains("does not exist")) || (!*missing_ok && m.contains("already exists")) =>
@@ -220,5 +225,26 @@ impl Database {
             Statement::ReleaseSavepoint(name) => self.release(name).map(|_| QueryResult::default()),
             Statement::RollbackTo(name) => self.rollback_to(name).map(|_| QueryResult::default()),
         }
+    }
+}
+
+/// What `EXPLAIN` says of a statement that is not a query: which kind it is, and that it was not run.
+fn explain_other(st: &Statement) -> QueryResult {
+    let what = match st {
+        Statement::Insert { table, .. } => format!("insert into {table}"),
+        Statement::Update { table, .. } => format!("update {table}"),
+        Statement::Delete { table, .. } => format!("delete from {table}"),
+        Statement::Merge(_) => "merge".to_string(),
+        Statement::Upsert { .. } => "insert with a conflict rule".to_string(),
+        Statement::Returning { stmt, .. } => return explain_other(stmt),
+        Statement::Guarded { stmt, .. } => return explain_other(stmt),
+        Statement::Exec { name, .. } => format!("run {name}"),
+        Statement::CreateTable { name, .. } => format!("create table {name}"),
+        _ => "statement".to_string(),
+    };
+    QueryResult {
+        columns: vec!["plan".to_string()],
+        rows: vec![vec![crate::value::Value::text(&what)], vec![crate::value::Value::text("(not run: EXPLAIN describes only what a statement is, and runs queries)")]],
+        affected: 0,
     }
 }

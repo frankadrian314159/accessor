@@ -97,6 +97,8 @@ pub struct Database {
     pub(crate) tx: Option<Tx>,
     /// Whether rows are kept as versions, so that transactions can overlap (see `SharedDatabase`).
     pub(crate) mvcc: bool,
+    /// Run-time parameters that have been set (`SET name TO value`); see `exec/settings.rs`.
+    pub(crate) settings: BTreeMap<String, String>,
     /// The commit timestamp of the latest commit.
     clock: u64,
     next_txn: u64,
@@ -136,6 +138,7 @@ impl Database {
             persist: None,
             tx: None,
             mvcc: std::env::var_os("ACCESSOR_FORCE_MVCC").is_some(),
+            settings: BTreeMap::new(),
             clock: 0,
             next_txn: 0,
             active: BTreeMap::new(),

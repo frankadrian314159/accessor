@@ -531,7 +531,106 @@ impl<'a> Parser<'a> {
             if self.eat_kw("QUERY") {
                 self.expect_kw("PLAN")?;
             }
+            // `EXPLAIN [ANALYZE] [VERBOSE] [(COSTS OFF, FORMAT TEXT, ...)] statement`. A query is run and its plan
+            // shown with the rows it really produced, whatever the options say (they are accepted so that scripts
+            // written for other systems run); a statement that is not a query is described and not run.
+            if !(self.eat_kw("ANALYZE") || self.eat_kw("ANALYSE")) {
+                self.eat_kw("VERBOSE");
+            } else {
+                self.eat_kw("VERBOSE");
+            }
+            if self.peek_sym("(") {
+                self.advance();
+                loop {
+                    let option = self.ident()?.to_ascii_uppercase();
+                    let value = match self.peek().clone() {
+                        Tok::Sym(",") | Tok::Sym(")") => None,
+                        _ => {
+                            let v = match self.advance() {
+                                Tok::Ident(s) | Tok::Str(s) => s.to_ascii_uppercase(),
+                                Tok::Int(i) => i.to_string(),
+                                _ => return Err(Error::syntax("an EXPLAIN option takes a word or a number")),
+                            };
+                            Some(v)
+                        }
+                    };
+                    const KNOWN: [&str; 14] = [
+                        "ANALYZE", "ANALYSE", "VERBOSE", "COSTS", "SETTINGS", "GENERIC_PLAN", "BUFFERS", "SERIALIZE", "WAL", "TIMING", "SUMMARY",
+                        "MEMORY", "FORMAT", "TRIGGERS",
+                    ];
+                    if !KNOWN.contains(&option.as_str()) {
+                        return Err(Error::syntax(format!("unrecognized EXPLAIN option '{option}'")));
+                    }
+                    if option == "FORMAT" && value.as_deref() != Some("TEXT") {
+                        return Err(Error::syntax("only EXPLAIN (FORMAT TEXT) is available"));
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            }
+            const OTHER: [&str; 12] = ["INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "EXEC", "CALL", "CREATE", "DROP", "ALTER", "TRUNCATE", "EXECUTE"];
+            if OTHER.iter().any(|k| self.peek_kw(k)) {
+                return Ok(Statement::ExplainOther(Box::new(self.statement()?)));
+            }
             return Ok(Statement::Explain(Box::new(self.select()?)));
+        }
+        if self.peek_kw("SET") && !self.peek_kw_at(1, "TIME") && !self.peek_kw_at(1, "TIMEZONE") && !self.peek_kw_at(1, "CONSTRAINTS") && !matches!(self.peek_at(1), Tok::Param(_)) {
+            self.advance();
+            let local = self.eat_kw("LOCAL");
+            if !local {
+                self.eat_kw("SESSION");
+            }
+            if self.peek_kw("TRANSACTION") || self.peek_kw("CHARACTERISTICS") || self.peek_kw("AUTHORIZATION") || self.peek_kw("ROLE") {
+                // `SET TRANSACTION ISOLATION LEVEL ...`, `SET SESSION CHARACTERISTICS AS ...`, `SET ROLE x`: there is one
+                // user and one isolation level, so these are read and ignored
+                let what = self.ident()?.to_ascii_lowercase();
+                while !matches!(self.peek(), Tok::Eof) && !self.peek_sym(";") {
+                    self.advance();
+                }
+                return Ok(Statement::SetParameter { name: what, value: Some(String::new()), local });
+            }
+            let name = self.parameter_name()?;
+            if !self.eat_kw("TO") {
+                self.expect_sym("=")?;
+            }
+            if self.eat_kw("DEFAULT") {
+                return Ok(Statement::SetParameter { name, value: None, local });
+            }
+            let mut parts: Vec<String> = Vec::new();
+            loop {
+                let negative = self.eat_sym("-");
+                let part = match self.advance() {
+                    Tok::Str(s) | Tok::Ident(s) | Tok::Quoted(s) => s,
+                    Tok::Int(i) => i.to_string(),
+                    Tok::Dec(d) => d.to_string(),
+                    Tok::Float(f) => f.to_string(),
+                    _ => {
+                        self.pos = self.pos.saturating_sub(1);
+                        return Err(self.unexpected("a value for the parameter"));
+                    }
+                };
+                parts.push(if negative { format!("-{part}") } else { part });
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            return Ok(Statement::SetParameter { name, value: Some(parts.join(", ")), local });
+        }
+        if self.eat_kw("RESET") {
+            if self.eat_kw("ALL") {
+                return Ok(Statement::ResetParameter(None));
+            }
+            let name = if self.eat_kw("TIME") { self.expect_kw("ZONE")?; "timezone".to_string() } else { self.parameter_name()? };
+            return Ok(Statement::ResetParameter(Some(name)));
+        }
+        if self.eat_kw("SHOW") {
+            if self.eat_kw("ALL") {
+                return Ok(Statement::ShowParameter(None));
+            }
+            let name = if self.eat_kw("TIME") { self.expect_kw("ZONE")?; "timezone".to_string() } else { self.parameter_name()? };
+            return Ok(Statement::ShowParameter(Some(name)));
         }
         if self.peek_kw("SET") && self.peek_kw_at(1, "CONSTRAINTS") {
             self.advance();
@@ -796,6 +895,16 @@ impl<'a> Parser<'a> {
             requalify(&mut st, &alias, &table)?;
         }
         Ok(st)
+    }
+
+    /// A run-time parameter's name: a word, or two joined by a dot (`my.setting`).
+    fn parameter_name(&mut self) -> Result<String> {
+        let mut name = self.ident()?;
+        while self.eat_sym(".") {
+            name.push('.');
+            name.push_str(&self.ident()?);
+        }
+        Ok(name.to_ascii_lowercase())
     }
 
     /// An optional `ASC` or `DESC` after an index column: true for `DESC`.
@@ -2611,6 +2720,10 @@ impl<'a> Parser<'a> {
 
     fn power(&mut self) -> Result<Expr> {
         let mut base = self.primary()?;
+        // `x::integer`, `'2024-01-01'::date`: PostgreSQL's cast, binding tighter than anything else
+        while self.eat_sym("::") {
+            base = self.type_cast(base)?;
+        }
         // `doc -> 'key'` (JSON) and `doc ->> 'key'` (JSON as text).
         while matches!(self.peek(), Tok::Sym("->") | Tok::Sym("->>")) {
             let text = matches!(self.advance(), Tok::Sym("->>"));
@@ -3013,22 +3126,29 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
         }
         self.expect_sym(")")?;
-        let name = match ty {
-            // CAST drops the fraction of a float; the Access function CInt() rounds
-            DataType::Integer => "CAST_INTEGER",
-            DataType::Bignum => "CAST_BIGNUM",
-            _ => cast_function(ty).ok_or_else(|| Error::syntax("cannot CAST to CALCULATED"))?,
-        };
-        let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };
-        Ok(match (ty, hints.get(1)) {
-            (DataType::Decimal | DataType::Currency, Some(scale)) => Expr::Function {
-                name: "ROUND".into(),
-                args: vec![call, Expr::Literal(Value::Int(*scale))],
-                distinct: false,
-                star: false,
-            },
-            _ => call,
-        })
+        Ok(make_cast(e, ty, &hints))
+    }
+
+    /// The type after `::`, with an optional size, applied to `e`.
+    fn type_cast(&mut self, e: Expr) -> Result<Expr> {
+        let tn = self.type_name()?;
+        let (ty, _) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+        if ty == DataType::Calculated {
+            return Err(Error::syntax("cannot cast to CALCULATED"));
+        }
+        let mut hints = Vec::new();
+        if self.eat_sym("(") {
+            while !self.peek_sym(")") && !self.at_eof() {
+                if let Tok::Int(i) = self.advance() {
+                    hints.push(i);
+                }
+            }
+            self.expect_sym(")")?;
+        }
+        if self.peek_sym("[") {
+            return Err(Error::syntax("array types are not supported"));
+        }
+        Ok(make_cast(e, ty, &hints))
     }
 
     /// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` after the parenthesis.
@@ -3347,5 +3467,25 @@ mod tests {
     fn errors_are_reported() {
         assert!(parse_statement("SELECT FROM").is_err());
         assert!(parse_statement("SELECT 1 2").is_err());
+    }
+}
+
+/// `CAST(e AS ty)` / `e::ty` as the function that does the conversion; a decimal scale rounds.
+fn make_cast(e: Expr, ty: DataType, hints: &[i64]) -> Expr {
+    let name = match ty {
+        // CAST drops the fraction of a float; the Access function CInt() rounds
+        DataType::Integer => "CAST_INTEGER",
+        DataType::Bignum => "CAST_BIGNUM",
+        _ => cast_function(ty).expect("not CALCULATED"),
+    };
+    let call = Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false };
+    match (ty, hints.get(1)) {
+        (DataType::Decimal | DataType::Currency, Some(scale)) => Expr::Function {
+            name: "ROUND".into(),
+            args: vec![call, Expr::Literal(Value::Int(*scale))],
+            distinct: false,
+            star: false,
+        },
+        _ => call,
     }
 }

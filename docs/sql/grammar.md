@@ -47,7 +47,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 ```bnf
 <statement> ::= <query>
               | <returning>
-              | <explain> | <set-time-zone> | <set-constraints>
+              | <explain> | <set-time-zone> | <set-constraints> | <set-parameter> | <reset-parameter> | <show-parameter>
               | <create-sequence> | <alter-sequence> | <drop-sequence>
               | <prepare> | <deallocate>
               | <create-routine> | <drop-routine> | <create-report> | <drop-report> | <run-report>
@@ -63,7 +63,11 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <crosstab>  ::= TRANSFORM <expr> [ AS <identifier> ]
                 <select-core> [ <order-by> ] { <row-limit> }
                 PIVOT <concat> [ IN '(' <expr-list> ')' ]
-<explain>   ::= EXPLAIN [ QUERY PLAN ] <query>
+<explain>   ::= EXPLAIN [ QUERY PLAN ] [ ANALYZE | ANALYSE ] [ VERBOSE ] [ '(' <explain-option> { ',' <explain-option> } ')' ] ( <query> | <statement> )
+<explain-option> ::= ( ANALYZE | VERBOSE | COSTS | SETTINGS | BUFFERS | WAL | TIMING | SUMMARY | FORMAT | MEMORY | SERIALIZE | GENERIC_PLAN | TRIGGERS ) [ <word> | <number> ]
+<set-parameter>  ::= SET [ SESSION | LOCAL ] <name> ( TO | '=' ) ( DEFAULT | <value> { ',' <value> } )
+<reset-parameter> ::= RESET ( <name> | ALL )
+<show-parameter>  ::= SHOW ( <name> | ALL | TIME ZONE )
 <upsert>      ::= <insert> ON CONFLICT [ '(' <identifier-list> ')' ] DO ( NOTHING | UPDATE SET <assignment> { ',' <assignment> } [ WHERE <expr> ] )
                 | REPLACE INTO ...  | INSERT OR ( REPLACE | IGNORE ) INTO ...
 <returning>   ::= ( <insert> | <upsert> | <update> | <delete> | <merge> ) RETURNING <select-item> { ',' <select-item> }

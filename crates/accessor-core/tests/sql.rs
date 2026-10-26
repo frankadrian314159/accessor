@@ -4163,3 +4163,109 @@ fn booleans_are_read_the_way_postgresql_reads_them() {
         assert!(db.query(&format!("SELECT CBool('{s}')")).is_err(), "{s}");
     }
 }
+
+// ----- :: casts, run-time parameters, EXPLAIN options, GROUPING ------------------------------------
+
+#[test]
+fn double_colon_casts() {
+    let db = Database::in_memory();
+    let t = |sql: &str| {
+        let r = db.query(sql).unwrap();
+        format!("{} {}", r.rows[0][0].type_label(), r.rows[0][0])
+    };
+    assert_eq!(t("SELECT '42'::int4"), "INTEGER 42");
+    assert_eq!(t("SELECT 'true'::boolean"), "YESNO Yes");
+    assert_eq!(t("SELECT 1.9::int"), "INTEGER 1");
+    assert_eq!(t("SELECT -5::int"), "INTEGER -5");
+    assert_eq!(t("SELECT 7::text || 'x'"), "TEXT 7x");
+    assert_eq!(t("SELECT '2024-03-01'::date"), "DATETIME 2024-03-01");
+    assert_eq!(t("SELECT 3::float8 / 2"), "DOUBLE 1.5");
+    assert_eq!(t("SELECT '1.55'::numeric(10, 1)"), "DECIMAL 1.6");
+    assert_eq!(t("SELECT (1 + 2)::text"), "TEXT 3");
+    assert_eq!(t("SELECT '1'::int::float8::text"), "TEXT 1");
+    assert_eq!(t("SELECT double precision '2.5'::int"), "INTEGER 2");
+    assert_eq!(t("SELECT '5'::int + '6'::int"), "INTEGER 11");
+    assert!(db.query("SELECT 'abc'::int").is_err());
+    assert!(db.query("SELECT 1::nosuchtype").is_err());
+}
+
+#[test]
+fn run_time_parameters_can_be_set_reset_and_shown() {
+    let mut db = Database::in_memory();
+    let show = |db: &mut Database, name: &str| db.execute(&format!("SHOW {name}")).unwrap().rows[0][0].to_string();
+    assert_eq!(show(&mut db, "extra_float_digits"), "1");
+    db.execute("SET extra_float_digits TO 3").unwrap();
+    assert_eq!(show(&mut db, "extra_float_digits"), "3");
+    db.execute("SET SESSION extra_float_digits = 2; SET LOCAL work_mem = '64MB'").unwrap();
+    assert_eq!((show(&mut db, "extra_float_digits"), show(&mut db, "work_mem")), ("2".to_string(), "64MB".to_string()));
+    db.execute("RESET extra_float_digits").unwrap();
+    assert_eq!(show(&mut db, "extra_float_digits"), "1");
+    db.execute("SET datestyle TO ISO, DMY").unwrap();
+    assert_eq!(show(&mut db, "DateStyle"), "ISO, DMY");
+    db.execute("SET extra_float_digits TO DEFAULT").unwrap();
+    // switches take on or off, in any of the usual spellings
+    db.execute("SET enable_seqscan = false; SET enable_hashjoin TO 'OFF'").unwrap();
+    assert_eq!((show(&mut db, "enable_seqscan"), show(&mut db, "enable_hashjoin")), ("off".to_string(), "off".to_string()));
+    assert!(db.execute("SET enable_seqscan TO maybe").is_err());
+    // names with a dot may be made up
+    db.execute("SET my.setting TO 'abc'").unwrap();
+    assert_eq!(show(&mut db, "my.setting"), "abc");
+    assert!(db.execute("SHOW other.thing").is_err());
+    // unknown names are refused
+    assert!(db.execute("SET nosuch = 1").is_err());
+    assert!(db.execute("SHOW nosuch").is_err());
+    assert!(db.execute("RESET nosuch").is_err());
+    // the time zone and the optimizer are real
+    db.execute("SET TIME ZONE 'Europe/Paris'").unwrap();
+    assert_eq!(show(&mut db, "timezone"), "Europe/Paris");
+    db.execute("SET timezone TO 'UTC'").unwrap();
+    assert_eq!(db.time_zone(), "UTC");
+    db.execute("SET optimizer = off").unwrap();
+    assert!(!db.optimizer_enabled());
+    db.execute("RESET optimizer").unwrap();
+    assert!(db.optimizer_enabled());
+    // SHOW ALL lists them; RESET ALL puts everything back
+    let all = db.execute("SHOW ALL").unwrap();
+    assert_eq!(all.columns, ["name", "setting", "description"]);
+    assert!(all.rows.len() > 50);
+    db.execute("RESET ALL").unwrap();
+    assert_eq!(show(&mut db, "enable_seqscan"), "on");
+    // statements about transactions and roles are read and ignored
+    db.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap();
+    db.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY").unwrap();
+}
+
+#[test]
+fn explain_takes_options_and_describes_other_statements() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a INTEGER PRIMARY KEY); INSERT INTO t VALUES (1), (2)").unwrap();
+    let lines = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join("\n");
+    for sql in [
+        "EXPLAIN SELECT * FROM t", "EXPLAIN (COSTS OFF) SELECT * FROM t", "EXPLAIN (ANALYZE, VERBOSE, BUFFERS OFF, TIMING false) SELECT * FROM t",
+        "EXPLAIN ANALYZE SELECT * FROM t", "EXPLAIN ANALYZE VERBOSE SELECT * FROM t WHERE a = 1", "EXPLAIN (FORMAT TEXT, SUMMARY OFF) SELECT 1",
+        "explain (costs off) WITH x AS (SELECT 1) SELECT * FROM x", "EXPLAIN (costs off) (SELECT a FROM t)",
+    ] {
+        assert!(lines(&mut db, sql).contains("row(s) returned"), "{sql}");
+    }
+    // a statement that is not a query is described, and not run
+    let plan = lines(&mut db, "EXPLAIN (COSTS OFF) INSERT INTO t VALUES (3)");
+    assert!(plan.contains("insert into t"), "{plan}");
+    assert_eq!(db.execute("SELECT COUNT(*) FROM t").unwrap().rows[0][0], Value::Int(2));
+    assert!(lines(&mut db, "EXPLAIN DELETE FROM t").contains("delete from t"));
+    assert_eq!(db.execute("SELECT COUNT(*) FROM t").unwrap().rows[0][0], Value::Int(2));
+    // options that cannot be honoured are refused
+    assert!(db.execute("EXPLAIN (FORMAT JSON) SELECT 1").is_err());
+    assert!(db.execute("EXPLAIN (NONSENSE) SELECT 1").is_err());
+}
+
+#[test]
+fn grouping_works_without_grouping_sets_and_count_needs_a_star() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE g (ten INTEGER); INSERT INTO g VALUES (1), (1), (2)").unwrap();
+    let r = db.query("SELECT ten, GROUPING(ten) FROM g GROUP BY (ten) HAVING GROUPING(ten) >= 0 ORDER BY 2, 1").unwrap();
+    assert_eq!(r.rows.iter().map(|x| format!("{}/{}", x[0], x[1])).collect::<Vec<_>>(), ["1/0", "2/0"]);
+    let r = db.query("SELECT GROUPING(ten) FROM g GROUP BY ten").unwrap();
+    assert_eq!(r.rows.len(), 2);
+    let e = db.query("SELECT COUNT() OVER () FROM g").unwrap_err().to_string();
+    assert!(e.contains("count(*)"), "{e}");
+}
