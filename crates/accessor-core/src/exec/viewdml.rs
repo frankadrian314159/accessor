@@ -88,7 +88,7 @@ impl Database {
             return Err(cannot("it summarises, limits or combines rows"));
         }
         let Some(from) = &inner.from else { return Err(cannot("it reads no table")) };
-        let TableFactor::Named { name: base, alias } = &from.first else {
+        let TableFactor::Named { name: base, alias, .. } = &from.first else {
             return Err(cannot("it does not read exactly one table"));
         };
         if !from.joins.is_empty() {

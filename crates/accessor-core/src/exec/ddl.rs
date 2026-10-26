@@ -18,6 +18,7 @@ impl Database {
         uniques: &[Vec<String>],
         foreign_keys: &[ForeignKeyDef],
     ) -> Result<QueryResult> {
+        self.check_schema_exists(name)?;
         let mut columns = Vec::with_capacity(defs.len());
         for d in defs {
             if d.data_type == DataType::Calculated {
@@ -94,7 +95,13 @@ impl Database {
 
     pub(crate) fn exec_drop_table(&mut self, name: &str) -> Result<QueryResult> {
         let real = self.table_checked(name)?.name().to_string();
-        self.apply_all(vec![Op::DropTable(real)])?;
+        if self.has_children(&real) {
+            return Err(Error::catalog(format!(
+                "cannot drop table {real} because other objects depend on it (use DROP TABLE {real} CASCADE)"
+            )));
+        }
+        self.apply_all(vec![Op::DropTable(real.clone())])?;
+        self.forget_family_links(&real)?;
         Ok(QueryResult::default())
     }
 

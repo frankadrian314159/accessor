@@ -61,6 +61,7 @@ pub(crate) struct CatalogUndo {
     sequence: Option<(String, Option<SequenceDef>)>,
     routines: Option<BTreeMap<String, Arc<RoutineDef>>>,
     reports: Option<BTreeMap<String, Arc<ReportDef>>>,
+    catalog: Option<BTreeMap<(String, String), String>>,
 }
 
 pub struct Database {
@@ -79,6 +80,10 @@ pub struct Database {
     pub(crate) capture: Option<Capture>,
     /// How many procedures are running, one inside another.
     pub(crate) call_depth: std::sync::atomic::AtomicU32,
+    /// While above zero (inside the body of a view), privileges are not checked.
+    pub(crate) priv_suspended: std::sync::atomic::AtomicU32,
+    /// Set while an `UPDATE ONLY` / `DELETE FROM ONLY` runs.
+    pub(crate) only_dml: std::sync::atomic::AtomicBool,
     /// SQL text recently read, with the statements it came to.
     pub(crate) parse_cache: Mutex<HashMap<String, Arc<Vec<Statement>>>>,
     /// `PREPARE`d statements of this session.
@@ -99,6 +104,8 @@ pub struct Database {
     pub(crate) mvcc: bool,
     /// Run-time parameters that have been set (`SET name TO value`); see `exec/settings.rs`.
     pub(crate) settings: BTreeMap<String, String>,
+    /// Catalog objects without a table of their own: `(kind, name)` to a description in text. See `exec/catalog.rs`.
+    pub(crate) catalog: BTreeMap<(String, String), String>,
     /// The commit timestamp of the latest commit.
     clock: u64,
     next_txn: u64,
@@ -128,6 +135,8 @@ impl Database {
             reports: BTreeMap::new(),
             capture: None,
             call_depth: std::sync::atomic::AtomicU32::new(0),
+            priv_suspended: std::sync::atomic::AtomicU32::new(0),
+            only_dml: std::sync::atomic::AtomicBool::new(false),
             parse_cache: Mutex::new(HashMap::new()),
             prepared: BTreeMap::new(),
             calc_cache: Default::default(),
@@ -139,6 +148,7 @@ impl Database {
             tx: None,
             mvcc: std::env::var_os("ACCESSOR_FORCE_MVCC").is_some(),
             settings: BTreeMap::new(),
+            catalog: BTreeMap::new(),
             clock: 0,
             next_txn: 0,
             active: BTreeMap::new(),
@@ -181,6 +191,9 @@ impl Database {
                 if let Some(t) = db.tables.get_mut(&key(&table)) {
                     let _ = t.set_foreign_key_timing(&name, deferrable, initially_deferred);
                 }
+            }
+            for (kind, name, value) in l.catalog {
+                db.catalog.insert((kind, name), value);
             }
             for (_, sql) in l.reports {
                 let def = parse_report(&sql)?;
@@ -485,6 +498,18 @@ impl Database {
                 }
                 Ok(None)
             }
+            Op::Catalog { kind, name, value } => {
+                let k = (kind.clone(), key(name));
+                match value {
+                    Some(v) => {
+                        self.catalog.insert(k, v.clone());
+                    }
+                    None => {
+                        self.catalog.remove(&k);
+                    }
+                }
+                Ok(None)
+            }
             Op::CreateReport { name, sql } => {
                 let def = parse_report(sql)?;
                 let k = key(name);
@@ -591,7 +616,7 @@ impl Database {
     /// Records what the schema change `op` is about to replace.
     fn catalog_snapshot(&self, op: &Op) -> CatalogUndo {
         let mut names: Vec<String> = Vec::new();
-        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None, sequence: None, routines: None, reports: None };
+        let mut undo = CatalogUndo { tables: Vec::new(), views: None, triggers: None, sequence: None, routines: None, reports: None, catalog: None };
         match op {
             Op::CreateTable(schema) => names.push(key(&schema.name)),
             Op::DropTable(table) => {
@@ -620,6 +645,7 @@ impl Database {
                 undo.sequence = Some((k, old));
             }
             Op::SequenceValue { .. } => {}
+            Op::Catalog { .. } => undo.catalog = Some(self.catalog.clone()),
             Op::CreateRoutine { .. } | Op::DropRoutine(_) => undo.routines = Some(self.routines.clone()),
             Op::CreateReport { .. } | Op::DropReport(_) => undo.reports = Some(self.reports.clone()),
             Op::CreateTrigger { .. } | Op::DropTrigger(_) => undo.triggers = Some(self.triggers.clone()),
@@ -673,6 +699,9 @@ impl Database {
         }
         if let Some(reports) = undo.reports {
             self.reports = reports;
+        }
+        if let Some(catalog) = undo.catalog {
+            self.catalog = catalog;
         }
         if let Some((k, old)) = undo.sequence {
             let mut s = self.seqs.lock().expect("sequences lock");
@@ -1135,6 +1164,7 @@ impl Database {
                 fk_timing,
                 self.routines.values().map(|r| (r.name.as_str(), r.sql.as_str())),
                 self.reports.values().map(|r| (r.name.as_str(), r.sql.as_str())),
+                self.catalog.iter().map(|((k, n), v)| (k.clone(), n.clone(), v.clone())).collect(),
             )?;
         }
         self.seqs.lock().expect("sequences lock").dirty.clear();

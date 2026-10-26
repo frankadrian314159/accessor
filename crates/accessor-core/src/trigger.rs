@@ -228,7 +228,7 @@ impl Database {
             Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. } => table.clone(),
             _ => unreachable!("only data changes are routed here"),
         };
-        let named = TableFactor::Named { name: view.clone(), alias: None };
+        let named = TableFactor::Named { name: view.clone(), alias: None, only: false };
         let names = self.resolve_factor(&named, 0)?.names;
         let schema = view_schema(&view, &names);
         let position = |c: &str| {

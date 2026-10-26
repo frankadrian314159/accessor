@@ -2,6 +2,10 @@
 
 An *access path* is the way rows of one table are found. The choices are a full scan, a lookup of one key, a scan of a range of keys, or a walk along an index in order.
 
+## Inheritance and partitions
+
+A table that other tables inherit from, or a partitioned table, is read as the union of the table and its descendants, each projected on the parent's columns, and *then* filtered: its rows are gathered into a computed row set first, so the conditions of the query are not pushed into the member tables and **their indexes are not used**. There is no partition pruning, for the same reason. Query a partition by its own name (or `FROM ONLY parent`) to get its indexes. See [inheritance-and-partitioning.md](../sql/inheritance-and-partitioning.md).
+
 ## Choosing an index
 
 For each table, the optimizer looks at the pushed-down conditions that compare a single column of that table with a constant:

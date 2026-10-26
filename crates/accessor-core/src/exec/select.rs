@@ -74,24 +74,29 @@ impl Source<'_> {
 impl Database {
     pub(crate) fn resolve_factor(&self, f: &TableFactor, depth: u32) -> Result<Source<'_>> {
         match f {
-            TableFactor::Named { name, alias } => {
+            TableFactor::Named { name, alias, only } => {
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
                 if let Some(view) = name.strip_prefix("information_schema.") {
                     let (names, rows) = self.information_schema(view)?;
                     return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
+                if !*only && self.table(name).is_some() && self.has_children(name) {
+                    return self.family_source(name, alias);
+                }
                 if let Some(t) = self.table(name) {
+                    self.require_privilege(name, "select")?;
                     let names = t.schema().columns.iter().map(|c| c.name.clone()).collect();
                     return Ok(Source { intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
                 }
                 if self.view_sql(name).is_some() {
+                    self.require_privilege(name, "select")?;
                     let (params, q) = self.resolve_query(name, 0)?;
                     if !params.is_empty() {
                         return Err(Error::runtime(format!(
                             "the query '{name}' needs parameters; run it with EXEC [{name}] ..."
                         )));
                     }
-                    let res = self.run_select_depth(&q, depth + 1)?;
+                    let res = self.without_privileges(|| self.run_select_depth(&q, depth + 1))?;
                     return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
@@ -193,7 +198,7 @@ impl Database {
     /// LATERAL sub-query or a table function may read.
     fn resolve_source(&self, f: &TableFactor, scope: &Scope, depth: u32, allow_merge: bool) -> Result<Source<'_>> {
         match f {
-            TableFactor::Named { name, alias } if allow_merge && self.table(name).is_none() && self.view_sql(name).is_some() => {
+            TableFactor::Named { name, alias, .. } if allow_merge && self.table(name).is_none() && self.view_sql(name).is_some() => {
                 match self.merged_view(name, alias.as_deref().unwrap_or(name))? {
                     Some(src) => Ok(src),
                     None => self.resolve_factor(f, depth),
@@ -2111,7 +2116,7 @@ fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Re
 fn subst_cte(s: &mut Select, name: &str, rows: &Arc<Vec<Row>>, cols: &[String]) {
     fn factor(f: &mut TableFactor, name: &str, rows: &Arc<Vec<Row>>, cols: &[String]) {
         match f {
-            TableFactor::Named { name: n, alias } if n.eq_ignore_ascii_case(name) => {
+            TableFactor::Named { name: n, alias, .. } if n.eq_ignore_ascii_case(name) => {
                 let alias = alias.clone().unwrap_or_else(|| n.clone());
                 *f = TableFactor::Materialized { rows: Arc::clone(rows), columns: cols.to_vec(), alias };
             }

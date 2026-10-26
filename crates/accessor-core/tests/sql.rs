@@ -4349,3 +4349,250 @@ fn numbers_formatted_and_read_with_patterns() {
     assert_eq!(one("SELECT to_number('12.5', '99.9')"), "12.5");
     assert!(db.query("SELECT to_number('abc', '999')").is_err());
 }
+
+#[test]
+fn schemas_qualify_table_names() {
+    let mut db = Database::in_memory();
+    assert!(db.execute("CREATE TABLE s.t (a INT)").is_err());
+    db.execute("CREATE SCHEMA s").unwrap();
+    assert!(db.execute("CREATE SCHEMA s").is_err());
+    db.execute("CREATE SCHEMA IF NOT EXISTS s").unwrap();
+    db.execute("CREATE TABLE s.t (a INT); CREATE TABLE public.u (b INT)").unwrap();
+    db.execute("INSERT INTO s.t VALUES (1), (2); INSERT INTO u VALUES (5)").unwrap();
+    assert_eq!(db.query("SELECT sum(a) FROM s.t").unwrap().rows[0][0].to_string(), "3");
+    assert_eq!(db.query("SELECT t.a FROM s.t ORDER BY a DESC").unwrap().rows[0][0].to_string(), "2");
+    assert_eq!(db.query("SELECT b FROM public.u").unwrap().rows[0][0].to_string(), "5");
+    assert!(db.execute("DROP SCHEMA s").is_err());
+    db.execute("DROP SCHEMA s CASCADE").unwrap();
+    assert!(db.query("SELECT * FROM s.t").is_err());
+    db.execute("DROP SCHEMA IF EXISTS s").unwrap();
+}
+
+#[test]
+fn domains_and_enums_expand_into_columns() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE DOMAIN posint AS INTEGER NOT NULL DEFAULT 1 CHECK (VALUE > 0)").unwrap();
+    db.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").unwrap();
+    db.execute("CREATE TABLE p (id posint, m mood)").unwrap();
+    db.execute("INSERT INTO p (m) VALUES ('ok')").unwrap();
+    assert_eq!(db.query("SELECT id FROM p").unwrap().rows[0][0].to_string(), "1");
+    assert!(db.execute("INSERT INTO p VALUES (0, 'ok')").is_err());
+    assert!(db.execute("INSERT INTO p VALUES (NULL, 'ok')").is_err());
+    assert!(db.execute("INSERT INTO p VALUES (3, 'angry')").is_err());
+    db.execute("INSERT INTO p VALUES (3, 'happy')").unwrap();
+    assert_eq!(db.query("SELECT '7'::posint + 1").unwrap().rows[0][0].to_string(), "8");
+    assert!(db.execute("CREATE DOMAIN posint AS INTEGER").is_err());
+    db.execute("DROP DOMAIN posint").unwrap();
+    db.execute("DROP TYPE mood").unwrap();
+    assert!(db.execute("CREATE TABLE q (id posint)").is_err());
+    db.execute("DROP TYPE IF EXISTS mood").unwrap();
+}
+
+#[test]
+fn types_survive_the_script_that_makes_them() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TYPE c AS ENUM ('r', 'g'); CREATE TABLE t (x c); INSERT INTO t VALUES ('r')").unwrap();
+    assert!(db.execute("INSERT INTO t VALUES ('b')").is_err());
+}
+
+#[test]
+fn extensions_are_recorded() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto").unwrap();
+    assert!(db.execute("CREATE EXTENSION pgcrypto").is_err());
+    db.execute("DROP EXTENSION pgcrypto").unwrap();
+    assert!(db.execute("DROP EXTENSION pgcrypto").is_err());
+}
+
+#[test]
+fn roles_and_privileges() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE secret (a INT); INSERT INTO secret VALUES (1); CREATE VIEW v AS SELECT a FROM secret").unwrap();
+    db.execute("CREATE ROLE alice LOGIN; CREATE USER bob PASSWORD 'x' SUPERUSER; CREATE ROLE staff").unwrap();
+    assert!(db.execute("CREATE ROLE alice").is_err());
+    db.execute("SET ROLE alice").unwrap();
+    assert!(db.query("SELECT * FROM secret").is_err());
+    assert!(db.execute("INSERT INTO secret VALUES (2)").is_err());
+    db.execute("RESET ROLE").unwrap_or_default();
+    db.execute("SET ROLE NONE").unwrap();
+    db.execute("GRANT SELECT ON secret TO alice").unwrap();
+    db.execute("SET ROLE alice").unwrap();
+    assert_eq!(db.query("SELECT a FROM secret").unwrap().rows.len(), 1);
+    assert!(db.execute("INSERT INTO secret VALUES (2)").is_err());
+    db.execute("SET ROLE NONE").unwrap();
+    db.execute("GRANT ALL ON secret TO staff; GRANT staff TO alice").unwrap();
+    db.execute("SET ROLE alice; INSERT INTO secret VALUES (3); SET ROLE NONE").unwrap();
+    db.execute("REVOKE ALL ON secret FROM staff; REVOKE SELECT ON secret FROM alice").unwrap();
+    db.execute("SET ROLE alice").unwrap();
+    assert!(db.query("SELECT * FROM secret").is_err());
+    db.execute("SET ROLE NONE; GRANT SELECT ON v TO alice; SET ROLE alice").unwrap();
+    assert_eq!(db.query("SELECT a FROM v").unwrap().rows.len(), 2);
+    db.execute("SET ROLE bob").unwrap();
+    assert_eq!(db.query("SELECT a FROM secret").unwrap().rows.len(), 2);
+    db.execute("SET ROLE NONE").unwrap();
+    assert!(db.execute("GRANT SELECT ON secret TO nobody").is_err());
+    db.execute("ALTER ROLE alice NOLOGIN; DROP ROLE staff, alice").unwrap();
+    assert!(db.execute("SET ROLE alice").is_err());
+}
+
+#[test]
+fn postgres_sql_functions() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql IMMUTABLE").unwrap();
+    db.execute("CREATE FUNCTION twice(int) RETURNS int AS 'SELECT $1 * 2' LANGUAGE sql").unwrap();
+    db.execute("CREATE TABLE t (id int, v int); INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    db.execute("CREATE FUNCTION total(lim int) RETURNS int AS $f$ SELECT sum(v)::int FROM t WHERE t.id <= lim $f$ LANGUAGE sql").unwrap();
+    let one = |db: &Database, sql: &str| db.query(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&db, "SELECT add(2, 3)"), "5");
+    assert_eq!(one(&db, "SELECT twice(21)"), "42");
+    assert_eq!(one(&db, "SELECT add(id, v) FROM t ORDER BY id"), "11");
+    assert_eq!(one(&db, "SELECT total(1)"), "10");
+    assert_eq!(one(&db, "SELECT total(2)"), "30");
+    db.execute("CREATE OR REPLACE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b + 1 $$ LANGUAGE sql").unwrap();
+    assert_eq!(one(&db, "SELECT add(2, 3)"), "6");
+    db.execute("DROP FUNCTION add(int, int)").unwrap();
+    assert!(db.query("SELECT add(1, 2)").is_err());
+    db.execute("DROP FUNCTION IF EXISTS add(int, int)").unwrap();
+    assert!(db.execute("CREATE FUNCTION s() RETURNS SETOF int AS $$ SELECT 1 $$ LANGUAGE sql").is_err());
+    assert!(db.execute("CREATE FUNCTION x() RETURNS int AS $$ SELECT 1 $$ LANGUAGE perl").is_err());
+}
+
+#[test]
+fn plpgsql_functions_and_procedures() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE FUNCTION fact(n int) RETURNS int AS $$
+         DECLARE r int := 1;
+         BEGIN
+           WHILE n > 1 LOOP r := r * n; n := n - 1; END LOOP;
+           RETURN r;
+         END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE FUNCTION kind(n int) RETURNS text AS $$
+         BEGIN
+           IF n < 0 THEN RETURN 'negative';
+           ELSIF n = 0 THEN RETURN 'zero';
+           ELSE RETURN 'positive';
+           END IF;
+         END; $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE FUNCTION sum_to(n int) RETURNS int AS $$
+         DECLARE s int := 0;
+         BEGIN
+           FOR i IN 1..n LOOP s := s + i; END LOOP;
+           RETURN s;
+         END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute("CREATE FUNCTION inc(x int) RETURNS int AS $$ BEGIN RETURN x + 1; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("CREATE TABLE log (msg text)").unwrap();
+    db.execute(
+        "CREATE PROCEDURE note(m text) AS $$ BEGIN INSERT INTO log VALUES (m); END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE FUNCTION checked(n int) RETURNS int AS $$
+         BEGIN
+           IF n > 10 THEN RAISE EXCEPTION 'too big: %', n; END IF;
+           RETURN n;
+         END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute("CREATE TABLE q (id int, v int); INSERT INTO q VALUES (1, 5), (2, 9)").unwrap();
+    db.execute(
+        "CREATE FUNCTION biggest() RETURNS int AS $$
+         DECLARE m int;
+         BEGIN
+           SELECT max(v) INTO m FROM q;
+           RETURN m;
+         END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT fact(5)"), "120");
+    assert_eq!(one(&mut db, "SELECT kind(-3)"), "negative");
+    assert_eq!(one(&mut db, "SELECT kind(0)"), "zero");
+    assert_eq!(one(&mut db, "SELECT kind(7)"), "positive");
+    assert_eq!(one(&mut db, "SELECT sum_to(10)"), "55");
+    assert_eq!(one(&mut db, "SELECT inc(41)"), "42");
+    assert_eq!(one(&mut db, "SELECT inc(id) FROM q ORDER BY id"), "2");
+    assert_eq!(one(&mut db, "SELECT checked(3)"), "3");
+    let err = db.execute("SELECT checked(11)").unwrap_err().to_string();
+    assert!(err.contains("too big: 11"), "{err}");
+    assert_eq!(one(&mut db, "SELECT biggest()"), "9");
+    db.execute("CALL note('hello')").unwrap();
+    assert_eq!(one(&mut db, "SELECT msg FROM log"), "hello");
+    assert!(db.execute("CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; EXCEPTION WHEN others THEN RETURN 2; END $$ LANGUAGE plpgsql").is_err());
+    assert!(db.execute("CREATE FUNCTION g() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql").is_err());
+}
+
+#[test]
+fn inheritance_reads_children_with_the_parent() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE cities (name text, pop int); CREATE TABLE capitals (state text) INHERITS (cities)").unwrap();
+    db.execute("INSERT INTO cities VALUES ('Oakland', 400); INSERT INTO capitals VALUES ('Sacramento', 500, 'CA')").unwrap();
+    let n = |db: &Database, sql: &str| db.query(sql).unwrap().rows.len();
+    assert_eq!(n(&db, "SELECT * FROM cities"), 2);
+    assert_eq!(n(&db, "SELECT * FROM ONLY cities"), 1);
+    assert_eq!(db.query("SELECT * FROM capitals").unwrap().columns, vec!["name", "pop", "state"]);
+    assert_eq!(db.query("SELECT * FROM cities").unwrap().columns, vec!["name", "pop"]);
+    db.execute("UPDATE cities SET pop = pop + 1").unwrap();
+    assert_eq!(db.query("SELECT sum(pop) FROM cities").unwrap().rows[0][0].to_string(), "902");
+    db.execute("UPDATE ONLY cities SET pop = 0").unwrap();
+    assert_eq!(db.query("SELECT sum(pop) FROM cities").unwrap().rows[0][0].to_string(), "501");
+    db.execute("DELETE FROM ONLY cities").unwrap();
+    assert_eq!(n(&db, "SELECT * FROM cities"), 1);
+    db.execute("DELETE FROM cities").unwrap();
+    assert_eq!(n(&db, "SELECT * FROM capitals"), 0);
+    assert!(db.execute("DROP TABLE cities").is_err());
+    db.execute("DROP TABLE cities CASCADE").unwrap();
+    assert!(db.query("SELECT * FROM capitals").is_err());
+}
+
+#[test]
+fn range_list_and_hash_partitions_take_inserts() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE m (d int, v text) PARTITION BY RANGE (d);
+         CREATE TABLE m1 PARTITION OF m FOR VALUES FROM (0) TO (10);
+         CREATE TABLE m2 PARTITION OF m FOR VALUES FROM (10) TO (MAXVALUE);
+         INSERT INTO m VALUES (5, 'a'), (10, 'b'), (99, 'c')",
+    )
+    .unwrap();
+    let c = |db: &Database, t: &str| db.query(&format!("SELECT count(*) FROM ONLY {t}")).unwrap().rows[0][0].to_string();
+    assert_eq!(c(&db, "m"), "0");
+    assert_eq!(c(&db, "m1"), "1");
+    assert_eq!(c(&db, "m2"), "2");
+    assert_eq!(db.query("SELECT count(*) FROM m").unwrap().rows[0][0].to_string(), "3");
+    assert!(db.execute("INSERT INTO m VALUES (-1, 'x')").is_err());
+    db.execute("CREATE TABLE l (k text) PARTITION BY LIST (k); CREATE TABLE la PARTITION OF l FOR VALUES IN ('a', 'b'); CREATE TABLE ld PARTITION OF l DEFAULT").unwrap();
+    db.execute("INSERT INTO l VALUES ('a'), ('z')").unwrap();
+    assert_eq!(c(&db, "la"), "1");
+    assert_eq!(c(&db, "ld"), "1");
+    db.execute(
+        "CREATE TABLE h (k int) PARTITION BY HASH (k);
+         CREATE TABLE h0 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+         CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+         INSERT INTO h VALUES (1), (2), (3), (4), (5), (6)",
+    )
+    .unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM h").unwrap().rows[0][0].to_string(), "6");
+    assert_eq!(c(&db, "h0").parse::<i32>().unwrap() + c(&db, "h1").parse::<i32>().unwrap(), 6);
+    assert!(db.execute("CREATE TABLE z PARTITION OF m2 FOR VALUES FROM (1) TO (2)").is_err());
+    db.execute("DROP TABLE m, l, h CASCADE").unwrap();
+    assert!(db.query("SELECT * FROM m1").is_err());
+}
+
+#[test]
+fn drop_table_lists_and_cascade() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE a (id int PRIMARY KEY); CREATE TABLE b (x int REFERENCES a(id)); CREATE VIEW vb AS SELECT * FROM a").unwrap();
+    db.execute("DROP TABLE IF EXISTS nope, a CASCADE").unwrap();
+    assert!(db.query("SELECT * FROM vb").is_err());
+    db.execute("INSERT INTO b VALUES (1)").unwrap();
+    db.execute("DROP TABLE b, nope").unwrap_err();
+}

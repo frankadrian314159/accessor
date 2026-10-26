@@ -92,3 +92,56 @@ Statements end with `;`. A variable or parameter used in an SQL statement is rep
 ## Where they are kept
 
 A routine is stored as its `CREATE` text, in the same file as the tables, and is part of the schema: creating or dropping one is transactional. `Database::routine_names()` lists them; `.routines` does so in the shell.
+
+## PostgreSQL-style functions and procedures
+
+`CREATE FUNCTION` and `CREATE PROCEDURE` also take PostgreSQL's form, so that scripts written for it run. It is chosen when the parameters have no `@` (or the definition has a `LANGUAGE` clause); the body is a quoted string, usually `$$ ... $$`:
+
+```sql
+CREATE FUNCTION add(a int, b int) RETURNS int AS $$ SELECT a + b $$ LANGUAGE sql IMMUTABLE;
+CREATE FUNCTION twice(int) RETURNS int AS 'SELECT $1 * 2' LANGUAGE sql;
+
+CREATE FUNCTION fact(n int) RETURNS int AS $$
+DECLARE r int := 1;
+BEGIN
+  WHILE n > 1 LOOP
+    r := r * n;
+    n := n - 1;
+  END LOOP;
+  RETURN r;
+END $$ LANGUAGE plpgsql;
+
+CREATE PROCEDURE note(m text) AS $$ BEGIN INSERT INTO log VALUES (m); END $$ LANGUAGE plpgsql;
+
+DROP FUNCTION add(int, int);        -- the argument types are read and ignored
+```
+
+Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is `$1`, `$2`, ...; one `OUT` parameter stands for `RETURNS`. The attributes `IMMUTABLE`, `STABLE`, `VOLATILE`, `STRICT`, `LEAKPROOF`, `PARALLEL x`, `COST n`, `ROWS n`, `SECURITY DEFINER/INVOKER`, `CALLED ON NULL INPUT` and `SET param ...` are accepted and ignored. A function with `RETURNS void` returns `NULL`.
+
+**What the two languages become.** A `LANGUAGE sql` body that is one `SELECT` is turned into the expression form above, so it is **expanded in place** and the optimizer sees through it, exactly like `CREATE FUNCTION f(@a) AS ...`. `BEGIN RETURN expr; END` in PL/pgSQL is the same. Anything else (several statements, variables, loops) becomes a block like a `CREATE PROCEDURE` body, which has to be *run*, not expanded:
+
+* A call of such a function works in `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `EXEC` statements **when its arguments are known before the statement runs** (constants, parameters, or expressions of them): `SELECT fact(5)`, `INSERT INTO t VALUES (fact(3))`, `WHERE x = fact(4)`. Called with a column (`SELECT fact(n) FROM t`) it is refused with a message saying so. The call is made once, before the statement, and its result put in its place.
+* The statement has to be run with `execute` (as in the shell), not the read-only `query` call.
+* The call is atomic, as a procedure is.
+
+**A name in the body that is a parameter or variable means that parameter or variable**, even where a column of the same name exists (PostgreSQL prefers the column). Write `t.col` to reach the column.
+
+**Functions are known by name.** A second function with the same name and different argument types is refused ("already exists"); `CREATE OR REPLACE` replaces it. There is no overloading.
+
+### PL/pgSQL
+
+| Statement | Notes |
+| --- | --- |
+| `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `%TYPE`, `record` and cursor variables are not |
+| `name := expr;` or `name = expr;` | assignment |
+| `IF c THEN ... ELSIF c THEN ... ELSE ... END IF;` | |
+| `CASE [expr] WHEN v [, v] THEN ... ELSE ... END CASE;` | the statement form |
+| `WHILE c LOOP ... END LOOP;`, `LOOP ... END LOOP;` | `EXIT [WHEN c];` leaves the innermost loop (a label is read and ignored) |
+| `FOR i IN [REVERSE] a..b [BY n] LOOP ... END LOOP;` | `i` is an integer; `FOR r IN query` is not available |
+| `RETURN [expr];` | |
+| `RAISE [level] 'format %', args;` | `EXCEPTION` (the default) stops with that message and undoes the call; the levels `NOTICE`, `INFO`, `WARNING`, `LOG`, `DEBUG` do nothing; `USING MESSAGE = ...` works, the other `USING` options are ignored |
+| `PERFORM query;` | runs the query and discards it |
+| `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
+| any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
+
+Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays and records, set-returning functions (`RETURNS TABLE`, `SETOF`), trigger functions (`RETURNS trigger`; write the body in `CREATE TRIGGER ... BEGIN ... END` instead), and every language except `sql` and `plpgsql`.

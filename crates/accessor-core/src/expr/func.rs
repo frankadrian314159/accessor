@@ -223,7 +223,7 @@ impl ScalarFn {
             "TYPENAME" => (TypeName, 1, 1),
             "CBOOL" => (CBool, 1, 1),
             "CDATE" => (CDate, 1, 1),
-            "FORMAT" => (Format, 1, 2),
+            "FORMAT" => (Format, 1, usize::MAX),
             "DATEPART" | "DATE_PART" => (DatePart, 2, 2),
             "TRIMOF" => (TrimOf, 3, 3),
             "NULLIF" => (NullIf, 2, 2),
@@ -498,6 +498,16 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
     }
 
     let vals: Vec<Cow<'_, Value>> = args.iter().map(|a| a.eval(row)).collect::<Result<_>>()?;
+    if f == Format {
+        // PostgreSQL's format('Hello %s', x) takes the pattern first; Access's Format(x, 'pattern') takes the value first
+        let owned: Vec<Value> = vals.iter().map(|v| (**v).clone()).collect();
+        if super::pgfuncs::is_pg_format(&owned) {
+            return super::pgfuncs::pg_format(&owned);
+        }
+        if owned.len() > 2 {
+            return Err(Error::runtime("Format takes a value and a pattern"));
+        }
+    }
     if !f.handles_null() && vals.iter().any(|v| v.is_null()) {
         return Ok(Value::Null);
     }

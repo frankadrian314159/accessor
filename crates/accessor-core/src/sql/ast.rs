@@ -95,7 +95,7 @@ pub enum SelectItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableFactor {
-    Named { name: String, alias: Option<String> },
+    Named { name: String, alias: Option<String>, only: bool },
     /// A parenthesised query. With `lateral`, it may read columns of the tables before it
     /// in the FROM clause and is evaluated once for each of their rows.
     Derived { query: Box<Select>, alias: String, columns: Vec<String>, lateral: bool },
@@ -488,6 +488,20 @@ pub enum Statement {
     Explain(Box<Select>),
     /// `EXPLAIN` of a statement that is not a query: described, not run.
     ExplainOther(Box<Statement>),
+    /// Creating or dropping an object kept in the catalog without a table of its own (see `exec/catalog.rs`).
+    Catalog(Box<CatalogChange>),
+    /// `ALTER ROLE name [WITH] options` / `ALTER ROLE name RENAME TO new`.
+    AlterRole { name: String, rename: Option<String>, options: Vec<(String, String)> },
+    /// `GRANT privileges ON object TO roles` / `REVOKE ...`; `GRANT role TO role` has no `object`.
+    Grant(Box<GrantDef>),
+    /// `SET ROLE name` / `SET SESSION AUTHORIZATION name`; `None` is `NONE` / `DEFAULT`.
+    SetRole(Option<String>),
+    /// `CREATE TABLE` with `INHERITS`, `PARTITION BY` or `PARTITION OF`.
+    CreateTableExt(Box<TableExt>),
+    /// `DROP TABLE a, b [CASCADE]`.
+    DropTables { names: Vec<String>, cascade: bool, if_exists: bool },
+    /// `UPDATE ONLY` / `DELETE FROM ONLY`: the table without the tables that inherit from it.
+    Only(Box<Statement>),
     /// `SET [SESSION | LOCAL] name { TO | = } value [, ...]`; `None` is `DEFAULT`.
     SetParameter { name: String, value: Option<String>, local: bool },
     /// `RESET name` / `RESET ALL` (`None`).
@@ -527,4 +541,40 @@ pub enum MergeAction {
     Update(Vec<(String, Expr)>),
     Delete,
     Insert { columns: Option<Vec<String>>, values: Vec<Expr> },
+}
+
+/// A schema, domain, type, extension, role or rule made or dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogChange {
+    /// `schema`, `type` (a domain or an enum), `extension`, `role`, `rule`.
+    pub kind: &'static str,
+    pub names: Vec<String>,
+    /// The description to store; `None` drops.
+    pub value: Option<String>,
+    pub replace: bool,
+    pub cascade: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GrantDef {
+    pub revoke: bool,
+    /// Lower-case privilege words; empty for a role membership.
+    pub privileges: Vec<String>,
+    /// `table`, `schema`, `sequence`, `function`, `database`, ...; for `ALL TABLES IN SCHEMA s` it is `all_tables` and the
+    /// object is the schema.
+    pub object_kind: String,
+    pub objects: Vec<String>,
+    pub grantees: Vec<String>,
+    pub cascade: bool,
+}
+
+/// What `INHERITS`, `PARTITION BY` and `PARTITION OF` add to a `CREATE TABLE` (which is `create`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableExt {
+    pub create: Statement,
+    pub parents: Vec<String>,
+    /// `(method, columns)` of `PARTITION BY`.
+    pub partition_by: Option<(String, Vec<String>)>,
+    /// `(parent, bound)` of `PARTITION OF`; the bound is saved as JSON text.
+    pub partition_of: Option<(String, String)>,
 }

@@ -54,6 +54,9 @@ pub enum Op {
     AlterSequence(SequenceDef),
     /// The last number a sequence handed out; written as it happens, outside any transaction.
     SequenceValue { name: String, last: Option<i64> },
+    /// A named object of the catalog that has no table of its own (a schema, domain, type, role, grant, extension,
+    /// rule, or a fact about a table such as its parents): `value` is its description as text, `None` removes it.
+    Catalog { kind: String, name: String, value: Option<String> },
 }
 
 impl Op {

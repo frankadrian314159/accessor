@@ -115,6 +115,7 @@ impl Database {
         if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
             return Ok(Arc::clone(hit));
         }
+        crate::sql::usertypes::set_types(self.user_types());
         let parsed = Arc::new(parse_script(sql)?);
         if sql.len() <= CACHE_MAX_TEXT {
             let mut cache = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner());

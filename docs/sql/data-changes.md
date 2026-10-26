@@ -54,7 +54,7 @@ SET column = expr [, column = expr ...]
 [WHERE condition];
 ```
 
-All the right-hand sides see the row as it was before the update, so `SET a = b, b = a` swaps. A calculated column cannot be set. Sub-queries may be [correlated](select.md#correlated-sub-queries) and may read the table being updated (they see its state before the statement).
+On a table that other tables [inherit from](inheritance-and-partitioning.md) the statement reaches those tables too; `UPDATE ONLY table` and `DELETE FROM ONLY table` leave them alone. All the right-hand sides see the row as it was before the update, so `SET a = b, b = a` swaps. A calculated column cannot be set. Sub-queries may be [correlated](select.md#correlated-sub-queries) and may read the table being updated (they see its state before the statement).
 
 ```sql
 UPDATE Product P SET Price = Price * 1.05 WHERE Price < 10;

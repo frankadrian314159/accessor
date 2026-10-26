@@ -54,6 +54,8 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
               | <insert> | <update> | <delete> | <merge> | <truncate>
               | <create-table> | <create-index> | <create-view> | <create-trigger>
               | <drop> | <alter-table>
+              | <create-schema> | <create-domain> | <create-type> | <create-extension> | <drop-catalog>
+              | <create-role> | <alter-role> | <grant> | <set-role>
               | <parameters> | <exec>
               | <transaction-statement>
               | <raise>
@@ -205,7 +207,17 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 ### Definitions
 
 ```bnf
-<create-table> ::= CREATE TABLE [ IF NOT EXISTS ] <identifier> '(' <table-element> { ',' <table-element> } ')'
+<create-table> ::= CREATE TABLE [ IF NOT EXISTS ] <table-name> '(' <table-element> { ',' <table-element> } ')'
+                   { INHERITS '(' <table-name> { ',' <table-name> } ')'
+                   | PARTITION BY ( RANGE | LIST | HASH ) '(' <identifier-list> ')'
+                   | WITH '(' ... ')' | TABLESPACE <identifier> | USING <identifier> | ON COMMIT ... }
+               | CREATE TABLE [ IF NOT EXISTS ] <table-name> PARTITION OF <table-name> <partition-bound> [ PARTITION BY ... ]
+<partition-bound> ::= FOR VALUES IN '(' <expr> { ',' <expr> } ')'
+                     | FOR VALUES FROM '(' <bound> { ',' <bound> } ')' TO '(' <bound> { ',' <bound> } ')'
+                     | FOR VALUES WITH '(' MODULUS <integer> ',' REMAINDER <integer> ')'
+                     | DEFAULT
+<bound>        ::= <expr> | MINVALUE | MAXVALUE
+<table-name>   ::= [ <identifier> '.' ] <identifier>     -- a schema prefix; public. and pg_catalog. are dropped
 <table-element> ::= <column-def>
                   | PRIMARY KEY '(' <identifier-list> ')'
                   | UNIQUE '(' <identifier-list> ')'
@@ -267,7 +279,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 <trigger-statement> ::= <insert> | <update> | <delete> | <query> | <raise>
 <raise>        ::= RAISE <expr>
 
-<drop>         ::= DROP TABLE [ IF EXISTS ] <identifier>
+<drop>         ::= DROP TABLE [ IF EXISTS ] <table-name> { ',' <table-name> } [ CASCADE | RESTRICT ]
                  | DROP ( VIEW | QUERY ) [ IF EXISTS ] <identifier>
                  | DROP TRIGGER [ IF EXISTS ] <identifier>
                  | DROP INDEX [ IF EXISTS ] <identifier> [ ON <identifier> ] | REINDEX [ <identifier> ]
@@ -364,3 +376,27 @@ Precedence, from loosest to tightest binding: `OR`; `AND`; `NOT`; comparison and
                 | <integer> PRECEDING | <integer> FOLLOWING        (* ROWS: a row count *)
                 | <constant> PRECEDING | <constant> FOLLOWING      (* RANGE: a number, or an interval for dates *)
 ```
+
+### Schemas, types, roles and privileges
+
+```bnf
+<create-schema>   ::= CREATE SCHEMA [ IF NOT EXISTS ] ( <identifier> | AUTHORIZATION <role> )
+<create-domain>   ::= CREATE DOMAIN <identifier> [ AS ] <type> { DEFAULT <expr> | [ NOT ] NULL | [ CONSTRAINT <identifier> ] CHECK '(' <expr> ')' }
+<create-type>     ::= CREATE TYPE <identifier> AS ENUM '(' [ <string> { ',' <string> } ] ')'
+<create-extension> ::= CREATE EXTENSION [ IF NOT EXISTS ] <identifier> { <any word> }
+<drop-catalog>    ::= DROP ( SCHEMA | DOMAIN | TYPE | EXTENSION | ROLE | USER | GROUP ) [ IF EXISTS ] <name> { ',' <name> } [ CASCADE | RESTRICT ]
+<create-role>     ::= CREATE ( ROLE | USER | GROUP ) [ IF NOT EXISTS ] <role> [ [ WITH ] <role-option> { <role-option> } ]
+<alter-role>      ::= ALTER ( ROLE | USER | GROUP ) <role> ( [ WITH ] <role-option> { <role-option> } | RENAME TO <role> )
+<role-option>     ::= [ NO ] ( SUPERUSER | CREATEDB | CREATEROLE | INHERIT | LOGIN | REPLICATION | BYPASSRLS )
+                    | PASSWORD ( <string> | NULL ) | CONNECTION LIMIT <integer> | VALID UNTIL <string>
+                    | IN ( ROLE | GROUP ) <role-list> | ROLE <role-list> | ADMIN <role-list>
+<grant>           ::= ( GRANT | REVOKE ) <privilege> { ',' <privilege> } ON [ TABLE ] <table-name> { ',' <table-name> }
+                        ( TO | FROM ) <role-list>
+                    | ( GRANT | REVOKE ) <privilege> { ',' <privilege> } ON ALL TABLES IN SCHEMA <identifier> ( TO | FROM ) <role-list>
+                    | ( GRANT | REVOKE ) <role-list> ( TO | FROM ) <role-list>
+<privilege>       ::= SELECT | INSERT | UPDATE | DELETE | TRUNCATE | REFERENCES | TRIGGER | ALL [ PRIVILEGES ] | <other word>
+<set-role>        ::= SET [ SESSION ] ROLE ( <role> | NONE ) | SET SESSION AUTHORIZATION ( <role> | DEFAULT )
+```
+
+`UPDATE ONLY <table>` and `DELETE FROM ONLY <table>` leave out the tables that inherit from it; so does `FROM ONLY <table>`.
+`CREATE FUNCTION` and `CREATE PROCEDURE` also take the PostgreSQL form described in [routines.md](routines.md#postgresql-style-functions-and-procedures).

@@ -3,6 +3,8 @@
 pub use prepared::Prepared;
 pub mod agg;
 pub mod bind;
+mod catalog;
+mod inherit;
 mod check;
 mod ddl;
 mod merge;
@@ -93,6 +95,11 @@ impl Database {
         self.enter_session();
         if !matches!(st, Statement::Begin | Statement::Commit | Statement::Rollback) {
             self.admit()?;
+            if matches!(st, Statement::Select(_) | Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Upsert { .. } | Statement::Returning { .. } | Statement::Exec { .. }) {
+                if let Some(rewritten) = self.run_block_functions(st)? {
+                    return self.run_statement(&rewritten);
+                }
+            }
         }
         match st {
             Statement::SetConstraints { names, deferred } => {
@@ -180,6 +187,26 @@ impl Database {
             Statement::Truncate(table) => self.exec_delete(table, None),
             Statement::Explain(sel) => self.run_explain(sel),
             Statement::ExplainOther(inner) => Ok(explain_other(inner)),
+            Statement::Catalog(c) => {
+                let result = self.exec_catalog(c)?;
+                if c.kind == "role" {
+                    if let (Some(value), Some(name)) = (&c.value, c.names.first()) {
+                        self.add_role_memberships(name, value)?;
+                    }
+                }
+                Ok(result)
+            }
+            Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
+            Statement::Grant(g) => self.exec_grant(g),
+            Statement::CreateTableExt(ext) => self.exec_create_table_ext(ext),
+            Statement::DropTables { names, cascade, if_exists } => self.exec_drop_tables(names, *cascade, *if_exists),
+            Statement::Only(inner) => {
+                self.only_dml.store(true, std::sync::atomic::Ordering::Relaxed);
+                let out = self.run_statement(inner);
+                self.only_dml.store(false, std::sync::atomic::Ordering::Relaxed);
+                out
+            }
+            Statement::SetRole(role) => self.exec_set_role(role.as_deref()),
             Statement::SetParameter { name, value, .. } => self.set_parameter(name, value.as_deref()).map(|()| QueryResult::default()),
             Statement::ResetParameter(name) => self.reset_parameter(name.as_deref()).map(|()| QueryResult::default()),
             Statement::ShowParameter(name) => self.show_parameter(name.as_deref()),

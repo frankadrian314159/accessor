@@ -14,7 +14,10 @@ ASQL is the SQL dialect of Accessor. It is a subset of standard SQL with the hab
 | [transactions.md](transactions.md) | `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints, `SET CONSTRAINTS` |
 | [information-schema.md](information-schema.md) | `INFORMATION_SCHEMA`: the catalog as tables |
 | [sequences.md](sequences.md) | `CREATE SEQUENCE`, `NEXT VALUE FOR`, sequence defaults |
-| [routines.md](routines.md) | `CREATE FUNCTION` (expression functions) and `CREATE PROCEDURE` (variables, `IF`, `WHILE`), `CALL` |
+| [routines.md](routines.md) | `CREATE FUNCTION` (expression functions) and `CREATE PROCEDURE` (variables, `IF`, `WHILE`), `CALL`; PostgreSQL-style `LANGUAGE sql` and PL/pgSQL |
+| [schemas-and-types.md](schemas-and-types.md) | `CREATE SCHEMA`, `CREATE DOMAIN`, `CREATE TYPE ... AS ENUM`, `CREATE EXTENSION` |
+| [roles-and-privileges.md](roles-and-privileges.md) | `CREATE ROLE`, `GRANT`, `REVOKE`, `SET ROLE` |
+| [inheritance-and-partitioning.md](inheritance-and-partitioning.md) | `INHERITS`, `PARTITION BY`, `PARTITION OF`, `ONLY` |
 | [reports.md](reports.md) | `CREATE REPORT`: grouped, totalled, paged output as text, HTML, Markdown, CSV or PDF |
 | [../optimizer/](../optimizer/README.md) | the query optimizer and `EXPLAIN` |
 | [session.md](session.md) | `SET TIME ZONE` and other session settings |

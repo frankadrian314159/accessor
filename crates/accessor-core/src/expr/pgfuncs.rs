@@ -685,3 +685,125 @@ fn parse_number(input: &str, fmt: &str) -> Result<Decimal> {
     let d = Decimal::parse(&s).ok_or_else(|| Error::runtime("invalid input syntax for type numeric"))?;
     Ok(if negative { d.neg() } else { d })
 }
+
+/// Is this call of `format` PostgreSQL's (`format('%s items', n)`, pattern first) and not Access's?
+pub fn is_pg_format(vals: &[Value]) -> bool {
+    match vals.first() {
+        Some(Value::Text(t)) if vals.len() >= 3 => t.contains('%') || vals.len() >= 3,
+        Some(Value::Text(t)) => {
+            let b = t.as_bytes();
+            b.iter().enumerate().any(|(i, &c)| c == b'%' && matches!(b.get(i + 1), Some(b's' | b'I' | b'L' | b'%' | b'0'..=b'9' | b'-')))
+        }
+        Some(Value::Null) => vals.len() >= 3,
+        _ => vals.len() >= 3,
+    }
+}
+
+/// PostgreSQL's `format(pattern, args...)`: `%s` text, `%I` identifier, `%L` literal, `%%`; `%2$s` picks an argument,
+/// and a width (`%10s`, `%-10s`) pads.
+pub fn pg_format(vals: &[Value]) -> Result<Value> {
+    let Value::Text(pattern) = &vals[0] else {
+        return Ok(Value::Null);
+    };
+    let args = &vals[1..];
+    let mut out = String::new();
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    let mut next = 0usize;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        // [position$]
+        let mut j = i;
+        let mut digits = String::new();
+        while j < chars.len() && chars[j].is_ascii_digit() {
+            digits.push(chars[j]);
+            j += 1;
+        }
+        let mut position = None;
+        if j < chars.len() && chars[j] == '$' && !digits.is_empty() {
+            position = Some(digits.parse::<usize>().map_err(|_| Error::runtime("format: bad argument position"))?);
+            i = j + 1;
+        }
+        let left = i < chars.len() && chars[i] == '-';
+        if left {
+            i += 1;
+        }
+        let mut width = String::new();
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            width.push(chars[i]);
+            i += 1;
+        }
+        let Some(&kind) = chars.get(i) else {
+            return Err(Error::runtime("unterminated format() type specifier"));
+        };
+        i += 1;
+        if kind == '%' {
+            out.push('%');
+            continue;
+        }
+        let at = match position {
+            Some(p) => {
+                if p == 0 {
+                    return Err(Error::runtime("format specifies argument 0, but arguments are numbered from 1"));
+                }
+                p - 1
+            }
+            None => {
+                next += 1;
+                next - 1
+            }
+        };
+        let arg = args.get(at).ok_or_else(|| Error::runtime("too few arguments for format()"))?;
+        let rendered = match kind {
+            's' => {
+                if arg.is_null() {
+                    String::new()
+                } else {
+                    text(arg).into_owned()
+                }
+            }
+            'I' => {
+                if arg.is_null() {
+                    return Err(Error::runtime("null values cannot be formatted as an SQL identifier"));
+                }
+                let t = text(arg).into_owned();
+                let plain = !t.is_empty()
+                    && !t.starts_with(|c: char| c.is_ascii_digit())
+                    && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                if plain {
+                    t
+                } else {
+                    format!("\"{}\"", t.replace('"', "\"\""))
+                }
+            }
+            'L' => {
+                if arg.is_null() {
+                    "NULL".to_string()
+                } else {
+                    format!("'{}'", text(arg).replace('\'', "''"))
+                }
+            }
+            other => return Err(Error::runtime(format!("unrecognized format() type specifier \"{other}\""))),
+        };
+        let w: usize = width.parse().unwrap_or(0);
+        let len = rendered.chars().count();
+        if len < w {
+            let pad = " ".repeat(w - len);
+            if left {
+                out.push_str(&rendered);
+                out.push_str(&pad);
+            } else {
+                out.push_str(&pad);
+                out.push_str(&rendered);
+            }
+        } else {
+            out.push_str(&rendered);
+        }
+    }
+    Ok(Value::text(&out))
+}

@@ -346,6 +346,10 @@ Names resolve to the subquery's own tables first, and to the outer query only wh
 
 `INSERT ... ON CONFLICT (k) DO UPDATE SET n = n + EXCLUDED.n` (or `DO NOTHING`, or `REPLACE INTO`) deals with a row that collides with an existing one on a unique key. `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR` and `SIMILAR TO` match patterns; `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `OVERLAY`, `TRANSLATE` and `INITCAP` shape text; `ATAN2`, `DEGREES`, `RADIANS`, `PI()`, `RANDOM()` and `TRUNC(x, n)` fill gaps in the maths. `SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'Orders'` lists a table's fields, and the other views list constraints, indexes, routines, sequences, triggers and reports. See [data changes](sql/data-changes.md), [regular expressions](functions/regex.md) and the [catalog views](sql/information-schema.md).
 
+#### PostgreSQL objects
+
+`CREATE SCHEMA`, `CREATE DOMAIN`, `CREATE TYPE ... AS ENUM` and `CREATE EXTENSION` are accepted in a reduced form ([schemas and types](sql/schemas-and-types.md)); `CREATE ROLE`, `GRANT`, `REVOKE` and `SET ROLE` restrict tables for the chosen role ([roles](sql/roles-and-privileges.md)); `INHERITS`, `PARTITION BY` and `PARTITION OF` give tables that are read together, with inserts routed to the right partition ([inheritance and partitioning](sql/inheritance-and-partitioning.md)). `CREATE FUNCTION ... AS $$ ... $$ LANGUAGE sql | plpgsql` takes PostgreSQL's form, including a PL/pgSQL subset ([routines](sql/routines.md#postgresql-style-functions-and-procedures)).
+
 #### Stored functions and procedures
 
 `CREATE FUNCTION tax(@amount CURRENCY, @rate DECIMAL = 0.2) AS @amount * @rate` defines an expression you can use anywhere (it is expanded in place, so indexes and the optimizer see through it). `CREATE PROCEDURE` takes a block with `DECLARE`, `SET`, `IF`, `WHILE`, `RETURN` and ordinary SQL statements, run by `CALL` as one all-or-nothing unit. See [routines](sql/routines.md).

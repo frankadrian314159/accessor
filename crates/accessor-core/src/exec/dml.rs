@@ -76,7 +76,10 @@ impl Database {
         columns: &Option<Vec<String>>,
         source: &InsertSource,
     ) -> Result<QueryResult> {
-        let ops = self.plan_insert(table, columns, source)?;
+        let mut ops = self.plan_insert(table, columns, source)?;
+        if self.is_partitioned(table) {
+            ops = self.route_partition_inserts(table, ops)?;
+        }
         let n = ops.len();
         self.apply_all(ops)?;
         Ok(QueryResult::affected(n))
@@ -175,14 +178,20 @@ impl Database {
         assignments: &[(String, Expr)],
         filter: Option<&Expr>,
     ) -> Result<QueryResult> {
-        let ops = self.plan_update(table, assignments, filter)?;
+        let mut ops = Vec::new();
+        for member in self.dml_members(table) {
+            ops.extend(self.plan_update(&member, assignments, filter)?);
+        }
         let n = ops.len();
         self.apply_all(ops)?;
         Ok(QueryResult::affected(n))
     }
 
     pub(crate) fn exec_delete(&mut self, table: &str, filter: Option<&Expr>) -> Result<QueryResult> {
-        let ops = self.plan_delete(table, filter)?;
+        let mut ops = Vec::new();
+        for member in self.dml_members(table) {
+            ops.extend(self.plan_delete(&member, filter)?);
+        }
         let n = ops.len();
         self.apply_all(ops)?;
         Ok(QueryResult::affected(n))
@@ -194,6 +203,7 @@ impl Database {
         columns: &Option<Vec<String>>,
         source: &InsertSource,
     ) -> Result<Vec<Op>> {
+        self.require_privilege(table, "insert")?;
         let ops = {
             let t = self.table_checked(table)?;
             let schema = t.schema();
@@ -255,6 +265,7 @@ impl Database {
         assignments: &[(String, Expr)],
         filter: Option<&Expr>,
     ) -> Result<Vec<Op>> {
+        self.require_privilege(table, "update")?;
         let t = self.table_checked(table)?;
         let schema = t.schema();
         let scope = table_scope(schema);
@@ -275,6 +286,7 @@ impl Database {
 
     /// The update of exactly the records `ids` (used by MERGE).
     pub(crate) fn plan_update_ids(&self, table: &str, assignments: &[(String, Expr)], ids: &[RowId]) -> Result<Vec<Op>> {
+        self.require_privilege(table, "update")?;
         let t = self.table_checked(table)?;
         let schema = t.schema();
         let scope = table_scope(schema);
@@ -290,6 +302,7 @@ impl Database {
     }
 
     pub(crate) fn plan_delete(&self, table: &str, filter: Option<&Expr>) -> Result<Vec<Op>> {
+        self.require_privilege(table, "delete")?;
         let t = self.table_checked(table)?;
         let schema = t.schema();
         let scope = table_scope(schema);

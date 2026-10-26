@@ -1,6 +1,9 @@
 //! Recursive-descent parser for the SQL dialect.
 
 use super::ast::*;
+use super::usertypes::UserType;
+
+mod pgfunc;
 use super::lexer::{lex, Tok, Token};
 use crate::error::{Error, Result};
 use crate::schema::RefAction;
@@ -431,6 +434,387 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A table name, possibly qualified with a schema (`s.t`). `public` and `pg_catalog` are the default schemas and
+    /// are dropped; any other schema stays part of the name (`s.t` is a table of its own, which `CREATE SCHEMA s`
+    /// must have announced).
+    fn table_ident(&mut self) -> Result<String> {
+        let name = self.ident()?;
+        if self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            self.advance();
+            let table = self.ident()?;
+            if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") {
+                return Ok(table);
+            }
+            return Ok(format!("{name}.{table}"));
+        }
+        Ok(name)
+    }
+
+    /// A role name: any word, even a reserved one such as `CURRENT_USER`.
+    fn role_name(&mut self) -> Result<String> {
+        match self.peek().clone() {
+            Tok::Ident(s) | Tok::Quoted(s) | Tok::Str(s) => {
+                self.advance();
+                Ok(s)
+            }
+            _ => Err(self.unexpected("a role name")),
+        }
+    }
+
+    fn role_list(&mut self) -> Result<Vec<String>> {
+        let mut v = vec![self.role_name()?];
+        while self.eat_sym(",") {
+            v.push(self.role_name()?);
+        }
+        Ok(v)
+    }
+
+    /// The options of `CREATE ROLE` and `ALTER ROLE`, as `(name, value)` pairs.
+    fn role_options(&mut self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        self.eat_kw("WITH");
+        loop {
+            let Tok::Ident(word) = self.peek().clone() else { break };
+            let up = word.to_ascii_uppercase();
+            match up.as_str() {
+                "SUPERUSER" | "CREATEDB" | "CREATEROLE" | "INHERIT" | "LOGIN" | "REPLICATION" | "BYPASSRLS" => {
+                    self.advance();
+                    out.push((up.to_ascii_lowercase(), "true".into()));
+                }
+                "NOSUPERUSER" | "NOCREATEDB" | "NOCREATEROLE" | "NOINHERIT" | "NOLOGIN" | "NOREPLICATION" | "NOBYPASSRLS" => {
+                    self.advance();
+                    out.push((up[2..].to_ascii_lowercase(), "false".into()));
+                }
+                "ENCRYPTED" | "UNENCRYPTED" => {
+                    self.advance();
+                }
+                "PASSWORD" => {
+                    self.advance();
+                    let v = if self.eat_kw("NULL") {
+                        String::new()
+                    } else {
+                        match self.advance() {
+                            Tok::Str(s) => s,
+                            _ => {
+                                self.pos -= 1;
+                                return Err(self.unexpected("a password in quotes"));
+                            }
+                        }
+                    };
+                    out.push(("password".into(), v));
+                }
+                "CONNECTION" => {
+                    self.advance();
+                    self.expect_kw("LIMIT")?;
+                    let neg = self.eat_sym("-");
+                    let n = match self.advance() {
+                        Tok::Int(i) => i,
+                        _ => {
+                            self.pos -= 1;
+                            return Err(self.unexpected("a number"));
+                        }
+                    };
+                    out.push(("connection limit".into(), if neg { format!("-{n}") } else { n.to_string() }));
+                }
+                "VALID" => {
+                    self.advance();
+                    self.expect_kw("UNTIL")?;
+                    match self.advance() {
+                        Tok::Str(s) => out.push(("valid until".into(), s)),
+                        _ => {
+                            self.pos -= 1;
+                            return Err(self.unexpected("a time in quotes"));
+                        }
+                    }
+                }
+                "IN" => {
+                    self.advance();
+                    if !self.eat_kw("ROLE") {
+                        self.expect_kw("GROUP")?;
+                    }
+                    out.push(("in role".into(), self.role_list()?.join(",")));
+                }
+                "ROLE" | "USER" | "ADMIN" => {
+                    self.advance();
+                    out.push((up.to_ascii_lowercase(), self.role_list()?.join(",")));
+                }
+                "SYSID" => {
+                    self.advance();
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn options_text(options: &[(String, String)]) -> String {
+        let mut map = serde_json::Map::new();
+        for (k, v) in options {
+            map.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        serde_json::Value::Object(map).to_string()
+    }
+
+    fn alter_role(&mut self) -> Result<Statement> {
+        self.advance();
+        let name = self.role_name()?;
+        if self.eat_kw("RENAME") {
+            self.expect_kw("TO")?;
+            return Ok(Statement::AlterRole { name, rename: Some(self.role_name()?), options: Vec::new() });
+        }
+        if self.peek_kw("SET") || self.peek_kw("RESET") || self.peek_kw("IN") {
+            // `ALTER ROLE r SET param TO value`: per-role settings are not kept
+            while !self.at_eof() && !self.peek_sym(";") {
+                self.advance();
+            }
+            return Ok(Statement::AlterRole { name, rename: None, options: Vec::new() });
+        }
+        let options = self.role_options()?;
+        Ok(Statement::AlterRole { name, rename: None, options })
+    }
+
+    /// `GRANT` and `REVOKE`.
+    fn grant(&mut self) -> Result<Statement> {
+        let revoke = self.eat_kw("REVOKE");
+        if !revoke {
+            self.expect_kw("GRANT")?;
+        }
+        if revoke && (self.eat_kw("GRANT") || self.eat_kw("ADMIN")) {
+            self.expect_kw("OPTION")?;
+            self.expect_kw("FOR")?;
+        }
+        let mut privileges: Vec<String> = Vec::new();
+        loop {
+            let Tok::Ident(word) = self.peek().clone() else {
+                return Err(self.unexpected("a privilege"));
+            };
+            self.advance();
+            let w = word.to_ascii_lowercase();
+            if w == "all" {
+                self.eat_kw("PRIVILEGES");
+            }
+            // column lists: `SELECT (a, b)`
+            if self.peek_sym("(") {
+                while !self.peek_sym(")") && !self.at_eof() {
+                    self.advance();
+                }
+                self.expect_sym(")")?;
+            }
+            privileges.push(w);
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        let (object_kind, objects) = if self.eat_kw("ON") {
+            if self.eat_kw("ALL") {
+                let kind = self.ident()?.to_ascii_lowercase();
+                self.expect_kw("IN")?;
+                self.expect_kw("SCHEMA")?;
+                (format!("all_{kind}"), self.ident_list()?)
+            } else {
+                let mut kind = "table".to_string();
+                if let Tok::Ident(w) = self.peek().clone() {
+                    let up = w.to_ascii_uppercase();
+                    if matches!(up.as_str(), "TABLE" | "SEQUENCE" | "SCHEMA" | "DATABASE" | "FUNCTION" | "PROCEDURE" | "ROUTINE" | "DOMAIN" | "TYPE" | "LANGUAGE" | "TABLESPACE") {
+                        self.advance();
+                        kind = up.to_ascii_lowercase();
+                    } else if matches!(up.as_str(), "FOREIGN" | "LARGE") {
+                        self.advance();
+                        self.advance();
+                        kind = "other".into();
+                    }
+                }
+                let mut objects = vec![self.table_ident()?];
+                while self.eat_sym(",") {
+                    objects.push(self.table_ident()?);
+                }
+                // a function's argument types: `f(int, text)`
+                if self.peek_sym("(") {
+                    while !self.peek_sym(")") && !self.at_eof() {
+                        self.advance();
+                    }
+                    self.expect_sym(")")?;
+                }
+                (kind, objects)
+            }
+        } else {
+            (String::new(), Vec::new())
+        };
+        if !self.eat_kw("TO") {
+            self.expect_kw("FROM")?;
+        }
+        let mut grantees = Vec::new();
+        loop {
+            self.eat_kw("GROUP");
+            grantees.push(self.role_name()?);
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        let mut cascade = false;
+        loop {
+            if self.eat_kw("WITH") {
+                // WITH GRANT OPTION / WITH ADMIN OPTION / WITH INHERIT ...
+                while !self.at_eof() && !self.peek_sym(";") && !self.peek_kw("GRANTED") {
+                    self.advance();
+                }
+            } else if self.eat_kw("GRANTED") {
+                self.expect_kw("BY")?;
+                self.role_name()?;
+            } else if self.eat_kw("CASCADE") {
+                cascade = true;
+            } else if self.eat_kw("RESTRICT") {
+            } else {
+                break;
+            }
+        }
+        let membership = object_kind.is_empty();
+        Ok(Statement::Grant(Box::new(GrantDef {
+            revoke,
+            privileges: if membership { Vec::new() } else { privileges.clone() },
+            object_kind,
+            objects: if membership { privileges } else { objects },
+            grantees,
+            cascade,
+        })))
+    }
+
+    /// `CREATE SCHEMA | DOMAIN | TYPE | EXTENSION | ROLE | USER | GROUP`, the objects kept in the catalog.
+    fn create_catalog_object(&mut self, guarded: &mut bool) -> Result<Option<Statement>> {
+        let change = |kind: &'static str, name: String, value: String| {
+            Statement::Catalog(Box::new(CatalogChange { kind, names: vec![name], value: Some(value), replace: false, cascade: false }))
+        };
+        if self.eat_kw("SCHEMA") {
+            self.if_exists_clause(true, guarded)?;
+            let name = if self.peek_kw("AUTHORIZATION") { None } else { Some(self.ident()?) };
+            let mut owner = None;
+            if self.eat_kw("AUTHORIZATION") {
+                owner = Some(self.role_name()?);
+            }
+            let name = name.or(owner).ok_or_else(|| self.unexpected("a schema name"))?;
+            if self.peek_kw("CREATE") || self.peek_kw("GRANT") {
+                return Err(Error::syntax("CREATE SCHEMA with objects inside is not supported; create them with the schema name in front"));
+            }
+            return Ok(Some(change("schema", name, String::new())));
+        }
+        if self.eat_kw("EXTENSION") {
+            self.if_exists_clause(true, guarded)?;
+            let name = self.ident()?;
+            while !self.at_eof() && !self.peek_sym(";") {
+                // WITH SCHEMA s VERSION 'x' CASCADE: accepted, ignored
+                self.advance();
+            }
+            return Ok(Some(change("extension", name, String::new())));
+        }
+        if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
+            self.advance();
+            self.if_exists_clause(true, guarded)?;
+            let name = self.role_name()?;
+            let options = self.role_options()?;
+            return Ok(Some(change("role", name, Self::options_text(&options))));
+        }
+        if self.eat_kw("DOMAIN") {
+            self.if_exists_clause(true, guarded)?;
+            let name = self.ident()?;
+            self.eat_kw("AS");
+            let type_name = self.type_name()?;
+            let mut t = match crate::sql::usertypes::lookup(&type_name) {
+                Some(base) => UserType { domain: true, ..base },
+                None => {
+                    DataType::from_sql_name(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
+                    UserType { base: type_name, domain: true, ..Default::default() }
+                }
+            };
+            if self.eat_sym("(") {
+                while !self.peek_sym(")") && !self.at_eof() {
+                    self.advance();
+                }
+                self.expect_sym(")")?;
+            }
+            loop {
+                if self.eat_kw("CONSTRAINT") {
+                    self.ident()?;
+                } else if self.eat_kw("COLLATE") {
+                    self.ident()?;
+                } else if self.eat_kw("DEFAULT") {
+                    let start = self.toks[self.pos].pos;
+                    self.expr()?;
+                    let end = self.toks[self.pos].pos;
+                    t.default = Some(self.src[start..end].trim().to_string());
+                } else if self.eat_kw("NOT") {
+                    self.expect_kw("NULL")?;
+                    t.not_null = true;
+                } else if self.eat_kw("NULL") {
+                } else if self.peek_kw("CHECK") {
+                    t.checks.push(self.check_clause()?);
+                } else {
+                    break;
+                }
+            }
+            crate::sql::usertypes::register(&name, t.clone());
+            let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
+            return Ok(Some(change("type", name, value)));
+        }
+        if self.eat_kw("TYPE") {
+            self.if_exists_clause(true, guarded)?;
+            let name = self.ident()?;
+            if !self.eat_kw("AS") {
+                return Err(Error::syntax("only CREATE TYPE name AS ENUM (...) is supported"));
+            }
+            if !self.eat_kw("ENUM") {
+                return Err(Error::syntax("only enumerated types can be created with CREATE TYPE; composite, range and base types are not available"));
+            }
+            self.expect_sym("(")?;
+            let mut labels = Vec::new();
+            if !self.peek_sym(")") {
+                loop {
+                    match self.advance() {
+                        Tok::Str(s) => labels.push(s),
+                        _ => {
+                            self.pos -= 1;
+                            return Err(self.unexpected("a label in quotes"));
+                        }
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+            }
+            self.expect_sym(")")?;
+            let t = UserType { base: "TEXT".into(), labels, ..Default::default() };
+            crate::sql::usertypes::register(&name, t.clone());
+            let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
+            return Ok(Some(change("type", name, value)));
+        }
+        Ok(None)
+    }
+
+    fn drop_catalog_object(&mut self, guarded: &mut bool) -> Result<Option<Statement>> {
+        let kind: &'static str = if self.eat_kw("SCHEMA") {
+            "schema"
+        } else if self.eat_kw("DOMAIN") || self.eat_kw("TYPE") {
+            "type"
+        } else if self.eat_kw("EXTENSION") {
+            "extension"
+        } else if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
+            self.advance();
+            "role"
+        } else {
+            return Ok(None);
+        };
+        self.if_exists_clause(false, guarded)?;
+        let names = if kind == "role" { self.role_list()? } else { self.ident_list()? };
+        let cascade = self.eat_kw("CASCADE");
+        self.eat_kw("RESTRICT");
+        if kind == "type" {
+            for n in &names {
+                crate::sql::usertypes::unregister(n);
+            }
+        }
+        Ok(Some(Statement::Catalog(Box::new(CatalogChange { kind, names, value: None, replace: false, cascade }))))
+    }
+
     fn peek_is_alias(&self) -> bool {
         match self.peek() {
             Tok::Quoted(_) => true,
@@ -582,7 +966,12 @@ impl<'a> Parser<'a> {
             if !local {
                 self.eat_kw("SESSION");
             }
-            if self.peek_kw("TRANSACTION") || self.peek_kw("CHARACTERISTICS") || self.peek_kw("AUTHORIZATION") || self.peek_kw("ROLE") {
+            if self.peek_kw("ROLE") || self.peek_kw("AUTHORIZATION") || (self.peek_kw("SESSION") && self.peek_kw_at(1, "AUTHORIZATION")) {
+                self.eat_kw("SESSION");
+                self.advance();
+                return Ok(Statement::SetRole(if self.eat_kw("NONE") || self.eat_kw("DEFAULT") { None } else { Some(self.role_name()?) }));
+            }
+            if self.peek_kw("TRANSACTION") || self.peek_kw("CHARACTERISTICS") {
                 // `SET TRANSACTION ISOLATION LEVEL ...`, `SET SESSION CHARACTERISTICS AS ...`, `SET ROLE x`: there is one
                 // user and one isolation level, so these are read and ignored
                 let what = self.ident()?.to_ascii_lowercase();
@@ -669,7 +1058,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("TRUNCATE") {
             self.eat_kw("TABLE");
-            return Ok(Statement::Truncate(self.ident()?));
+            return Ok(Statement::Truncate(self.table_ident()?));
         }
         if self.eat_kw("UPDATE") {
             return self.update();
@@ -685,6 +1074,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("ALTER") {
             return self.alter();
+        }
+        if self.peek_kw("GRANT") || self.peek_kw("REVOKE") {
+            return self.grant();
         }
         if self.eat_kw("PARAMETERS") {
             return Ok(Statement::Parameters(self.param_list()?));
@@ -747,7 +1139,7 @@ impl<'a> Parser<'a> {
 
     fn insert(&mut self) -> Result<Statement> {
         self.expect_kw("INTO")?;
-        let table = self.ident()?;
+        let table = self.table_ident()?;
         let mut columns = None;
         if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") && !self.peek_kw_at(1, "WITH") {
             self.advance();
@@ -782,7 +1174,13 @@ impl<'a> Parser<'a> {
     }
 
     fn update(&mut self) -> Result<Statement> {
-        let table = self.ident()?;
+        let only = self.peek_kw("ONLY") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && self.eat_kw("ONLY");
+        let st = self.update_inner()?;
+        Ok(if only { Statement::Only(Box::new(st)) } else { st })
+    }
+
+    fn update_inner(&mut self) -> Result<Statement> {
+        let table = self.table_ident()?;
         let alias = self.target_alias()?;
         self.expect_kw("SET")?;
         let mut assignments = Vec::new();
@@ -813,7 +1211,7 @@ impl<'a> Parser<'a> {
     /// `MERGE INTO t [AS a] USING source ON cond WHEN [NOT] MATCHED [AND c] THEN action ...`.
     fn merge(&mut self) -> Result<Statement> {
         self.expect_kw("INTO")?;
-        let target = self.ident()?;
+        let target = self.table_ident()?;
         let target_alias = self.target_alias()?;
         self.expect_kw("USING")?;
         let source = self.table_factor()?;
@@ -887,7 +1285,13 @@ impl<'a> Parser<'a> {
     fn delete(&mut self) -> Result<Statement> {
         self.eat_sym("*");
         self.expect_kw("FROM")?;
-        let table = self.ident()?;
+        let only = self.peek_kw("ONLY") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && self.eat_kw("ONLY");
+        let st = self.delete_inner()?;
+        Ok(if only { Statement::Only(Box::new(st)) } else { st })
+    }
+
+    fn delete_inner(&mut self) -> Result<Statement> {
+        let table = self.table_ident()?;
         let alias = self.target_alias()?;
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let mut st = Statement::Delete { table: table.clone(), filter };
@@ -1119,6 +1523,7 @@ impl<'a> Parser<'a> {
     /// A data type written as a name (`INTEGER`, `VARCHAR(20)`, `DOUBLE PRECISION`, ...).
     fn data_type_name(&mut self) -> Result<DataType> {
         let tn = self.type_name()?;
+        let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
         let (ty, auto) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         if auto || ty == DataType::Calculated {
             return Err(Error::syntax(format!("'{tn}' cannot be used as the type of a parameter")));
@@ -1264,7 +1669,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_kw("ON")?;
-        let table = self.ident()?;
+        let table = self.table_ident()?;
         let mut each_statement = false;
         if self.eat_kw("FOR") {
             self.expect_kw("EACH")?;
@@ -1356,6 +1761,11 @@ impl<'a> Parser<'a> {
         if !unique && self.eat_kw("TRIGGER") {
             return self.trigger(create_pos);
         }
+        if !unique {
+            if let Some(st) = self.create_catalog_object(guarded)? {
+                return Ok(st);
+            }
+        }
         if self.eat_kw("TABLE") {
             self.if_exists_clause(true, guarded)?;
             return self.create_table();
@@ -1368,6 +1778,9 @@ impl<'a> Parser<'a> {
             let function = self.peek_kw("FUNCTION");
             self.advance();
             self.if_exists_clause(true, guarded)?;
+            if self.looks_like_pg_routine() {
+                return self.pg_routine(function, create_pos);
+            }
             return self.routine(function, create_pos);
         }
         if !unique && self.eat_kw("SEQUENCE") {
@@ -1380,7 +1793,7 @@ impl<'a> Parser<'a> {
             self.if_exists_clause(true, guarded)?;
             let name = self.ident()?;
             self.expect_kw("ON")?;
-            let table = self.ident()?;
+            let table = self.table_ident()?;
             self.expect_sym("(")?;
             let mut columns = vec![self.ident()?];
             let mut descending = vec![self.index_direction()];
@@ -1460,7 +1873,149 @@ impl<'a> Parser<'a> {
     }
 
     fn create_table(&mut self) -> Result<Statement> {
-        let name = self.ident()?;
+        let save = self.pos;
+        let name = self.table_ident()?;
+        if self.peek_kw("PARTITION") && self.peek_kw_at(1, "OF") {
+            return self.create_partition(name);
+        }
+        self.pos = save;
+        let st = self.create_table_core()?;
+        let mut parents = Vec::new();
+        let mut partition_by = None;
+        loop {
+            if self.eat_kw("INHERITS") {
+                self.expect_sym("(")?;
+                loop {
+                    parents.push(self.table_ident()?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            } else if self.peek_kw("PARTITION") && self.peek_kw_at(1, "BY") {
+                partition_by = Some(self.partition_by()?);
+            } else if self.eat_kw("WITH") {
+                self.skip_parens()?;
+            } else if self.eat_kw("TABLESPACE") || self.eat_kw("USING") {
+                self.ident()?;
+            } else if self.peek_kw("ON") && self.peek_kw_at(1, "COMMIT") {
+                while !self.at_eof() && !self.peek_sym(";") {
+                    self.advance();
+                }
+            } else {
+                break;
+            }
+        }
+        if parents.is_empty() && partition_by.is_none() {
+            return Ok(st);
+        }
+        Ok(Statement::CreateTableExt(Box::new(TableExt { create: st, parents, partition_by, partition_of: None })))
+    }
+
+    fn skip_parens(&mut self) -> Result<()> {
+        self.expect_sym("(")?;
+        let mut depth = 1;
+        while depth > 0 {
+            match self.advance() {
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth -= 1,
+                Tok::Eof => return Err(self.unexpected("')'")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// `PARTITION BY RANGE | LIST | HASH (columns)`
+    fn partition_by(&mut self) -> Result<(String, Vec<String>)> {
+        self.expect_kw("PARTITION")?;
+        self.expect_kw("BY")?;
+        let method = self.ident()?.to_ascii_lowercase();
+        if !matches!(method.as_str(), "range" | "list" | "hash") {
+            return Err(Error::syntax("PARTITION BY takes RANGE, LIST or HASH"));
+        }
+        self.expect_sym("(")?;
+        let columns = self.ident_list().map_err(|_| Error::syntax("a partition key must be made of column names"))?;
+        self.expect_sym(")")?;
+        Ok((method, columns))
+    }
+
+    fn expr_text(&mut self) -> Result<String> {
+        let start = self.toks[self.pos].pos;
+        self.expr()?;
+        let end = self.toks[self.pos].pos;
+        Ok(self.src[start..end].trim().to_string())
+    }
+
+    fn bound_list(&mut self) -> Result<Vec<String>> {
+        self.expect_sym("(")?;
+        let mut out = Vec::new();
+        loop {
+            if self.peek_kw("MINVALUE") || self.peek_kw("MAXVALUE") {
+                let Tok::Ident(w) = self.advance() else { unreachable!("checked") };
+                out.push(w.to_ascii_uppercase());
+            } else {
+                out.push(self.expr_text()?);
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        Ok(out)
+    }
+
+    /// `CREATE TABLE name PARTITION OF parent FOR VALUES ... | DEFAULT`, after the name.
+    fn create_partition(&mut self, name: String) -> Result<Statement> {
+        self.expect_kw("PARTITION")?;
+        self.expect_kw("OF")?;
+        let parent = self.table_ident()?;
+        if self.peek_sym("(") {
+            self.skip_parens()?;
+        }
+        let bound = if self.eat_kw("DEFAULT") {
+            serde_json::json!({"kind": "default"})
+        } else {
+            self.expect_kw("FOR")?;
+            self.expect_kw("VALUES")?;
+            if self.eat_kw("IN") {
+                serde_json::json!({"kind": "list", "values": self.bound_list()?})
+            } else if self.eat_kw("FROM") {
+                let from = self.bound_list()?;
+                self.expect_kw("TO")?;
+                let to = self.bound_list()?;
+                serde_json::json!({"kind": "range", "from": from, "to": to})
+            } else if self.eat_kw("WITH") {
+                self.expect_sym("(")?;
+                let (mut modulus, mut remainder) = (0i64, 0i64);
+                loop {
+                    let which = self.ident()?.to_ascii_uppercase();
+                    let Tok::Int(n) = self.advance() else {
+                        self.pos -= 1;
+                        return Err(self.unexpected("a number"));
+                    };
+                    match which.as_str() {
+                        "MODULUS" => modulus = n,
+                        "REMAINDER" => remainder = n,
+                        _ => return Err(Error::syntax("hash partitions take MODULUS and REMAINDER")),
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                serde_json::json!({"kind": "hash", "modulus": modulus, "remainder": remainder})
+            } else {
+                return Err(self.unexpected("IN, FROM or WITH"));
+            }
+        };
+        let partition_by = if self.peek_kw("PARTITION") && self.peek_kw_at(1, "BY") { Some(self.partition_by()?) } else { None };
+        let create = Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() };
+        Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), partition_by, partition_of: Some((parent, bound.to_string())) })))
+    }
+
+    fn create_table_core(&mut self) -> Result<Statement> {
+        let name = self.table_ident()?;
         self.expect_sym("(")?;
         let mut columns = Vec::new();
         let mut primary_key = Vec::new();
@@ -1517,7 +2072,7 @@ impl<'a> Parser<'a> {
 
     /// Everything after the `REFERENCES` keyword.
     fn references_clause(&mut self, name: Option<String>, columns: Vec<String>) -> Result<ForeignKeyDef> {
-        let ref_table = self.ident()?;
+        let ref_table = self.table_ident()?;
         let mut ref_columns = Vec::new();
         if self.eat_sym("(") {
             ref_columns = self.ident_list()?;
@@ -1646,8 +2201,11 @@ impl<'a> Parser<'a> {
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.ident()?;
         let type_name = self.type_name()?;
-        let (data_type, autonumber) = DataType::from_sql_name(&type_name)
-            .ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
+        let user = crate::sql::usertypes::lookup(&type_name);
+        let (data_type, autonumber) = match &user {
+            Some(u) => DataType::from_sql_name(&u.base).ok_or_else(|| Error::syntax(format!("unknown data type '{}'", u.base)))?,
+            None => DataType::from_sql_name(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?,
+        };
         let mut expression = None;
         if data_type == DataType::Calculated {
             expression = Some(self.calculated_expression(&name)?);
@@ -1670,6 +2228,19 @@ impl<'a> Parser<'a> {
             expression,
             check: None,
         };
+        if let Some(u) = user {
+            // a domain or an enum: its base type, and what it requires of the column
+            def.not_null = u.not_null;
+            if let Some(d) = &u.default {
+                if let Ok(Expr::Literal(v)) = parse_expression(d) {
+                    def.default = Some(v);
+                }
+            }
+            let checks = u.checks_for(&def.name);
+            if !checks.is_empty() {
+                def.check = Some(checks.iter().map(|c| format!("({c})")).collect::<Vec<_>>().join(" AND "));
+            }
+        }
         loop {
             if self.eat_kw("CONSTRAINT") {
                 // A name for the constraint that follows; only CHECK uses it.
@@ -1792,6 +2363,9 @@ impl<'a> Parser<'a> {
     }
 
     fn alter(&mut self) -> Result<Statement> {
+        if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
+            return self.alter_role();
+        }
         if self.eat_kw("SEQUENCE") {
             let mut guarded = false;
             self.if_exists_clause(false, &mut guarded)?;
@@ -1801,7 +2375,7 @@ impl<'a> Parser<'a> {
             return Ok(if guarded { Statement::Guarded { missing_ok: true, stmt: Box::new(st) } } else { st });
         }
         self.expect_kw("TABLE")?;
-        let table = self.ident()?;
+        let table = self.table_ident()?;
         let action = if self.eat_kw("ADD") {
             if self.peek_kw("CHECK") {
                 AlterAction::AddCheck { name: None, expr: self.check_clause()? }
@@ -1882,12 +2456,25 @@ impl<'a> Parser<'a> {
     }
 
     fn drop_object(&mut self, guarded: &mut bool) -> Result<Statement> {
+        if let Some(st) = self.drop_catalog_object(guarded)? {
+            return Ok(st);
+        }
         if self.eat_kw("TABLE") {
             self.if_exists_clause(false, guarded)?;
-            Ok(Statement::DropTable(self.ident()?))
+            let mut names = vec![self.table_ident()?];
+            while self.eat_sym(",") {
+                names.push(self.table_ident()?);
+            }
+            let cascade = self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            if names.len() == 1 && !cascade {
+                return Ok(Statement::DropTable(names.remove(0)));
+            }
+            let if_exists = std::mem::take(guarded);
+            Ok(Statement::DropTables { names, cascade, if_exists })
         } else if self.eat_kw("VIEW") || self.eat_kw("QUERY") {
             self.if_exists_clause(false, guarded)?;
-            Ok(Statement::DropView(self.ident()?))
+            Ok(Statement::DropView(self.table_ident()?))
         } else if self.eat_kw("REPORT") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropReport(self.ident()?))
@@ -1895,7 +2482,11 @@ impl<'a> Parser<'a> {
             let function = self.peek_kw("FUNCTION");
             self.advance();
             self.if_exists_clause(false, guarded)?;
-            Ok(Statement::DropRoutine { name: self.ident()?, function })
+            let name = self.table_ident()?;
+            self.skip_argument_types()?;
+            self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            Ok(Statement::DropRoutine { name, function })
         } else if self.eat_kw("SEQUENCE") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropSequence(self.ident()?))
@@ -1905,7 +2496,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("INDEX") {
             self.if_exists_clause(false, guarded)?;
             let name = self.ident()?;
-            let table = if self.eat_kw("ON") { Some(self.ident()?) } else { None };
+            let table = if self.eat_kw("ON") { Some(self.table_ident()?) } else { None };
             Ok(Statement::DropIndex { name, table })
         } else {
             Err(self.unexpected("TABLE, VIEW, INDEX, SEQUENCE, FUNCTION, PROCEDURE, REPORT or TRIGGER"))
@@ -2484,6 +3075,7 @@ impl<'a> Parser<'a> {
         if lateral {
             return Err(self.unexpected("a sub-query or function after LATERAL"));
         }
+        let only = self.peek_kw("ONLY") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && self.eat_kw("ONLY");
         let mut name = self.ident()?;
         let mut default_alias = None;
         if name.eq_ignore_ascii_case("information_schema") && self.eat_sym(".") {
@@ -2491,9 +3083,14 @@ impl<'a> Parser<'a> {
             let part = self.ident()?;
             name = format!("information_schema.{}", part.to_ascii_lowercase());
             default_alias = Some(part);
+        } else if self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            self.advance();
+            let part = self.ident()?;
+            default_alias = Some(part.clone());
+            name = if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") { part } else { format!("{name}.{part}") };
         }
         let alias = if self.eat_kw("AS") || self.peek_is_alias() { Some(self.ident()?) } else { default_alias };
-        Ok(TableFactor::Named { name, alias })
+        Ok(TableFactor::Named { name, alias, only })
     }
 
     // ----- expressions ------------------------------------------------------
@@ -3132,6 +3729,7 @@ impl<'a> Parser<'a> {
     /// The type after `::`, with an optional size, applied to `e`.
     fn type_cast(&mut self, e: Expr) -> Result<Expr> {
         let tn = self.type_name()?;
+        let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
         let (ty, _) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         if ty == DataType::Calculated {
             return Err(Error::syntax("cannot cast to CALCULATED"));

@@ -27,7 +27,7 @@ const WAL_MAGIC: &[u8; 4] = b"ACWL";
 /// Current file format. Version 6 adds descending index columns (a flag on the column number, so a file
 /// without any is laid out as version 5 was). Older versions are still read, and are rewritten as the
 /// current one on open; version 1 predates foreign keys.
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 /// The version of the file format this build writes (older versions are still read).
 pub const FILE_FORMAT_VERSION: u32 = VERSION;
 const V1: u32 = 1;
@@ -35,6 +35,7 @@ const V2: u32 = 2;
 const V3: u32 = 3;
 const V4: u32 = 4;
 const V5: u32 = 5;
+const V6: u32 = 6;
 const WAL_HEADER_LEN: u64 = 16;
 const SNAP_HEADER_LEN: usize = 28;
 /// Frames larger than this are treated as corruption rather than allocated.
@@ -67,6 +68,8 @@ pub(crate) struct SnapshotOut<'a> {
     pub fk_timing: Vec<(String, String, bool, bool)>,
     pub routines: Vec<(&'a str, &'a str)>,
     pub reports: Vec<(&'a str, &'a str)>,
+    /// `(kind, name, description)` of the catalog objects without a table of their own.
+    pub catalog: Vec<(String, String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -85,6 +88,7 @@ pub(crate) struct SnapshotIn {
     pub fk_timing: Vec<(String, String, bool, bool)>,
     pub routines: Vec<(String, String)>,
     pub reports: Vec<(String, String)>,
+    pub catalog: Vec<(String, String, String)>,
 }
 
 pub(crate) struct Loaded {
@@ -95,6 +99,7 @@ pub(crate) struct Loaded {
     pub fk_timing: Vec<(String, String, bool, bool)>,
     pub routines: Vec<(String, String)>,
     pub reports: Vec<(String, String)>,
+    pub catalog: Vec<(String, String, String)>,
     pub epoch: u64,
     /// The file was written in an older format.
     pub legacy: bool,
@@ -162,7 +167,7 @@ impl Persistence {
             let bytes = fs::read(&wal_path)?;
             if bytes.len() >= WAL_HEADER_LEN as usize && &bytes[..4] == WAL_MAGIC {
                 let version = u32_at(&bytes, 4);
-                if !matches!(version, V1 | V2 | V3 | V4 | V5 | VERSION) {
+                if !matches!(version, V1 | V2 | V3 | V4 | V5 | V6 | VERSION) {
                     return Err(Error::Corrupt("unsupported WAL version".into()));
                 }
                 let wal_legacy = version == V1;
@@ -236,6 +241,7 @@ impl Persistence {
         fk_timing: Vec<(String, String, bool, bool)>,
         routines: impl Iterator<Item = (&'a str, &'a str)>,
         reports: impl Iterator<Item = (&'a str, &'a str)>,
+        catalog: Vec<(String, String, String)>,
     ) -> Result<()> {
         let out = SnapshotOut {
             tables: tables
@@ -247,6 +253,7 @@ impl Persistence {
             fk_timing,
             routines: routines.collect(),
             reports: reports.collect(),
+            catalog,
         };
         let payload = postcard::to_allocvec(&out).map_err(|e| Error::runtime(format!("encode failed: {e}")))?;
         let epoch = self.epoch + 1;
@@ -346,6 +353,7 @@ fn read_snapshot(path: &Path) -> Result<Loaded> {
         V2 => postcard::from_bytes::<v2::SnapshotIn>(payload).map_err(decode_err)?.into(),
         V3 => postcard::from_bytes::<v3::SnapshotIn>(payload).map_err(decode_err)?.into(),
         V4 => postcard::from_bytes::<v4::SnapshotIn>(payload).map_err(decode_err)?.into(),
+        V5 | V6 => postcard::from_bytes::<v6::SnapshotIn>(payload).map_err(decode_err)?.into(),
         _ => postcard::from_bytes(payload).map_err(decode_err)?,
     };
     let tables = snap
@@ -361,6 +369,7 @@ fn read_snapshot(path: &Path) -> Result<Loaded> {
         fk_timing: snap.fk_timing,
         routines: snap.routines,
         reports: snap.reports,
+        catalog: snap.catalog,
         epoch,
         legacy: version != VERSION,
     })
@@ -415,6 +424,7 @@ mod v1 {
                 fk_timing: Vec::new(),
                 routines: Vec::new(),
                 reports: Vec::new(),
+                catalog: Vec::new(),
             }
         }
     }
@@ -472,7 +482,7 @@ mod v2 {
 
     impl From<SnapshotIn> for New {
         fn from(s: SnapshotIn) -> Self {
-            New { tables: s.tables, views: s.views, triggers: Vec::new(), sequences: Vec::new(), fk_timing: Vec::new(), routines: Vec::new(), reports: Vec::new() }
+            New { tables: s.tables, views: s.views, triggers: Vec::new(), sequences: Vec::new(), fk_timing: Vec::new(), routines: Vec::new(), reports: Vec::new(), catalog: Vec::new() }
         }
     }
 }
@@ -500,6 +510,7 @@ mod v3 {
                 fk_timing: Vec::new(),
                 routines: Vec::new(),
                 reports: Vec::new(),
+                catalog: Vec::new(),
             }
         }
     }
@@ -531,6 +542,41 @@ mod v4 {
                 fk_timing: s.fk_timing,
                 routines: Vec::new(),
                 reports: Vec::new(),
+                catalog: Vec::new(),
+            }
+        }
+    }
+}
+
+/// Versions 5 and 6: the same as now, before the catalog of other objects.
+mod v6 {
+    use serde::Deserialize;
+
+    use super::{SnapshotIn as New, TableIn};
+    use crate::sequence::SequenceDef;
+
+    #[derive(Deserialize)]
+    pub struct SnapshotIn {
+        tables: Vec<TableIn>,
+        views: Vec<(String, String)>,
+        triggers: Vec<(String, String)>,
+        sequences: Vec<SequenceDef>,
+        fk_timing: Vec<(String, String, bool, bool)>,
+        routines: Vec<(String, String)>,
+        reports: Vec<(String, String)>,
+    }
+
+    impl From<SnapshotIn> for New {
+        fn from(s: SnapshotIn) -> Self {
+            New {
+                tables: s.tables,
+                views: s.views,
+                triggers: s.triggers,
+                sequences: s.sequences,
+                fk_timing: s.fk_timing,
+                routines: s.routines,
+                reports: s.reports,
+                catalog: Vec::new(),
             }
         }
     }

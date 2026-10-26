@@ -134,7 +134,7 @@ impl Database {
             if self.table(&def.table).is_some() || self.view_sql(&def.table).is_none() {
                 return Err(Error::catalog(format!("an INSTEAD OF trigger belongs to a query, and '{}' is not one", def.table)));
             }
-            crate::trigger::view_schema(&def.table, &self.resolve_factor(&crate::sql::ast::TableFactor::Named { name: def.table.clone(), alias: None }, 0)?.names)
+            crate::trigger::view_schema(&def.table, &self.resolve_factor(&crate::sql::ast::TableFactor::Named { name: def.table.clone(), alias: None, only: false }, 0)?.names)
         } else {
             self.table_checked(&def.table)?.schema().clone()
         };

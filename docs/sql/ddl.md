@@ -182,10 +182,12 @@ Schema changes take part in [transactions](transactions.md) and can be rolled ba
 ## DROP TABLE
 
 ```sql
-DROP TABLE [IF EXISTS] name;
+DROP TABLE [IF EXISTS] name [, name ...] [CASCADE | RESTRICT];
 ```
 
-Removes the table with its data, indexes and triggers. It is refused while another table has a foreign key that refers to it.
+Removes the table with its data, indexes and triggers. It is refused while another table has a foreign key that refers to it, or while tables [inherit from it](inheritance-and-partitioning.md). `CASCADE` drops those along with it: the tables that inherit from it, the queries (views) that mention it, and the foreign keys that point at it. Several names are dropped in order; with `IF EXISTS` the ones that do not exist are skipped.
+
+`CREATE TABLE` also takes `INHERITS (parent)`, `PARTITION BY ...` and `PARTITION OF parent FOR VALUES ...` ([inheritance-and-partitioning.md](inheritance-and-partitioning.md)), a schema prefix on the name ([schemas-and-types.md](schemas-and-types.md)), and the storage clauses `WITH (...)`, `TABLESPACE t`, `USING method` and `ON COMMIT ...`, which are read and ignored.
 
 ## CREATE OR REPLACE
 

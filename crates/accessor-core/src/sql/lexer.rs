@@ -33,8 +33,8 @@ pub struct Token {
     pub pos: usize,
 }
 
-const SYMBOLS: [&str; 23] = [
-    "->>", "->", "::", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "=", "<", ">", "%",
+const SYMBOLS: [&str; 25] = [
+    "->>", "->", "::", ":=", "..", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "=", "<", ">", "%",
 ];
 
 fn is_ident_start(c: char) -> bool {
@@ -42,6 +42,24 @@ fn is_ident_start(c: char) -> bool {
 }
 fn is_ident_part(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// `$$` or `$tag$` at `i`: the opening delimiter as text.
+fn dollar_tag(chars: &[(usize, char)], i: usize) -> Option<String> {
+    let mut j = i + 1;
+    let mut tag = String::from("$");
+    while let Some(&(_, c)) = chars.get(j) {
+        if c == '$' {
+            tag.push('$');
+            return Some(tag);
+        }
+        if !(c.is_alphanumeric() || c == '_') || (j == i + 1 && c.is_ascii_digit()) {
+            return None;
+        }
+        tag.push(c);
+        j += 1;
+    }
+    None
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>> {
@@ -127,6 +145,35 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             let text = String::from_utf8(bytes)
                 .map_err(|_| Error::syntax("an X'...' literal is read as text, and these bytes are not valid UTF-8 (there is no BLOB type)"))?;
             out.push(Token { tok: Tok::Str(text), pos });
+        } else if c == '$' && at(i + 1).is_some_and(|d| d.is_ascii_digit()) {
+            // `$1`: the first argument of a PostgreSQL-style function body
+            i += 1;
+            let start = i;
+            while at(i).is_some_and(|d| d.is_ascii_digit()) {
+                i += 1;
+            }
+            let end = chars.get(i).map_or(src.len(), |&(p, _)| p);
+            out.push(Token { tok: Tok::Param(format!("${}", &src[chars[start].0..end])), pos });
+        } else if c == '$' && dollar_tag(&chars, i).is_some() {
+            // `$$ text $$` or `$tag$ text $tag$`: a string in which nothing needs escaping
+            let tag = dollar_tag(&chars, i).expect("checked");
+            let open_len = tag.chars().count();
+            let body_start = i + open_len;
+            let mut j = body_start;
+            let tag_chars: Vec<char> = tag.chars().collect();
+            let mut found = None;
+            while j + open_len <= chars.len() {
+                if (0..open_len).all(|k| chars[j + k].1 == tag_chars[k]) {
+                    found = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            let Some(close) = found else { return Err(Error::syntax(format!("unterminated {tag} string"))) };
+            let from = chars[body_start].0.min(src.len());
+            let to = chars[close].0;
+            out.push(Token { tok: Tok::Str(src[if body_start >= chars.len() { src.len() } else { from }..to].to_string()), pos });
+            i = close + open_len;
         } else if is_ident_start(c) {
             let start = i;
             while at(i).is_some_and(is_ident_part) {

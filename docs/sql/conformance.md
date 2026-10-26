@@ -20,7 +20,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | Definition | `CREATE`/`ALTER`/`DROP TABLE` (including `RENAME TO`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`); `CREATE OR REPLACE VIEW`/`TRIGGER`; `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` `RESTRICT`/`CASCADE`/`SET NULL`; identity columns (`GENERATED ... AS IDENTITY`); generated columns (`GENERATED ALWAYS AS (expr)`); `IF [NOT] EXISTS`; `CREATE`/`DROP INDEX`; `CREATE`/`DROP VIEW`; `CREATE`/`DROP TRIGGER`; `CREATE`/`ALTER`/`DROP SEQUENCE` with `NEXT VALUE FOR`; `DEFERRABLE` foreign keys with `SET CONSTRAINTS`; `SET DEFAULT` and `NO ACTION` referential actions |
 | Triggers | `BEFORE`, `AFTER` and `INSTEAD OF`; `FOR EACH ROW` and `FOR EACH STATEMENT`; several events in one trigger; `UPDATE OF column`; `WHEN` |
 | JSON | a `JSON` type; `->`, `->>`; value, query, set, remove, merge-patch, contains, object/array construction, `JSON_ARRAYAGG`, `JSON_EACH` (a simplified form of SQL/JSON, with a limited path language) |
-| Routines | `CREATE FUNCTION` with an expression body, `CREATE PROCEDURE` with `DECLARE`, `SET`, `IF`, `WHILE`, `LEAVE`, `RETURN`; `CALL` |
+| Routines | `CREATE FUNCTION` with an expression body, `CREATE PROCEDURE` with `DECLARE`, `SET`, `IF`, `WHILE`, `LEAVE`, `RETURN`; `CALL`; PostgreSQL-style `LANGUAGE sql` and PL/pgSQL functions |
 | Transactions | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`; transactional DDL |
 | Types | exact and approximate numerics, character strings, booleans, date-times, `TIMESTAMP WITH TIME ZONE`, `INTERVAL`, with the standard's spellings (`VARCHAR`, `NUMERIC`, `DOUBLE PRECISION`, `BOOLEAN`, `TIMESTAMP`, ...) |
 
@@ -55,11 +55,11 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 * `INTERVAL` is a single type (months, days, seconds), not the standard's separate year-month and day-time classes with qualifiers such as `INTERVAL DAY(3) TO SECOND(2)`; `OVERLAPS`; `TIME WITH TIME ZONE` as a type of its own (it is read as `TIMESTAMPTZ`); sub-second precision.
 * `BLOB`, `BINARY`/`VARBINARY` and binary literals.
-* Collection and structured types: `ARRAY`, `MULTISET`, `ROW`, `REF`, user-defined and distinct types (`CREATE TYPE`).
+* Collection and structured types: `ARRAY`, `MULTISET`, `ROW`, `REF`, composite and distinct types. `CREATE DOMAIN` and `CREATE TYPE ... AS ENUM` exist in a reduced form ([schemas-and-types.md](schemas-and-types.md)).
 * The `XML` type and SQL/XML. SQL/JSON is only partly there: there is no `IS JSON` predicate (use `JSON_VALID`), no `JSON_TABLE`, no `JSON_EXISTS`, and the path language has only keys, positions and `$` (no filters, wildcards or recursive descent).
 * Row values in `SELECT` lists and as sub-query results (`(a, b) = (SELECT x, y ...)`); row comparisons and `IN` work. The `UNIQUE` and `MATCH` predicates.
 * `LIKE_REGEX` and `NORMALIZE` (`SIMILAR TO` is there, and the regular-expression functions `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR` and `REGEXP_COUNT` that other systems have).
-* `CURRENT_USER`, `SESSION_USER` and the other user functions (there are no users).
+* `CURRENT_USER`, `SESSION_USER` and the other user functions (a role is chosen with `SET ROLE`, but there is no log-in).
 
 ### Queries
 
@@ -74,8 +74,9 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 ### Definitions and data changes
 
-* Schemas, catalogs and qualified names (`schema.table`); `CREATE SCHEMA`. `INFORMATION_SCHEMA` exists with the views listed in [information-schema.md](information-schema.md), which is the one schema, with no `catalog` or `schema` columns; the standard's views for privileges, domains, collations and so on are absent.
-* `CREATE DOMAIN`, `CREATE ASSERTION`, collations and character sets (`COLLATE`).
+* Catalogs, and schemas as namespaces: `CREATE SCHEMA` and `schema.table` exist, but a schema is a prefix of the table's name with no search path ([schemas-and-types.md](schemas-and-types.md)). `INFORMATION_SCHEMA` exists with the views listed in [information-schema.md](information-schema.md), which is the one schema, with no `catalog` or `schema` columns; the standard's views for privileges, domains, collations and so on are absent.
+* `CREATE ASSERTION`, collations and character sets (`COLLATE`). `CREATE DOMAIN` is there, with its rules copied into the columns that use it.
+* Table inheritance and declarative partitioning (`INHERITS`, `PARTITION BY`) exist as extensions, without partition pruning ([inheritance-and-partitioning.md](inheritance-and-partitioning.md)).
 * `CREATE OR REPLACE TABLE`, `CREATE TABLE ... AS`, `CREATE TABLE ... LIKE`, temporary tables, materialised views, recursive views, views updatable by the standard's fuller rules (joins, aggregates), `WITH LOCAL/CASCADED CHECK OPTION`.
 * `ALTER TABLE` actions `ADD PRIMARY KEY` and `ADD UNIQUE` (use `CREATE UNIQUE INDEX`).
 * Deferrable `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints (only foreign keys can be deferred); `MATCH FULL/PARTIAL`; sequence options `AS type` and `CACHE` are accepted and ignored; `OWNED BY`.
@@ -85,9 +86,9 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 ### Routines, triggers and administration
 
-* The rest of SQL/PSM: functions with statement bodies (a function is one expression; use a procedure for statements), `LOOP`, `REPEAT`, `FOR`, `CASE` statements, `ITERATE`, cursors, condition handlers (`DECLARE ... HANDLER`), `OUT`/`INOUT` parameters, table functions (`RETURNS TABLE`), overloading, `SIGNAL`/`RESIGNAL`, external routines. `RAISE` stops a procedure.
+* The rest of SQL/PSM: `REPEAT`, `ITERATE`, cursors, condition handlers (`DECLARE ... HANDLER`), `INOUT` parameters, table functions (`RETURNS TABLE`), overloading, `SIGNAL`/`RESIGNAL`, external routines. `RAISE` stops a procedure. Functions with statement bodies exist only in the PostgreSQL form (`LANGUAGE plpgsql`), which also has `LOOP`, `FOR i IN a..b` and `CASE` statements ([routines.md](routines.md#postgresql-style-functions-and-procedures)).
 * Triggers: `REFERENCING OLD/NEW TABLE` transition tables, `INSTEAD OF` on tables, statement triggers that fire when no row changed, `SET NEW.col = ...` in `BEFORE` triggers, procedural trigger bodies.
-* Privileges and roles (`GRANT`, `REVOKE`, `CREATE ROLE`), `SET TRANSACTION` isolation levels, `SET SESSION` statements.
+* Privileges are limited to the table rights `SELECT`, `INSERT`, `UPDATE` and `DELETE`, checked for the role chosen with `SET ROLE` ([roles-and-privileges.md](roles-and-privileges.md)); there are no owners, no `WITH GRANT OPTION`, no row-level security; `SET TRANSACTION` isolation levels are read and ignored.
 * The other parts of the standard: client interface (SQL/CLI), foreign data (SQL/MED), Java routines (SQL/JRT), XML (SQL/XML), multidimensional arrays (SQL/MDA), property graphs (SQL/PGQ).
 
 ## Extensions to the standard
@@ -101,23 +102,12 @@ These parts of the standard are not available. Using one gives a syntax error or
 
 ## Differences found by sqllogictest
 
-Running SQLite's [sqllogictest](../extern/testing.md#sqllogictest) over `select1`–`select5`, `evidence/` and `index/` (2.07 million records, 99.89% passing) leaves 2,288 failures. They fall into a few groups.
+Running SQLite's [sqllogictest](../extern/testing.md#sqllogictest) over every file of the suite (622 files, 5.94 million records) passes **all but two records**. Both are the same difference, and it is on purpose:
 
-**ASQL differs on purpose** (these are the same as in the table above, not bugs):
+* **Simple views can be updated.** The suite expects `DELETE FROM view1` and `UPDATE view1 SET ...` to fail, as they do in SQLite, where views are read-only. ASQL accepts them for [simple views](data-changes.md).
 
-* **`/` is exact division.** `7 / 2` is `3.5`, not `3`, and `SELECT DISTINCT 52 / col` returns more rows as a result. Use `\` (integer division) or `Int(...)` for SQLite's behavior. Accounts for the "wrong values" in `index/random` (42 of the 44 examples shown).
-* **Division by zero is an error,** not NULL.
-* **Simple views can be updated** (`DELETE FROM view`, `UPDATE view`); SQLite refuses.
-* **Text compares without regard to case,** and double quotes make text.
+The first runs found more, which were fixed rather than excused: `/` now divides like SQLite does (whole numbers truncate; `DIV` is the exact operator), division by zero gives NULL, `ALL` is accepted inside aggregates, `IN ()` and `X'..'` literals are read, `CREATE TRIGGER` without a timing means `BEFORE`, `DROP INDEX name` and `REINDEX` exist, a column that is not grouped may be selected in a grouped query, and `CAST(x AS INTEGER)` truncates. Those that remain different from the standard are in the table above.
 
-**Missing, and fit to add:**
+## Differences found by the PostgreSQL regression suite
 
-* **`ALL` inside an aggregate:** `AVG(ALL x)`, `MIN(ALL x)`, `SUM(ALL x)`. This is standard SQL and `ALL` is the default; it is one syntax error that accounts for 2,090 of the 2,288 failures.
-* **`IN ()` with an empty list** (not standard SQL, but accepted by SQLite, MySQL and others) and `x'303132'` blob literals.
-* **`DROP INDEX name`** without `ON table` (SQLite's form). Index names are per table here, so the table is needed unless the name is unique.
-* **Triggers without a timing:** `CREATE TRIGGER t UPDATE ON t BEGIN ... END` (SQLite defaults to `BEFORE`). The `DROP TRIGGER` failures in the suite follow from the triggers that could not be created.
-* **`REINDEX`.**
-
-**Bugs:**
-
-* **`NULL IN (subquery)` over an empty subquery.** The standard says FALSE (and `NOT IN` TRUE), because `x = ANY (empty set)` is false whatever `x` is. Accessor returns NULL. `evidence/in1.test` lines 97 and 108.
+See [testing](../extern/testing.md#the-postgresql-regression-suite).

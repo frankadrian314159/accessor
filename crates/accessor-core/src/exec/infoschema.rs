@@ -71,7 +71,7 @@ impl Database {
                     let probe = crate::sql::ast::Select {
                         items: vec![crate::sql::ast::SelectItem::Wildcard],
                         from: Some(crate::sql::ast::From {
-                            first: crate::sql::ast::TableFactor::Named { name: name.clone(), alias: None },
+                            first: crate::sql::ast::TableFactor::Named { name: name.clone(), alias: None, only: false },
                             joins: Vec::new(),
                         }),
                         limit: Some(0),

@@ -61,7 +61,11 @@ fn uses(body: &Expr, name: &str) -> usize {
 /// A function's body with its parameters replaced by the arguments of a call.
 pub(crate) fn inline_call(def: &RoutineDef, args: &[Expr]) -> Result<Expr> {
     let RoutineBody::Expr(body) = &def.body else {
-        return Err(Error::catalog(format!("'{}' is a procedure; run it with CALL", def.name)));
+        return Err(Error::catalog(if def.function {
+            format!("the function '{}' has statements for a body, so it can only be called with arguments that are known before the query runs (not columns), and not by query()", def.name)
+        } else {
+            format!("'{}' is a procedure; run it with CALL", def.name)
+        }));
     };
     if args.len() > def.params.len() {
         return Err(Error::runtime(format!("{} takes {} argument(s), not {}", def.name, def.params.len(), args.len())));
@@ -172,8 +176,56 @@ impl Database {
 
     /// `CALL name (args)` for a stored procedure, or `None` if there is no such procedure.
     pub(crate) fn call_procedure(&mut self, name: &str, args: &[(Option<String>, Expr)]) -> Result<Option<QueryResult>> {
+        self.call_routine(name, args, false)
+    }
+
+    /// Runs the calls of functions with a block for a body (PL/pgSQL, several SQL statements) that sit in `st` with
+    /// arguments that are known now, and puts their results in their place. `None` if there is nothing to run.
+    /// A call with a column for an argument is left, and fails when the statement is bound.
+    pub(crate) fn run_block_functions(&mut self, st: &Statement) -> Result<Option<Statement>> {
+        if !self.routines.values().any(|r| r.function && matches!(r.body, RoutineBody::Block(_))) {
+            return Ok(None);
+        }
+        let mut copy = st.clone();
+        let mut any = false;
+        for _ in 0..8 {
+            let mut changed = false;
+            crate::sql::walk::walk_statement(&mut copy, &mut |e| {
+                let Expr::Function { name, args, .. } = e else { return Ok(()) };
+                let Some(def) = self.function_def(name) else { return Ok(()) };
+                if !matches!(def.body, RoutineBody::Block(_)) {
+                    return Ok(());
+                }
+                let mut given = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    match self.eval_const(a) {
+                        Ok(v) => given.push((None, Expr::Literal(v))),
+                        Err(_) => return Ok(()),
+                    }
+                }
+                let result = self.call_routine(&def.name, &given, true)?.unwrap_or_default();
+                let mut v = match result.columns.first().map(String::as_str) {
+                    Some("return") => result.rows.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                if let (Some(t), false) = (def.returns, v.is_null()) {
+                    v = v.coerce_to(t)?;
+                }
+                *e = Expr::Literal(v);
+                changed = true;
+                Ok(())
+            })?;
+            any |= changed;
+            if !changed {
+                break;
+            }
+        }
+        Ok(any.then_some(copy))
+    }
+
+    pub(crate) fn call_routine(&mut self, name: &str, args: &[(Option<String>, Expr)], allow_function: bool) -> Result<Option<QueryResult>> {
         let Some(def) = self.routines.get(&key(name)).cloned() else { return Ok(None) };
-        if def.function {
+        if def.function && !allow_function {
             return Err(Error::catalog(format!("'{name}' is a function; use it in an expression")));
         }
         let RoutineBody::Block(body) = &def.body else { unreachable!("procedures have blocks") };

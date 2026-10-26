@@ -63,3 +63,15 @@ Results on this build (the `random/` folder has not been run in full; of the two
 | `evidence/` and `index/` (226 files) | 2,058,631 | 2,056,343 (**99.89%**), 0 killed, 0 panics |
 
 On a machine with 12 cores, `evidence/` and `index/` took 18.5 minutes at 8 files at a time; a file of 10,000 records takes 20–50 seconds, so the whole suite one file at a time would be about 4.5 hours. The failures, and what they say about ASQL, are in [the conformance page](../sql/conformance.md#differences-found-by-sqllogictest).
+
+All 622 files of the suite (5.94 million records) were run in 48 minutes at 8 files at a time: 5,939,712 records pass, and the two that do not are the updatable-view difference described there.
+
+## The PostgreSQL regression suite
+
+`crates/accessor-pgreg` runs the SQL files of PostgreSQL's `src/test/regress` (239 tests, 53,459 statements) against the engine and compares, statement by statement, whether the statement is accepted and, where PostgreSQL's expected output has a result table, whether the rows agree. It is a measure of how much PostgreSQL SQL Accessor reads, not a conformance claim: the suite exercises PostgreSQL's own types, catalogs and error messages.
+
+```
+target/release/accessor-pgreg --pg PATH-TO/postgres/src/test/regress --report report.md --stall 20 --memory-mb 2048
+```
+
+Each test runs in its own memory-capped child process; a statement that runs past `--stall` seconds, or kills the process, is skipped and listed. Latest run: agreement on acceptance **37.3%** (up from 25.9% before the PostgreSQL function pack, `::`, `SET`/`SHOW`, types, schemas, roles, inheritance and PL/pgSQL), 24 statements skipped as killers, 1 engine panic, 2,766 of 4,442 compared result tables different (many of them because a table they read was empty after an earlier refusal).

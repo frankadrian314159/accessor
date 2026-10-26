@@ -984,8 +984,8 @@ fn index_directions_survive_a_snapshot_and_the_log() {
 }
 
 #[test]
-fn a_file_with_no_descending_index_is_still_a_version_5_file_inside() {
-    // Version 6 only adds a flag on column numbers: an all-ascending file differs from version 5 in its header.
+fn a_file_with_no_descending_index_or_catalog_is_still_a_version_5_file_inside() {
+    // Versions 6 and 7 only add a flag on column numbers and a list of other catalog objects (empty here): such a file differs from version 5 in its header.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v.adb");
     {
@@ -995,7 +995,7 @@ fn a_file_with_no_descending_index_is_still_a_version_5_file_inside() {
         db.checkpoint().unwrap();
     }
     let mut bytes = std::fs::read(&path).unwrap();
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 6);
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 7);
     bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     let mut wal = std::fs::read(wal_path(&path)).unwrap();
@@ -1006,7 +1006,40 @@ fn a_file_with_no_descending_index_is_still_a_version_5_file_inside() {
     db.execute("CREATE INDEX t_ad ON t (a DESC)").unwrap();
     drop(db);
     let bytes = std::fs::read(&path).unwrap();
-    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 6, "and is written as version 6");
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 7, "and is written as version 7");
     let db = Database::open(&path).unwrap();
     assert_eq!(directions(&db, "t").last().unwrap().1, vec![true]);
+}
+
+#[test]
+fn schemas_types_roles_and_grants_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.adb");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE SCHEMA s; CREATE TABLE s.t (a INT); CREATE TYPE mood AS ENUM ('a', 'b'); CREATE DOMAIN pos AS INT CHECK (VALUE > 0)").unwrap();
+        db.execute("CREATE ROLE r; GRANT SELECT ON s.t TO r; CREATE EXTENSION hstore").unwrap();
+    }
+    {
+        // from the log
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE u (m mood, p pos)").unwrap();
+        assert!(db.execute("INSERT INTO u VALUES ('c', 1)").is_err());
+        assert!(db.execute("INSERT INTO u VALUES ('a', 0)").is_err());
+        db.execute("INSERT INTO u VALUES ('a', 1)").unwrap();
+        db.execute("SET ROLE r").unwrap();
+        db.query("SELECT * FROM s.t").unwrap();
+        assert!(db.execute("INSERT INTO s.t VALUES (1)").is_err());
+        db.execute("SET ROLE NONE").unwrap();
+        db.checkpoint().unwrap();
+    }
+    // from a snapshot
+    let mut db = Database::open(&path).unwrap();
+    assert!(db.execute("CREATE SCHEMA s").is_err());
+    assert!(db.execute("CREATE ROLE r").is_err());
+    assert!(db.execute("CREATE EXTENSION hstore").is_err());
+    assert!(db.execute("CREATE DOMAIN pos AS INT").is_err());
+    db.execute("SET ROLE r").unwrap();
+    db.query("SELECT * FROM s.t").unwrap();
+    db.execute("SET ROLE NONE; DROP SCHEMA s CASCADE").unwrap();
 }
