@@ -67,6 +67,18 @@ UPDATE Docs SET body = JSON_MERGE_PATCH(body, '{"tags": null, "reviewed": true}'
 
 `JSON_EACH(doc)` is a [table function](table-functions.md#json_each): it returns one row for each member of an object or element of an array.
 
+## SQL/JSON path
+
+`jsonb_path_query(target, path [, vars [, silent]])` returns the items a path selects, one row each (in `FROM`, or alone in the select list); `jsonb_path_query_array` gives them as a JSON array and `jsonb_path_query_first` the first (or NULL); `jsonb_path_exists` says whether there is any, and `jsonb_path_match` is the truth of a path that is a predicate. The `_tz` forms are the same. `target @? path` is `jsonb_path_exists` and `target @@ path` is `jsonb_path_match`, both silent. `vars` is a JSON object for `$name`; with `silent` true an error gives no result.
+
+```sql
+SELECT jsonb_path_query('{"a": [1, 2, 3, 4]}', '$.a[*] ? (@ > 2)');          -- 3, then 4
+SELECT jsonb_path_query_array(doc, 'strict $.items[*].price ? (@ < $max)', '{"max": 50}') FROM orders;
+SELECT doc @? '$.tags[*] ? (@ == "new")' FROM articles;
+```
+
+The path language: `lax` (the default; a missing key gives no item, an array is looked into) or `strict` (those are errors); `$`, `@`, `$var`; `.key`, `."odd key"`, `.*`, `.**`; `[n]`, `[a to b]`, `[*]`, `last`, `last - 1`; filters `? (...)` with `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `exists(path)`, `like_regex "re" flag "i"`, `starts with`, `is unknown`; arithmetic `+ - * / %`; and the methods `.type()`, `.size()`, `.abs()`, `.floor()`, `.ceiling()`, `.double()`, `.keyvalue()`. Not available: `.datetime()` and the other date and `decimal` methods, `.**{levels}`, and the SQL/JSON constructors `JSON_EXISTS`, `JSON_QUERY`, `JSON_VALUE` with `PASSING`, and `JSON_TABLE`. Results are `JSON` values (a string keeps its quotes). Comparisons between different types are unknown, not false, as in the standard.
+
 ## Notes
 
 * NULL in, NULL out, as for other functions; `JSON_ARRAY`, `JSON_OBJECT` and `TO_JSON` take NULL as a value (JSON `null`).

@@ -41,6 +41,10 @@ pub enum PgFn {
     Decode,
     Zero,
     Same,
+    JsonPathArray,
+    JsonPathFirst,
+    JsonPathExists,
+    JsonPathMatch,
 }
 
 pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
@@ -68,6 +72,10 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "CONCAT_WS" => (ConcatWs, 2, usize::MAX),
         "REGEXP_INSTR" => (RegexpInstr, 2, 7),
         "WIDTH_BUCKET" => (WidthBucket, 4, 4),
+        "JSONB_PATH_QUERY_ARRAY" | "JSONB_PATH_QUERY_ARRAY_TZ" => (JsonPathArray, 2, 4),
+        "JSONB_PATH_QUERY_FIRST" | "JSONB_PATH_QUERY_FIRST_TZ" => (JsonPathFirst, 2, 4),
+        "JSONB_PATH_EXISTS" | "JSONB_PATH_EXISTS_TZ" => (JsonPathExists, 2, 4),
+        "JSONB_PATH_MATCH" | "JSONB_PATH_MATCH_TZ" => (JsonPathMatch, 2, 4),
         "ENCODE" => (Encode, 2, 2),
         "DECODE" => (Decode, 2, 2),
         "PG_RELATION_SIZE" | "PG_TOTAL_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" => (Zero, 1, 2),
@@ -209,6 +217,21 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 other => return Err(Error::runtime(format!("unrecognized encoding: \"{other}\""))),
             };
             Value::text(&String::from_utf8_lossy(&bytes))
+        }
+        JsonPathArray | JsonPathFirst | JsonPathExists | JsonPathMatch => {
+            let (doc, path, vars, silent) = json_path_args(vals)?;
+            let items = crate::jsonpath::query(&doc, &path, vars.as_ref(), silent)?;
+            match f {
+                JsonPathArray => json_value(&serde_json::Value::Array(items)),
+                JsonPathFirst => items.first().map_or(Value::Null, json_value),
+                JsonPathExists => Value::Bool(!items.is_empty()),
+                _ => match items.as_slice() {
+                    [serde_json::Value::Bool(b)] => Value::Bool(*b),
+                    [serde_json::Value::Null] => Value::Null,
+                    _ if silent => Value::Null,
+                    _ => return Err(Error::runtime("single boolean result is expected")),
+                },
+            }
         }
         Zero => Value::Int(0),
         Same => v(0).clone(),
@@ -902,4 +925,21 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// The target, path, variables and `silent` flag of the `jsonb_path_*` functions.
+pub(crate) fn json_path_args(vals: &[Cow<'_, Value>]) -> Result<(serde_json::Value, crate::jsonpath::Path, Option<serde_json::Value>, bool)> {
+    let doc = crate::json::document(&vals[0])?;
+    let path = crate::jsonpath::parse(&text(&vals[1]))?;
+    let vars = match vals.get(2) {
+        Some(v) if !v.is_null() => Some(crate::json::document(v)?),
+        _ => None,
+    };
+    let silent = matches!(vals.get(3).map(|v| &**v), Some(Value::Bool(true)));
+    Ok((doc, path, vars, silent))
+}
+
+/// A JSON value as a `JSON` value (a string stays quoted).
+pub(crate) fn json_value(j: &serde_json::Value) -> Value {
+    Value::Json(j.to_string().into())
 }

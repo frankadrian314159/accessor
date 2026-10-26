@@ -369,9 +369,10 @@ fn join_distinct(sources: &[Source<'_>], s: usize, pairs: &JoinPairs, offs: &[us
 
 /// The order to join the sources in: start from the smallest filtered source,
 /// then keep adding the one that leaves the smallest intermediate result.
-pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], offs: &[usize]) -> Vec<usize> {
+pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], offs: &[usize], deps: &[SourceMask]) -> Vec<usize> {
     let m = sources.len();
     let start = (0..m)
+        .filter(|&s| deps[s] == 0)
         .min_by(|&a, &b| est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)))
         .expect("at least one source");
     let mut order = vec![start];
@@ -380,7 +381,7 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
     while order.len() < m {
         let mut best: Option<(usize, f64, f64)> = None; // (source, result rows, work)
         for s in 0..m {
-            if placed & (1 << s) != 0 {
+            if placed & (1 << s) != 0 || deps[s] & !placed != 0 {
                 continue;
             }
             let (r, pairs) = reach(&sources[s], s, placed, preds, offs);

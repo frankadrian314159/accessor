@@ -85,6 +85,21 @@ impl Database {
                 }
                 if let Some(t) = self.table(name) {
                     self.require_privilege(name, "select")?;
+                    if let Some(policy) = self.rls_expr(name, "select", false)? {
+                        let _recursion = super::catalog::rls_enter(name)?;
+                        // row-level security: only the rows the policies of the current role let through
+                        let schema = t.schema();
+                        let scope = super::dml::table_scope(schema);
+                        let keep = Binder::new(self, &scope, 0).bind(&policy)?;
+                        let mut rows = Vec::new();
+                        for (_, row) in t.iter() {
+                            if keep.eval_bool(row)? {
+                                rows.push(row.clone());
+                            }
+                        }
+                        let names = schema.columns.iter().map(|c| c.name.clone()).collect();
+                        return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                    }
                     let names = t.schema().columns.iter().map(|c| c.name.clone()).collect();
                     return Ok(Source { intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
                 }
@@ -257,6 +272,7 @@ impl Database {
             "GENERATE_SERIES" => vec!["generate_series".into()],
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
             "JSON_EACH" => vec!["key".into(), "value".into()],
+            "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => vec!["jsonb_path_query".into()],
             other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES, SPLIT_STRING and JSON_EACH are available)"))),
         })
     }
@@ -311,6 +327,18 @@ impl Database {
                 let rows = parts.into_iter().enumerate().map(|(i, p)| vec![Value::text(&p), Value::Int(i as i64 + 1)]).collect();
                 Ok((cols, rows))
             }
+            "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => {
+                if !(2..=4).contains(&args.len()) {
+                    return Err(wrong("JSONB_PATH_QUERY"));
+                }
+                if args.iter().take(2).any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let cows: Vec<std::borrow::Cow<'_, Value>> = args.iter().map(std::borrow::Cow::Borrowed).collect();
+                let (doc, path, vars, silent) = crate::expr::pgfuncs::json_path_args(&cows)?;
+                let items = crate::jsonpath::query(&doc, &path, vars.as_ref(), silent)?;
+                Ok((cols, items.iter().map(|j| vec![crate::expr::pgfuncs::json_value(j)]).collect()))
+            }
             "JSON_EACH" => {
                 if args.len() != 1 {
                     return Err(wrong("JSON_EACH"));
@@ -336,6 +364,7 @@ impl Database {
         left: Vec<Row>,
         right: &Source<'_>,
         lat: &Lateral,
+        outer: &[(String, usize)],
         kind: JoinKind,
         on: Option<&BExpr>,
         right_pre: Option<&BExpr>,
@@ -367,11 +396,11 @@ impl Database {
         let mut indexes: HashMap<Vec<Value>, HashMap<Vec<Value>, Vec<usize>>> = HashMap::new();
         for l in &left {
             super::budget::tick()?;
-            let key: Vec<Value> = lat.outer.iter().map(|(_, c)| l[*c].clone()).collect();
+            let key: Vec<Value> = outer.iter().map(|(_, c)| l[*c].clone()).collect();
             let produced = match cache.get(&key) {
                 Some(r) => Arc::clone(r),
                 None => {
-                    let values: HashMap<String, Value> = lat.outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
+                    let values: HashMap<String, Value> = outer.iter().map(|(n, _)| n.clone()).zip(key.iter().cloned()).collect();
                     runs += 1;
                     let rows = match &lat.kind {
                         LateralKind::Query(q) => {
@@ -943,8 +972,7 @@ impl Database {
         }
 
         // Inner and cross joins may be done in any order; outer joins keep theirs.
-        let has_lateral = sources.iter().any(|s| matches!(s.data, SourceData::Lateral(_)));
-        let reorder = optimize && !has_lateral && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross));
+        let reorder = optimize && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross));
 
         // The conditions, each with the sources it reads.
         let mut preds: Vec<Pred> = Vec::new();
@@ -1010,8 +1038,20 @@ impl Database {
             }
         }
 
-        let est: Vec<f64> = (0..m).map(|s| if optimize { estimate(&sources[s], &pre[s]) } else { 0.0 }).collect();
-        let order: Vec<usize> = if reorder { choose_order(sources, &est, &preds, &offs) } else { (0..m).collect() };
+        let mut est: Vec<f64> = (0..m).map(|s| if optimize { estimate(&sources[s], &pre[s]) } else { 0.0 }).collect();
+        // A LATERAL item can only come after the tables whose columns it reads, and is taken to give about one row
+        // for each of their rows.
+        let owner_of = |c: usize| offs.partition_point(|&o| o <= c).saturating_sub(1);
+        let mut deps: Vec<SourceMask> = vec![0; m];
+        for (s, src) in sources.iter().enumerate() {
+            if let SourceData::Lateral(lat) = &src.data {
+                for (_, c) in &lat.outer {
+                    deps[s] |= bit(owner_of(*c));
+                }
+                est[s] = 1.0;
+            }
+        }
+        let order: Vec<usize> = if reorder { choose_order(sources, &est, &preds, &offs, &deps) } else { (0..m).collect() };
         let reordered = order.iter().enumerate().any(|(i, &s)| i != s);
         self.note(depth, || {
             let names: Vec<&str> = order.iter().map(|&s| sources[s].alias.as_str()).collect();
@@ -1074,7 +1114,11 @@ impl Database {
             let right_pre = if matches!(kind, JoinKind::Right | JoinKind::Full) { None } else { and(pre[s].clone()) };
             let before = rows.len();
             let (joined, how) = match &right.data {
-                SourceData::Lateral(lat) => self.lateral_step(rows, right, lat, kind, on.as_ref(), right_pre.as_ref(), depth)?,
+                SourceData::Lateral(lat) => {
+                    // the outer columns, where they are in the rows built in this join order
+                    let outer: Vec<(String, usize)> = lat.outer.iter().map(|(n, c)| (n.clone(), colmap(*c))).collect();
+                    self.lateral_step(rows, right, lat, &outer, kind, on.as_ref(), right_pre.as_ref(), depth)?
+                }
                 _ => join_step(rows, width, right, kind, on.as_ref(), right_pre.as_ref(), self.optimizer_on)?,
             };
             rows = joined;
@@ -1741,6 +1785,9 @@ enum Strategy {
     /// Hash the right side on `right` key expressions (evaluated against a
     /// right row alone), probe with `left` key expressions.
     Hash { left: Vec<BExpr>, right: Vec<BExpr> },
+    /// `a.x = b.p OR a.y = b.q OR ...`: the right rows found through each of the OR-ed equalities, together.
+    /// Each term is a `(left key, right key)` pair; a row matching several is taken once.
+    Union(Vec<(BExpr, BExpr)>),
     Scan,
 }
 
@@ -1825,7 +1872,50 @@ fn join_step(
     }
     let only_equi = !conj.is_empty() && keyed.len() == conj.len();
 
+    // No plain equality, but an OR of conditions that each contain one: look the rows up for each and join the results
+    let union_terms: Option<Vec<(BExpr, BExpr)>> = if keyed.is_empty() {
+        conj.iter().find_map(|c| {
+            if !matches!(c, BExpr::Bin(BinOp::Or, ..)) {
+                return None;
+            }
+            let mut terms: Vec<&BExpr> = Vec::new();
+            let mut stack = vec![*c];
+            while let Some(x) = stack.pop() {
+                match x {
+                    BExpr::Bin(BinOp::Or, a, b) => {
+                        stack.push(b);
+                        stack.push(a);
+                    }
+                    other => terms.push(other),
+                }
+            }
+            let mut out = Vec::new();
+            for t in terms {
+                let found = split_and(t).into_iter().find_map(|e| {
+                    let BExpr::Bin(BinOp::Eq, a, b) = e else { return None };
+                    let side = |e: &BExpr| match e.col_bounds() {
+                        Some((_, hi)) if hi < lw => Some(false),
+                        Some((lo, hi)) if lo >= lw && hi < lw + rw => Some(true),
+                        _ => None,
+                    };
+                    match (side(a), side(b)) {
+                        (Some(false), Some(true)) => Some(((**a).clone(), b.map_cols(&shift))),
+                        (Some(true), Some(false)) => Some(((**b).clone(), a.map_cols(&shift))),
+                        _ => None,
+                    }
+                })?;
+                out.push(found);
+            }
+            (out.len() >= 2).then_some(out)
+        })
+    } else {
+        None
+    };
+
     let strategy = 'pick: {
+        if let Some(terms) = union_terms {
+            break 'pick Strategy::Union(terms);
+        }
         if keyed.is_empty() {
             break 'pick Strategy::Scan;
         }
@@ -1885,15 +1975,38 @@ fn join_step(
         }
     }
 
+    // One hash table per OR-ed equality
+    let mut union_hashes: Vec<HashMap<Vec<Value>, Vec<usize>>> = Vec::new();
+    if let Strategy::Union(terms) = &strategy {
+        for (_, rk) in terms {
+            let mut h: HashMap<Vec<Value>, Vec<usize>> = HashMap::new();
+            for slot in 0..right.slot_count() {
+                let Some(r) = right.get(slot) else { continue };
+                if let Some(p) = right_pre {
+                    if !p.eval_bool(r)? {
+                        continue;
+                    }
+                }
+                let k = rk.eval(r)?.into_owned();
+                if !k.is_null() {
+                    h.entry(vec![k]).or_default().push(slot);
+                }
+            }
+            union_hashes.push(h);
+        }
+    }
+
     // The ON predicate can be skipped only when the strategy already enforces
     // every one of its (purely equi-join) conjuncts.
     let covers_all = match &strategy {
+        Strategy::Union(_) => false,
         Strategy::Hash { .. } => true,
         Strategy::Index { left_cols, .. } => left_cols.len() == keyed.len(),
         Strategy::Scan => false,
     };
     let residual = if only_equi && covers_all { None } else { on };
     let how = match &strategy {
+        Strategy::Union(terms) => format!("hash lookups for each of {} OR-ed equalities, results joined", terms.len()),
         Strategy::Scan => "nested loop".to_string(),
         Strategy::Hash { .. } if swap => format!("hash join, built on the {} left rows", left.len()),
         Strategy::Hash { .. } => format!("hash join, built on the right table ({} slots)", right.slot_count()),
@@ -1954,6 +2067,18 @@ fn join_step(
         cands.clear();
         match &strategy {
             Strategy::Scan => cands.extend(0..right.slot_count()),
+            Strategy::Union(terms) => {
+                for ((lk, _), h) in terms.iter().zip(&union_hashes) {
+                    let k = lk.eval(l)?.into_owned();
+                    if !k.is_null() {
+                        if let Some(slots) = h.get(&vec![k]) {
+                            cands.extend_from_slice(slots);
+                        }
+                    }
+                }
+                cands.sort_unstable();
+                cands.dedup();
+            }
             Strategy::Hash { left: left_keys, .. } => {
                 let key = left_keys
                     .iter()

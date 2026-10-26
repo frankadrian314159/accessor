@@ -541,7 +541,8 @@ impl Database {
                 Ok(None)
             }
             Op::CreateTrigger { name, sql } => {
-                let def = parse_trigger(sql)?;
+                let mut def = parse_trigger(sql)?;
+                crate::trigger::rule_target(self, &mut def);
                 if def.timing == crate::sql::ast::TriggerTiming::InsteadOf {
                     if !self.views.contains_key(&key(&def.table)) {
                         return Err(Error::catalog(format!("the query '{}' does not exist", def.table)));

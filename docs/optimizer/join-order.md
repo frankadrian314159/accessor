@@ -42,7 +42,7 @@ Each step applies the join conditions that have just become available ([pushdown
 
 ## LATERAL and table functions
 
-An item that reads earlier tables (`LATERAL (SELECT ...)`, or a table function whose arguments use them) depends on those tables, so a query containing one keeps the order written and is not reordered. Each such item is run for each row of the tables before it, but only once for every **distinct** set of the outer values it reads, and the answers are remembered: for 10 000 orders belonging to 200 customers, a lateral item that uses only the customer runs 200 times. A table function with constant arguments (`GENERATE_SERIES(1, 100)`) is computed once and is an ordinary, reorderable source. Conditions in the `WHERE` that read only the lateral item's columns are applied to its rows as they come back. `EXPLAIN` says `LATERAL, run N time(s) for M left row(s)`.
+An item that reads earlier tables (`LATERAL (SELECT ...)`, or a table function whose arguments use them) depends on those tables: it is joined **after** all of them, and is taken to give about one row for each of their rows, so it is placed as soon as they are in. For `FROM a, b JOIN LATERAL (VALUES (a.x)) s(y) ON b.k = s.y` the order is `a`, the lateral item, then `b`, which is looked up through its index, instead of the 100-million-row product of `a` and `b` first. Queries with outer joins keep the order written. Each such item is run for each row of the tables before it, but only once for every **distinct** set of the outer values it reads, and the answers are remembered: for 10 000 orders belonging to 200 customers, a lateral item that uses only the customer runs 200 times. A table function with constant arguments (`GENERATE_SERIES(1, 100)`) is computed once and is an ordinary, reorderable source. Conditions in the `WHERE` that read only the lateral item's columns are applied to its rows as they come back. `EXPLAIN` says `LATERAL, run N time(s) for M left row(s)`.
 
 ## Join methods
 
@@ -59,6 +59,10 @@ Primary keys, unique constraints, foreign keys (which create an index on the ref
 If there is an equality between expressions of the two sides but no usable index, one side is loaded into a hash table keyed on the join columns and the other probes it. Normally the right table is hashed; when the join is an inner join and the left side has fewer than half as many rows as the right table has slots, the **left** is hashed instead and the right table is streamed past it. Rows whose key contains NULL never match, as in SQL.
 
 Any equality works, not only column = column: `ON LOWER(A.name) = LOWER(B.name)` is hashed.
+
+### OR-ed equalities
+
+When the condition has no plain equality but an `OR` whose every branch contains one (`t2.thousand = t1.a OR t2.thousand = t1.b OR t2.other = t1.c`), a hash table is built for each branch's right-hand side. For each left row the right rows found through every branch are taken together (a row that several branches find is taken once) and the whole condition is checked on them. `EXPLAIN` says `hash lookups for each of N OR-ed equalities`.
 
 ### Nested loop
 

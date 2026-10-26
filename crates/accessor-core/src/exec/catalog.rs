@@ -351,3 +351,161 @@ impl Database {
         out
     }
 }
+
+// ---- row-level security ----
+
+thread_local! {
+    /// Tables whose policies are being evaluated, to stop policies that read each other.
+    static RLS_ACTIVE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) struct RlsGuard;
+
+impl Drop for RlsGuard {
+    fn drop(&mut self) {
+        RLS_ACTIVE.with(|a| {
+            a.borrow_mut().pop();
+        });
+    }
+}
+
+/// Marks `table` as having its policies evaluated; fails if it already is (the policies lead back to themselves).
+pub(crate) fn rls_enter(table: &str) -> Result<RlsGuard> {
+    let k = key(table);
+    if RLS_ACTIVE.with(|a| a.borrow().contains(&k)) {
+        return Err(Error::runtime(format!("infinite recursion detected in policy for relation \"{table}\"")));
+    }
+    RLS_ACTIVE.with(|a| a.borrow_mut().push(k));
+    Ok(RlsGuard)
+}
+
+#[derive(serde::Deserialize)]
+struct Policy {
+    #[serde(default = "yes")]
+    permissive: bool,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    roles: Vec<String>,
+    using: Option<String>,
+    check: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// `CURRENT_USER`, `SESSION_USER` and `USER` as the quoted name of the role.
+fn with_role(text: &str, role: &str) -> String {
+    let quoted = format!("'{}'", role.replace('\'', "''"));
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            in_quote = !in_quote;
+        }
+        if !in_quote && (c.is_alphabetic() || c == '_') {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if matches!(word.to_ascii_lowercase().as_str(), "current_user" | "session_user") {
+                out.push_str(&quoted);
+            } else {
+                out.push_str(&word);
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+impl Database {
+    /// `ALTER TABLE t ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY`.
+    pub(crate) fn exec_set_rls(&mut self, table: &str, enable: Option<bool>, force: Option<bool>) -> Result<QueryResult> {
+        let real = self.table_checked(table)?.name().to_string();
+        let (mut on, mut forced) = self.rls_state(&real);
+        if let Some(e) = enable {
+            on = e;
+        }
+        if let Some(f) = force {
+            forced = f;
+        }
+        let value = format!("{}{}", u8::from(on), u8::from(forced));
+        self.catalog_set("rls", &real, Some(value))?;
+        Ok(QueryResult::default())
+    }
+
+    fn rls_state(&self, table: &str) -> (bool, bool) {
+        match self.catalog.get(&("rls".to_string(), key(table))) {
+            Some(v) => (v.starts_with('1'), v.ends_with('1')),
+            None => (false, false),
+        }
+    }
+
+    /// The condition the policies of the current role put on `command` ("select", "insert", "update", "delete") of
+    /// `table`: `None` when nothing is restricted (security is off for the table, or no role is chosen, or the role is
+    /// a superuser); a condition that is false when no policy lets the role in. With `check`, the `WITH CHECK` side.
+    pub(crate) fn rls_expr(&self, table: &str, command: &str, check: bool) -> Result<Option<crate::sql::ast::Expr>> {
+        use crate::sql::ast::{BinOp, Expr};
+        use crate::value::Value;
+        if self.catalog.is_empty() || !self.rls_state(table).0 {
+            return Ok(None);
+        }
+        let Some(role) = self.settings.get("role").filter(|r| !r.is_empty()) else { return Ok(None) };
+        if self.is_superuser(role) {
+            return Ok(None);
+        }
+        let roles = self.effective_roles(role);
+        let prefix = format!("{}|", key(table));
+        let mut permissive: Vec<Expr> = Vec::new();
+        let mut restrictive: Vec<Expr> = Vec::new();
+        for ((k, n), v) in &self.catalog {
+            if k != "policy" || !n.starts_with(&prefix) {
+                continue;
+            }
+            let p: Policy = serde_json::from_str(v).map_err(|e| Error::runtime(format!("a policy is damaged: {e}")))?;
+            if !(p.command == "all" || p.command == command) {
+                continue;
+            }
+            if !p.roles.is_empty() && !p.roles.iter().any(|r| roles.contains(r) || r == "public") {
+                continue;
+            }
+            let text = if check { p.check.clone().or(p.using.clone()) } else { p.using.clone() };
+            let expr = match text {
+                Some(t) => crate::sql::parse_expression(&with_role(&t, role))?,
+                None => Expr::Literal(Value::Bool(true)),
+            };
+            if p.permissive { permissive.push(expr) } else { restrictive.push(expr) }
+        }
+        let or = |v: Vec<Expr>| v.into_iter().reduce(|a, b| Expr::Binary { op: BinOp::Or, left: Box::new(a), right: Box::new(b) });
+        let mut all = vec![or(permissive).unwrap_or(Expr::Literal(Value::Bool(false)))];
+        all.extend(restrictive);
+        Ok(all.into_iter().reduce(|a, b| Expr::Binary { op: BinOp::And, left: Box::new(a), right: Box::new(b) }))
+    }
+
+    /// Fails when a row about to be written does not satisfy the `WITH CHECK` of the policies.
+    pub(crate) fn rls_check(&self, table: &str, command: &str, ops: &[crate::storage::Op]) -> Result<()> {
+        let Some(expr) = self.rls_expr(table, command, true)? else { return Ok(()) };
+        let _recursion = rls_enter(table)?;
+        let t = self.table_checked(table)?;
+        let scope = super::dml::table_scope(t.schema());
+        let bound = super::bind::Binder::new(self, &scope, 0).bind(&expr)?;
+        for op in ops {
+            let row = match op {
+                crate::storage::Op::Insert { row, .. } | crate::storage::Op::Update { row, .. } => row,
+                _ => continue,
+            };
+            if !bound.eval_bool(row)? {
+                return Err(Error::constraint(format!("new row violates row-level security policy for table \"{}\"", t.name())));
+            }
+        }
+        Ok(())
+    }
+}

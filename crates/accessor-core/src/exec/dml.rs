@@ -53,7 +53,16 @@ pub(crate) fn build_row(schema: &TableSchema, positions: &[usize], vals: Vec<Val
     Ok(row)
 }
 
-fn table_scope(schema: &TableSchema) -> Scope {
+/// `a AND b`, where either may be missing.
+fn combine_filters(a: Option<&Expr>, b: Option<Expr>) -> Option<Expr> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Expr::Binary { op: crate::sql::ast::BinOp::And, left: Box::new(a.clone()), right: Box::new(b) }),
+        (Some(a), None) => Some(a.clone()),
+        (None, b) => b,
+    }
+}
+
+pub(crate) fn table_scope(schema: &TableSchema) -> Scope {
     Scope {
         cols: schema
             .columns
@@ -265,6 +274,7 @@ impl Database {
             }
             ops
         };
+        self.rls_check(table, "insert", &ops)?;
         Ok(ops)
     }
 
@@ -275,6 +285,8 @@ impl Database {
         filter: Option<&Expr>,
     ) -> Result<Vec<Op>> {
         self.require_privilege(table, "update")?;
+        let rls = combine_filters(filter, self.rls_expr(table, "update", false)?);
+        let filter = rls.as_ref();
         let t = self.table_checked(table)?;
         let schema = t.schema();
         let scope = table_scope(schema);
@@ -290,7 +302,9 @@ impl Database {
         let f = filter.map(|f| binder.bind(f)).transpose()?;
         let corr = std::mem::take(&mut binder.corr);
         let hits = self.matching_with_corr(t, f, &corr, schema.columns.len())?;
-        update_ops(t, &sets, hits)
+        let ops = update_ops(t, &sets, hits)?;
+        self.rls_check(table, "update", &ops)?;
+        Ok(ops)
     }
 
     /// The update of exactly the records `ids` (used by MERGE).
@@ -312,6 +326,8 @@ impl Database {
 
     pub(crate) fn plan_delete(&self, table: &str, filter: Option<&Expr>) -> Result<Vec<Op>> {
         self.require_privilege(table, "delete")?;
+        let rls = combine_filters(filter, self.rls_expr(table, "delete", false)?);
+        let filter = rls.as_ref();
         let t = self.table_checked(table)?;
         let schema = t.schema();
         let scope = table_scope(schema);

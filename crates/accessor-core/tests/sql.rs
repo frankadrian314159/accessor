@@ -4825,3 +4825,131 @@ fn where_on_an_outer_joined_table_filters_it_first_and_keeps_null_rows() {
     assert!(t.elapsed().as_secs() < 20);
     assert!(r.rows[0][0].to_string().parse::<i64>().unwrap() > 0);
 }
+
+#[test]
+fn or_of_equalities_is_joined_through_lookups() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 6000);
+    big(&mut db, "b", 6000);
+    let t = std::time::Instant::now();
+    let r = db.query("SELECT count(*) FROM a x, b y WHERE y.u1 = x.u2 OR y.u1 = x.h OR y.u2 = x.u1").unwrap();
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    // the same by a plain nested loop on a small slice
+    let slow = db.query("SELECT count(*) FROM (SELECT * FROM a WHERE u1 < 50) x, b y WHERE y.u1 = x.u2 OR y.u1 = x.h OR y.u2 = x.u1 + 0 * y.h").unwrap();
+    let fast = db.query("SELECT count(*) FROM (SELECT * FROM a WHERE u1 < 50) x, b y WHERE y.u1 = x.u2 OR y.u1 = x.h OR y.u2 = x.u1").unwrap();
+    assert_eq!(slow.rows, fast.rows);
+    assert!(r.rows[0][0].to_string().parse::<i64>().unwrap() > 6000);
+}
+
+#[test]
+fn a_lateral_item_is_joined_as_soon_as_its_tables_are_there() {
+    let mut db = Database::in_memory();
+    big(&mut db, "a", 3000);
+    big(&mut db, "b", 3000);
+    db.execute("CREATE INDEX b_u2 ON b (u2)").unwrap();
+    let t = std::time::Instant::now();
+    let r = db.query("SELECT count(*) FROM a, b JOIN LATERAL (VALUES (a.u1)) ss(x) ON b.u2 = ss.x").unwrap();
+    assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+    assert_eq!(r.rows[0][0].to_string(), "3000");
+    let r = db.query("SELECT count(*) FROM a, b JOIN LATERAL (VALUES (a.u1), (-1)) ss(x) ON b.u2 = ss.x").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "3000");
+}
+
+#[test]
+fn json_path_queries() {
+    let mut db = Database::in_memory();
+    let all = |db: &mut Database, sql: &str| -> Vec<String> { db.execute(sql).unwrap().rows.iter().map(|r| r[0].to_string()).collect() };
+    let d = "'{\"a\": [1, 2, 3, 4], \"b\": {\"c\": \"x\"}, \"n\": null}'::jsonb";
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, '$.a[*] ? (@ > 2)')")), vec!["3", "4"]);
+    assert_eq!(all(&mut db, &format!("SELECT * FROM jsonb_path_query({d}, '$.b.c')")), vec!["\"x\""]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query_array({d}, '$.a[*] ? (@ >= 2 && @ < 4)')")), vec!["[2,3]"]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query_first({d}, '$.a[last]')")), vec!["4"]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_exists({d}, '$.b.zz')")), vec!["No"]);
+    assert_eq!(all(&mut db, &format!("SELECT {d} @? '$.a[1 to 2]'")), vec!["Yes"]);
+    assert_eq!(all(&mut db, &format!("SELECT {d} @@ '$.a[0] == 1'")), vec!["Yes"]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, '$.a.size()')")), vec!["4"]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, '$.a[*] ? (@ > $x)', '{{\"x\": 3}}')")), vec!["4"]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, '$.a[0] + 10')")), vec!["11"]);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, '$.b.c ? (@ like_regex \"^x\")')")), vec!["\"x\""]);
+    assert!(db.execute(&format!("SELECT jsonb_path_query({d}, 'strict $.nope')")).is_err());
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, 'strict $.nope', '{{}}', true)")).len(), 0);
+    assert_eq!(all(&mut db, &format!("SELECT jsonb_path_query({d}, 'lax $.nope')")).len(), 0);
+    assert!(db.execute("SELECT jsonb_path_query('{}', '$.a[')").is_err());
+    assert_eq!(all(&mut db, "SELECT generate_series(1, 3)"), vec!["1", "2", "3"]);
+}
+
+#[test]
+fn rules_are_row_triggers() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE base (id int, v text); CREATE TABLE log (id int, what text); CREATE TABLE archive (id int, v text)").unwrap();
+    db.execute("CREATE RULE r_log AS ON INSERT TO base DO ALSO INSERT INTO log VALUES (new.id, 'ins')").unwrap();
+    db.execute("CREATE RULE r_arch AS ON DELETE TO base DO (INSERT INTO archive VALUES (old.id, old.v); INSERT INTO log VALUES (old.id, 'del'))").unwrap();
+    db.execute("INSERT INTO base VALUES (1, 'a'), (2, 'b')").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM log").unwrap().rows[0][0].to_string(), "2");
+    db.execute("DELETE FROM base WHERE id = 1").unwrap();
+    assert_eq!(db.query("SELECT v FROM archive").unwrap().rows[0][0].to_string(), "a");
+    // DO INSTEAD NOTHING with a condition
+    db.execute("CREATE RULE no_neg AS ON INSERT TO base WHERE new.id < 0 DO INSTEAD NOTHING").unwrap();
+    db.execute("INSERT INTO base VALUES (-5, 'x'), (5, 'y')").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM base").unwrap().rows[0][0].to_string(), "2");
+    // DO INSTEAD a different command
+    db.execute("CREATE TABLE t2 (id int); CREATE RULE redirect AS ON INSERT TO t2 DO INSTEAD INSERT INTO log VALUES (new.id, 'redirected')").unwrap();
+    db.execute("INSERT INTO t2 VALUES (9)").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM t2").unwrap().rows[0][0].to_string(), "0");
+    assert_eq!(db.query("SELECT count(*) FROM log WHERE what = 'redirected'").unwrap().rows[0][0].to_string(), "1");
+    // on a view
+    db.execute("CREATE VIEW vb AS SELECT id, v FROM base; CREATE RULE vb_ins AS ON INSERT TO vb DO INSTEAD INSERT INTO base VALUES (new.id + 100, new.v)").unwrap();
+    db.execute("INSERT INTO vb VALUES (1, 'z')").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM base WHERE id = 101").unwrap().rows[0][0].to_string(), "1");
+    db.execute("DROP RULE r_log ON base").unwrap();
+    db.execute("INSERT INTO base VALUES (7, 'q')").unwrap();
+    assert_eq!(db.query("SELECT count(*) FROM log WHERE id = 7").unwrap().rows[0][0].to_string(), "0");
+}
+
+#[test]
+fn row_level_security() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE docs (id int, owner text, body text);
+         INSERT INTO docs VALUES (1, 'alice', 'a1'), (2, 'bob', 'b1'), (3, 'alice', 'a2');
+         CREATE ROLE alice; CREATE ROLE bob; CREATE ROLE boss SUPERUSER;
+         GRANT ALL ON docs TO alice, bob;
+         ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY mine ON docs FOR ALL TO PUBLIC USING (owner = current_user)",
+    )
+    .unwrap();
+    let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    // nobody chosen: no restriction
+    assert_eq!(n(&mut db, "SELECT count(*) FROM docs"), "3");
+    db.execute("SET ROLE alice").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM docs"), "2");
+    assert!(db.execute("INSERT INTO docs VALUES (4, 'bob', 'sneaky')").is_err());
+    db.execute("INSERT INTO docs VALUES (4, 'alice', 'fine')").unwrap();
+    assert_eq!(db.execute("UPDATE docs SET body = 'x' WHERE id = 2").unwrap().affected, 0);
+    assert!(db.execute("UPDATE docs SET owner = 'bob' WHERE id = 1").is_err());
+    assert_eq!(db.execute("DELETE FROM docs").unwrap().affected, 3);
+    db.execute("SET ROLE boss").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM docs"), "1");
+    db.execute("SET ROLE NONE; CREATE ROLE carol; GRANT SELECT ON docs TO carol; CREATE POLICY open ON docs FOR SELECT TO carol USING (true); CREATE POLICY nobob ON docs AS RESTRICTIVE FOR SELECT USING (owner <> 'bob'); SET ROLE carol").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM docs"), "0");
+    db.execute("SET ROLE NONE; ALTER TABLE docs DISABLE ROW LEVEL SECURITY; SET ROLE carol").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM docs"), "1");
+    db.execute("SET ROLE NONE; DROP POLICY mine ON docs").unwrap();
+    assert!(db.execute("DROP POLICY mine ON docs").is_err());
+}
+
+#[test]
+fn policies_that_read_each_other_are_an_error_not_a_loop() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE s1 (a int); CREATE TABLE s2 (b int); INSERT INTO s1 VALUES (1); INSERT INTO s2 VALUES (1);
+         CREATE ROLE u; GRANT ALL ON s1, s2 TO u;
+         ALTER TABLE s1 ENABLE ROW LEVEL SECURITY; ALTER TABLE s2 ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY p1 ON s1 USING (a IN (SELECT b FROM s2));
+         CREATE POLICY p2 ON s2 USING (b IN (SELECT a FROM s1));
+         SET ROLE u",
+    )
+    .unwrap();
+    let e = db.execute("SELECT * FROM s1").unwrap_err().to_string();
+    assert!(e.contains("infinite recursion"), "{e}");
+}

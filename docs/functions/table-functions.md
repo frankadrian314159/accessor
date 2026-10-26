@@ -49,6 +49,8 @@ SELECT D.ID, t.value FROM Docs D, LATERAL JSON_EACH(D.Body -> 'tags') AS t;    -
 
 `SPLIT_STRING(text, separator)` returns the pieces of `text` between occurrences of `separator`, with columns `value` (text) and `ordinal` (1, 2, 3, ...). An empty separator splits into characters; a NULL argument gives no rows.
 
+A table function alone in a select list (`SELECT generate_series(1, 3)`, `SELECT jsonb_path_query(doc, path)`) is the same as selecting from it; with other items in the list, or a `FROM`, it is not available there (put it in `FROM`).
+
 ```sql
 SELECT value, ordinal FROM SPLIT_STRING('red,green,blue', ',');
 

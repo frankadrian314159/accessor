@@ -213,6 +213,7 @@ impl Database {
             Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
             Statement::Grant(g) => self.exec_grant(g),
             Statement::Ignored(_) => Ok(QueryResult::default()),
+            Statement::SetRls { table, enable, force } => self.exec_set_rls(table, *enable, *force),
             Statement::Batch(list) => self.atomically(|db| {
                 let mut last = QueryResult::default();
                 for s in list {

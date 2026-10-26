@@ -126,6 +126,9 @@ impl Database {
     // ----- triggers ---------------------------------------------------------------
 
     pub(crate) fn exec_create_trigger(&mut self, def: &TriggerDef) -> Result<QueryResult> {
+        let mut owned = def.clone();
+        crate::trigger::rule_target(self, &mut owned);
+        let def = &owned;
         if self.triggers.contains_key(&key(&def.name)) {
             return Err(Error::catalog(format!("the trigger '{}' already exists", def.name)));
         }

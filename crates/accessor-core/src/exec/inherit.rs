@@ -374,6 +374,13 @@ impl Database {
         if self.is_partitioned(table) {
             ops.push(Op::Catalog { kind: "part".into(), name: table.to_string(), value: None });
         }
+        // policies and the security switch of the table go with it
+        let prefix = format!("{t}|");
+        for (k, n) in self.catalog.keys() {
+            if (k == "policy" && n.starts_with(&prefix)) || (k == "rls" && *n == t) {
+                ops.push(Op::Catalog { kind: k.clone(), name: n.clone(), value: None });
+            }
+        }
         if !ops.is_empty() {
             self.apply_all(ops)?;
         }

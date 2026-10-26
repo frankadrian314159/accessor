@@ -97,6 +97,16 @@ DEALLOCATE [PREPARE] { name | ALL };
 
 `PREPARE` remembers one statement, which may use `@parameters`, for the rest of the session. `EXEC name (v1, v2)` (or `EXECUTE`, or `CALL`) runs it, the values filling the parameters in the order of their first appearance in the statement; `EXEC name (@city = 'Rome')` names them. It is the same `EXEC` as for saved queries: a saved query of that name is used if there is one, and a prepared statement cannot take the name of a saved query. Prepared statements are not stored in the file. From Rust, `Database::prepare`, `execute_prepared` and `query_prepared` do the same without SQL text; see [the optimizer notes on prepared statements](../optimizer/prepared.md).
 
+## Rules
+
+```sql
+CREATE [OR REPLACE] RULE name AS ON INSERT | UPDATE | DELETE TO table [WHERE condition]
+    DO [ALSO | INSTEAD] ( NOTHING | command | (command; command; ...) );
+DROP RULE [IF EXISTS] name ON table;
+```
+
+PostgreSQL's rule system is kept as a row trigger. `DO ALSO` is an `AFTER` trigger that runs the commands for each row, with `NEW` and `OLD` as in a trigger body; `DO INSTEAD` runs them and then **drops the operation** on the table (`DO INSTEAD NOTHING` is a rule that refuses to change anything); on a saved query (view) it is an `INSTEAD OF` trigger. `WHERE` is the trigger's `WHEN`. The commands are `INSERT`, `UPDATE`, `DELETE` or `SELECT` (a `NOTIFY` is left out). Rules share the namespace of triggers, so a rule and a trigger cannot have one name. Not available: rules `ON SELECT` (use `CREATE VIEW`), and `ALTER RULE`.
+
 ## Triggers
 
 A trigger runs statements automatically when rows are inserted, updated or deleted.

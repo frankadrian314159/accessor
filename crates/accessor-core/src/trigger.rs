@@ -37,6 +37,14 @@ pub(crate) enum Fire {
     Skip,
 }
 
+/// A rule `DO INSTEAD` on a query is an INSTEAD OF trigger.
+pub(crate) fn rule_target(db: &Database, def: &mut TriggerDef) {
+    if def.function.as_deref() == Some(crate::sql::ast::INSTEAD_MARK) && db.table(&def.table).is_none() && db.view_sql(&def.table).is_some() {
+        def.timing = TriggerTiming::InsteadOf;
+        def.function = None;
+    }
+}
+
 pub(crate) struct Fired {
     table: String,
     event: TriggerEvent,
@@ -156,7 +164,8 @@ impl Database {
                 return Ok(Fire::Go);
             }
         }
-        if let Some(function) = &trigger.function {
+        let instead = trigger.function.as_deref() == Some(crate::sql::ast::INSTEAD_MARK);
+        if let (Some(function), false) = (&trigger.function, instead) {
             return self.run_trigger_function(trigger, function, ctx, timing);
         }
         for stmt in &trigger.body {
@@ -182,7 +191,7 @@ impl Database {
                 self.apply_tracked(op, ops, undo, queue, refs, depth + 1)?;
             }
         }
-        Ok(Fire::Go)
+        Ok(if instead { Fire::Skip } else { Fire::Go })
     }
 
     /// Runs a PL/pgSQL trigger function for the rows in `ctx`. `NEW.col`/`OLD.col` are its variables; whatever it

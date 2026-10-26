@@ -412,6 +412,9 @@ pub enum TriggerEvent {
     Delete,
 }
 
+/// The `function` of a trigger made from `CREATE RULE ... DO INSTEAD`: run the body, then drop the operation.
+pub const INSTEAD_MARK: &str = "\u{1}instead";
+
 /// A trigger, for each row or each statement. `sql` is the original `CREATE TRIGGER` text,
 /// which is what gets stored.
 #[derive(Clone, Debug, PartialEq)]
@@ -502,6 +505,8 @@ pub enum Statement {
     Grant(Box<GrantDef>),
     /// `SET ROLE name` / `SET SESSION AUTHORIZATION name`; `None` is `NONE` / `DEFAULT`.
     SetRole(Option<String>),
+    /// `ALTER TABLE t ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY`.
+    SetRls { table: String, enable: Option<bool>, force: Option<bool> },
     /// Several statements run as one (`ALTER TABLE t ADD a, DROP b`).
     Batch(Vec<Statement>),
     /// `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...` (a bound), or `DETACH PARTITION child` (`None`).

@@ -36,6 +36,7 @@ pub mod sequence;
 pub mod report;
 pub mod shared;
 mod json;
+mod jsonpath;
 mod trigger;
 pub mod schema;
 pub mod sql;

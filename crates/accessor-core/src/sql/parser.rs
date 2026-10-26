@@ -1238,6 +1238,111 @@ impl<'a> Parser<'a> {
         Err(self.unexpected("a statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, EXEC, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE)"))
     }
 
+    /// `CREATE RULE name AS ON event TO table [WHERE cond] DO [ALSO | INSTEAD] (NOTHING | command | (command; ...))`.
+    /// A rule is a row trigger here: `ALSO` is an AFTER trigger running the commands (with `NEW` and `OLD`), `INSTEAD`
+    /// a BEFORE trigger that runs them and drops the operation (on a query, an INSTEAD OF trigger).
+    fn rule(&mut self, start: usize) -> Result<Statement> {
+        let name = self.ident()?;
+        self.expect_kw("AS")?;
+        self.expect_kw("ON")?;
+        let event = if self.eat_kw("INSERT") {
+            TriggerEvent::Insert
+        } else if self.eat_kw("UPDATE") {
+            TriggerEvent::Update
+        } else if self.eat_kw("DELETE") {
+            TriggerEvent::Delete
+        } else {
+            return Err(Error::syntax("a rule on SELECT (the way views are made in PostgreSQL) is not supported; use CREATE VIEW"));
+        };
+        self.expect_kw("TO")?;
+        let table = self.table_ident()?;
+        let when = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+        self.expect_kw("DO")?;
+        let instead = if self.eat_kw("INSTEAD") {
+            true
+        } else {
+            self.eat_kw("ALSO");
+            false
+        };
+        let mut body = Vec::new();
+        if self.eat_kw("NOTHING") {
+        } else if self.eat_sym("(") {
+            loop {
+                while self.eat_sym(";") {}
+                if self.eat_sym(")") {
+                    break;
+                }
+                body.push(self.statement()?);
+            }
+        } else {
+            body.push(self.statement()?);
+        }
+        // NOTIFY and the like do nothing here
+        body.retain(|s| !matches!(s, Statement::Ignored(_)));
+        for s in &body {
+            if !matches!(s, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Select(_)) {
+                return Err(Error::syntax("a rule can run INSERT, UPDATE, DELETE and SELECT commands"));
+            }
+        }
+        let end = self.toks[self.pos].pos;
+        let sql = self.src[start..end].to_string();
+        Ok(Statement::CreateTrigger(Box::new(TriggerDef {
+            name,
+            timing: if instead { TriggerTiming::Before } else { TriggerTiming::After },
+            events: vec![event],
+            update_of: Vec::new(),
+            each_statement: false,
+            table,
+            when,
+            body,
+            function: instead.then(|| INSTEAD_MARK.to_string()),
+            sql,
+        })))
+    }
+
+    /// The text of a parenthesised expression, `(expr)`.
+    fn paren_expr_text(&mut self) -> Result<String> {
+        self.expect_sym("(")?;
+        let start = self.toks[self.pos].pos;
+        self.expr()?;
+        let end = self.toks[self.pos].pos;
+        self.expect_sym(")")?;
+        Ok(self.src[start..end].trim().to_string())
+    }
+
+    /// `CREATE POLICY name ON table [AS PERMISSIVE | RESTRICTIVE] [FOR cmd] [TO roles] [USING (e)] [WITH CHECK (e)]`
+    fn policy(&mut self) -> Result<Statement> {
+        let name = self.ident()?;
+        self.expect_kw("ON")?;
+        let table = self.table_ident()?;
+        let (mut permissive, mut command, mut roles) = (true, "all".to_string(), Vec::<String>::new());
+        let (mut using, mut check) = (None, None);
+        loop {
+            if self.eat_kw("AS") {
+                permissive = !self.eat_kw("RESTRICTIVE");
+                if permissive {
+                    self.expect_kw("PERMISSIVE")?;
+                }
+            } else if self.eat_kw("FOR") {
+                command = self.role_name()?.to_ascii_lowercase();
+                if !matches!(command.as_str(), "all" | "select" | "insert" | "update" | "delete") {
+                    return Err(Error::syntax("a policy is FOR ALL, SELECT, INSERT, UPDATE or DELETE"));
+                }
+            } else if self.eat_kw("TO") {
+                roles = self.role_list()?.into_iter().map(|r| r.to_ascii_lowercase()).collect();
+            } else if self.eat_kw("USING") {
+                using = Some(self.paren_expr_text()?);
+            } else if self.eat_kw("WITH") {
+                self.expect_kw("CHECK")?;
+                check = Some(self.paren_expr_text()?);
+            } else {
+                break;
+            }
+        }
+        let value = serde_json::json!({"permissive": permissive, "command": command, "roles": roles, "using": using, "check": check}).to_string();
+        Ok(Statement::Catalog(Box::new(CatalogChange { kind: "policy", names: vec![format!("{table}|{name}")], value: Some(value), replace: false, cascade: false })))
+    }
+
     /// An item of a `VALUES` row: an expression, or `DEFAULT` (the column's default).
     fn values_item(&mut self) -> Result<Expr> {
         if self.peek_kw("DEFAULT") && matches!(self.peek_at(1), Tok::Sym(",") | Tok::Sym(")")) {
@@ -1908,6 +2013,12 @@ impl<'a> Parser<'a> {
         let unique = self.eat_kw("UNIQUE");
         if !unique && self.eat_kw("TRIGGER") {
             return self.trigger(create_pos);
+        }
+        if !unique && self.eat_kw("RULE") {
+            return self.rule(create_pos);
+        }
+        if !unique && self.eat_kw("POLICY") {
+            return self.policy();
         }
         if !unique {
             if let Some(st) = self.create_catalog_object(guarded)? {
@@ -2598,6 +2709,26 @@ impl<'a> Parser<'a> {
     /// One action of `ALTER TABLE name action [, action ...]`.
     fn alter_table_action(&mut self, table: &str) -> Result<Statement> {
         let table = table.to_string();
+        {
+            let no = self.peek_kw("NO") && self.peek_kw_at(1, "FORCE");
+            let k = usize::from(no);
+            if (self.peek_kw("ENABLE") || self.peek_kw("DISABLE") || self.peek_kw("FORCE") || no) && self.peek_kw_at(k + 1, "ROW") && self.peek_kw_at(k + 2, "LEVEL") {
+                let word = self.ident()?.to_ascii_uppercase();
+                if no {
+                    self.advance();
+                }
+                for w in ["ROW", "LEVEL", "SECURITY"] {
+                    self.expect_kw(w)?;
+                }
+                let (enable, force) = match (word.as_str(), no) {
+                    ("ENABLE", _) => (Some(true), None),
+                    ("DISABLE", _) => (Some(false), None),
+                    ("NO", _) => (None, Some(false)),
+                    _ => (None, Some(true)),
+                };
+                return Ok(Statement::SetRls { table, enable, force });
+            }
+        }
         // properties of a server table that mean nothing here
         if self.peek_kw("ENABLE") || self.peek_kw("DISABLE") || self.peek_kw("FORCE") || self.peek_kw("NO") && self.peek_kw_at(1, "FORCE")
             || self.peek_kw("OWNER") || self.peek_kw("REPLICA") || self.peek_kw("CLUSTER") || self.peek_kw("SET") && !self.peek_kw_at(1, "DATA") && !self.peek_kw_at(1, "DEFAULT")
@@ -2725,6 +2856,24 @@ impl<'a> Parser<'a> {
     }
 
     fn drop_object(&mut self, guarded: &mut bool) -> Result<Statement> {
+        if self.eat_kw("POLICY") {
+            self.if_exists_clause(false, guarded)?;
+            let name = self.ident()?;
+            self.expect_kw("ON")?;
+            let table = self.table_ident()?;
+            self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            return Ok(Statement::Catalog(Box::new(CatalogChange { kind: "policy", names: vec![format!("{table}|{name}")], value: None, replace: false, cascade: false })));
+        }
+        if self.eat_kw("RULE") {
+            self.if_exists_clause(false, guarded)?;
+            let name = self.ident()?;
+            self.expect_kw("ON")?;
+            self.table_ident()?;
+            self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            return Ok(Statement::DropTrigger(name));
+        }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("DROP"));
         }
@@ -2789,6 +2938,22 @@ impl<'a> Parser<'a> {
         }
         let with = if self.peek_kw("WITH") { Some(Box::new(self.with_clause()?)) } else { None };
         let mut sel = self.select_core()?;
+        // `SELECT generate_series(1, 3)` / `SELECT jsonb_path_query(doc, path)`: a function that returns rows, alone in the
+        // select list, is the same as selecting from it
+        if sel.from.is_none() && sel.items.len() == 1 {
+            if let SelectItem::Expr { expr: Expr::Function { name, args, .. }, alias } = &sel.items[0] {
+                let up = name.to_ascii_uppercase();
+                if matches!(up.as_str(), "GENERATE_SERIES" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ") {
+                    let col = if up == "GENERATE_SERIES" { "generate_series" } else { "jsonb_path_query" };
+                    let label = alias.clone().unwrap_or_else(|| name.to_ascii_lowercase());
+                    sel.from = Some(From {
+                        first: TableFactor::Function { name: up, args: args.clone(), alias: "srf".into(), columns: Vec::new() },
+                        joins: Vec::new(),
+                    });
+                    sel.items = vec![SelectItem::Expr { expr: Expr::Column { table: Some("srf".into()), name: col.into() }, alias: Some(label) }];
+                }
+            }
+        }
         // Set operators combine left to right.
         loop {
             let op = if self.eat_kw("UNION") {
@@ -3415,6 +3580,18 @@ impl<'a> Parser<'a> {
                 Tok::Sym(">=") => Some(BinOp::Ge),
                 _ => None,
             };
+            if let Tok::Sym(s @ ("@?" | "@@")) = self.peek().clone() {
+                // jsonb @? path (does the path select anything?), jsonb @@ path (is the predicate true?)
+                self.advance();
+                let right = self.concat()?;
+                left = Expr::Function {
+                    name: if s == "@?" { "JSONB_PATH_EXISTS" } else { "JSONB_PATH_MATCH" }.into(),
+                    args: vec![left, right, Expr::Literal(Value::text("{}")), Expr::Literal(Value::Bool(true))],
+                    distinct: false,
+                    star: false,
+                };
+                continue;
+            }
             if let Tok::Sym(s @ ("~" | "~*" | "!~" | "!~*")) = self.peek().clone() {
                 // PostgreSQL's regular-expression match: ~ (case-sensitive), ~* (ignoring case), and their negations
                 self.advance();

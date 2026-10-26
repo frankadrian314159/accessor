@@ -32,6 +32,17 @@ The refusal is "permission denied for table t". A role has the rights granted to
 
 A **view** is checked by its own name only: a role that may select from a view may read the tables under it without any right on them, as in PostgreSQL where the view's owner's rights are used. A trigger or a stored function runs with the rights of the role that fired it.
 
+## Row-level security
+
+```sql
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;     -- also DISABLE, FORCE, NO FORCE
+CREATE POLICY mine ON docs [AS PERMISSIVE | RESTRICTIVE] [FOR ALL | SELECT | INSERT | UPDATE | DELETE]
+    [TO role, ...] [USING (condition)] [WITH CHECK (condition)];
+DROP POLICY mine ON docs;
+```
+
+With security enabled on a table, a role chosen with `SET ROLE` sees and changes only the rows its policies allow. `USING` says which existing rows a `SELECT`, `UPDATE` or `DELETE` can reach; `WITH CHECK` (the `USING` condition when left out) must hold for each row an `INSERT` or `UPDATE` writes, or the statement fails with "new row violates row-level security policy". The permissive policies that apply to the role (its own, its groups', `PUBLIC`) are OR-ed, the restrictive ones AND-ed; with no permissive policy that applies, **no row** is allowed. `CURRENT_USER` in a condition is the chosen role. Security does not apply to a superuser role or to the session before any `SET ROLE` (there are no table owners, so `FORCE` changes nothing). Not available: `ALTER POLICY` (drop and create again), and `current_setting()` in a policy.
+
 ## What is only recorded
 
 Everything else is accepted and kept but does not change what a role may do:
@@ -39,6 +50,6 @@ Everything else is accepted and kept but does not change what a role may do:
 * Rights on schemas, sequences, functions, domains, the database (`GRANT USAGE ON SCHEMA s`, `GRANT CREATE ON DATABASE d`): stored, not checked.
 * Role attributes (`CREATEDB`, `LOGIN`, `PASSWORD`, `CONNECTION LIMIT`, `VALID UNTIL`): stored, not checked. There is no log-in; a connection is not a role.
 * `GRANT ... WITH GRANT OPTION`, `GRANTED BY`, column lists (`SELECT (a, b)`): read, and the option or list is ignored (a column privilege is a whole-table privilege).
-* Tables have **no owner**. A role that creates a table has no automatic rights on it, and there is no `ALTER TABLE ... OWNER TO` or `ALTER DEFAULT PRIVILEGES`. Row-level security (`CREATE POLICY`) is not available.
+* Tables have **no owner**. A role that creates a table has no automatic rights on it, and there is no `ALTER TABLE ... OWNER TO` or `ALTER DEFAULT PRIVILEGES`. Row-level security is described above.
 
 Roles and grants live in the database file and are transactional. `SET ROLE` belongs to the open database, not to a transaction: `ROLLBACK` does not undo it. `DROP ROLE` removes the role's grants and memberships and, if it was the current role, goes back to the unrestricted session.
