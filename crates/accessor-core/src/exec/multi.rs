@@ -78,11 +78,16 @@ fn and(a: Option<Expr>, b: Expr) -> Expr {
 
 /// `base.c IS NOT DISTINCT FROM __m.c` for every column of `base`.
 fn same_row(db: &Database, base: &str) -> Result<Expr> {
+    same_row_as(db, base, COPY)
+}
+
+/// `base.c IS NOT DISTINCT FROM other.c` for every column of `base`.
+fn same_row_as(db: &Database, base: &str, other: &str) -> Result<Expr> {
     let schema = db.table_checked(base)?.schema().clone();
     let mut out: Option<Expr> = None;
     for c in &schema.columns {
         let a = Expr::Column { table: Some(schema.name.clone()), name: c.name.clone() };
-        let b = Expr::Column { table: Some(COPY.to_string()), name: c.name.clone() };
+        let b = Expr::Column { table: Some(other.to_string()), name: c.name.clone() };
         let eq = Expr::Binary { op: BinOp::Eq, left: Box::new(a.clone()), right: Box::new(b.clone()) };
         let both_null = Expr::Binary {
             op: BinOp::And,
@@ -99,7 +104,117 @@ fn one() -> SelectItem {
     SelectItem::Expr { expr: Expr::Literal(Value::Int(1)), alias: None }
 }
 
+const FIRST: &str = "__l";
+
+/// Replaces the qualifier `from` by `to` in `e`.
+fn requalify_to(e: &mut Expr, from: &str, to: &str) {
+    let _ = walk_expr(e, &mut |x| {
+        if let Expr::Column { table: Some(t), .. } = x {
+            if t.eq_ignore_ascii_case(from) {
+                *t = to.to_string();
+            }
+        }
+        Ok(())
+    });
+}
+
 impl Database {
+    /// MySQL's `HANDLER`: a cursor over a table, kept by name until it is closed. Rows come in the order they are kept.
+    pub(crate) fn exec_handler(&mut self, h: &crate::sql::ast::HandlerStmt) -> Result<QueryResult> {
+        use crate::sql::ast::HandlerAction;
+        let key = h.name.to_ascii_lowercase();
+        match &h.action {
+            HandlerAction::Open { alias } => {
+                let table = self.table_checked(&h.name)?.name().to_string();
+                let name = alias.clone().unwrap_or_else(|| h.name.clone()).to_ascii_lowercase();
+                self.handlers.insert(name, (table, 0));
+                Ok(QueryResult::default())
+            }
+            HandlerAction::Close => {
+                self.handlers.remove(&key).ok_or_else(|| Error::catalog(format!("the handler '{}' is not open", h.name)))?;
+                Ok(QueryResult::default())
+            }
+            HandlerAction::Read { direction, filter, limit } => {
+                let (table, pos) = self.handlers.get(&key).cloned().ok_or_else(|| Error::catalog(format!("the handler '{}' is not open", h.name)))?;
+                // every row, and with it whether the condition holds, so that the position counts the rows of the table
+                let mut items = vec![SelectItem::Wildcard];
+                if let Some(f) = filter {
+                    items.push(SelectItem::Expr { expr: f.clone(), alias: Some("__ok".into()) });
+                }
+                let select = Select {
+                    items,
+                    from: Some(FromClause { first: TableFactor::Named { name: table.clone(), alias: None, only: false }, joins: Vec::new() }),
+                    ..Select::default()
+                };
+                let mut all = self.execute_statement(&Statement::Select(select))?;
+                let n = all.rows.len();
+                let width = all.columns.len() - usize::from(filter.is_some());
+                let ok = |i: usize| filter.is_none() || matches!(all.rows[i].last(), Some(Value::Bool(true)) | Some(Value::Int(1)));
+                // `pos` is one past the row read last; the rows to read go forward from it, or backward
+                let indexes: Vec<usize> = match *direction {
+                    "first" => (0..n).filter(|&i| ok(i)).take(*limit).collect(),
+                    "next" => (pos..n).filter(|&i| ok(i)).take(*limit).collect(),
+                    "last" => (0..n).rev().filter(|&i| ok(i)).take(*limit).collect(),
+                    _ => (0..pos.saturating_sub(1).min(n)).rev().filter(|&i| ok(i)).take(*limit).collect(),
+                };
+                let rows: Vec<_> = indexes.iter().map(|&i| all.rows[i][..width].to_vec()).collect();
+                all.columns.truncate(width);
+                if let Some(last) = indexes.last() {
+                    if let Some(e) = self.handlers.get_mut(&key) {
+                        e.1 = last + 1;
+                    }
+                }
+                Ok(QueryResult { columns: all.columns, rows, affected: 0 })
+            }
+        }
+    }
+
+    /// `DELETE FROM t WHERE f ORDER BY o LIMIT n` and the `UPDATE` likewise: the rows to change are those that equal one of
+    /// the first `n` rows (`SELECT * FROM t AS __m WHERE f ORDER BY o LIMIT n`) in every column.
+    pub(crate) fn exec_limited(
+        &mut self,
+        table: &str,
+        alias: Option<&str>,
+        assignments: Option<&Vec<(String, Expr)>>,
+        filter: Option<&Expr>,
+        order_by: &[crate::sql::ast::OrderItem],
+        limit: Option<usize>,
+    ) -> Result<QueryResult> {
+        let base = self.table_checked(table)?.name().to_string();
+        let shown = alias.unwrap_or(table).to_string();
+        let mut filter2 = filter.cloned();
+        let mut order2 = order_by.to_vec();
+        for e in filter2.iter_mut().chain(order2.iter_mut().map(|o| &mut o.expr)) {
+            requalify_to(e, &shown, COPY);
+            requalify_to(e, &base, COPY);
+        }
+        let inner = Select {
+            items: vec![SelectItem::Wildcard],
+            from: Some(FromClause { first: TableFactor::Named { name: base.clone(), alias: Some(COPY.to_string()), only: false }, joins: Vec::new() }),
+            filter: filter2,
+            order_by: order2,
+            limit,
+            ..Select::default()
+        };
+        let derived = FromClause {
+            first: TableFactor::Derived { query: Box::new(inner), alias: FIRST.to_string(), columns: Vec::new(), lateral: false },
+            joins: Vec::new(),
+        };
+        let pick = Select { items: vec![one()], from: Some(derived), filter: Some(same_row_as(self, &base, FIRST)?), ..Select::default() };
+        let filter = Some(Expr::Exists { query: Box::new(pick), negated: false });
+        let statement = match assignments {
+            None => Statement::Delete { table: base, filter },
+            Some(sets) => {
+                let mut sets = sets.clone();
+                for (_, e) in sets.iter_mut() {
+                    requalify_to(e, &shown, &base);
+                }
+                Statement::Update { table: base, assignments: sets, filter }
+            }
+        };
+        self.execute_statement(&statement)
+    }
+
     pub(crate) fn exec_delete_multi(&mut self, target: &str, from: &FromClause, filter: Option<&Expr>) -> Result<QueryResult> {
         let mut from2 = from.clone();
         let mut filter2 = filter.cloned();

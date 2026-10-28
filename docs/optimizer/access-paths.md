@@ -15,6 +15,7 @@ For each table, the optimizer looks at the pushed-down conditions that compare a
 | `col = constant` | an equality on `col` |
 | `col < c`, `<=`, `>`, `>=` | a range bound on `col` |
 | `col BETWEEN a AND b` | a range on `col` |
+| any of the above on a Yes/No column, except `=` | none: Yes compares as -1, so lower than No, but an index keeps No first; only `=` can use the index |
 | `constant op col` | the same, with the operator turned round |
 
 (`NULL` constants, and constants of a type that cannot be compared with the column through the index, are not used. Conditions on expressions, such as `Year(d) = 2024`, `col + 1 = 5`, `LIKE`, `IN` and `OR`, are applied to rows as they are read but do not select an index.)

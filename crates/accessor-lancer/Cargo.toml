@@ -1,0 +1,11 @@
+[package]
+name = "accessor-lancer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Finds logic bugs in Accessor with the test oracles of SQLancer (TLP, NoREC) and an optimizer on/off comparison"
+publish = false
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }

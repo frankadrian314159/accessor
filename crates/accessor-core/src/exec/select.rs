@@ -1662,6 +1662,10 @@ pub(crate) fn choose_access(table: &Table, conj: &[&BExpr]) -> Access {
                 if lit.is_null() || !compatible(cols[col].data_type, lit) {
                     continue;
                 }
+                // Yes/No compares as -1 and 0 but an index keeps No before Yes: only equality can use the index
+                if cols[col].data_type == DataType::YesNo && op != BinOp::Eq {
+                    continue;
+                }
                 match op {
                     BinOp::Eq => eq[col] = eq[col].or(Some(lit)),
                     BinOp::Gt => lo[col] = Some((lit, false)),
@@ -1673,7 +1677,12 @@ pub(crate) fn choose_access(table: &Table, conj: &[&BExpr]) -> Access {
             }
             BExpr::Between { expr, low, high, negated: false } => {
                 if let (BExpr::Col(i), BExpr::Lit(l), BExpr::Lit(h)) = (&**expr, &**low, &**high) {
-                    if *i < n && !l.is_null() && !h.is_null() && compatible(cols[*i].data_type, l) && compatible(cols[*i].data_type, h)
+                    if *i < n
+                        && !l.is_null()
+                        && !h.is_null()
+                        && cols[*i].data_type != DataType::YesNo
+                        && compatible(cols[*i].data_type, l)
+                        && compatible(cols[*i].data_type, h)
                     {
                         lo[*i] = Some((l, true));
                         hi[*i] = Some((h, true));
@@ -2430,8 +2439,10 @@ impl Database {
     /// parts run again and again on the rows the previous round produced,
     /// until a round produces nothing.
     fn run_recursive(&self, cte: &Cte, q: &Select, depth: u32) -> Result<(Vec<String>, Vec<Row>)> {
-        const MAX_ROUNDS: usize = 100_000;
-        const MAX_ROWS: usize = 10_000_000;
+        // MySQL's cte_max_recursion_depth
+        const MAX_ROUNDS: usize = 1_000;
+        // a recursion that multiplies its rows (a join with itself) would otherwise run for a very long time
+        const MAX_ROWS: usize = 2_000_000;
         let name = &cte.name;
         if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
             return Err(Error::runtime(format!("the recursive query '{name}' cannot have ORDER BY or LIMIT")));

@@ -661,11 +661,12 @@ impl<'a> Binder<'a> {
             }
             // Arguments are evaluated per input row, outside the group layout.
             let saved = self.group.take();
-            let (corr_ok, win_ok) = (self.allow_corr, self.allow_win);
-            (self.allow_corr, self.allow_win) = (false, false);
+            // a sub-query in an argument may read the columns of the row it is evaluated for
+            let win_ok = self.allow_win;
+            self.allow_win = false;
             let r = self.bind(&args[0]);
             let sep = args.get(1).map(|s| self.bind(s));
-            (self.allow_corr, self.allow_win) = (corr_ok, win_ok);
+            self.allow_win = win_ok;
             self.group = saved;
             if let Some(sep) = sep {
                 match sep? {

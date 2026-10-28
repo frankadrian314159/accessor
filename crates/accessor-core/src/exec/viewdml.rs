@@ -262,8 +262,13 @@ impl Database {
                 .map(|c| ScopeCol { table: schema.name.clone(), name: c.name.clone(), hidden: false })
                 .collect(),
         };
+        // A condition that cannot be bound on its own (a sub-query that reads the table's columns, say) is left to the
+        // ordinary way of running the view or derived table, which reports any real error itself.
         let intrinsic = match &t.filter {
-            Some(f) => vec![Binder::new(self, &scope, 0).bind(f)?],
+            Some(f) => match Binder::new(self, &scope, 0).bind(f) {
+                Ok(b) => vec![b],
+                Err(_) => return Ok(None),
+            },
             None => Vec::new(),
         };
         Ok(Some(Source {

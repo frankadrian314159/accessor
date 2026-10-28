@@ -50,6 +50,7 @@ impl Database {
     /// Runs every statement in `sql`, returning the result of the last one.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let mut last = QueryResult::default();
+        let _hint = budget::hinted_time(sql).map(budget::limit);
         for st in self.parse_cached(sql)?.iter() {
             last = self.execute_statement(st)?;
         }
@@ -215,8 +216,15 @@ impl Database {
             Statement::AlterRole { name, rename, options } => self.exec_alter_role(name, rename.as_deref(), options),
             Statement::Grant(g) => self.exec_grant(g),
             Statement::Ignored(_) => Ok(QueryResult::default()),
+            Statement::Handler(h) => self.exec_handler(h),
             Statement::DeleteMulti { target, from, filter } => self.exec_delete_multi(target, from, filter.as_ref()),
             Statement::UpdateMulti { from, assignments, filter } => self.exec_update_multi(from, assignments, filter.as_ref()),
+            Statement::DeleteLimited { table, alias, filter, order_by, limit } => {
+                self.exec_limited(table, alias.as_deref(), None, filter.as_ref(), order_by, *limit)
+            }
+            Statement::UpdateLimited { table, alias, assignments, filter, order_by, limit } => {
+                self.exec_limited(table, alias.as_deref(), Some(assignments), filter.as_ref(), order_by, *limit)
+            }
             Statement::SetVar { name, expr } => {
                 let v = self.eval_const(expr)?;
                 self.user_vars.insert(name.to_ascii_lowercase(), v);

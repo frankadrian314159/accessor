@@ -38,6 +38,9 @@ enum Unit {
     Cmd { name: String, rest: String, line: usize },
 }
 
+/// Marks a skip entry that means "stop the test at this statement".
+const STOP: usize = 1 << 40;
+
 const COMMANDS: &[&str] = &[
     "echo", "source", "let", "eval", "error", "inc", "dec", "disable_query_log", "enable_query_log", "disable_result_log", "enable_result_log",
     "disable_warnings", "enable_warnings", "disable_info", "enable_info", "disable_abort_on_error", "enable_abort_on_error", "disable_metadata",
@@ -97,6 +100,12 @@ fn split_test(src: &str) -> Vec<Unit> {
                 None => (text.clone(), String::new()),
             };
             let lname = name.to_ascii_lowercase();
+            if lname == "delimiter" {
+                let d = rest.trim_end_matches(';').trim();
+                delim = if d.is_empty() { vec![';'] } else { d.chars().collect() };
+                i = j;
+                continue;
+            }
             if COMMANDS.contains(&lname.as_str()) {
                 out.push(Unit::Cmd { name: lname.clone(), rest: rest.clone(), line });
                 if matches!(lname.as_str(), "perl" | "write_file" | "append_file") {
@@ -166,7 +175,7 @@ fn split_test(src: &str) -> Vec<Unit> {
             if ch == '\n' {
                 line += 1;
                 // a command with no delimiter ends at the line's end when it is one of the line commands
-                if command && quote.is_none() && matches!(word.as_str(), "echo" | "source" | "let" | "inc" | "dec" | "connection" | "disconnect" | "error" | "sleep" | "exit" | "die" | "skip") && !text.trim_end().ends_with('`') && !(word == "let" && text.contains('`') && text.matches('`').count() % 2 == 1) {
+                if command && quote.is_none() && matches!(word.as_str(), "echo" | "source" | "inc" | "dec" | "connection" | "disconnect" | "error" | "sleep" | "exit" | "die" | "skip") && !text.trim_end().ends_with('`') && !(word == "let" && text.contains('`') && text.matches('`').count() % 2 == 1) && !(word == "let" && text.split_once('=').map_or(true, |(_, v)| v.trim().is_empty())) {
                     break;
                 }
             }
@@ -568,6 +577,11 @@ impl Runner<'_> {
         self.idx += 1;
         let idx = self.idx;
         let lead_word = lead(text);
+        // a test given up at some statement: the ones after it are not run
+        if self.skip.iter().any(|(t, i)| *t == self.name && *i & STOP != 0 && idx >= *i & !STOP) {
+            self.expect_error = false;
+            return;
+        }
         if self.skip.iter().any(|(t, i)| *t == self.name && *i == idx) {
             self.record(idx, line, "killer", &lead_word, "", &short(text, 160));
             self.expect_error = false;
@@ -576,7 +590,7 @@ impl Runner<'_> {
         self.write_progress();
         let sorted = std::mem::take(&mut self.sorted_result);
         let expect_error = std::mem::take(&mut self.expect_error);
-        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.db.execute(text))) {
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.db.execute(&strip_test_schema(text)))) {
             Err(_) => Outcome::Panic,
             Ok(Ok(r)) => Outcome::Rows(r),
             Ok(Err(e)) => Outcome::Err(e.to_string()),
@@ -780,7 +794,10 @@ fn run_test(root: &Path, name: &str, progress: Option<&Path>, skip: &[(String, u
     vars.insert("MYSQL_TEST_DIR".to_string(), root.display().to_string());
     vars.insert("MYSQLTEST_VARDIR".to_string(), std::env::temp_dir().display().to_string());
     let mut run = Runner {
-        db: Database::in_memory(),
+        db: {
+            accessor_core::schema::set_lenient(false);
+            Database::in_memory()
+        },
         root,
         name: name.to_string(),
         vars,
@@ -977,8 +994,10 @@ fn main() {
         }
         if killers.iter().filter(|(kt, _)| *kt == t).count() >= 5 {
             // a test that keeps killing the process is given up: its other statements are not run
-            let _ = writeln!(data, "{t}\t0\t0\tkiller\tTEST\t\tthe test was abandoned after 5 statements killed the process");
-            from = format!("{t}\u{1}");
+            // the statements before the first of them are kept; the rest of the test is not run
+            let first = killers.iter().filter(|(kt, _)| *kt == t).map(|(_, ki)| *ki).min().unwrap_or(i);
+            skip.push((t.clone(), first | STOP));
+            from = t;
             continue;
         }
         skip.push((t.clone(), i));
@@ -1095,4 +1114,36 @@ fn main() {
     let _ = std::fs::write(report.with_extension("tsv"), &data);
     println!("{}", md.lines().take(24).collect::<Vec<_>>().join("\n"));
     println!("\n(full report: {})", report.display());
+}
+
+/// The database of the tests is called `test`; Accessor has one schema, so `test.t1` is read as `t1` (outside quotes).
+fn strip_test_schema(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                } else if (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_' || c[i - 1] == '.'))
+                    && c[i..].iter().take(5).collect::<String>().eq_ignore_ascii_case("test.")
+                    && c.get(i + 5).is_some_and(|n| n.is_alphabetic() || *n == '_' || *n == '`')
+                {
+                    i += 5;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
 }

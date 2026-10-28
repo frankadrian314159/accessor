@@ -84,6 +84,8 @@ pub struct Database {
     pub(crate) priv_suspended: std::sync::atomic::AtomicU32,
     /// MySQL's `@name` user variables.
     pub(crate) user_vars: BTreeMap<String, crate::value::Value>,
+    /// MySQL's open `HANDLER`s: the name, the table and the position of the next row to read.
+    pub(crate) handlers: BTreeMap<String, (String, usize)>,
     /// Set while an `UPDATE ONLY` / `DELETE FROM ONLY` runs.
     pub(crate) only_dml: std::sync::atomic::AtomicBool,
     /// SQL text recently read, with the statements it came to.
@@ -139,6 +141,7 @@ impl Database {
             call_depth: std::sync::atomic::AtomicU32::new(0),
             priv_suspended: std::sync::atomic::AtomicU32::new(0),
             user_vars: BTreeMap::new(),
+            handlers: BTreeMap::new(),
             only_dml: std::sync::atomic::AtomicBool::new(false),
             parse_cache: Mutex::new(HashMap::new()),
             prepared: BTreeMap::new(),

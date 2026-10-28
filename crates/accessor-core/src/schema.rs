@@ -267,11 +267,43 @@ impl TableSchema {
         }
         for (v, c) in row.iter_mut().zip(&self.columns) {
             if v.data_type() != Some(c.data_type) && !v.is_null() && !c.is_calculated() {
-                *v = v
-                    .coerce_to(c.data_type)
-                    .map_err(|e| Error::type_err(format!("column '{}': {e}", c.name)))?;
+                *v = match v.coerce_to(c.data_type) {
+                    Ok(x) => x,
+                    Err(e) => lenient_number(v, c.data_type).ok_or_else(|| Error::type_err(format!("column '{}': {e}", c.name)))?,
+                };
             }
         }
         Ok(row)
     }
+}
+
+thread_local! {
+    static LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turns the lenient reading of values on or off (MySQL's non-strict `sql_mode`).
+pub fn set_lenient(on: bool) {
+    LENIENT.with(|l| l.set(on));
+}
+
+/// In lenient mode a text that is not a number is stored in a numeric column as the number it starts with, or 0.
+fn lenient_number(v: &Value, ty: DataType) -> Option<Value> {
+    if !LENIENT.with(|l| l.get()) {
+        return None;
+    }
+    let Value::Text(s) = v else { return None };
+    if !matches!(ty, DataType::Integer | DataType::Bignum | DataType::Float | DataType::Double | DataType::Decimal | DataType::Currency) {
+        return None;
+    }
+    let t = s.trim_start();
+    let mut end = 0;
+    for (i, ch) in t.char_indices() {
+        if ch.is_ascii_digit() || ch == '.' || (i == 0 && (ch == '-' || ch == '+')) {
+            end = i + 1;
+        } else {
+            break;
+        }
+    }
+    let head = &t[..end];
+    Value::text(if head.is_empty() || head == "-" || head == "+" || head == "." { "0" } else { head }).coerce_to(ty).ok()
 }

@@ -245,6 +245,10 @@ impl Database {
         if name == "optimizer" {
             self.set_optimizer(shown == "on");
         }
+        if name == "sql_mode" {
+            // MySQL: without a STRICT mode a value that does not fit becomes the nearest one that does
+            crate::schema::set_lenient(!shown.to_ascii_uppercase().contains("STRICT"));
+        }
         self.settings.insert(name, shown);
         Ok(())
     }

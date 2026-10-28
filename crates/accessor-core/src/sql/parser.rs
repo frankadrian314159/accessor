@@ -23,7 +23,40 @@ const RESERVED: &[&str] = &[
 
 /// Parses a script of one or more `;`-separated statements.
 pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new() };
+    let toks = lex(sql)?;
+    // Each level of nesting costs the parser tens of kilobytes of stack; a text nested deeply is read on a thread with a
+    // stack of its own, so that it ends in an error and not in a crash.
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    for t in &toks {
+        match t.tok {
+            Tok::Sym("(") => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            Tok::Sym(")") => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if deepest <= 8 {
+        return parse_tokens(sql, toks);
+    }
+    let types = super::usertypes::snapshot();
+    let read = std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new().stack_size(256 << 20).spawn_scoped(scope, || {
+            super::usertypes::set_types(types);
+            (parse_tokens(sql, toks), super::usertypes::snapshot())
+        });
+        match handle {
+            Ok(h) => h.join().map_err(|_| Error::syntax("the statement is nested too deeply")),
+            Err(_) => Err(Error::syntax("the statement is nested too deeply")),
+        }
+    })?;
+    super::usertypes::set_types(read.1);
+    read.0
+}
+
+fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
+    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), depth: 0, selects: 0 };
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -86,7 +119,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new() };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), depth: 0, selects: 0 };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -373,7 +406,15 @@ struct Parser<'a> {
     pos: usize,
     /// The variables of a `SELECT ... INTO @a, @b` just read.
     into_vars: Vec<String>,
+    /// How deep the expressions being read are nested, and how deep the sub-queries: a limit keeps a hostile text from
+    /// overflowing the stack.
+    depth: usize,
+    selects: usize,
 }
+
+/// As deep as parentheses and operators may nest, and as sub-queries (MySQL's own limit on nested selects is 61).
+const MAX_DEPTH: usize = 150;
+const MAX_SELECTS: usize = 61;
 
 impl<'a> Parser<'a> {
     // ----- token helpers -------------------------------------------------
@@ -758,9 +799,20 @@ impl<'a> Parser<'a> {
         let change = |kind: &'static str, name: String, value: String| {
             Statement::Catalog(Box::new(CatalogChange { kind, names: vec![name], value: Some(value), replace: false, cascade: false }))
         };
-        if self.eat_kw("SCHEMA") {
+        // MySQL's CREATE DATABASE is a schema; the `test` database of its tests is the default schema
+        let database = self.peek_kw("DATABASE");
+        if database && self.peek_kw_at(1, "test") {
+            return Ok(Some(self.ignore_rest("CREATE DATABASE")));
+        }
+        if self.eat_kw("SCHEMA") || self.eat_kw("DATABASE") {
             self.if_exists_clause(true, guarded)?;
             let name = if self.peek_kw("AUTHORIZATION") { None } else { Some(self.ident()?) };
+            if database {
+                // DEFAULT CHARACTER SET .. COLLATE .. ENCRYPTION ..
+                while !self.at_eof() && !self.peek_sym(";") {
+                    self.advance();
+                }
+            }
             let mut owner = None;
             if self.eat_kw("AUTHORIZATION") {
                 owner = Some(self.role_name()?);
@@ -868,7 +920,10 @@ impl<'a> Parser<'a> {
     }
 
     fn drop_catalog_object(&mut self, guarded: &mut bool) -> Result<Option<Statement>> {
-        let kind: &'static str = if self.eat_kw("SCHEMA") {
+        if self.peek_kw("DATABASE") && self.peek_kw_at(1, "test") {
+            return Ok(Some(self.ignore_rest("DROP DATABASE")));
+        }
+        let kind: &'static str = if self.eat_kw("SCHEMA") || self.eat_kw("DATABASE") {
             "schema"
         } else if self.eat_kw("DOMAIN") || self.eat_kw("TYPE") {
             "type"
@@ -906,8 +961,8 @@ impl<'a> Parser<'a> {
     /// Is the statement about a kind of object that only a server has (a tablespace, a publication, a text search
     /// configuration, ...)? Such statements are read and ignored.
     fn ignorable_object(&self) -> bool {
-        const ALONE: [&str; 15] = [
-            "TABLESPACE", "DATABASE", "PUBLICATION", "SUBSCRIPTION", "SERVER", "FOREIGN", "STATISTICS", "COLLATION", "CONVERSION", "TRANSFORM",
+        const ALONE: [&str; 14] = [
+            "TABLESPACE", "PUBLICATION", "SUBSCRIPTION", "SERVER", "FOREIGN", "STATISTICS", "COLLATION", "CONVERSION", "TRANSFORM",
             "LANGUAGE", "OWNED", "PROCEDURAL", "OPERATOR", "CAST",
         ];
         ALONE.iter().any(|w| self.peek_kw(w))
@@ -1120,23 +1175,84 @@ impl<'a> Parser<'a> {
         if self.peek_kw("CHECK") && (self.peek_kw_at(1, "TABLE") || self.peek_kw_at(1, "TABLES")) {
             return Ok(Some(self.ignore_rest("CHECK TABLE")));
         }
+        // events never run here: CREATE [DEFINER = ..] EVENT, ALTER EVENT, DROP EVENT are read and ignored
+        if (self.peek_kw("DROP") || self.peek_kw("ALTER")) && self.peek_kw_at(1, "EVENT") && !self.peek_kw_at(2, "TRIGGER") {
+            return Ok(Some(self.ignore_rest("EVENT")));
+        }
+        if self.peek_kw("CREATE") {
+            for i in 1..14 {
+                if self.peek_kw_at(i, "EVENT") && !self.peek_kw_at(i + 1, "TRIGGER") {
+                    return Ok(Some(self.ignore_rest("EVENT")));
+                }
+                if ["TABLE", "TRIGGER", "PROCEDURE", "FUNCTION", "VIEW", "INDEX", "DATABASE", "SCHEMA", "ROLE", "USER", "TYPE", "RULE"]
+                    .iter()
+                    .any(|w| self.peek_kw_at(i, w))
+                {
+                    break;
+                }
+            }
+        }
+        if self.peek_kw("RENAME") && self.peek_kw_at(1, "USER") {
+            return Ok(Some(self.ignore_rest("RENAME USER")));
+        }
+        if self.peek_kw("RENAME") && (self.peek_kw_at(1, "TABLE") || self.peek_kw_at(1, "TABLES")) {
+            // RENAME TABLE a TO b [, c TO d]: the renames one after the other
+            self.advance();
+            self.advance();
+            let mut all = Vec::new();
+            loop {
+                let table = self.table_ident()?;
+                self.expect_kw("TO")?;
+                let to = self.table_ident()?;
+                all.push(Statement::AlterTable { table, action: AlterAction::RenameTable(to) });
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            return Ok(Some(if all.len() == 1 { all.remove(0) } else { Statement::Batch(all) }));
+        }
+        if self.peek_kw("HANDLER") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            self.advance();
+            let name = self.table_ident()?;
+            let action = if self.eat_kw("OPEN") {
+                self.eat_kw("AS");
+                HandlerAction::Open { alias: if self.at_eof() || self.peek_sym(";") { None } else { Some(self.ident()?) } }
+            } else if self.eat_kw("CLOSE") {
+                HandlerAction::Close
+            } else {
+                self.expect_kw("READ")?;
+                let mut direction = None;
+                for (w, d) in [("FIRST", "first"), ("NEXT", "next"), ("PREV", "prev"), ("LAST", "last")] {
+                    if direction.is_none() && self.peek_kw(w) {
+                        self.advance();
+                        direction = Some(d);
+                    }
+                }
+                if direction.is_none() {
+                    // READ index FIRST | NEXT | PREV | LAST: the rows come in the order they are kept, whatever the index
+                    self.ident()?;
+                    for (w, d) in [("FIRST", "first"), ("NEXT", "next"), ("PREV", "prev"), ("LAST", "last")] {
+                        if direction.is_none() && self.peek_kw(w) {
+                            self.advance();
+                            direction = Some(d);
+                        }
+                    }
+                }
+                let Some(direction) = direction else {
+                    return Err(Error::syntax("HANDLER ... READ by the value of an index is not supported; use FIRST, NEXT, PREV or LAST"));
+                };
+                let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+                let limit = if self.eat_kw("LIMIT") { self.usize_literal()? } else { 1 };
+                HandlerAction::Read { direction, filter, limit }
+            };
+            return Ok(Some(Statement::Handler(Box::new(HandlerStmt { name, action }))));
+        }
         if self.peek_kw("CALL") && matches!(self.peek_at(1), Tok::Ident(s) if s.eq_ignore_ascii_case("mtr")) {
             return Ok(Some(self.ignore_rest("CALL")));
         }
         if (self.peek_kw("DESCRIBE") || self.peek_kw("DESC")) && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
             self.advance();
-            let target = Some(self.table_ident()?);
-            let mut show = ShowStmt { what: "columns".into(), target, ..ShowStmt::default() };
-            if let Tok::Ident(_) | Tok::Quoted(_) | Tok::Str(_) = self.peek() {
-                // DESCRIBE t col / 'pattern': a column to show
-                if !self.at_eof() && !self.peek_sym(";") {
-                    show.like = Some(match self.advance() {
-                        Tok::Ident(s) | Tok::Quoted(s) | Tok::Str(s) => s,
-                        _ => String::new(),
-                    });
-                }
-            }
-            return Ok(Some(Statement::Show(Box::new(show))));
+            return Ok(Some(self.describe_table()?));
         }
         if self.peek_kw("PREPARE") && self.peek_kw_at(2, "FROM") {
             self.advance();
@@ -1163,6 +1279,22 @@ impl<'a> Parser<'a> {
             return self.show_statement();
         }
         Ok(None)
+    }
+
+    /// `t [col | 'pattern']` after `DESCRIBE` or `EXPLAIN`: the columns of a table.
+    fn describe_table(&mut self) -> Result<Statement> {
+        let target = Some(self.table_ident()?);
+        let mut show = ShowStmt { what: "columns".into(), target, ..ShowStmt::default() };
+        if let Tok::Ident(_) | Tok::Quoted(_) | Tok::Str(_) = self.peek() {
+            // DESCRIBE t col / 'pattern': a column to show
+            if !self.at_eof() && !self.peek_sym(";") {
+                show.like = Some(match self.advance() {
+                    Tok::Ident(s) | Tok::Quoted(s) | Tok::Str(s) => s,
+                    _ => String::new(),
+                });
+            }
+        }
+        Ok(Statement::Show(Box::new(show)))
     }
 
     /// MySQL's `SHOW ...`; `None` (nothing consumed) for the PostgreSQL forms `SHOW name`, `SHOW ALL`.
@@ -1423,16 +1555,16 @@ impl<'a> Parser<'a> {
     fn mysql_alter_action(&mut self, table: &str) -> Result<Option<Statement>> {
         let table = table.to_string();
         // table options and maintenance: read and ignored
-        const IGNORED: [&str; 31] = [
+        const IGNORED: [&str; 33] = [
             "ENGINE", "CONVERT", "CHARACTER", "CHARSET", "COLLATE", "AUTO_INCREMENT", "COMMENT", "ROW_FORMAT", "ALGORITHM", "LOCK", "KEY_BLOCK_SIZE",
             "STATS_AUTO_RECALC", "STATS_PERSISTENT", "STATS_SAMPLE_PAGES", "PACK_KEYS", "CHECKSUM", "MAX_ROWS", "MIN_ROWS", "DELAY_KEY_WRITE", "ORDER",
-            "WITH", "WITHOUT", "ANALYZE", "OPTIMIZE", "REBUILD", "REORGANIZE", "EXCHANGE", "DISCARD", "IMPORT", "COALESCE", "REMOVE",
+            "WITH", "WITHOUT", "ANALYZE", "OPTIMIZE", "REBUILD", "REORGANIZE", "EXCHANGE", "DISCARD", "IMPORT", "COALESCE", "REMOVE", "PARTITION", "TRUNCATE",
         ];
         let first = match self.peek() {
             Tok::Ident(w) => w.to_ascii_uppercase(),
             _ => return Ok(None),
         };
-        let ignored = IGNORED.contains(&first.as_str()) || (first == "DEFAULT" && (self.peek_kw_at(1, "CHARACTER") || self.peek_kw_at(1, "CHARSET") || self.peek_kw_at(1, "COLLATE")));
+        let ignored = IGNORED.contains(&first.as_str()) || ((first == "ADD" || first == "DROP") && self.peek_kw_at(1, "PARTITION")) || (first == "DEFAULT" && (self.peek_kw_at(1, "CHARACTER") || self.peek_kw_at(1, "CHARSET") || self.peek_kw_at(1, "COLLATE")));
         if ignored {
             let mut depth = 0;
             while !self.at_eof() && !self.peek_sym(";") && !(depth == 0 && self.peek_sym(",")) {
@@ -1561,6 +1693,10 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) if s.eq_ignore_ascii_case("WINDOW") && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_kw_at(2, "AS") => false,
             // `CREATE TABLE t AS SELECT ... FROM s WITH NO DATA`
             Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && self.peek_kw_at(1, "NO") => false,
+            Tok::Ident(s) if s.eq_ignore_ascii_case("STRAIGHT_JOIN") => false,
+            // `FROM t FOR UPDATE`, `FROM t LOCK IN SHARE MODE`: locking clauses
+            Tok::Ident(s) if s.eq_ignore_ascii_case("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) => false,
+            Tok::Ident(s) if s.eq_ignore_ascii_case("LOCK") && self.peek_kw_at(1, "IN") && self.peek_kw_at(2, "SHARE") => false,
             Tok::Ident(s) => !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)),
             _ => false,
         }
@@ -1762,6 +1898,11 @@ impl<'a> Parser<'a> {
             const OTHER: [&str; 12] = ["INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "EXEC", "CALL", "CREATE", "DROP", "ALTER", "TRUNCATE", "EXECUTE"];
             if OTHER.iter().any(|k| self.peek_kw(k)) {
                 return Ok(Statement::ExplainOther(Box::new(self.statement()?)));
+            }
+            // MySQL: `EXPLAIN t` is `DESCRIBE t`
+            const QUERY: [&str; 7] = ["SELECT", "WITH", "VALUES", "TABLE", "FROM", "SET", "TRANSFORM"];
+            if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && !QUERY.iter().any(|k| self.peek_kw(k)) && !self.peek_sym("(") {
+                return self.describe_table();
             }
             let sel = Box::new(self.select()?);
             return Ok(if analyze { Statement::ExplainAnalyze(sel) } else { Statement::Explain(sel) });
@@ -2142,6 +2283,12 @@ impl<'a> Parser<'a> {
             }
         }
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+        let mut tail = Select::default();
+        self.select_tail(&mut tail)?;
+        // without a LIMIT the order changes nothing
+        if tail.limit.is_some() {
+            return Ok(Statement::UpdateLimited { table, alias, assignments, filter, order_by: tail.order_by, limit: tail.limit });
+        }
         let mut st = Statement::Update { table: table.clone(), assignments, filter };
         if let Some(alias) = alias {
             requalify(&mut st, &alias, &table)?;
@@ -2276,6 +2423,11 @@ impl<'a> Parser<'a> {
         let table = self.table_ident()?;
         let alias = self.target_alias()?;
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+        let mut tail = Select::default();
+        self.select_tail(&mut tail)?;
+        if tail.limit.is_some() {
+            return Ok(Statement::DeleteLimited { table, alias, filter, order_by: tail.order_by, limit: tail.limit });
+        }
         let mut st = Statement::Delete { table: table.clone(), filter };
         if let Some(alias) = alias {
             requalify(&mut st, &alias, &table)?;
@@ -3018,7 +3170,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_sym(")")?;
             } else if self.peek_kw("PARTITION") && self.peek_kw_at(1, "BY") {
-                partition_by = Some(self.partition_by()?);
+                if !self.skip_mysql_partitions()? {
+                    partition_by = Some(self.partition_by()?);
+                }
             } else if self.eat_kw("WITH") {
                 self.skip_parens()?;
             } else if self.eat_kw("TABLESPACE") || self.eat_kw("USING") {
@@ -3074,6 +3228,49 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(())
+    }
+
+    /// MySQL's `PARTITION BY [LINEAR] HASH | KEY | RANGE | LIST [COLUMNS] (..) [PARTITIONS n] [SUBPARTITION BY ..] [(PARTITION ..)]`:
+    /// the table is kept whole and the partitions are ignored. False (nothing consumed) for PostgreSQL's plain form.
+    fn skip_mysql_partitions(&mut self) -> Result<bool> {
+        let save = self.pos;
+        self.advance();
+        self.advance();
+        let linear = self.eat_kw("LINEAR");
+        let method = self.ident()?.to_ascii_uppercase();
+        let columns = (method == "RANGE" || method == "LIST") && self.eat_kw("COLUMNS");
+        if method == "KEY" && self.eat_kw("ALGORITHM") {
+            self.expect_sym("=")?;
+            self.advance();
+        }
+        if !matches!(method.as_str(), "HASH" | "KEY" | "RANGE" | "LIST") || !self.peek_sym("(") {
+            self.pos = save;
+            return Ok(false);
+        }
+        self.skip_parens()?;
+        let more = self.peek_kw("PARTITIONS") || self.peek_kw("SUBPARTITION") || self.peek_sym("(");
+        if !(linear || columns || method == "KEY" || more) {
+            self.pos = save;
+            return Ok(false);
+        }
+        if self.eat_kw("PARTITIONS") {
+            self.advance();
+        }
+        if self.eat_kw("SUBPARTITION") {
+            self.expect_kw("BY")?;
+            self.eat_kw("LINEAR");
+            self.advance();
+            if self.peek_sym("(") {
+                self.skip_parens()?;
+            }
+            if self.eat_kw("SUBPARTITIONS") {
+                self.advance();
+            }
+        }
+        if self.peek_sym("(") {
+            self.skip_parens()?;
+        }
+        Ok(true)
     }
 
     /// `PARTITION BY RANGE | LIST | HASH (columns)`
@@ -3388,7 +3585,16 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
-        while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {}
+        let mut unsigned = false;
+        while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {
+            unsigned |= matches!(self.toks[self.pos - 1].tok, Tok::Ident(ref w) if w.eq_ignore_ascii_case("UNSIGNED"));
+        }
+        // BIGINT UNSIGNED reaches 18446744073709551615, beyond a 64-bit signed integer
+        let data_type = if unsigned && data_type == DataType::Integer && !autonumber && ["BIGINT", "INT8"].iter().any(|t| type_name.eq_ignore_ascii_case(t)) {
+            DataType::Bignum
+        } else {
+            data_type
+        };
         let mut def = ColumnDef {
             name,
             data_type,
@@ -3813,7 +4019,13 @@ impl<'a> Parser<'a> {
             Ok(Statement::DropTables { names, cascade, if_exists })
         } else if self.eat_kw("VIEW") || self.eat_kw("QUERY") {
             self.if_exists_clause(false, guarded)?;
-            Ok(Statement::DropView(self.table_ident()?))
+            let mut names = vec![self.table_ident()?];
+            while self.eat_sym(",") {
+                names.push(self.table_ident()?);
+            }
+            self.eat_kw("RESTRICT");
+            self.eat_kw("CASCADE");
+            Ok(if names.len() == 1 { Statement::DropView(names.remove(0)) } else { Statement::Batch(names.into_iter().map(Statement::DropView).collect()) })
         } else if self.eat_kw("REPORT") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropReport(self.ident()?))
@@ -3845,6 +4057,13 @@ impl<'a> Parser<'a> {
     // ----- SELECT -----------------------------------------------------------
 
     fn select(&mut self) -> Result<Select> {
+        self.selects += 1;
+        let r = if self.selects > MAX_SELECTS { Err(Error::syntax("too high level of nesting for select")) } else { self.select_nested() };
+        self.selects -= 1;
+        r
+    }
+
+    fn select_nested(&mut self) -> Result<Select> {
         if self.peek_kw("TRANSFORM") {
             return self.crosstab();
         }
@@ -4010,6 +4229,11 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("ALL") {
             } else if sel.top.is_none() && self.eat_kw("TOP") {
                 sel.top = Some(self.usize_literal()?);
+            } else if ["STRAIGHT_JOIN", "HIGH_PRIORITY", "SQL_SMALL_RESULT", "SQL_BIG_RESULT", "SQL_BUFFER_RESULT", "SQL_NO_CACHE", "SQL_CACHE", "SQL_CALC_FOUND_ROWS"]
+                .iter()
+                .any(|w| self.eat_kw(w))
+            {
+                // MySQL modifiers that only advise the optimizer
             } else {
                 break;
             }
@@ -4074,6 +4298,26 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_kw("LIMIT") {
                 sel.limit = Some(self.usize_literal()?);
+                if self.eat_sym(",") {
+                    // MySQL: LIMIT offset, count
+                    sel.offset = sel.limit;
+                    sel.limit = Some(self.usize_literal()?);
+                }
+            } else if self.peek_kw("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) {
+                // FOR UPDATE | SHARE | NO KEY UPDATE | KEY SHARE [OF t, ..] [NOWAIT | SKIP LOCKED]: there is nobody to lock against
+                self.advance();
+                while self.eat_kw("NO") || self.eat_kw("KEY") {}
+                self.advance();
+                if self.eat_kw("OF") {
+                    self.ident_list()?;
+                }
+                if !self.eat_kw("NOWAIT") && self.eat_kw("SKIP") {
+                    self.expect_kw("LOCKED")?;
+                }
+            } else if self.peek_kw("LOCK") && self.peek_kw_at(1, "IN") && self.peek_kw_at(2, "SHARE") {
+                for _ in 0..4 {
+                    self.advance();
+                }
             } else if self.eat_kw("OFFSET") {
                 sel.offset = Some(self.usize_literal()?);
                 if !self.eat_kw("ROWS") {
@@ -4212,8 +4456,17 @@ impl<'a> Parser<'a> {
             return Ok(SelectItem::QualifiedWildcard(t));
         }
         let expr = self.expr()?;
+        // MySQL also takes a string as the alias: `SELECT a AS 'x'`, `SELECT a 'x'`
         let alias = if self.eat_kw("AS") {
-            Some(self.ident()?)
+            if let Tok::Str(s) = self.peek().clone() {
+                self.advance();
+                Some(s)
+            } else {
+                Some(self.ident()?)
+            }
+        } else if let Tok::Str(s) = self.peek().clone() {
+            self.advance();
+            Some(s)
         } else if self.peek_is_alias() {
             Some(self.ident()?)
         } else {
@@ -4226,7 +4479,7 @@ impl<'a> Parser<'a> {
         let mut from = self.from_source()?;
         loop {
             let natural = self.eat_kw("NATURAL");
-            let kind = if self.eat_kw("INNER") {
+            let mut kind = if self.eat_kw("INNER") {
                 self.expect_kw("JOIN")?;
                 JoinKind::Inner
             } else if self.eat_kw("LEFT") {
@@ -4244,7 +4497,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("CROSS") {
                 self.expect_kw("JOIN")?;
                 JoinKind::Cross
-            } else if self.eat_kw("JOIN") {
+            } else if self.eat_kw("JOIN") || self.eat_kw("STRAIGHT_JOIN") {
                 JoinKind::Inner
             } else if natural {
                 return Err(self.unexpected("JOIN"));
@@ -4261,6 +4514,9 @@ impl<'a> Parser<'a> {
                     self.expect_sym("(")?;
                     using = self.ident_list()?;
                     self.expect_sym(")")?;
+                } else if kind == JoinKind::Inner && !self.peek_kw("ON") {
+                    // MySQL: an inner JOIN without a condition is a cross join
+                    kind = JoinKind::Cross;
                 } else {
                     self.expect_kw("ON")?;
                     on = Some(self.expr()?);
@@ -4445,8 +4701,41 @@ impl<'a> Parser<'a> {
             default_alias = Some(part.clone());
             name = if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") { part } else { format!("{name}.{part}") };
         }
-        let alias = if self.eat_kw("AS") || self.peek_is_alias() { Some(self.ident()?) } else { default_alias };
+        if self.peek_kw("PARTITION") && matches!(self.peek_at(1), Tok::Sym("(")) {
+            // MySQL's `t PARTITION (p1, p2)`: the partitions are not kept apart, so every row is read
+            self.advance();
+            self.skip_parens()?;
+        }
+        self.skip_index_hints()?;
+        let alias = if self.eat_kw("AS") || (!self.at_index_hint() && self.peek_is_alias()) { Some(self.ident()?) } else { default_alias };
+        self.skip_index_hints()?;
         Ok(TableFactor::Named { name, alias, only })
+    }
+
+    fn at_index_hint(&self) -> bool {
+        (self.peek_kw("USE") || self.peek_kw("IGNORE") || self.peek_kw("FORCE")) && (self.peek_kw_at(1, "INDEX") || self.peek_kw_at(1, "KEY"))
+    }
+
+    /// MySQL's `USE | IGNORE | FORCE INDEX | KEY [FOR JOIN | ORDER BY | GROUP BY] (names)`: read and ignored.
+    fn skip_index_hints(&mut self) -> Result<()> {
+        while self.at_index_hint() {
+            self.advance();
+            self.advance();
+            if self.eat_kw("FOR") {
+                if !self.eat_kw("JOIN") {
+                    if !self.eat_kw("ORDER") {
+                        self.expect_kw("GROUP")?;
+                    }
+                    self.expect_kw("BY")?;
+                }
+            }
+            self.expect_sym("(")?;
+            if !self.peek_sym(")") {
+                self.ident_list()?;
+            }
+            self.expect_sym(")")?;
+        }
+        Ok(())
     }
 
     // ----- expressions ------------------------------------------------------
@@ -4638,7 +4927,17 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// `a | b` (MySQL's bitwise OR) binds looser than `&`, the text join.
     fn concat(&mut self) -> Result<Expr> {
+        let mut left = self.join_text()?;
+        while self.eat_sym("|") {
+            let right = self.join_text()?;
+            left = Expr::Function { name: "__BITOR".into(), args: vec![left, right], distinct: false, star: false };
+        }
+        Ok(left)
+    }
+
+    fn join_text(&mut self) -> Result<Expr> {
         let mut left = self.additive()?;
         while self.eat_sym("&") {
             let right = self.additive()?;
@@ -4710,6 +5009,11 @@ impl<'a> Parser<'a> {
         if self.eat_sym("+") {
             return self.unary();
         }
+        if self.eat_sym("~") {
+            // MySQL's bitwise NOT
+            let inner = self.unary()?;
+            return Ok(Expr::Function { name: "__BITNOT".into(), args: vec![inner], distinct: false, star: false });
+        }
         self.power()
     }
 
@@ -4738,6 +5042,11 @@ impl<'a> Parser<'a> {
             let zone = self.primary()?;
             base = Expr::Function { name: "ATTIMEZONE".into(), args: vec![base, zone], distinct: false, star: false };
         }
+        // `x COLLATE name`: text is compared by its characters here whatever the collation, so it is read and dropped
+        while self.peek_kw("COLLATE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_) | Tok::Str(_)) {
+            self.advance();
+            self.advance();
+        }
         if self.eat_sym("^") {
             let exp = self.unary()?;
             return Ok(Expr::Binary { op: BinOp::Pow, left: Box::new(base), right: Box::new(exp) });
@@ -4746,6 +5055,13 @@ impl<'a> Parser<'a> {
     }
 
     fn primary(&mut self) -> Result<Expr> {
+        self.depth += 1;
+        let r = if self.depth > MAX_DEPTH { Err(Error::syntax("the expression is nested too deeply")) } else { self.primary_inner() };
+        self.depth -= 1;
+        r
+    }
+
+    fn primary_inner(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Tok::Int(i) => {
                 self.advance();
@@ -5092,6 +5408,10 @@ impl<'a> Parser<'a> {
             while self.eat_sym(",") {
                 args.push(self.expr()?);
             }
+            // CHAR(n, ... USING charset): the character set changes nothing here
+            if self.eat_kw("USING") {
+                self.advance();
+            }
         }
         self.expect_sym(")")?;
         let up = name.to_ascii_uppercase();
@@ -5186,6 +5506,17 @@ impl<'a> Parser<'a> {
         let e = self.expr()?;
         self.expect_kw("AS")?;
         let tn = self.type_name()?;
+        if tn.eq_ignore_ascii_case("TIME") {
+            // CAST(x AS TIME): the time of day, as hh:mm:ss text (there is no type for a time alone)
+            if self.eat_sym("(") {
+                while !self.peek_sym(")") && !self.at_eof() {
+                    self.advance();
+                }
+                self.expect_sym(")")?;
+            }
+            self.expect_sym(")")?;
+            return Ok(Expr::Function { name: "__TIMEOF".into(), args: vec![e], distinct: false, star: false });
+        }
         let (ty, _) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         let mut hints = Vec::new();
         if self.eat_sym("(") {

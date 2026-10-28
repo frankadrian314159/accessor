@@ -173,7 +173,7 @@ ALTER TABLE t ALTER [COLUMN] column SET DEFAULT literal;
 ALTER TABLE t ALTER [COLUMN] column DROP DEFAULT;
 ALTER TABLE t ALTER [COLUMN] column SET NOT NULL;
 ALTER TABLE t ALTER [COLUMN] column DROP NOT NULL;
-ALTER TABLE t RENAME TO new_name;
+ALTER TABLE t RENAME TO new_name;      -- MySQL: RENAME TABLE a TO b, c TO d
 ```
 
 * **ADD COLUMN** fills the new column with its default (or NULL) in existing records.

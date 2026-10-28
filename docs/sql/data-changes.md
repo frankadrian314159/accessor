@@ -51,7 +51,8 @@ The conflict target `(column, ...)` must be exactly the columns of the primary k
 ```sql
 UPDATE table [[AS] alias]
 SET column = expr [, column = expr ...]
-[WHERE condition];
+[WHERE condition]
+[ORDER BY expr [DESC], ... ] [LIMIT n];       -- the last two as in MySQL
 ```
 
 On a table that other tables [inherit from](inheritance-and-partitioning.md) the statement reaches those tables too; `UPDATE ONLY table` and `DELETE FROM ONLY table` leave them alone. All the right-hand sides see the row as it was before the update, so `SET a = b, b = a` swaps. A calculated column cannot be set. Sub-queries may be [correlated](select.md#correlated-sub-queries) and may read the table being updated (they see its state before the statement).
@@ -64,7 +65,7 @@ UPDATE Emp SET Rank = (SELECT COUNT(*) FROM Emp E2 WHERE E2.Sal > Emp.Sal) + 1;
 ## DELETE
 
 ```sql
-DELETE FROM table [[AS] alias] [WHERE condition];
+DELETE FROM table [[AS] alias] [WHERE condition] [ORDER BY expr [DESC], ...] [LIMIT n];
 ```
 
 `DELETE * FROM t` is accepted as in Access. Foreign keys with `ON DELETE CASCADE` or `SET NULL` act as part of the statement; with `RESTRICT` (the default) a delete that would orphan a record is refused.
@@ -73,6 +74,8 @@ DELETE FROM table [[AS] alias] [WHERE condition];
 DELETE FROM Orders O
 WHERE NOT EXISTS (SELECT 1 FROM Lines L WHERE L.OrderID = O.ID);
 ```
+
+Without a `LIMIT`, `ORDER BY` changes nothing and is ignored. With a `LIMIT` only the first rows of that order are changed; rows that are equal in every column are not told apart, so a `LIMIT` that cuts through a run of identical rows changes all of them.
 
 ## Through a view
 

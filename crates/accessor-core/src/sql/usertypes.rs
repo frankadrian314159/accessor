@@ -29,6 +29,11 @@ thread_local! {
     static TYPES: RefCell<HashMap<String, UserType>> = RefCell::new(HashMap::new());
 }
 
+/// The types the parser knows now.
+pub(crate) fn snapshot() -> HashMap<String, UserType> {
+    TYPES.with(|t| t.borrow().clone())
+}
+
 /// Replaces the types the parser knows.
 pub(crate) fn set_types(types: HashMap<String, UserType>) {
     TYPES.with(|t| *t.borrow_mut() = types);

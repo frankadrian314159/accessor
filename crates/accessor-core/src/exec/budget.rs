@@ -74,3 +74,17 @@ pub(crate) fn parse_timeout(text: &str) -> Option<Duration> {
     };
     (ms > 0.0).then(|| Duration::from_micros((ms * 1000.0) as u64))
 }
+
+/// MySQL's optimizer hint `/*+ MAX_EXECUTION_TIME(n) */` in a `SELECT`: the milliseconds, if the text has one.
+pub(crate) fn hinted_time(sql: &str) -> Option<Duration> {
+    let head = sql.trim_start();
+    if !head.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("select")) {
+        return None;
+    }
+    let start = sql.find("/*+")?;
+    let end = sql[start..].find("*/")? + start;
+    let hint = sql[start..end].to_ascii_uppercase();
+    let at = hint.find("MAX_EXECUTION_TIME(")? + "MAX_EXECUTION_TIME(".len();
+    let ms: u64 = hint[at..].split(')').next()?.trim().parse().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
+}

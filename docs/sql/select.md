@@ -11,7 +11,7 @@ SELECT [DISTINCT | ALL] [TOP n] select-list
 [ HAVING condition ]
 [ { UNION | INTERSECT | EXCEPT } [ALL] select ... ]
 [ ORDER BY sort-list ]
-[ LIMIT n ] [ OFFSET m [ROWS] ] [ FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY ]
+[ LIMIT n | LIMIT m, n ] [ OFFSET m [ROWS] ] [ FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY ]
 ```
 
 The full grammar is in [grammar.md](grammar.md).
@@ -91,6 +91,8 @@ HAVING COUNT(*) > 1
 ORDER BY Mean DESC;
 ```
 
+The argument of an aggregate may hold a sub-query that reads columns of the row it is computed for: `SUM(CASE WHEN EXISTS (SELECT 1 FROM T s WHERE s.k = T.k AND s.id <> T.id) THEN 1 ELSE 0 END)`.
+
 A column in the select list (or in `HAVING` or `ORDER BY`) that is neither a `GROUP BY` expression nor inside an aggregate is allowed, as in SQLite and MySQL: it has the value it has in the **first row** of the group, exactly as `ANY_VALUE(column)` would give it. Which row that is depends on the order the rows are read in, so use it only when the value is the same for the whole group (a column that depends on the grouped one), or write `ANY_VALUE` to say so. (The SQL standard, PostgreSQL and SQL Server refuse such a query.) An aggregate query with no `GROUP BY` forms one group, and returns exactly one row even over no input. The aggregate functions are listed in [../functions/aggregate.md](../functions/aggregate.md).
 
 ### ROLLUP, CUBE and GROUPING SETS
@@ -148,7 +150,7 @@ WITH RECURSIVE n (i) AS (
 SELECT SUM(i) FROM n;
 ```
 
-The parts that do not mention the CTE start it; the parts that do are run again on the rows the previous round produced, until a round adds nothing. With `UNION` (not `ALL`) rows already produced are not added again, so a graph walk over a cyclic graph stops. The parts may be joined only with `UNION` / `UNION ALL`, and the CTE query cannot have its own `ORDER BY` or `LIMIT`. A recursion is stopped with an error after 100,000 rounds or 10,000,000 rows.
+The parts that do not mention the CTE start it; the parts that do are run again on the rows the previous round produced, until a round adds nothing. With `UNION` (not `ALL`) rows already produced are not added again, so a graph walk over a cyclic graph stops. The parts may be joined only with `UNION` / `UNION ALL`, and the CTE query cannot have its own `ORDER BY` or `LIMIT`. A recursion is stopped with an error after 1,000 rounds (MySQL's `cte_max_recursion_depth`) or 2,000,000 rows.
 
 ## VALUES
 

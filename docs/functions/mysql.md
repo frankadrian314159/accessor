@@ -36,3 +36,4 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `STD(x)` | population standard deviation (the aggregate `STDDEV_POP`) |
 | `DATE_ADD`, `DATE_SUB`, `ADDDATE`, `SUBDATE` | date arithmetic with `INTERVAL n unit` ([mysql.md](../sql/mysql.md#dates-and-intervals)) |
 | `CONVERT(x, type)`, `CONVERT(x USING cs)` | a cast; the text itself |
+| `a \| b`, `~a`, `a << b`, `a >> b` | bitwise OR, NOT, and shifts (`&` joins text and `^` is a power, so there is no AND or XOR operator) |

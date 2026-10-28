@@ -434,7 +434,7 @@ WITH RECURSIVE n (i) AS (
 SELECT Sum(i) FROM n;          -- 55
 ```
 
-A runaway recursion is stopped after 100,000 rounds or ten million rows. `VALUES (1, 'a'), (2, 'b')` is a query too, and can stand wherever one can: `FROM (VALUES ...) AS t (n, s)`.
+A runaway recursion is stopped after 1,000 rounds or two million rows. `VALUES (1, 'a'), (2, 'b')` is a query too, and can stand wherever one can: `FROM (VALUES ...) AS t (n, s)`.
 
 #### Window functions
 

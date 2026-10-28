@@ -50,6 +50,9 @@ pub enum MyFn {
     Oct,
     BitShl,
     BitShr,
+    BitOr,
+    BitNot,
+    TimeOf,
     Conv,
 }
 
@@ -93,6 +96,9 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "BIN" => (Bin, 1, 1),
         "BIT_SHL" => (BitShl, 2, 2),
         "BIT_SHR" => (BitShr, 2, 2),
+        "__BITOR" => (BitOr, 2, 2),
+        "__BITNOT" => (BitNot, 1, 1),
+        "__TIMEOF" => (TimeOf, 1, 1),
         "CONV" => (Conv, 3, 3),
         "OCT" => (Oct, 1, 1),
         _ => return None,
@@ -551,6 +557,9 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         }
         BitShl => Value::Int(int(v(0)).unwrap_or(0).checked_shl(int(v(1)).unwrap_or(0).clamp(0, 64) as u32).unwrap_or(0)),
         BitShr => Value::Int(((int(v(0)).unwrap_or(0) as u64).checked_shr(int(v(1)).unwrap_or(0).clamp(0, 64) as u32).unwrap_or(0)) as i64),
+        BitOr => Value::Int(int(v(0)).unwrap_or(0) | int(v(1)).unwrap_or(0)),
+        BitNot => Value::Int(!int(v(0)).unwrap_or(0)),
+        TimeOf => datetime_of(v(0)).map_or(Value::Null, |d| Value::text(&format_date(d, "%H:%i:%s"))),
         Conv => {
             let (from, to) = (int(v(1)).unwrap_or(10), int(v(2)).unwrap_or(10));
             let ok = |b: i64| (2..=36).contains(&b.abs());

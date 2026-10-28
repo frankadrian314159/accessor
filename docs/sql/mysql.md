@@ -8,6 +8,8 @@ Scripts and tests written for MySQL run on the engine when they stay within what
 
 ## Variables
 
+**`sql_mode`.** `SET sql_mode = ''` (any value without `STRICT`) makes a text that is not a number, stored in a numeric column, become the number it starts with, or 0, as MySQL does without a warning being shown; a mode with `STRICT` (and the start of a session) refuses it. Only this conversion changes; out-of-range numbers and bad dates are still refused.
+
 ```sql
 SET @a = 5, @b := @a + 1;           -- user variables
 SELECT @a * @b;                     -- 30
@@ -80,6 +82,40 @@ The placeholders are numbered in the order they are written. (`PREPARE name AS s
 
 `CURRENT_USER()`, `USER()` and `SESSION_USER()` are `root@localhost`; `DATABASE()` and `SCHEMA()` are `test`; `VERSION()` is `8.0.40`; the other MySQL functions are in [mysql.md](../functions/mysql.md). `FLUSH ...`, `OPTIMIZE`, `REPAIR`, `CHECK TABLE`, `PURGE`, `KILL`, `CHANGE`, `XA`, `LOAD INDEX`, `SIGNAL`, `RESIGNAL`, `GET DIAGNOSTICS`, `HELP`, `INSTALL`, `UNINSTALL`, `BINLOG`, `CACHE INDEX` and `CALL mtr.add_suppression(...)` are read to the end of the statement and ignored.
 
+## LIMIT offset, COLLATE, HANDLER and nesting
+
+`LIMIT m, n` is `LIMIT n OFFSET m`. `expr COLLATE name` is read and the collation dropped: text is compared as everywhere else in Accessor (see [expressions](expressions.md)), whatever the collation named.
+
+```sql
+HANDLER t OPEN [AS h];
+HANDLER h READ FIRST | NEXT | PREV | LAST [WHERE cond] [LIMIT n];
+HANDLER h READ index FIRST | NEXT | PREV | LAST;   -- the index is ignored
+HANDLER h CLOSE;
+```
+
+A handler is a cursor over a table: the rows come in the order they are kept, `WHERE` picks the rows to return from the position on, and `LIMIT` (default 1) says how many. Reading by the value of an index (`READ idx = (v)`, `>=`, ...) is refused.
+
+`SELECT ... FOR UPDATE | SHARE [OF t] [NOWAIT | SKIP LOCKED]` and `LOCK IN SHARE MODE` are read and ignored (there is nobody to lock against), as are the select modifiers `STRAIGHT_JOIN`, `HIGH_PRIORITY`, `SQL_NO_CACHE`, `SQL_CALC_FOUND_ROWS` and the rest; `a STRAIGHT_JOIN b ON ...` is an inner join. `CHAR(n, ... USING charset)` ignores the character set. `CAST(x AS TIME)` gives the time of day as `hh:mm:ss` text (there is no type for a time alone). A `BIGINT UNSIGNED` column is a `BIGNUM`, so it holds up to 18446744073709551615 (other `UNSIGNED` columns are still not limited to non-negative values).
+
+`/*+ MAX_EXECUTION_TIME(n) */` in a `SELECT` ends it with a timeout error after `n` milliseconds. A recursive common table expression that has produced more than 2,000,000 rows stops with the error "produced too many rows".
+
+Texts nested too deeply are refused with an error and never overflow the stack: more than 61 levels of sub-queries (MySQL's own limit, "too high level of nesting for select"), or expressions nested more than 150 levels (parentheses, functions, `CASE`). A text with more than 8 levels of parentheses is read on a thread with a large stack of its own; the executor stops a chain of sub-queries that is still too deep after that ("queries are nested too deeply").
+
+## RENAME TABLE, ORDER BY and LIMIT in changes, aliases, events, hints, partitions
+
+```sql
+RENAME TABLE a TO b, c TO a;                                  -- the renames one after the other, so a swap needs a third name
+UPDATE t SET v = v + 1 WHERE k > 1 ORDER BY k DESC LIMIT 2;
+DELETE FROM t ORDER BY k LIMIT 10;
+SELECT k AS 'the key', v 'value' FROM t JOIN u;              -- a string is a column alias; JOIN without ON is a cross join
+EXPLAIN t;                                                    -- the same as DESCRIBE t
+CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO DELETE FROM log;   -- CREATE / ALTER / DROP EVENT are read and ignored
+```
+
+`USE INDEX`, `IGNORE INDEX` and `FORCE INDEX` (also `KEY`, and `FOR JOIN | ORDER BY | GROUP BY`) after a table in `FROM` are read and ignored; the optimizer chooses its own indexes. `DROP VIEW a, b, c` drops each in turn. MySQL's `PARTITION BY [LINEAR] HASH | KEY | RANGE | LIST [COLUMNS] (..) [PARTITIONS n] [SUBPARTITION BY ..] [(PARTITION p VALUES ..)]` in `CREATE TABLE`, and `ALTER TABLE` with `PARTITION BY`, `ADD PARTITION`, `DROP PARTITION`, `TRUNCATE PARTITION` and the other partition maintenance, are read and ignored: the table stays whole and any row goes in. (PostgreSQL's plain `PARTITION BY RANGE (col)` still makes a [partitioned table](inheritance-and-partitioning.md).)
+
+With `ORDER BY` or `LIMIT`, the rows changed are those equal in every column to one of the first rows of `SELECT * FROM t WHERE ... ORDER BY ... LIMIT n`; two rows alike in every column are not told apart (the same rule as the [several-table forms](#multi-table-delete-and-update)). Events never run: there is no scheduler. `RENAME USER` is ignored.
+
 ## Multi-table DELETE and UPDATE
 
 ```sql
@@ -88,7 +124,7 @@ UPDATE t1, t2 SET t1.v = t1.v + t2.w WHERE t1.k = t2.k;
 UPDATE t1 JOIN t2 ON t1.k = t2.k SET t1.v = 0 WHERE t2.w > 200;
 ```
 
-The rows of the named table that the join reaches are deleted or changed; the other tables are only read. They are run as the single-table statement they amount to (`DELETE ... WHERE EXISTS (join)`, each new value a sub-query over the join), so two rows of the target that are equal in every column are treated alike. One table may be changed at a time (`DELETE t1, t2 FROM ...` and `UPDATE ... SET t1.a = .., t2.b = ..` are refused), and `ORDER BY` and `LIMIT` in these statements are not available.
+The rows of the named table that the join reaches are deleted or changed; the other tables are only read. They are run as the single-table statement they amount to (`DELETE ... WHERE EXISTS (join)`, each new value a sub-query over the join), so two rows of the target that are equal in every column are treated alike. One table may be changed at a time (`DELETE t1, t2 FROM ...` and `UPDATE ... SET t1.a = .., t2.b = ..` are refused). `ORDER BY` and `LIMIT` are not available in the several-table forms.
 
 ## Stored procedures, functions and triggers
 
@@ -107,7 +143,7 @@ CREATE TRIGGER trg2 BEFORE UPDATE ON t FOR EACH ROW BEGIN
 END;
 ```
 
-The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `SET`, `IF` / `ELSEIF`, `WHILE ... DO`, `REPEAT ... UNTIL`, `LOOP` and `LEAVE`, `CASE`, `RETURN`, `SELECT ... INTO var`, and ordinary SQL statements; the characteristics (`DETERMINISTIC`, `NO SQL`, `READS SQL DATA`, `SQL SECURITY ...`, `COMMENT`) and `DEFINER = ...` are read and ignored. A name in the body that is a parameter or variable means that variable even if a column has the same name. In a trigger, `SET NEW.col = ...` changes the row a `BEFORE` trigger lets through. Procedures are run with `CALL`; a function whose body has statements is run like the [PL/pgSQL functions](routines.md#postgresql-style-functions-and-procedures) (with arguments known before the statement runs). Not available: `OUT` and `INOUT` parameters, cursors, `DECLARE ... HANDLER`, `ITERATE`, `SIGNAL`, events (`CREATE EVENT`), and a `FOLLOWS`/`PRECEDES` order of triggers (read and ignored).
+The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `SET`, `IF` / `ELSEIF`, `WHILE ... DO`, `REPEAT ... UNTIL`, `LOOP` and `LEAVE`, `CASE`, `RETURN`, `SELECT ... INTO var`, and ordinary SQL statements; the characteristics (`DETERMINISTIC`, `NO SQL`, `READS SQL DATA`, `SQL SECURITY ...`, `COMMENT`) and `DEFINER = ...` are read and ignored. A name in the body that is a parameter or variable means that variable even if a column has the same name. In a trigger, `SET NEW.col = ...` changes the row a `BEFORE` trigger lets through. Procedures are run with `CALL`; a function whose body has statements is run like the [PL/pgSQL functions](routines.md#postgresql-style-functions-and-procedures) (with arguments known before the statement runs). Not available: `OUT` and `INOUT` parameters, cursors, `DECLARE ... HANDLER`, `ITERATE`, `SIGNAL`, and a `FOLLOWS`/`PRECEDES` order of triggers (read and ignored).
 
 ## Dates and intervals
 
@@ -119,8 +155,8 @@ The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `S
 
 ## Accounts and the rest that is read and ignored
 
-`CREATE USER 'u'@'host' IDENTIFIED BY ...`, `ALTER USER`, `DROP USER`, `SET PASSWORD` and `GRANT` / `REVOKE` in MySQL's forms (`ON *.*`, `ON db.*`, a user with a host, privileges of two words such as `REPLICATION SLAVE`) are read and **ignored**: there are no accounts, and a connection is not a user. `CREATE USER name` with no host and only PostgreSQL's options is a [role](roles-and-privileges.md). `ALTER SCHEMA`/`ALTER DATABASE`, `RESET PERSIST`, `RESET MASTER`, `CHECK TABLE[S]`, `EXPLAIN FORMAT=...` (the plan is always the text plan) and `DROP PREPARE` are accepted. `COMMIT` and `ROLLBACK` with no transaction do nothing. `0x41FF` is a number, `_utf8mb4 'x'` is `'x'`, `a << b` and `a >> b` shift (bitwise `|`, `^` and `~` are not available: `&` and `|` join text), and `CONV(n, from, to)` converts between bases. A column may be `BINARY`, `ASCII` or `UNICODE` (ignored).
+`CREATE USER 'u'@'host' IDENTIFIED BY ...`, `ALTER USER`, `DROP USER`, `SET PASSWORD` and `GRANT` / `REVOKE` in MySQL's forms (`ON *.*`, `ON db.*`, a user with a host, privileges of two words such as `REPLICATION SLAVE`) are read and **ignored**: there are no accounts, and a connection is not a user. `CREATE USER name` with no host and only PostgreSQL's options is a [role](roles-and-privileges.md). `ALTER SCHEMA`/`ALTER DATABASE`, `RESET PERSIST`, `RESET MASTER`, `CHECK TABLE[S]`, `EXPLAIN FORMAT=...` (the plan is always the text plan) and `DROP PREPARE` are accepted. `COMMIT` and `ROLLBACK` with no transaction do nothing. `0x41FF` is a number, `_utf8mb4 'x'` is `'x'`, `a << b` and `a >> b` shift (`a | b` is bitwise OR and `~a` bitwise NOT; `&` joins text and `^` is a power, as in Access, so there is no bitwise AND or XOR operator), and `CONV(n, from, to)` converts between bases. A column may be `BINARY`, `ASCII` or `UNICODE` (ignored).
 
 ## Not available
 
-`CREATE USER 'u'@'host'` and `GRANT` for such users, `HANDLER`, the effect of `LOCK TABLES` (it is read and ignored, like `UNLOCK TABLES`), `performance_schema`, `ORDER BY`/`LIMIT` in `UPDATE` and `DELETE`, `EXPLAIN FORMAT=`, optimizer hints other than as comments, `GROUP BY ... WITH ROLLUP`, full-text search (`MATCH ... AGAINST`), spatial functions (`ST_*`), `LAST_INSERT_ID()`, `FOUND_ROWS()`, and the MySQL functions that are not in [the MySQL functions](../functions/mysql.md) or the [function reference](../functions/README.md).
+`CREATE USER 'u'@'host'` and `GRANT` for such users, the effect of `LOCK TABLES` (it is read and ignored, like `UNLOCK TABLES`), `performance_schema`, optimizer hints other than as comments, `GROUP BY ... WITH ROLLUP`, full-text search (`MATCH ... AGAINST`), spatial functions (`ST_*`), `LAST_INSERT_ID()`, `FOUND_ROWS()`, and the MySQL functions that are not in [the MySQL functions](../functions/mysql.md) or the [function reference](../functions/README.md).

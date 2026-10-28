@@ -147,7 +147,7 @@ The reserved words are: `ALL AND AS ASC BETWEEN BY CASE CREATE CROSS DELETE DESC
 
 <order-by>      ::= ORDER BY <order-item> { ',' <order-item> }
 <order-item>    ::= <expr> [ ASC | DESC ] [ NULLS ( FIRST | LAST ) ]
-<row-limit>     ::= LIMIT <integer>
+<row-limit>     ::= LIMIT <integer> [ ',' <integer> ]     -- MySQL: LIMIT offset, count
                   | OFFSET <integer> [ ROW | ROWS ]
                   | FETCH ( FIRST | NEXT ) [ <integer> ] ( ROW | ROWS ) ONLY
 ```

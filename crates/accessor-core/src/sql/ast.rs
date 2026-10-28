@@ -527,8 +527,21 @@ pub enum Statement {
     DeleteMulti { target: String, from: From, filter: Option<Expr> },
     /// `UPDATE t1, t2 SET t1.a = t2.b WHERE ...`.
     UpdateMulti { from: From, assignments: Vec<(Option<String>, String, Expr)>, filter: Option<Expr> },
+    /// `DELETE FROM t [WHERE ..] ORDER BY .. LIMIT n`: only the first rows of the order are deleted.
+    DeleteLimited { table: String, alias: Option<String>, filter: Option<Expr>, order_by: Vec<OrderItem>, limit: Option<usize> },
+    /// `UPDATE t SET .. [WHERE ..] ORDER BY .. LIMIT n`: only the first rows of the order are changed.
+    UpdateLimited {
+        table: String,
+        alias: Option<String>,
+        assignments: Vec<(String, Expr)>,
+        filter: Option<Expr>,
+        order_by: Vec<OrderItem>,
+        limit: Option<usize>,
+    },
     /// `CREATE TABLE name AS query [WITH [NO] DATA]`.
     CreateTableAs { name: String, query: Box<Select>, with_data: bool },
+    /// MySQL's `HANDLER t OPEN [AS a]`, `HANDLER a READ FIRST | NEXT | PREV | LAST [WHERE c] [LIMIT n]`, `HANDLER a CLOSE`.
+    Handler(Box<HandlerStmt>),
     /// A command that is read and does nothing (`VACUUM`, `ANALYZE`, `COMMENT ON`, `LOCK`, ...).
     Ignored(String),
     /// `CREATE TABLE` with `INHERITS`, `PARTITION BY` or `PARTITION OF`.
@@ -627,4 +640,20 @@ pub struct ShowStmt {
     pub like: Option<String>,
     pub filter: Option<Expr>,
     pub full: bool,
+}
+
+/// What a `HANDLER` statement does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandlerStmt {
+    /// The table (to open) or the name it was opened under.
+    pub name: String,
+    pub action: HandlerAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HandlerAction {
+    Open { alias: Option<String> },
+    Close,
+    /// `direction` is `first`, `next`, `prev` or `last`.
+    Read { direction: &'static str, filter: Option<Expr>, limit: usize },
 }

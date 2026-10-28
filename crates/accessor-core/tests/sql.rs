@@ -5070,6 +5070,84 @@ fn mysql_multi_table_delete_and_update() {
 }
 
 #[test]
+fn mysql_rename_limits_aliases_events_and_bit_operators() {
+    let mut db = Database::in_memory();
+    let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    db.execute("CREATE TABLE a (k int, v int); CREATE TABLE c (z int); INSERT INTO a VALUES (1,10),(2,20),(3,30),(4,40),(5,50)").unwrap();
+    // RENAME TABLE, several pairs one after the other (a swap)
+    db.execute("RENAME TABLE a TO b").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM b"), "5");
+    db.execute("RENAME TABLE b TO tmp, c TO b, tmp TO c").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM c"), "5");
+    assert_eq!(n(&mut db, "SELECT count(*) FROM b"), "0");
+    // ORDER BY and LIMIT in UPDATE and DELETE
+    db.execute("UPDATE c SET v = v + 1 WHERE k > 1 ORDER BY k DESC LIMIT 2").unwrap();
+    assert_eq!(n(&mut db, "SELECT group_concat(v) FROM (SELECT v FROM c ORDER BY k) q"), "10,20,30,41,51");
+    db.execute("DELETE FROM c ORDER BY k LIMIT 2").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM c"), "3");
+    db.execute("DELETE FROM c LIMIT 1").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM c"), "2");
+    // quoted aliases, JOIN without ON
+    let r = db.execute("SELECT k AS 'the key', v 'val' FROM c").unwrap();
+    assert_eq!(r.columns, vec!["the key".to_string(), "val".to_string()]);
+    assert_eq!(n(&mut db, "SELECT count(*) FROM c JOIN c AS d"), "4");
+    // EXPLAIN table, events
+    assert_eq!(db.execute("EXPLAIN c").unwrap().rows.len(), 2);
+    db.execute("CREATE EVENT ev ON SCHEDULE EVERY 1 SECOND DO INSERT INTO c VALUES (9, 9)").unwrap();
+    db.execute("DROP EVENT IF EXISTS ev").unwrap();
+    // bitwise
+    assert_eq!(n(&mut db, "SELECT 5 | 2"), "7");
+    assert_eq!(n(&mut db, "SELECT ~0"), "-1");
+    assert_eq!(n(&mut db, "SELECT 1 | 2 << 1"), "5");
+    // index hints, DROP VIEW lists, MySQL partitioning, lenient numbers
+    db.execute("CREATE TABLE h (a int, b text, KEY (a))").unwrap();
+    db.execute("INSERT INTO h VALUES (1, 'x')").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM h USE INDEX (a) WHERE a = 1"), "1");
+    assert_eq!(n(&mut db, "SELECT count(*) FROM h AS q FORCE INDEX FOR ORDER BY (a) WHERE q.a = 1"), "1");
+    assert_eq!(n(&mut db, "SELECT count(*) FROM h IGNORE INDEX (a)"), "1");
+    db.execute("CREATE VIEW v1 AS SELECT a FROM h; CREATE VIEW v2 AS SELECT b FROM h").unwrap();
+    db.execute("DROP VIEW v1, v2").unwrap();
+    db.execute("CREATE TABLE p (id int, d int) ENGINE=InnoDB PARTITION BY LIST (d) (PARTITION p1 VALUES IN (1) ENGINE = InnoDB, PARTITION p2 VALUES IN (2))").unwrap();
+    db.execute("CREATE TABLE p2 (id int) PARTITION BY KEY (id) PARTITIONS 4").unwrap();
+    db.execute("CREATE TABLE p3 (id int, d date) PARTITION BY RANGE COLUMNS (d) (PARTITION a VALUES LESS THAN ('2000-01-01'))").unwrap();
+    db.execute("ALTER TABLE p ADD PARTITION (PARTITION p3 VALUES IN (3))").unwrap();
+    db.execute("ALTER TABLE p DROP PARTITION p3").unwrap();
+    db.execute("INSERT INTO p VALUES (1, 1), (2, 5)").unwrap();
+    assert_eq!(n(&mut db, "SELECT count(*) FROM p"), "2");
+    db.execute("CREATE TABLE ln (x int, y decimal(5,2))").unwrap();
+    assert!(db.execute("INSERT INTO ln VALUES ('abc', 'zz')").is_err());
+    db.execute("SET sql_mode = ''").unwrap();
+    db.execute("INSERT INTO ln VALUES ('12abc', 'zz')").unwrap();
+    assert_eq!(n(&mut db, "SELECT x FROM ln"), "12");
+    assert_eq!(n(&mut db, "SELECT y FROM ln"), "0");
+    db.execute("SET sql_mode = 'STRICT_ALL_TABLES'").unwrap();
+    assert!(db.execute("INSERT INTO ln VALUES ('abc', 1)").is_err());
+    // LIMIT offset, count; COLLATE; HANDLER
+    db.execute("CREATE TABLE lim (k int, v text); INSERT INTO lim VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')").unwrap();
+    assert_eq!(n(&mut db, "SELECT group_concat(v) FROM (SELECT v FROM lim ORDER BY k LIMIT 1, 2) q"), "b,c");
+    assert_eq!(n(&mut db, "SELECT count(*) FROM lim WHERE v = 'b' COLLATE latin1_bin"), "1");
+    assert_eq!(n(&mut db, "SELECT count(*) FROM lim WHERE v COLLATE utf8mb4_general_ci = 'B'"), "1");
+    db.execute("HANDLER lim OPEN AS hh").unwrap();
+    assert_eq!(db.execute("HANDLER hh READ FIRST").unwrap().rows[0][0].to_string(), "1");
+    assert_eq!(db.execute("HANDLER hh READ NEXT").unwrap().rows[0][0].to_string(), "2");
+    assert_eq!(db.execute("HANDLER hh READ NEXT LIMIT 2").unwrap().rows.len(), 2);
+    assert_eq!(db.execute("HANDLER hh READ PREV").unwrap().rows[0][0].to_string(), "3");
+    assert_eq!(db.execute("HANDLER hh READ LAST").unwrap().rows[0][0].to_string(), "5");
+    assert_eq!(db.execute("HANDLER hh READ FIRST WHERE k > 2").unwrap().rows[0][0].to_string(), "3");
+    assert_eq!(db.execute("HANDLER hh READ NEXT").unwrap().rows[0][0].to_string(), "4");
+    db.execute("HANDLER hh CLOSE").unwrap();
+    assert!(db.execute("HANDLER hh READ NEXT").is_err());
+    // texts nested absurdly deep end in an error, not a crash
+    let mut q = String::from("COUNT(k)");
+    for _ in 0..70 {
+        q = format!("(SELECT {q})");
+    }
+    assert!(db.execute(&format!("SELECT k FROM lim WHERE {q} > 0")).is_err());
+    assert!(db.execute(&format!("SELECT {}1{}", "(".repeat(20000), ")".repeat(20000))).is_err());
+    assert_eq!(n(&mut db, "SELECT ((((((((((((1))))))))))))"), "1");
+}
+
+#[test]
 fn mysql_routines_and_triggers() {
     let mut db = Database::in_memory();
     db.execute("CREATE TABLE t2 (d int); CREATE TABLE log (m text)").unwrap();
@@ -5154,4 +5232,84 @@ fn mysql_accounts_hex_numbers_and_leniency() {
     db.execute("PREPARE p FROM 'SELECT 1'; DROP PREPARE p").unwrap();
     assert_eq!(one(&mut db, "SELECT CAST('2001-01-01 00:00:00.12' AS DATETIME)"), "2001-01-01");
     assert_eq!(one(&mut db, "SELECT CAST('0000-00-00' AS DATETIME)"), "0001-01-01");
+}
+
+#[test]
+fn found_by_the_lancer_oracles() {
+    let mut db = Database::in_memory();
+    let count = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows.len();
+    // an index on a Yes/No column keeps No before Yes, but Yes compares as -1: only equality may use it
+    db.execute("CREATE TABLE b (c BOOLEAN, i INTEGER); INSERT INTO b VALUES (TRUE, 1), (FALSE, 2), (NULL, 3)").unwrap();
+    let queries = [
+        "SELECT i FROM b WHERE c >= TRUE",
+        "SELECT i FROM b WHERE c < FALSE",
+        "SELECT i FROM b WHERE c <= FALSE",
+        "SELECT i FROM b WHERE c BETWEEN TRUE AND FALSE",
+        "SELECT i FROM b WHERE c = TRUE",
+    ];
+    let before: Vec<usize> = queries.iter().map(|q| count(&mut db, q)).collect();
+    db.execute("CREATE INDEX b_c ON b (c)").unwrap();
+    let after: Vec<usize> = queries.iter().map(|q| count(&mut db, q)).collect();
+    assert_eq!(before, after);
+    assert_eq!(before, vec![2, 1, 2, 2, 1]);
+    // a derived table or view whose condition holds a sub-query that reads its own table
+    db.execute("CREATE TABLE t0 (c0 TEXT, c1 INTEGER); INSERT INTO t0 VALUES ('a', 1), ('b', 2), ('c', NULL)").unwrap();
+    for opt in [true, false] {
+        db.set_optimizer(opt);
+        assert_eq!(count(&mut db, "SELECT * FROM (SELECT c0 AS v0 FROM t0 WHERE EXISTS (SELECT 1 FROM t0 AS s WHERE s.c1 = t0.c1)) AS d"), 2);
+        assert_eq!(count(&mut db, "SELECT * FROM (SELECT c0 AS v0 FROM t0 WHERE EXISTS (SELECT 1 FROM t0 AS s WHERE s.c1 = t0.c1)) AS d WHERE d.v0 = 'a'"), 1);
+    }
+    db.execute("CREATE VIEW v AS SELECT c0 FROM t0 WHERE EXISTS (SELECT 1 FROM t0 AS s WHERE s.c1 = t0.c1)").unwrap();
+    assert_eq!(count(&mut db, "SELECT * FROM v WHERE c0 = 'b'"), 1);
+}
+
+#[test]
+fn mysql_locking_reads_straight_join_char_using_hints_and_runaway_recursion() {
+    let mut db = Database::in_memory();
+    let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    db.execute("CREATE TABLE t1 (a int, b int); CREATE TABLE t2 (a int); INSERT INTO t1 VALUES (1,10),(2,20),(3,30); INSERT INTO t2 VALUES (2),(3),(4)").unwrap();
+    // locking reads lock nothing
+    assert_eq!(n(&mut db, "SELECT count(*) FROM (SELECT * FROM t1 FOR UPDATE) q"), "3");
+    assert_eq!(db.execute("SELECT a FROM t1 WHERE a > 1 ORDER BY a LIMIT 1 FOR SHARE").unwrap().rows.len(), 1);
+    assert_eq!(db.execute("SELECT a FROM t1 LOCK IN SHARE MODE").unwrap().rows.len(), 3);
+    assert_eq!(db.execute("SELECT a FROM t1 FOR UPDATE OF t1 NOWAIT").unwrap().rows.len(), 3);
+    assert_eq!(db.execute("SELECT a FROM t1 FOR UPDATE SKIP LOCKED").unwrap().rows.len(), 3);
+    // STRAIGHT_JOIN and the other select modifiers
+    assert_eq!(n(&mut db, "SELECT STRAIGHT_JOIN count(*) FROM t1 STRAIGHT_JOIN t2 ON t1.a = t2.a"), "2");
+    assert_eq!(n(&mut db, "SELECT SQL_NO_CACHE SQL_CALC_FOUND_ROWS HIGH_PRIORITY count(*) FROM t1"), "3");
+    // CHAR(.. USING cs)
+    assert_eq!(n(&mut db, "SELECT CHAR(77, 121 USING utf8mb4)"), "My");
+    // CAST(x AS TIME) is the time of day; BIGINT UNSIGNED holds what a signed 64-bit integer cannot
+    assert_eq!(n(&mut db, "SELECT CAST('1:2:3' AS TIME)"), "01:02:03");
+    assert_eq!(n(&mut db, "SELECT CAST('2024-05-06 07:08:09' AS TIME)"), "07:08:09");
+    db.execute("CREATE TABLE u8t (u BIGINT UNSIGNED); INSERT INTO u8t VALUES (18446744073709551615), (0)").unwrap();
+    assert_eq!(n(&mut db, "SELECT max(u) FROM u8t"), "18446744073709551615");
+    // MAX_EXECUTION_TIME ends a long select
+    db.execute("CREATE TABLE big (x int)").unwrap();
+    db.execute("INSERT INTO big SELECT g FROM generate_series(1, 3000) AS s(g)").unwrap();
+    let e = db.execute("SELECT /*+ MAX_EXECUTION_TIME(1) */ count(*) FROM big a, big b, big c").unwrap_err().to_string();
+    assert!(e.contains("timeout"), "{e}");
+    // a recursion that multiplies its rows ends with an error, soon
+    let started = std::time::Instant::now();
+    let e = db.execute("WITH RECURSIVE qn AS (SELECT 1 AS x FROM t1 UNION ALL SELECT 1 FROM t1 LEFT JOIN qn ON 1) SELECT count(*) FROM qn").unwrap_err().to_string();
+    assert!(e.contains("too many rows"), "{e}");
+    assert!(started.elapsed().as_secs() < 30);
+    // a correlated sub-query in the argument of an aggregate
+    db.execute("CREATE TABLE g (c0 text, c1 int, k int); INSERT INTO g VALUES ('a',1,1),('b',2,1),('c',NULL,2),('d',2,2)").unwrap();
+    for opt in [true, false] {
+        db.set_optimizer(opt);
+        assert_eq!(n(&mut db, "SELECT SUM(CASE WHEN EXISTS (SELECT 1 FROM g s WHERE s.c1 = g.c1 AND s.c0 <> g.c0) THEN 1 ELSE 0 END) FROM g"), "2");
+        assert_eq!(n(&mut db, "SELECT SUM((SELECT MAX(s.c1) FROM g s WHERE s.k = g.k)) FROM g"), "8");
+    }
+}
+
+#[test]
+fn mysql_databases_are_schemas_and_recursion_stops_after_a_thousand_rounds() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE DATABASE mysqltest DEFAULT CHARACTER SET utf8mb4; CREATE TABLE mysqltest.t1 (a int); INSERT INTO mysqltest.t1 VALUES (7)").unwrap();
+    assert_eq!(db.execute("SELECT a FROM mysqltest.t1").unwrap().rows[0][0].to_string(), "7");
+    db.execute("CREATE DATABASE IF NOT EXISTS test; DROP DATABASE test; DROP TABLE mysqltest.t1; DROP DATABASE IF EXISTS mysqltest").unwrap();
+    assert!(db.execute("SELECT 1 FROM mysqltest.t1").is_err());
+    assert_eq!(db.execute("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 900) SELECT count(*) FROM r").unwrap().rows[0][0].to_string(), "900");
+    assert!(db.execute("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r").is_err());
 }
