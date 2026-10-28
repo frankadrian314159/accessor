@@ -37,6 +37,10 @@ crates/accessor-capi/fuzz/run-fuzz.sh [seconds per target] [target ...]
 
 **Results so far.** No crash, sanitizer report, caught panic, timeout or out-of-memory in any run: `binds` for 240 seconds (95,453 inputs) and `strings` for 120 seconds (8,077 inputs, after fixing the harness so that it never creates files from fuzz data; an earlier run had let some fuzzed paths through to `acc_open`). That is a short fuzzing session, not a proof; run it for hours before a release, and again after changing `crates/accessor-capi/src/lib.rs`.
 
+## Isolation: Hermitage
+
+`cargo test -p accessor-core --test hermitage` plays the scenarios of [Hermitage](https://github.com/ept/hermitage) against overlapping transactions: eleven tests, one per anomaly. All of them behave as snapshot isolation should, with and without `ACCESSOR_FORCE_MVCC=1`; no engine fix was needed. See [concurrency](../concurrency.md).
+
 ## The JDBC driver
 
 `jdbc/src/test/java/com/accessor/jdbc/JdbcTest.java` runs 23 groups of tests against the real native library (`jdbc/build.sh`): types in and out, exactness of decimals, NULLs, scrolling, every bind type, placeholders in odd places, batches that fail, generated keys, error states, transactions and savepoints, closed objects, metadata, files and locking, reports, unsupported features, strange text, many connections, several threads, and a result of 50,000 rows. The jar is also run on its own, loading the library from inside itself.

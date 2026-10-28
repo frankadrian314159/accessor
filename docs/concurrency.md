@@ -69,6 +69,8 @@ The same rule decides:
 
 *Write skew.* Two transactions each read the same rows, each decide on that basis, and each write a **different** row; neither collides with the other, and both commit, so the result is one no serial order would give. The textbook case: two doctors on call, each checks that the other is on call before going off. The test `write_skew_is_possible_under_snapshot_isolation` shows it happening. If a rule spans rows, make the transactions touch a common row (update a counter, or a summary row, in each) so that they collide.
 
+The tests in `tests/hermitage.rs` follow [Hermitage](https://github.com/ept/hermitage), Martin Kleppmann's catalogue of isolation anomalies: dirty writes (G0), aborted and intermediate reads (G1a, G1b), circular information flow (G1c), observed transaction vanishes, predicate phantoms (PMP, PMP-write), lost update (P4) and read skew (G-single) are all prevented, as under PostgreSQL's `REPEATABLE READ`; write skew over rows and over a predicate (G2-item, G2) happens.
+
 ## Turns: how statements are run
 
 The tables are one shared structure, so the engine runs **one statement at a time**, but a transaction is not a statement: other transactions' statements run in between.
