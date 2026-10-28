@@ -209,8 +209,10 @@ impl Database {
             }
             AlterAction::DropConstraint(name) => {
                 let is_fk = self.table_checked(&table)?.schema().foreign_keys.iter().any(|f| f.name.eq_ignore_ascii_case(name));
-                if !is_fk && self.trigger_sql(&format!("{name}_ins")).is_some() {
-                    // A CHECK constraint is a pair of triggers.
+                // a CHECK constraint is a pair of triggers, named with the table's when another table had the name first
+                let own = format!("{table}__{name}");
+                let trigger = if self.trigger_sql(&format!("{own}_ins")).is_some() { Some(own) } else { Some(name.clone()).filter(|n| self.trigger_sql(&format!("{n}_ins")).is_some()) };
+                if let (false, Some(name)) = (is_fk, trigger) {
                     self.execute(&format!("DROP TRIGGER [{name}_ins]; DROP TRIGGER [{name}_upd]"))?;
                     return Ok(QueryResult::default());
                 }

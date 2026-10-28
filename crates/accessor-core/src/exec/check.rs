@@ -60,6 +60,9 @@ impl Database {
         }
 
         let base = match name {
+            // constraint names belong to a table, trigger names to the database: a second table with a constraint of
+            // the same name gets the table's name in front
+            Some(n) if self.trigger_sql(&format!("{n}_ins")).is_some() => format!("{real}__{n}"),
             Some(n) => n.to_string(),
             None => (1..)
                 .map(|k| format!("ck_{real}_{k}"))

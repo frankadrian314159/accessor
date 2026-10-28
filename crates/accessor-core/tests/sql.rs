@@ -5346,3 +5346,28 @@ fn tpcds_forms_set_operations_in_parentheses_and_aliases_in_order_by_expressions
     // an alias that is not there is still an error
     assert!(db.execute("SELECT g FROM t ORDER BY CASE WHEN nothing = 0 THEN g END").is_err());
 }
+
+#[test]
+fn a_column_called_key_is_not_a_mysql_key_definition() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE k1 (key int, data text)").unwrap();
+    db.execute("CREATE TABLE k3 (key varchar(10), id int, KEY idx (id), data text)").unwrap();
+    db.execute("INSERT INTO k1 VALUES (1, 'a'); INSERT INTO k3 VALUES ('x', 1, 'd')").unwrap();
+    assert_eq!(db.execute("SELECT key FROM k1").unwrap().rows[0][0].to_string(), "1");
+    assert_eq!(db.execute("SELECT key FROM k3").unwrap().rows[0][0].to_string(), "x");
+}
+
+#[test]
+fn constraint_names_belong_to_a_table_and_column_renames_need_no_keyword() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE c1 (a int, CONSTRAINT check_a CHECK (a > 0)); CREATE TABLE c2 (a int, CONSTRAINT check_a CHECK (a < 0))").unwrap();
+    assert!(db.execute("INSERT INTO c1 VALUES (-1)").is_err());
+    assert!(db.execute("INSERT INTO c2 VALUES (1)").is_err());
+    db.execute("INSERT INTO c1 VALUES (1); INSERT INTO c2 VALUES (-1)").unwrap();
+    db.execute("ALTER TABLE c2 DROP CONSTRAINT check_a").unwrap();
+    db.execute("INSERT INTO c2 VALUES (5)").unwrap();
+    assert!(db.execute("INSERT INTO c1 VALUES (-1)").is_err(), "the other table keeps its constraint");
+    db.execute("ALTER TABLE c1 RENAME a TO b").unwrap();
+    assert_eq!(db.execute("SELECT b FROM c1").unwrap().rows[0][0].to_string(), "1");
+    db.execute("CREATE DATABASE d1; DROP DATABASE IF EXISTS d1 WITH (FORCE)").unwrap();
+}

@@ -51,10 +51,11 @@ pub(crate) fn tick() -> Result<()> {
     Ok(())
 }
 
-/// Under a time limit, a result this many rows long is not worth waiting for either (and may not fit in memory): it ends
-/// like a timeout. The limit is high enough for a join of a few million rows, as in TPC-H at a scale factor of 1.
-pub(crate) fn rows(n: usize) -> Result<()> {
-    if n >= 16_777_216 && n & 0xFFFF == 0 && DEADLINE.with(|d| d.get()).is_some() {
+/// Under a time limit, a result with this many values (rows times columns) is not worth waiting for either, and may not fit
+/// in memory: it ends like a timeout. Wide rows reach it sooner, so a join of a few million narrow rows, as in TPC-H at a scale
+/// factor of 0.5, still runs.
+pub(crate) fn rows(n: usize, width: usize) -> Result<()> {
+    if n >= 262_144 && n & 0xFFFF == 0 && n.saturating_mul(width.max(1)) >= 16_000_000 && DEADLINE.with(|d| d.get()).is_some() {
         return Err(Error::runtime(EXPIRED));
     }
     Ok(())

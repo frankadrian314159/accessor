@@ -923,6 +923,7 @@ impl<'a> Parser<'a> {
         if self.peek_kw("DATABASE") && self.peek_kw_at(1, "test") {
             return Ok(Some(self.ignore_rest("DROP DATABASE")));
         }
+        let database = self.peek_kw("DATABASE");
         let kind: &'static str = if self.eat_kw("SCHEMA") || self.eat_kw("DATABASE") {
             "schema"
         } else if self.eat_kw("DOMAIN") || self.eat_kw("TYPE") {
@@ -941,6 +942,12 @@ impl<'a> Parser<'a> {
         let names = if kind == "role" { self.role_list()? } else { self.ident_list()? };
         let cascade = self.eat_kw("CASCADE");
         self.eat_kw("RESTRICT");
+        if database {
+            // DROP DATABASE d [WITH] (FORCE)
+            while !self.at_eof() && !self.peek_sym(";") {
+                self.advance();
+            }
+        }
         if kind == "type" {
             for n in &names {
                 crate::sql::usertypes::unregister(n);
@@ -1469,8 +1476,21 @@ impl<'a> Parser<'a> {
         }
         (self.peek_kw_at(k, "PRIMARY") && self.peek_kw_at(k + 1, "KEY"))
             || self.peek_kw_at(k, "UNIQUE")
-            || ((self.peek_kw_at(k, "KEY") || self.peek_kw_at(k, "INDEX")) && !matches!(self.peek_at(k + 1), Tok::Sym(",") | Tok::Sym(")")) && k == 0)
+            || ((self.peek_kw_at(k, "KEY") || self.peek_kw_at(k, "INDEX")) && k == 0 && self.mysql_key_ahead(k))
             || ((self.peek_kw_at(k, "FULLTEXT") || self.peek_kw_at(k, "SPATIAL")) && (self.peek_kw_at(k + 1, "KEY") || self.peek_kw_at(k + 1, "INDEX") || matches!(self.peek_at(k + 1), Tok::Sym("("))))
+    }
+
+    /// At `KEY` / `INDEX` inside a table definition or `ALTER TABLE`: MySQL's `KEY [name] [USING ..] (columns)`, rather than a
+    /// column that happens to be called `key` (`key int`, `key varchar(10)`; an index column is a name, not a length).
+    fn mysql_key_ahead(&self, k: usize) -> bool {
+        match self.peek_at(k + 1) {
+            Tok::Sym("(") => true,
+            Tok::Ident(_) | Tok::Quoted(_) => {
+                self.peek_kw_at(k + 2, "USING")
+                    || (matches!(self.peek_at(k + 2), Tok::Sym("(")) && matches!(self.peek_at(k + 3), Tok::Ident(_) | Tok::Quoted(_)))
+            }
+            _ => false,
+        }
     }
 
     fn key_element(&mut self, primary_key: &mut Vec<String>, uniques: &mut Vec<Vec<String>>, indexes: &mut Vec<IndexSpec>) -> Result<()> {
@@ -1609,8 +1629,7 @@ impl<'a> Parser<'a> {
             }
             let is_key = self.peek_kw_at(look, "PRIMARY") && self.peek_kw_at(look + 1, "KEY")
                 || self.peek_kw_at(look, "UNIQUE")
-                || self.peek_kw_at(look, "KEY")
-                || self.peek_kw_at(look, "INDEX")
+                || ((self.peek_kw_at(look, "KEY") || self.peek_kw_at(look, "INDEX")) && self.mysql_key_ahead(look))
                 || self.peek_kw_at(look, "FULLTEXT")
                 || self.peek_kw_at(look, "SPATIAL");
             if is_key {
@@ -1667,7 +1686,7 @@ impl<'a> Parser<'a> {
             all.push(Statement::AlterTable { table, action: AlterAction::SetNotNull { name: def.name.clone(), not_null: def.not_null } });
             return Ok(Some(Statement::Batch(all)));
         }
-        if self.peek_kw("RENAME") && !self.peek_kw_at(1, "COLUMN") && !self.peek_kw_at(1, "KEY") && !self.peek_kw_at(1, "INDEX") && !self.peek_kw_at(1, "TO") {
+        if self.peek_kw("RENAME") && !self.peek_kw_at(1, "COLUMN") && !self.peek_kw_at(1, "KEY") && !self.peek_kw_at(1, "INDEX") && !self.peek_kw_at(1, "TO") && !self.peek_kw_at(2, "TO") {
             self.advance();
             self.eat_kw("AS");
             return Ok(Some(Statement::AlterTable { table, action: AlterAction::RenameTable(self.ident()?) }));

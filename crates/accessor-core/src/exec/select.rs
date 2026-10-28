@@ -2157,7 +2157,7 @@ fn join_step(
                 m[slot] = true;
             }
             out.push(scratch.clone());
-            super::budget::rows(out.len())?;
+            super::budget::rows(out.len(), lw + rw)?;
         }
         if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
             let mut row = l.clone();
