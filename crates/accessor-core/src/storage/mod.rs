@@ -11,6 +11,7 @@ use crate::schema::{Column, ForeignKey, IndexDef, TableSchema};
 use crate::sequence::SequenceDef;
 use crate::value::{DataType, Row, Value};
 pub use table::{RowId, Table};
+pub(crate) use table::Claim;
 
 /// A single logical mutation. Every change to a database — whether from SQL,
 /// the GUI, replay of the write-ahead log, or undo — is expressed as an `Op`.

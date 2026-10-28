@@ -857,6 +857,7 @@ Accessor is a Cargo workspace of five crates, about 35,600 lines of Rust in all 
 | `accessor-gui` | 3,250 | The desktop application, on `egui`/`eframe`. It uses the library's public API only, as any other program would. |
 | `accessor-capi` | 1,030, plus 430 of fuzz targets | The C interface (`accessor.h`, generated), with 670 lines of C tests. |
 | `accessor-slt` | 600 | A runner for SQLite's *sqllogictest* files (see [extern/testing.md](extern/testing.md#sqllogictest)). |
+| `accessor-tpcc` | 730 | TPC-C: the five transactions from several terminals at once, then the consistency conditions of the specification (see [concurrency.md](concurrency.md#tpc-c)). |
 | `jdbc/` (Java, not a crate) | 7,000 (2,800 of it generated stubs), plus 800 of tests | The JDBC driver, over the C interface. |
 
 (Counted with `wc -l` over the source files, blank lines and comments included.)

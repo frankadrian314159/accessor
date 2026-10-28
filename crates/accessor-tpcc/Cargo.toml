@@ -1,0 +1,11 @@
+[package]
+name = "accessor-tpcc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runs the five transactions of TPC-C against Accessor from several terminals at once, then checks the consistency conditions of the specification"
+publish = false
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }

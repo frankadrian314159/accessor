@@ -175,6 +175,28 @@ pub struct Select {
     pub crosstab: Option<Box<Crosstab>>,
     /// `WINDOW w AS (...)` definitions that window functions can name.
     pub windows: Vec<(String, WindowSpec)>,
+    /// `FOR UPDATE`, `FOR SHARE`, `LOCK IN SHARE MODE`: the rows this select returns are claimed for the transaction.
+    pub lock: Option<LockClause>,
+}
+
+/// The locking clause of a `SELECT`. Every strength (`UPDATE`, `NO KEY UPDATE`, `SHARE`, `KEY SHARE`) claims the rows alike.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct LockClause {
+    /// `OF t, ..`: the tables to lock (empty: all of them).
+    pub of: Vec<String>,
+    pub wait: LockWait,
+}
+
+/// What a locking read does with a row another transaction has claimed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LockWait {
+    /// Waits for the other transaction to end.
+    #[default]
+    Wait,
+    /// `NOWAIT`: fails at once.
+    NoWait,
+    /// `SKIP LOCKED`: leaves the row out.
+    SkipLocked,
 }
 
 /// The `TRANSFORM aggregate ... PIVOT column [IN (values)]` parts of a crosstab query.

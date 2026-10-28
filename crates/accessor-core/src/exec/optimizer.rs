@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use super::select::{choose_access, Access, Source, SourceData};
 use crate::database::Database;
 use crate::expr::BExpr;
+use crate::schema::IndexDef;
 use crate::sql::ast::{BinOp, JoinKind};
 use crate::storage::Table;
 use crate::value::Value;
@@ -301,10 +302,27 @@ enum Reach {
     Unique,
 }
 
+/// How many rows an index probe finds for one left row when the join equates the first `k` columns of `def`: one
+/// for a unique index that is fully equated, otherwise the table's rows over the distinct values of those columns.
+pub(crate) fn probe_fanout(t: &Table, def: &IndexDef, k: usize) -> f64 {
+    if def.unique && k >= def.columns.len() {
+        return 1.0;
+    }
+    let n = t.estimated_len() as f64;
+    let distinct: f64 = def.columns.iter().take(k).map(|&c| t.column_stats(c).distinct.max(1.0)).product();
+    (n / distinct.min(n.max(1.0))).max(1.0)
+}
+
+/// Whether probing an index `left` times, finding `fanout` rows each time, reads fewer rows than reading the table
+/// once to hash it. An index on a column with few values (the warehouse of every row) does not.
+pub(crate) fn probe_pays(t: &Table, fanout: f64, left: f64) -> bool {
+    left * fanout <= t.estimated_len() as f64 + left
+}
+
 /// `(this source's column, another source's column)` for each equality of two plain columns.
 type JoinPairs = Vec<(usize, usize)>;
 
-fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs: &[usize]) -> (Reach, JoinPairs) {
+fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs: &[usize], left: f64) -> (Reach, JoinPairs) {
     let me: SourceMask = 1 << s;
     let mut cols: Vec<usize> = Vec::new();
     let mut pairs: JoinPairs = Vec::new();
@@ -336,7 +354,8 @@ fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs
     if let SourceData::Table(t) = &source.data {
         let mut best = Reach::Hash;
         for def in t.index_defs() {
-            if def.columns.first().is_some_and(|c| cols.contains(c)) {
+            let k = def.columns.iter().take_while(|c| cols.contains(c)).count();
+            if k > 0 && probe_pays(t, probe_fanout(t, def, k), left) {
                 best = best.max(Reach::Index);
             }
             if def.unique && def.columns.iter().all(|c| cols.contains(c)) {
@@ -368,7 +387,8 @@ fn join_distinct(sources: &[Source<'_>], s: usize, pairs: &JoinPairs, offs: &[us
 }
 
 /// The order to join the sources in: start from the smallest filtered source,
-/// then keep adding the one that leaves the smallest intermediate result.
+/// then keep adding the one that leaves the smallest intermediate result, one that is linked
+/// to the rows already joined before any that would be a cross product.
 pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], offs: &[usize], deps: &[SourceMask]) -> Vec<usize> {
     let m = sources.len();
     let start = (0..m)
@@ -379,12 +399,12 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
     let mut placed: SourceMask = 1 << start;
     let mut current = est[start];
     while order.len() < m {
-        let mut best: Option<(usize, f64, f64)> = None; // (source, result rows, work)
+        let mut best: Option<(usize, f64, f64, bool)> = None; // (source, result rows, work, a cross product)
         for s in 0..m {
             if placed & (1 << s) != 0 || deps[s] & !placed != 0 {
                 continue;
             }
-            let (r, pairs) = reach(&sources[s], s, placed, preds, offs);
+            let (r, pairs) = reach(&sources[s], s, placed, preds, offs, current);
             // About |A|·|B| / (the larger number of distinct join values), or the larger input when
             // nothing is known (the foreign-key-to-key pattern).
             let joined = || match join_distinct(sources, s, &pairs, offs, est[s], current) {
@@ -397,15 +417,19 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
                 Reach::Hash => (joined(), current + est[s]),
                 Reach::Cross => (current * est[s], current * est[s]),
             };
+            // a cross product only when nothing else is linked to the rows joined so far: a small one now (two
+            // nations) multiplies every later step, and the source that links them may come later
+            let cross = r == Reach::Cross;
             let better = match &best {
                 None => true,
-                Some((_, bo, bw)) => out < *bo || (out == *bo && work < *bw),
+                Some((_, _, _, bc)) if *bc != cross => *bc,
+                Some((_, bo, bw, _)) => out < *bo || (out == *bo && work < *bw),
             };
             if better {
-                best = Some((s, out, work));
+                best = Some((s, out, work, cross));
             }
         }
-        let (s, out, _) = best.expect("a source remains");
+        let (s, out, _, _) = best.expect("a source remains");
         order.push(s);
         placed |= 1 << s;
         current = out;

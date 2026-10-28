@@ -24,6 +24,7 @@ mod viewdml;
 pub(crate) mod optimizer;
 mod proc;
 mod dml;
+mod lock;
 pub(crate) mod select;
 pub(crate) mod window;
 
@@ -122,6 +123,7 @@ impl Database {
                 self.set_constraints(names.as_deref(), *deferred).map(|_| QueryResult::default())
             }
             Statement::SetTimeZone(name) => self.set_time_zone(name).map(|_| QueryResult::default()),
+            Statement::Select(s) if s.lock.is_some() => self.exec_locking_select(s),
             Statement::Select(s) => self.run_select(s),
             Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. }
                 if self.table(table).is_none() && self.view_sql(table).is_some() =>

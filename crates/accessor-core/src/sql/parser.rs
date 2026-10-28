@@ -4304,20 +4304,26 @@ impl<'a> Parser<'a> {
                     sel.limit = Some(self.usize_literal()?);
                 }
             } else if self.peek_kw("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) {
-                // FOR UPDATE | SHARE | NO KEY UPDATE | KEY SHARE [OF t, ..] [NOWAIT | SKIP LOCKED]: there is nobody to lock against
+                // FOR UPDATE | SHARE | NO KEY UPDATE | KEY SHARE [OF t, ..] [NOWAIT | SKIP LOCKED]
                 self.advance();
                 while self.eat_kw("NO") || self.eat_kw("KEY") {}
                 self.advance();
+                let mut lock = LockClause::default();
                 if self.eat_kw("OF") {
-                    self.ident_list()?;
+                    lock.of = self.ident_list()?;
                 }
-                if !self.eat_kw("NOWAIT") && self.eat_kw("SKIP") {
+                if self.eat_kw("NOWAIT") {
+                    lock.wait = LockWait::NoWait;
+                } else if self.eat_kw("SKIP") {
                     self.expect_kw("LOCKED")?;
+                    lock.wait = LockWait::SkipLocked;
                 }
+                sel.lock = Some(lock);
             } else if self.peek_kw("LOCK") && self.peek_kw_at(1, "IN") && self.peek_kw_at(2, "SHARE") {
                 for _ in 0..4 {
                     self.advance();
                 }
+                sel.lock = Some(LockClause::default());
             } else if self.eat_kw("OFFSET") {
                 sel.offset = Some(self.usize_literal()?);
                 if !self.eat_kw("ROWS") {

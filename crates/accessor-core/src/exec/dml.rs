@@ -345,7 +345,7 @@ impl Database {
     /// The records of `t` passing `filter`. A filter that reads correlated
     /// sub-query values needs each record extended with them first; those
     /// extended records come back alongside the ids.
-    fn matching_with_corr(
+    pub(crate) fn matching_with_corr(
         &self,
         t: &Table,
         filter: Option<BExpr>,

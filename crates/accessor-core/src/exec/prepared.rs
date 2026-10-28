@@ -63,6 +63,9 @@ impl Database {
             [Statement::Explain(s) | Statement::ExplainAnalyze(s)] => (**s).clone(),
             _ => return false,
         };
+        if copy.lock.is_some() {
+            return false; // a locking read claims rows
+        }
         let sequences_in_views = self.views.values().any(|(_, sql)| {
             let up = sql.to_ascii_uppercase();
             up.contains("NEXTVAL") || up.contains("SETVAL") || up.contains("NEXT VALUE")

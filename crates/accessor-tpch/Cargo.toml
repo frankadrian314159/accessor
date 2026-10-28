@@ -1,0 +1,11 @@
+[package]
+name = "accessor-tpch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runs the 22 queries of TPC-H against Accessor, on data generated in the shape of dbgen"
+publish = false
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }

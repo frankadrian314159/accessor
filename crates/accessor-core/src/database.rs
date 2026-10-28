@@ -610,6 +610,30 @@ impl Database {
         }
     }
 
+    /// Claims row `id` of `table` for the open transaction (a locking read), and remembers how to let go.
+    pub(crate) fn claim_row(&mut self, table: &str, id: RowId) -> Result<crate::storage::Claim> {
+        let claim = self.table_mut(table)?.claim(id)?;
+        if let (crate::storage::Claim::Taken(old), Some(tx)) = (&claim, &mut self.tx) {
+            // taking the claim back is taking back an update, and committing it stamps the row
+            tx.undo.push(Undo::Dml(Op::Update { table: table.to_string(), id, row: old.clone() }));
+        }
+        Ok(claim)
+    }
+
+    /// How much the open transaction has done so far, to let go of what a statement did with [`release_to`](Self::release_to).
+    pub(crate) fn undo_mark(&self) -> usize {
+        self.tx.as_ref().map_or(0, |t| t.undo.len())
+    }
+
+    /// Takes back what the open transaction did after `mark`.
+    pub(crate) fn release_to(&mut self, mark: usize) {
+        let undo = match &mut self.tx {
+            Some(tx) if tx.undo.len() > mark => tx.undo.split_off(mark),
+            _ => return,
+        };
+        self.revert(undo);
+    }
+
     fn unwind(&mut self, table: &str, f: impl FnOnce(&mut Table)) {
         if let Some(t) = self.tables.get_mut(&key(table)) {
             f(t);
@@ -828,7 +852,7 @@ impl Database {
         Ok(())
     }
 
-    fn start_tx(&mut self, auto: bool) {
+    pub(crate) fn start_tx(&mut self, auto: bool) {
         let mut tx = Tx { auto, ..Tx::default() };
         if self.mvcc {
             self.next_txn += 1;

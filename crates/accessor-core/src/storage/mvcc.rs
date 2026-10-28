@@ -112,3 +112,36 @@ pub fn view() -> View {
 pub fn set_view(v: View) {
     VIEW.with(|c| c.set(v));
 }
+
+thread_local! {
+    static ONLY: std::cell::RefCell<Option<(String, std::collections::HashSet<u32>)>> = const { std::cell::RefCell::new(None) };
+    static ONLY_ON: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` with the rows of `table` limited to `ids`: how a locking read leaves out the rows it skipped.
+pub fn only_rows<R>(table: &str, ids: std::collections::HashSet<u32>, f: impl FnOnce() -> R) -> R {
+    let before = ONLY.with(|c| c.replace(Some((table.to_ascii_lowercase(), ids))));
+    ONLY_ON.with(|c| c.set(true));
+    let out = f();
+    let was_on = before.is_some();
+    ONLY.with(|c| *c.borrow_mut() = before);
+    ONLY_ON.with(|c| c.set(was_on));
+    out
+}
+
+/// Whether row `id` of `table` may be seen, given any limit set by [`only_rows`].
+pub fn row_allowed(table: &str, id: u32) -> bool {
+    if !ONLY_ON.with(Cell::get) {
+        return true;
+    }
+    ONLY.with(|c| match &*c.borrow() {
+        Some((t, ids)) => !t.eq_ignore_ascii_case(table) || ids.contains(&id),
+        None => true,
+    })
+}
+
+/// Whether [`only_rows`] is in force (the table cannot then count its rows from its totals).
+pub fn rows_limited() -> bool {
+    ONLY_ON.with(Cell::get)
+}
+

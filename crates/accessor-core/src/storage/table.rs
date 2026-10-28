@@ -93,6 +93,16 @@ impl Version {
     }
 }
 
+/// What claiming a row came to.
+pub(crate) enum Claim {
+    /// The row is now the caller's; the contents are those it had.
+    Taken(Row),
+    /// The caller's transaction had it already.
+    Mine,
+    /// The row has been deleted.
+    Gone,
+}
+
 /// `Busy`, remembering which transaction is in the way.
 fn busy(stamp: Stamp, what: String) -> Error {
     mvcc::blocked_by(stamp);
@@ -167,7 +177,7 @@ impl Table {
     }
     /// Number of rows the caller can see.
     pub fn len(&self) -> usize {
-        if self.outstanding == 0 {
+        if self.outstanding == 0 && !mvcc::rows_limited() {
             self.live
         } else {
             self.iter().count()
@@ -206,14 +216,41 @@ impl Table {
         let view = mvcc::view();
         self.rows.iter().enumerate().filter_map(move |(i, slot)| {
             let v = slot.as_ref()?.chain().find(|v| view.sees(v.begin, v.end))?;
-            Some((i as RowId, &v.row))
+            mvcc::row_allowed(&self.schema.name, i as RowId).then_some((i as RowId, &v.row))
         })
     }
 
     /// The version of row `id` the caller can see.
     fn visible(&self, id: RowId) -> Option<&Version> {
         let view = mvcc::view();
-        self.rows.get(id as usize)?.as_ref()?.chain().find(|v| view.sees(v.begin, v.end))
+        let v = self.rows.get(id as usize)?.as_ref()?.chain().find(|v| view.sees(v.begin, v.end))?;
+        mvcc::row_allowed(&self.schema.name, id).then_some(v)
+    }
+
+    /// Claims row `id` for the caller's transaction, as a locking read does: the row gets a new version,
+    /// with the contents of the newest committed one (whatever the caller's snapshot), which the
+    /// caller then sees and which no other transaction can change until this one ends. `Busy` if
+    /// another transaction has an unfinished change to the row.
+    pub(crate) fn claim(&mut self, id: RowId) -> Result<Claim> {
+        let view = mvcc::view();
+        let me = pending(view.txn);
+        let Some(head) = self.rows.get(id as usize).and_then(Option::as_ref) else { return Ok(Claim::Gone) };
+        if (head.begin >= PENDING && head.begin != me) || (head.end >= PENDING && head.end != me) {
+            return Err(busy(if head.begin >= PENDING && head.begin != me { head.begin } else { head.end }, format!("row {id} of '{}'", self.schema.name)));
+        }
+        if head.end != INF {
+            return Ok(Claim::Gone); // deleted, by this transaction or one that has committed
+        }
+        if head.begin == me {
+            return Ok(Claim::Mine);
+        }
+        let row = head.row.clone();
+        self.edit(id, |s| {
+            let mut old = s.take().expect("checked");
+            old.end = me;
+            *s = Some(Version { row: row.clone(), begin: me, end: INF, prev: Some(Box::new(old)) });
+        });
+        Ok(Claim::Taken(row))
     }
 
     /// Changes slot `id` with `f`, keeping the counts right.
@@ -1075,6 +1112,12 @@ impl Table {
             let Some(head) = self.rows.get(id as usize).and_then(Option::as_ref) else { continue };
             let other_begin = head.begin >= PENDING && head.begin != me;
             let other_end = head.end >= PENDING && head.end != me;
+            if other_begin && matches(head) && head.prev.as_deref().is_some_and(matches) {
+                // another transaction's new version of a row that has the key before and after: it is there however that ends
+                // (this is also what a locking read leaves)
+                out.push(id);
+                continue;
+            }
             // A change not yet committed by another transaction: whether the row is there depends on it.
             if (other_begin && (matches(head) || head.prev.as_deref().is_some_and(matches))) || (other_end && matches(head)) {
                 return Err(busy(if other_begin { head.begin } else { head.end }, format!("a row of '{}' is being changed", self.schema.name)));

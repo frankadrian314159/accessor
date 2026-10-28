@@ -30,7 +30,7 @@ The optimizer works greedily, one table at a time:
    | Reach | Meaning | Estimated rows out | Work |
    | --- | --- | --- | --- |
    | **unique** | an equality links it to the joined tables and a unique index covers the linked columns, so each row matches at most one | the rows so far (no growth) | one lookup per row |
-   | **index** | an equality links it and some index starts with a linked column | the equality-join estimate below | one lookup per row |
+   | **index** | an equality links it and some index starts with a linked column, and probing it is [worth it](#when-an-index-is-not-worth-probing) | the equality-join estimate below | one lookup per row |
    | **hash** | an equality links it but no index helps | the equality-join estimate below | rows so far + the table's rows |
    | **cross** | no equality links it to the joined tables | the product of the two | the product |
 
@@ -50,9 +50,15 @@ Each step joins the rows so far (the *left*) to the next table (the *right*), by
 
 ### Index nested-loop
 
-For each left row, look the matching right rows up through an index on the right table whose leading columns are the join columns. Cost grows with the left rows, not the right table's size. It is used when such an index exists, except when the right table has at most 64 rows and the left has more than four times as many: then hashing the small table once is cheaper.
+For each left row, look the matching right rows up through an index on the right table whose leading columns are the join columns. Cost grows with the left rows, not the right table's size. It is used when such an index exists, except when the right table has at most 64 rows and the left has more than four times as many (then hashing the small table once is cheaper), and except when the index [finds too much](#when-an-index-is-not-worth-probing).
 
 Primary keys, unique constraints, foreign keys (which create an index on the referencing columns automatically) and `CREATE INDEX` all provide indexes. A composite index serves as many of its leading columns as the join equates.
+
+#### When an index is not worth probing
+
+An index finds, for one left row, every row with the same values in the columns the join equates. If those columns have few distinct values, that is a large part of the table: an index whose first column is the warehouse of every row, joined on that column alone, finds the whole table each time. The optimizer works out the rows a probe finds (the table's rows divided by the distinct values of the equated columns, from the [column statistics](estimates.md); one for a unique index that is fully equated), and probes only if left rows × that is no more than the table's rows plus the left rows, which is what hashing the table once costs. Otherwise the join is hashed, and the table's own conditions thin it out as it is read. `EXPLAIN` then says `hash join` where it would have said `index nested-loop`.
+
+This matters most for foreign keys, which create an index on the referencing columns that a join on only the first of them can use. In TPC-C's Stock-Level query that index (`ol_w_id, ol_d_id, ol_o_id`, joined on `ol_w_id`) made the join run in 0.9 to 1.9 seconds instead of 11 ms whenever the statistics put `stock` first.
 
 ### Hash join
 
@@ -82,3 +88,8 @@ join L: hash join, built on the right table (2000 slots); 8 rows in, ...
 ```
 
 The first line gives the order and says whether it differs from the written one; each `join` line gives the method, the rows in and out and the estimate. See [explain.md](explain.md).
+
+
+## Cross products come last
+
+At each step the source linked to the rows already joined (by an equality) is preferred to one that would make a cross product, even when the cross product is smaller right now. Two copies of a small table (TPC-H query 8 uses `nation` twice) would otherwise be multiplied first (5 × 25 rows) and every later step would carry that factor, when the big table that links each copy to the rest comes a step later. A cross product is chosen only when nothing left is linked.

@@ -41,6 +41,10 @@ crates/accessor-capi/fuzz/run-fuzz.sh [seconds per target] [target ...]
 
 `cargo test -p accessor-core --test hermitage` plays the scenarios of [Hermitage](https://github.com/ept/hermitage) against overlapping transactions: eleven tests, one per anomaly. All of them behave as snapshot isolation should, with and without `ACCESSOR_FORCE_MVCC=1`; no engine fix was needed. See [concurrency](../concurrency.md).
 
+## TPC-H
+
+`cargo run --release -p accessor-tpch -- --sf 0.1 [--compare] [--only 1,5] [--no-indexes] [--explain] [--timeout SECONDS]` generates data in the shape of `dbgen` (the official tool is not in the repository, so values differ from the official answers), loads it with the keys and indexes, and runs the 22 queries with the parameters of the validation run. With `--compare` each answer is checked against the optimizer switched off and against the same data without indexes. At scale factors 0.01 to 0.5 (3 million line items) all 22 queries run and agree. The run found a join order that multiplied two small tables first (query 8, never finishing at 0.1; now 0.3 seconds, see [join order](../optimizer/join-order.md)) and a row limit under `statement_timeout` that stopped joins of 262,144 rows (queries 9 and 13 at 0.2 and up; now 16 million). Slowest at 0.5: query 1 (17 s, a scan of 3 million rows) and query 9 (28 s).
+
 ## The JDBC driver
 
 `jdbc/src/test/java/com/accessor/jdbc/JdbcTest.java` runs 23 groups of tests against the real native library (`jdbc/build.sh`): types in and out, exactness of decimals, NULLs, scrolling, every bind type, placeholders in odd places, batches that fail, generated keys, error states, transactions and savepoints, closed objects, metadata, files and locking, reports, unsupported features, strange text, many connections, several threads, and a result of 50,000 rows. The jar is also run on its own, loading the library from inside itself.

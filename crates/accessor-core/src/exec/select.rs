@@ -1941,6 +1941,10 @@ fn join_step(
                 if left_cols.is_empty() {
                     continue;
                 }
+                // an index on a column with few values finds most of the table for every left row: hashing is cheaper
+                if !super::optimizer::probe_pays(t, super::optimizer::probe_fanout(t, def, left_cols.len()), left.len() as f64) {
+                    continue;
+                }
                 let score = left_cols.len() * 2 + usize::from(def.unique && left_cols.len() == def.columns.len());
                 if best.as_ref().is_none_or(|(s, ..)| score > *s) {
                     best = Some((score, pos, left_cols));

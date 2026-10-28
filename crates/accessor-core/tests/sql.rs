@@ -5268,7 +5268,7 @@ fn mysql_locking_reads_straight_join_char_using_hints_and_runaway_recursion() {
     let mut db = Database::in_memory();
     let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
     db.execute("CREATE TABLE t1 (a int, b int); CREATE TABLE t2 (a int); INSERT INTO t1 VALUES (1,10),(2,20),(3,30); INSERT INTO t2 VALUES (2),(3),(4)").unwrap();
-    // locking reads lock nothing
+    // locking reads lock nothing in a database used by one transaction at a time (see tests/locking.rs for shared ones)
     assert_eq!(n(&mut db, "SELECT count(*) FROM (SELECT * FROM t1 FOR UPDATE) q"), "3");
     assert_eq!(db.execute("SELECT a FROM t1 WHERE a > 1 ORDER BY a LIMIT 1 FOR SHARE").unwrap().rows.len(), 1);
     assert_eq!(db.execute("SELECT a FROM t1 LOCK IN SHARE MODE").unwrap().rows.len(), 3);
@@ -5312,4 +5312,20 @@ fn mysql_databases_are_schemas_and_recursion_stops_after_a_thousand_rounds() {
     assert!(db.execute("SELECT 1 FROM mysqltest.t1").is_err());
     assert_eq!(db.execute("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 900) SELECT count(*) FROM r").unwrap().rows[0][0].to_string(), "900");
     assert!(db.execute("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r").is_err());
+}
+
+#[test]
+fn a_small_table_is_not_cross_joined_before_the_table_that_links_it() {
+    // TPC-H Q8 in miniature: two copies of a small table, each linked to the rest only through a big one
+    let mut db = Database::in_memory();
+    let mut sql = String::from("CREATE TABLE reg (id int PRIMARY KEY); CREATE TABLE nat (id int PRIMARY KEY, rid int); CREATE TABLE sup (id int PRIMARY KEY, nid int); CREATE TABLE cus (id int PRIMARY KEY, nid int, sid int);");
+    sql.push_str("CREATE INDEX sup_nid ON sup (nid); CREATE INDEX cus_nid ON cus (nid);");
+    sql.push_str("INSERT INTO reg SELECT g FROM generate_series(1, 5) AS s(g); INSERT INTO nat SELECT g, g % 5 + 1 FROM generate_series(1, 25) AS s(g);");
+    sql.push_str("INSERT INTO sup SELECT g, g % 25 + 1 FROM generate_series(1, 1000) AS s(g); INSERT INTO cus SELECT g, g % 25 + 1, g % 1000 + 1 FROM generate_series(1, 3000) AS s(g); ANALYZE");
+    db.execute(&sql).unwrap();
+    let q = "SELECT count(*) FROM reg, nat n1, nat n2, sup, cus WHERE n1.rid = reg.id AND reg.id = 1 AND cus.nid = n1.id AND cus.sid = sup.id AND sup.nid = n2.id";
+    let plan: Vec<String> = db.execute(&format!("EXPLAIN {q}")).unwrap().rows.iter().map(|r| r[0].to_string()).collect();
+    let order = plan.iter().find(|l| l.contains("join order")).expect("a join order");
+    let at = |name: &str| order.find(&format!("{name} ")).or_else(|| order.find(name)).unwrap();
+    assert!(at("n2") > at("sup") && at("n2") > at("cus"), "{order}");
 }

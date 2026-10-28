@@ -65,9 +65,31 @@ The same rule decides:
 * **Foreign keys.** A child added while its parent is being deleted, or a parent deleted while a child is being added, waits and then fails the usual way: whichever commits first wins, and the other sees a relationship that is no longer satisfied. Foreign keys are checked against the *newest* state, not the snapshot, which is what keeps them whole. A cascade that would have to delete a child the transaction cannot see is a `Conflict` rather than a skipped row.
 * **Deadlocks.** Two transactions each holding a row the other wants would wait for ever. The one that notices first (the second to start waiting) gets `Conflict` ("a deadlock") at once, rolls back, and the other goes on.
 
+### Locking reads: `SELECT ... FOR UPDATE`
+
+A transaction that reads a value and then writes a new one based on it (`SELECT d_next_o_id`, then `UPDATE district SET d_next_o_id = ...`) would, under the rules above, be told `Conflict` whenever someone else committed a change to that row after it began. Say what you are about to change, and the row is yours until the transaction ends:
+
+```sql
+BEGIN;
+SELECT n FROM counters WHERE id = 1 FOR UPDATE;    -- waits if another transaction has the row
+UPDATE counters SET n = n + 1 WHERE id = 1;        -- cannot fail with a conflict
+COMMIT;
+```
+
+* **What the lock is.** Each row the `SELECT` returns gets a new version, with the contents of the newest committed one, as an `UPDATE` that changed nothing would give. From then on it is a row this transaction has changed: others that want it wait, as for any pending change, and the deadlock rule above applies. Nothing is written to the log for it.
+* **Newest values, not the snapshot.** A locking read goes by the *newest committed* contents of each row, not by the snapshot (this is what MySQL's `FOR UPDATE` does, and PostgreSQL's under `READ COMMITTED`; PostgreSQL's `REPEATABLE READ` gives a serialization error instead). The transaction that waited and then got the row sees what the holder left, and may update it. A row that has been deleted since, or that no longer satisfies the `WHERE`, is not returned. Other rows are read from the snapshot as usual.
+* **Waiting.** By default the statement waits for a row another transaction holds, up to the busy timeout ([below](#waiting-and-not-waiting-for-ever)), then `Conflict`. `NOWAIT` fails at once with `Conflict`, claiming nothing. `SKIP LOCKED` leaves such rows out and returns the others: `SELECT id FROM jobs WHERE done = 0 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED` takes the first job nobody else has. With `LIMIT`, the rows are claimed in the order asked for until there are enough.
+* **Strengths.** `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE` and `LOCK IN SHARE MODE` all claim the rows alike: there is one kind of lock, an exclusive one, so two `FOR SHARE` readers of a row take turns. That is stronger than asked, never weaker.
+* **Outside a transaction** the claim lasts for the statement, so only `NOWAIT` and `SKIP LOCKED` tell you anything.
+* **Only a `SELECT` of one table is locked.** `OF t` is accepted. A join, a derived table, a `UNION`, a `WITH`, a view, a table with child tables or partitions, or a table under row-level security is read as if it had no locking clause. An `ORDER BY` on a locking read must name the columns of the table (or a select item that does).
+* **Foreign keys.** A transaction adding a child row to a parent that another transaction has locked or updated *without changing its key* does not wait for it; it waits only if the other transaction might make the parent go away or change its key.
+* **A database used by one transaction at a time** (`Database` used directly) has nobody to lock against: the clause is read and ignored.
+
+Locking is also the answer to write skew: have each transaction `FOR UPDATE` the row both depend on.
+
 ### What snapshot isolation does not prevent
 
-*Write skew.* Two transactions each read the same rows, each decide on that basis, and each write a **different** row; neither collides with the other, and both commit, so the result is one no serial order would give. The textbook case: two doctors on call, each checks that the other is on call before going off. The test `write_skew_is_possible_under_snapshot_isolation` shows it happening. If a rule spans rows, make the transactions touch a common row (update a counter, or a summary row, in each) so that they collide.
+*Write skew.* Two transactions each read the same rows, each decide on that basis, and each write a **different** row; neither collides with the other, and both commit, so the result is one no serial order would give. The textbook case: two doctors on call, each checks that the other is on call before going off. The test `write_skew_is_possible_under_snapshot_isolation` shows it happening. If a rule spans rows, make the transactions touch a common row (update a counter, or a summary row, in each, or read it `FOR UPDATE`) so that they collide.
 
 The tests in `tests/hermitage.rs` follow [Hermitage](https://github.com/ept/hermitage), Martin Kleppmann's catalogue of isolation anomalies: dirty writes (G0), aborted and intermediate reads (G1a, G1b), circular information flow (G1c), observed transaction vanishes, predicate phantoms (PMP, PMP-write), lost update (P4) and read skew (G-single) are all prevented, as under PostgreSQL's `REPEATABLE READ`; write skew over rows and over a predicate (G2-item, G2) happens.
 
@@ -130,8 +152,23 @@ Each commit is one record in the write-ahead log, written when the transaction c
 * **Not serializable.** See write skew above.
 * **The C interface and JDBC driver** still use one connection per open database, on its own thread; they do not expose `SharedDatabase`. (`ACC_ERR_CONFLICT` and SQL state `40001` exist for when they do.)
 
+## TPC-C
+
+`cargo run --release -p accessor-tpcc -- --warehouses 2 --terminals 8 --seconds 15` loads the nine tables of TPC-C, runs the five transactions from that many terminals (a connection each, on its own thread, in the mix of the specification), and then checks the consistency conditions of clause 3.3.2 of the specification (1 to 10 and 12) and that the orders, the payments and the deliveries the terminals saw committed are the ones the tables show. A transaction that gets `Conflict` is run again and counted. `--customers` and `--items` scale the data down from 3,000 per district and 100,000 (the defaults are 300 and 10,000); `--no-fk` leaves out the foreign keys, and `--no-lock` leaves out `FOR UPDATE`. There is no network and no think time, so the figures are a test of correctness, not a TPC result.
+
+Before a transaction changes a warehouse, district, customer or stock row it reads it `FOR UPDATE` (New-Order takes `d_next_o_id` that way), and Delivery takes the oldest new order `FOR UPDATE`. On a laptop, 8 terminals on 2 warehouses, 15 seconds, no foreign keys:
+
+| | New-Order done | New-Order retried | Payment retried | consistent |
+| --- | --- | --- | --- | --- |
+| with `FOR UPDATE` | 2,806 | 2 | 0 | yes |
+| without | 3,931 | 1,521 | 2,885 | yes |
+
+Without the locks a transaction that read a row is told to start over if anyone committed a change to it meanwhile, and with ten districts and two warehouses Payments were retried 2,885 times for 3,777 completed. With them, the few retries left are probably deadlocks between New-Orders that lock the same two stock rows in opposite orders. The checks pass either way: the retries are the isolation working, and the locks only avoid them. With the foreign keys of the specification, as it runs by default, the same run (with locks) does about 12,900 New-Orders a minute, against 14,700 with `--no-fk`. (It once did 4,300: the index a foreign key creates was being probed by a join on its first column alone, which found a warehouse's worth of rows each time; see [when an index is not worth probing](optimizer/join-order.md#when-an-index-is-not-worth-probing).)
+
 ## Tests
 
 * `tests/mvcc.rs`: snapshots (no dirty reads, repeatable reads, indexes finding the right version, savepoints), the first-committer-wins rules for rows, unique keys and foreign keys, deadlock detection, schema changes among open transactions, clean-up (the number of versions kept), crash recovery with interleaved commits and a checkpoint in the middle, and two stress tests: transfers between accounts while readers check that every snapshot adds up, and a mixed load of transfers, deletes, key changes and cascades that ends by checking every row against every index and that no versions are left over.
+* `tests/locking.rs`: locking reads: waiting for the holder and then seeing what it left, no conflicts for eight threads incrementing one row, `NOWAIT`, `SKIP LOCKED` used as a queue, rollback and statements outside a transaction, rows that changed or vanished, deadlocks between locking reads, and foreign keys against a locked parent.
+* `crates/accessor-tpcc`: TPC-C (below).
 * `tests/shared.rs`: the basics from several threads. `tests/send_sync.rs` keeps `Database` `Send` and `Sync`.
 * The whole test suite is also run with every `Database` in version mode (`ACCESSOR_FORCE_MVCC=1 cargo test --workspace`), which checks that the versioned storage behaves like the plain one.
