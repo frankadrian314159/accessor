@@ -201,6 +201,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "accessor-tpcds"
+version = "0.1.0"
+dependencies = [
+ "accessor-core",
+]
+
+[[package]]
 name = "accessor-tpch"
 version = "0.1.0"
 dependencies = [

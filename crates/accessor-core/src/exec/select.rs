@@ -562,7 +562,29 @@ impl Database {
                     out_items.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)).expect("checked")
                 }
                 other => {
-                    hidden.push(binder.bind(other)?);
+                    // an output alias inside an expression (`ORDER BY CASE WHEN lochierarchy = 0 ...`) is read
+                    // as the select item it names, when no column of that name is there
+                    let bound = match binder.bind(other) {
+                        Ok(b) => b,
+                        Err(first) => {
+                            let mut e = other.clone();
+                            let mut changed = false;
+                            crate::sql::walk::walk_expr(&mut e, &mut |x| {
+                                if let Expr::Column { table: None, name } = x {
+                                    if let Some((_, item)) = out_items.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                                        *x = item.clone();
+                                        changed = true;
+                                    }
+                                }
+                                Ok(())
+                            })?;
+                            if !changed {
+                                return Err(first);
+                            }
+                            binder.bind(&e).map_err(|_| first)?
+                        }
+                    };
+                    hidden.push(bound);
                     n_vis + hidden.len() - 1
                 }
             };

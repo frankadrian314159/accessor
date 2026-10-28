@@ -1,0 +1,11 @@
+[package]
+name = "accessor-tpcds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runs queries of TPC-DS against Accessor, on data generated in the shape of dsdgen"
+publish = false
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }

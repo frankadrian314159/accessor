@@ -5329,3 +5329,20 @@ fn a_small_table_is_not_cross_joined_before_the_table_that_links_it() {
     let at = |name: &str| order.find(&format!("{name} ")).or_else(|| order.find(name)).unwrap();
     assert!(at("n2") > at("sup") && at("n2") > at("cus"), "{order}");
 }
+
+#[test]
+fn tpcds_forms_set_operations_in_parentheses_and_aliases_in_order_by_expressions() {
+    let mut db = Database::in_memory();
+    let n = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    // TPC-DS query 87: a derived table that is a parenthesised set operation
+    assert_eq!(n(&mut db, "SELECT count(*) FROM ((SELECT 1 AS a UNION ALL SELECT 2) EXCEPT (SELECT 2) EXCEPT (SELECT 3)) t"), "1");
+    // and a parenthesised join still is a join
+    assert_eq!(n(&mut db, "SELECT count(*) FROM ((SELECT 1 AS a) x JOIN (SELECT 1 AS b) y ON a = b)"), "1");
+    // TPC-DS queries 36 and 70: an output alias inside an ORDER BY expression
+    db.execute("CREATE TABLE t (g text, v int); INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 5)").unwrap();
+    let r = db.execute("SELECT g, SUM(v) AS total, GROUPING(g) AS roll FROM t GROUP BY ROLLUP (g) ORDER BY CASE WHEN roll = 0 THEN g END DESC, roll").unwrap();
+    let firsts: Vec<String> = r.rows.iter().map(|x| x[0].to_string()).collect();
+    assert_eq!(firsts[..2], ["b".to_string(), "a".to_string()]);
+    // an alias that is not there is still an error
+    assert!(db.execute("SELECT g FROM t ORDER BY CASE WHEN nothing = 0 THEN g END").is_err());
+}

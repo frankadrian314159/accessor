@@ -4535,7 +4535,8 @@ impl<'a> Parser<'a> {
 
     /// A table factor, or a parenthesised join list (Access nests joins).
     fn from_source(&mut self) -> Result<From> {
-        if self.peek_sym("(") && !(self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH")) {
+        // `((SELECT ..) EXCEPT (SELECT ..)) t` is a derived table, `((a JOIN b ..) JOIN c ..)` a nested join
+        if self.peek_sym("(") && self.parenthesised_join_ahead() {
             self.advance();
             let inner = self.from_clause()?;
             self.expect_sym(")")?;
@@ -4649,10 +4650,42 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// At `(`: is it a parenthesised join list, `((SELECT ..) x JOIN ..)`, rather than a query?
+    fn parenthesised_join_ahead(&self) -> bool {
+        let mut ahead = 1;
+        while matches!(self.peek_at(ahead), Tok::Sym("(")) {
+            ahead += 1;
+        }
+        if !(self.peek_kw_at(ahead, "SELECT") || self.peek_kw_at(ahead, "VALUES") || self.peek_kw_at(ahead, "WITH")) {
+            return true;
+        }
+        if ahead == 1 {
+            return false;
+        }
+        let (mut depth, mut i) = (0, 1);
+        loop {
+            match self.peek_at(i) {
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Tok::Eof => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        !["UNION", "INTERSECT", "EXCEPT", "MINUS"].iter().any(|w| self.peek_kw_at(i + 1, w))
+    }
+
     fn table_factor_base(&mut self) -> Result<TableFactor> {
         let lateral = self.eat_kw("LATERAL");
+        // `(SELECT ..)`, and `((SELECT ..) EXCEPT (SELECT ..))` with parentheses around the operands
         if self.peek_sym("(")
-            && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH"))
+            && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "WITH") || matches!(self.peek_at(1), Tok::Sym("(")))
+            && !self.parenthesised_join_ahead()
         {
             self.advance();
             let query = Box::new(self.select()?);

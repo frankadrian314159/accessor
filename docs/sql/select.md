@@ -350,3 +350,5 @@ SELECT * FROM T ORDER BY X FETCH NEXT ROW ONLY;    -- one row
 ```
 
 `OFFSET` skips rows before the limit is applied. Without `ORDER BY` the rows are those the engine finds first, which is not a guaranteed order. `FETCH ... WITH TIES` is not supported.
+
+An output alias may also stand inside an `ORDER BY` expression (`ORDER BY CASE WHEN roll = 0 THEN g END`) when no column of the query has that name; it is read as the select item. A set operation in parentheses can be a derived table: `FROM ((SELECT ..) EXCEPT (SELECT ..)) t`.
