@@ -155,6 +155,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "accessor-job"
+version = "0.1.0"
+dependencies = [
+ "accessor-core",
+]
+
+[[package]]
 name = "accessor-lancer"
 version = "0.1.0"
 dependencies = [

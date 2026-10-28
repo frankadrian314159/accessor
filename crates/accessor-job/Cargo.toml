@@ -1,0 +1,11 @@
+[package]
+name = "accessor-job"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Runs the Join Order Benchmark (113 queries over the IMDB data) against Accessor"
+publish = false
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }
