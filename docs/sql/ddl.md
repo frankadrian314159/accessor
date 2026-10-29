@@ -72,7 +72,7 @@ Each type has a canonical name and aliases; the aliases are what the standard an
 | `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL` | an `INTEGER` filled in automatically |
 | `CALCULATED` | | a value computed from the other columns |
 
-A length or precision after a type name (`VARCHAR(50)`, `NUMERIC(10, 2)`) is accepted and ignored: text has no length limit, and decimals have no fixed scale. Use `CAST(x AS DECIMAL(10,2))` or `ROUND` to round a value. `TIMESTAMP WITH TIME ZONE` makes a `TIMESTAMPTZ`; `TIMESTAMP WITHOUT TIME ZONE` is the plain `DATETIME`. `INTEGER`, `FLOAT` and the other numeric types behave as described in the README's Numbers section.
+A length or precision after a type name (`VARCHAR(50)`, `NUMERIC(10, 2)`) is accepted and ignored: text has no length limit, and decimals have no fixed scale. Use `CAST(x AS DECIMAL(10,2))` or `ROUND` to round a value. `TIMESTAMP WITH TIME ZONE` makes a `TIMESTAMPTZ`; `TIMESTAMP WITHOUT TIME ZONE` is the plain `DATETIME`, with or without a precision before the zone (`timestamp(2) without time zone`, `time(3) with time zone`, where a time of day with a zone is a `TIMESTAMPTZ` too). `BIT VARYING(n)` keeps its bits as text. `INTEGER`, `FLOAT` and the other numeric types behave as described in the README's Numbers section.
 
 ### AutoNumber
 
@@ -136,6 +136,8 @@ CONSTRAINT FK_Child FOREIGN KEY (ParentID) REFERENCES Parent (ID)
 Inside a transaction, a deferred relationship may be broken for a while, so rows can be inserted in any order, or two rows can swap keys; when the transaction commits, every deferred relationship is verified, and if one is still broken the whole transaction is rolled back and `COMMIT` fails. [`SET CONSTRAINTS`](transactions.md#set-constraints) changes the timing for the rest of a transaction. Outside a transaction every statement is its own, so nothing is ever deferred.
 
 A deferrable relationship that gives no action behaves as `NO ACTION`; one without a `DEFERRABLE` clause behaves as `RESTRICT`. `RESTRICT` is always checked at once, and so are the actions that change rows (`CASCADE`, `SET NULL`, `SET DEFAULT`): only the check that a row has its parent, and the refusal of `NO ACTION`, wait. Only foreign keys can be deferred; `UNIQUE`, `PRIMARY KEY` and `CHECK` are always immediate.
+
+The other options of a constraint that PostgreSQL accepts are read and change nothing here: `NO INHERIT`, `[NOT] ENFORCED` and `NOT VALID` on `CHECK` and `REFERENCES`, `MATCH FULL | SIMPLE | PARTIAL` (every foreign key is `MATCH SIMPLE`), `NULLS [NOT] DISTINCT` and `INCLUDE (columns)` on `UNIQUE` and `PRIMARY KEY`, `DEFERRABLE` and `INITIALLY ...` on those two (they stay immediate), and `COMPRESSION method` on a column. A default that is more than a literal (`DEFAULT 100 + (200 - 199) * 2`, `DEFAULT 'x'::text`) is read and not applied, as a default that calls a function is. `PARTITION BY` takes `COLLATE` and an operator class after a column; a key that is an expression (`lower(a)`) is still refused.
 
 ### CREATE TABLE AS
 

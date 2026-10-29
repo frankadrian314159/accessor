@@ -5547,3 +5547,28 @@ fn a_real_column_compared_with_text_reads_the_text_as_real() {
     db.execute("CREATE INDEX f4_f1 ON f4 (f1)").unwrap();
     assert_eq!(rows(&db, "SELECT f1 FROM f4 WHERE f1 = '1004.3'"), [["1004.3"]]);
 }
+
+#[test]
+fn create_table_reads_the_constraint_options_and_types_of_postgresql() {
+    let mut db = Database::in_memory();
+    for sql in [
+        "CREATE TABLE t1 (d1 timestamp(2) without time zone, d2 time(2) with time zone, d3 timestamp(3) with time zone, d4 time without time zone)",
+        "CREATE TABLE t2 (v BIT VARYING(11), w BIT(3))",
+        "CREATE TABLE t3 (i int UNIQUE DEFERRABLE, j int UNIQUE NULLS NOT DISTINCT, k int CHECK (k > 0) NO INHERIT, l int CHECK (l > 0) NOT ENFORCED, m varchar COMPRESSION pglz)",
+        "CREATE TABLE t4 (a int, b int, c int, CONSTRAINT cov UNIQUE (a, b) INCLUDE (c), CONSTRAINT pk2 PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE pk (id int PRIMARY KEY)",
+        "CREATE TABLE fk (x int CONSTRAINT fk1 REFERENCES pk MATCH FULL ON DELETE CASCADE ON UPDATE CASCADE NOT ENFORCED, y int REFERENCES pk MATCH SIMPLE)",
+        "CREATE TABLE t5 (i1 int DEFAULT 100 + (200 - 199) * 2, i2 text DEFAULT 'x'::text, i3 int DEFAULT 7)",
+        "CREATE TABLE t6 (a text, b int) PARTITION BY RANGE (a COLLATE \"C\", b int4_ops)",
+    ] {
+        db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // the options change nothing: the constraints are still kept, and the timestamp with a zone is a timestamp with a zone
+    db.execute("INSERT INTO t3 VALUES (1, 1, 5, 5, 'x')").unwrap();
+    assert!(db.execute("INSERT INTO t3 VALUES (1, 2, 5, 5, 'x')").is_err());
+    assert!(db.execute("INSERT INTO t3 VALUES (2, 3, -1, 5, 'x')").is_err());
+    db.execute("INSERT INTO t1 (d3) VALUES ('2020-01-02 03:04:05+00')").unwrap();
+    assert_eq!(rows(&db, "SELECT TypeName(d3) FROM t1"), [["TIMESTAMPTZ"]]);
+    // a partition key that is an expression is still refused
+    assert!(db.execute("CREATE TABLE t7 (a text) PARTITION BY LIST (lower(a))").is_err());
+}

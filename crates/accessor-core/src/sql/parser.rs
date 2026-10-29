@@ -1448,7 +1448,44 @@ impl<'a> Parser<'a> {
     }
 
     /// A default that is not a constant (`CURRENT_TIMESTAMP`, `NOW()`, `(expression)`) is read and not applied.
+    /// One option of a constraint that PostgreSQL accepts and that changes nothing here: `NO INHERIT`, `[NOT] ENFORCED`,
+    /// `NOT VALID`, `[NOT] DEFERRABLE`, `INITIALLY DEFERRED | IMMEDIATE`, `COMPRESSION method`, `NULLS [NOT] DISTINCT`,
+    /// `INCLUDE (columns)`, `MATCH FULL | SIMPLE | PARTIAL`. True if one was read.
+    fn skip_constraint_option(&mut self) -> bool {
+        if (self.peek_kw("NO") && self.peek_kw_at(1, "INHERIT"))
+            || (self.peek_kw("NOT") && (self.peek_kw_at(1, "ENFORCED") || self.peek_kw_at(1, "VALID") || self.peek_kw_at(1, "DEFERRABLE")))
+        {
+            self.advance();
+            self.advance();
+            return true;
+        }
+        if self.eat_kw("ENFORCED") || self.eat_kw("DEFERRABLE") {
+            return true;
+        }
+        if self.eat_kw("INITIALLY") || self.eat_kw("COMPRESSION") || self.eat_kw("MATCH") {
+            self.advance();
+            return true;
+        }
+        if self.peek_kw("NULLS") && (self.peek_kw_at(1, "DISTINCT") || (self.peek_kw_at(1, "NOT") && self.peek_kw_at(2, "DISTINCT"))) {
+            while !self.eat_kw("DISTINCT") {
+                self.advance();
+            }
+            return true;
+        }
+        if self.peek_kw("INCLUDE") && matches!(self.peek_at(1), Tok::Sym("(")) {
+            self.advance();
+            return self.skip_parens().is_ok();
+        }
+        false
+    }
+
     fn skip_default_expr(&mut self) -> Result<()> {
+        // a whole expression, when it reads as one
+        let save = self.pos;
+        if self.expr().is_ok() {
+            return Ok(());
+        }
+        self.pos = save;
         if self.peek_sym("(") {
             return self.skip_parens();
         }
@@ -1514,6 +1551,9 @@ impl<'a> Parser<'a> {
         }
         let primary = self.eat_kw("PRIMARY");
         let unique = !primary && self.eat_kw("UNIQUE");
+        if unique {
+            self.skip_constraint_option(); // NULLS [NOT] DISTINCT
+        }
         if !primary && !unique {
             self.eat_kw("FULLTEXT");
             self.eat_kw("SPATIAL");
@@ -1533,6 +1573,7 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
         }
+        while self.skip_constraint_option() {}
         if primary {
             *primary_key = cols;
         } else if unique {
@@ -3316,7 +3357,21 @@ impl<'a> Parser<'a> {
             return Err(Error::syntax("PARTITION BY takes RANGE, LIST or HASH"));
         }
         self.expect_sym("(")?;
-        let columns = self.ident_list().map_err(|_| Error::syntax("a partition key must be made of column names"))?;
+        let not_columns = || Error::syntax("a partition key must be made of column names");
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.ident().map_err(|_| not_columns())?);
+            // a collation or an operator class after the column (`a COLLATE "C"`, `a int4_ops`) is read and not used
+            if self.peek_sym("(") || self.peek_sym(".") {
+                return Err(not_columns());
+            }
+            while !self.peek_sym(",") && !self.peek_sym(")") && !self.at_eof() {
+                self.advance();
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
         self.expect_sym(")")?;
         Ok((method, columns))
     }
@@ -3461,13 +3516,22 @@ impl<'a> Parser<'a> {
             ref_columns = self.ident_list()?;
             self.expect_sym(")")?;
         }
+        if self.eat_kw("MATCH") {
+            self.advance(); // FULL, SIMPLE or PARTIAL: only the default is done
+        }
         let (mut del, mut upd) = self.references_actions()?;
         // `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]`, before or after the actions.
         let (mut deferrable, mut initially_deferred) = (false, false);
         loop {
             if self.eat_kw("NOT") {
+                if self.eat_kw("ENFORCED") || self.eat_kw("VALID") {
+                    continue;
+                }
                 self.expect_kw("DEFERRABLE")?;
                 deferrable = false;
+            } else if self.eat_kw("ENFORCED") {
+            } else if self.eat_kw("MATCH") {
+                self.advance();
             } else if self.eat_kw("DEFERRABLE") {
                 deferrable = true;
             } else if self.eat_kw("INITIALLY") {
@@ -3578,6 +3642,7 @@ impl<'a> Parser<'a> {
         self.expr()?;
         let end = self.toks[self.pos].pos;
         self.expect_sym(")")?;
+        while self.skip_constraint_option() {}
         Ok(self.src[start..end].trim().to_string())
     }
 
@@ -3659,6 +3724,9 @@ impl<'a> Parser<'a> {
             }
         }
         loop {
+            if self.skip_constraint_option() {
+                continue;
+            }
             if self.eat_kw("CONSTRAINT") {
                 // A name for the constraint that follows; only CHECK uses it.
                 self.ident()?;
@@ -3721,9 +3789,12 @@ impl<'a> Parser<'a> {
                 def.autonumber = true;
             } else if self.eat_kw("DEFAULT") {
                 let save = self.pos;
-                match self.default_value() {
-                    Ok(v) => def.default = Some(v),
-                    Err(_) => {
+                let literal = self.default_value();
+                // `DEFAULT 100 + (200 - 199) * 2` or `DEFAULT 'x'::text`: more than the literal it begins with
+                let more = literal.is_ok() && matches!(self.peek(), Tok::Sym(s) if matches!(*s, "+" | "-" | "*" | "/" | "%" | "||" | "::" | "^" | "&" | "|"));
+                match literal {
+                    Ok(v) if !more => def.default = Some(v),
+                    _ => {
                         // DEFAULT CURRENT_TIMESTAMP is the time of the insert; other expressions are read and not applied
                         self.pos = save;
                         let now = matches!(self.peek(), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(), "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE"))
@@ -5566,7 +5637,23 @@ impl<'a> Parser<'a> {
                 }
                 return Ok("INTEGER".into());
             }
+            "BIT" if self.peek_kw("VARYING") => {
+                // no bit strings: the bits are kept as text
+                self.advance();
+                return Ok("TEXT".into());
+            }
             "TIMESTAMP" | "TIME" => {
+                // `timestamp(2) without time zone`: the precision comes first
+                if matches!(self.peek(), Tok::Sym("("))
+                    && matches!(self.peek_at(1), Tok::Int(_))
+                    && matches!(self.peek_at(2), Tok::Sym(")"))
+                    && (self.peek_kw_at(3, "WITH") || self.peek_kw_at(3, "WITHOUT"))
+                    && self.peek_kw_at(4, "TIME")
+                {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                }
                 let with = self.eat_kw("WITH");
                 if with || self.eat_kw("WITHOUT") {
                     self.expect_kw("TIME")?;
