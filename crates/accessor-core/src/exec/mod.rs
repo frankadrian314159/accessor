@@ -20,6 +20,7 @@ mod infoschema;
 mod returning;
 mod prepared;
 mod cursor;
+mod outfile;
 pub(crate) use cursor::Cursor;
 mod decorrelate;
 mod viewdml;
@@ -352,6 +353,8 @@ impl Database {
                 self.drop_cursors(false);
                 Ok(QueryResult::default())
             }
+            Statement::Do(exprs) => self.run_do(exprs),
+            Statement::SelectOutfile { select, spec } => self.select_outfile(select, spec),
             Statement::DeclareCursor { name, query, hold } => self.declare_cursor(name, query, *hold),
             Statement::Fetch { name, direction, move_only } => self.fetch_cursor(name, *direction, *move_only),
             Statement::CloseCursor(name) => self.close_cursor(name.as_deref()),

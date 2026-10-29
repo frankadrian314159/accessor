@@ -686,7 +686,7 @@ fn sql_body(body: &str, names: &Names, value: bool) -> Result<RoutineBody> {
 
 /// The body of a `LANGUAGE plpgsql` function.
 fn plpgsql_body(body: &str, mut names: Names, value: bool) -> Result<RoutineBody> {
-    let mut p = Parser { src: body, toks: lex(body)?, pos: 0, into_vars: Vec::new(), depth: 0, selects: 0 };
+    let mut p = Parser { src: body, toks: lex(body)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
     let block = p.pl_block(&mut names)?;
     let value = value && !names.trigger;
     while p.eat_sym(";") {}

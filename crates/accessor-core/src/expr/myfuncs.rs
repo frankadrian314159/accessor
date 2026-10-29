@@ -54,6 +54,15 @@ pub enum MyFn {
     BitNot,
     TimeOf,
     Conv,
+    Strcmp,
+    MakeTime,
+    AddTime,
+    SubTime,
+    TimeDiff,
+    TimestampDiff,
+    ConvertTz,
+    BitCount,
+    LoadFile,
 }
 
 pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
@@ -101,6 +110,15 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "__TIMEOF" => (TimeOf, 1, 1),
         "CONV" => (Conv, 3, 3),
         "OCT" => (Oct, 1, 1),
+        "STRCMP" => (Strcmp, 2, 2),
+        "MAKETIME" => (MakeTime, 3, 3),
+        "ADDTIME" => (AddTime, 2, 2),
+        "SUBTIME" => (SubTime, 2, 2),
+        "TIMEDIFF" => (TimeDiff, 2, 2),
+        "TIMESTAMPDIFF" => (TimestampDiff, 3, 3),
+        "CONVERT_TZ" => (ConvertTz, 3, 3),
+        "BIT_COUNT" => (BitCount, 1, 1),
+        "LOAD_FILE" => (LoadFile, 1, 1),
         _ => return None,
     })
 }
@@ -581,7 +599,109 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             out.reverse();
             Value::text(&String::from_utf8_lossy(&out))
         }
+        Strcmp => Value::Int(match text(v(0)).to_lowercase().cmp(&text(v(1)).to_lowercase()) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }),
+        MakeTime => {
+            let (h, m) = (int(v(0)).unwrap_or(0), int(v(1)).unwrap_or(0));
+            let sec = text(v(2)).trim().parse::<f64>().unwrap_or(-1.0);
+            if !(0..60).contains(&m) || !(0.0..60.0).contains(&sec) {
+                return Ok(Value::Null);
+            }
+            let sign = if h < 0 { -1 } else { 1 };
+            Value::text(&time_text(sign * (h.abs() * 3600 + m * 60 + sec as i64)))
+        }
+        AddTime | SubTime => {
+            let (Some((a, a_is_time)), Some((b, true))) = (temporal(v(0)), temporal(v(1))) else { return Ok(Value::Null) };
+            let secs = if f == AddTime { a + b } else { a - b };
+            if a_is_time {
+                Value::text(&time_text(secs))
+            } else {
+                Value::DateTime(secs)
+            }
+        }
+        TimeDiff => match (temporal(v(0)), temporal(v(1))) {
+            (Some((a, ka)), Some((b, kb))) if ka == kb => Value::text(&time_text(a - b)),
+            _ => Value::Null,
+        },
+        TimestampDiff => {
+            let (Some((a, _)), Some((b, _))) = (temporal(v(1)), temporal(v(2))) else { return Ok(Value::Null) };
+            let d = b - a;
+            let months = || -> i64 {
+                let (ca, cb) = (crate::datetime::components(a), crate::datetime::components(b));
+                let m = (cb.0 - ca.0) * 12 + (cb.1 as i64 - ca.1 as i64);
+                // a whole month only when the day and time of the later one have come round
+                let (ra, rb) = ((ca.2, ca.3, ca.4, ca.5), (cb.2, cb.3, cb.4, cb.5));
+                if m > 0 && rb < ra {
+                    m - 1
+                } else if m < 0 && rb > ra {
+                    m + 1
+                } else {
+                    m
+                }
+            };
+            Value::Int(match text(v(0)).to_ascii_lowercase().as_str() {
+                "second" => d,
+                "minute" => d / 60,
+                "hour" => d / 3600,
+                "day" => d / 86_400,
+                "week" => d / (7 * 86_400),
+                "month" => months(),
+                "quarter" => months() / 3,
+                "year" => months() / 12,
+                _ => return Ok(Value::Null),
+            })
+        }
+        ConvertTz => {
+            let Some((local, false)) = temporal(v(0)) else { return Ok(Value::Null) };
+            let (Some(from), Some(to)) = (crate::tz::Zone::parse(&text(v(1))), crate::tz::Zone::parse(&text(v(2)))) else { return Ok(Value::Null) };
+            Value::DateTime(to.to_local(from.to_utc(local)))
+        }
+        BitCount => Value::Int(int(v(0)).map_or(0, |n| (n as u64).count_ones() as i64)),
+        LoadFile => match std::fs::read(text(v(0))) {
+            Ok(bytes) => Value::text(&String::from_utf8_lossy(&bytes)),
+            Err(_) => Value::Null,
+        },
         Bin => Value::text(&format!("{:b}", int(v(0)).unwrap_or(0) as u64)),
         Oct => Value::text(&format!("{:o}", int(v(0)).unwrap_or(0) as u64)),
     })
+}
+
+/// A time of day as seconds, `[-][D ]hh:mm:ss[.ffffff]` (the hours may pass 24, as MySQL's TIME does); a fraction is dropped.
+fn time_secs(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t),
+    };
+    let (days, t) = match t.split_once(' ') {
+        Some((d, rest)) if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) => (d.parse::<i64>().ok()?, rest),
+        _ => (0, t),
+    };
+    let mut parts = t.split('.').next()?.split(':');
+    let h: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next().map_or(Some(0), |x| x.parse().ok())?;
+    let sec: i64 = parts.next().map_or(Some(0), |x| x.parse().ok())?;
+    if parts.next().is_some() || !(0..60).contains(&m) || !(0..60).contains(&sec) {
+        return None;
+    }
+    let total = (days * 24 + h) * 3600 + m * 60 + sec;
+    Some(if neg { -total } else { total })
+}
+
+/// Seconds as `hh:mm:ss` (more than two digits of hours when needed), with a sign.
+fn time_text(secs: i64) -> String {
+    let a = secs.abs();
+    format!("{}{:02}:{:02}:{:02}", if secs < 0 { "-" } else { "" }, a / 3600, a % 3600 / 60, a % 60)
+}
+
+/// The seconds a value stands for and whether it is a time of day (true) or a date and time (false).
+fn temporal(v: &Value) -> Option<(i64, bool)> {
+    match v {
+        Value::DateTime(t) | Value::TimestampTz(t) => Some((*t, false)),
+        Value::Text(s) => time_secs(s).map(|t| (t, true)).or_else(|| crate::datetime::parse(s).map(|t| (t, false))),
+        _ => None,
+    }
 }

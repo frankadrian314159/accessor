@@ -581,6 +581,10 @@ pub enum Statement {
     /// `DROP ... IF EXISTS` (`missing_ok`) or `CREATE ... IF NOT EXISTS`.
     Guarded { missing_ok: bool, stmt: Box<Statement> },
     Merge(Box<MergeDef>),
+    /// `DO expr, ...`: evaluates the expressions and gives no rows.
+    Do(Vec<Expr>),
+    /// `SELECT ... INTO OUTFILE | DUMPFILE 'file' ...`: the rows of the query written to a file.
+    SelectOutfile { select: Box<Select>, spec: OutfileSpec },
     /// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR query`
     DeclareCursor { name: String, query: Box<Select>, hold: bool },
     /// `FETCH direction FROM name`, or `MOVE ...` (`move_only`: the position changes, no rows come back)
@@ -699,4 +703,19 @@ pub enum FetchDirection {
     Forward(Option<i64>),
     /// The previous `n` rows, last first (`None`: all of them)
     Backward(Option<i64>),
+}
+
+/// How `SELECT ... INTO OUTFILE` writes its rows (MySQL's defaults: tab between fields, newline after a row, `\N` for NULL).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutfileSpec {
+    pub path: String,
+    /// `INTO DUMPFILE`: one row, written as it is.
+    pub dump: bool,
+    pub fields_terminated: String,
+    pub enclosed: Option<char>,
+    /// `OPTIONALLY ENCLOSED BY`: only text is enclosed, not numbers.
+    pub optionally: bool,
+    pub escaped: Option<char>,
+    pub lines_starting: String,
+    pub lines_terminated: String,
 }

@@ -56,7 +56,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
 }
 
 fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), depth: 0, selects: 0 };
+    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -134,7 +134,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), depth: 0, selects: 0 };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -421,6 +421,8 @@ struct Parser<'a> {
     pos: usize,
     /// The variables of a `SELECT ... INTO @a, @b` just read.
     into_vars: Vec<String>,
+    /// The file of a `SELECT ... INTO OUTFILE` just read.
+    outfile: Option<OutfileSpec>,
     /// How deep the expressions being read are nested, and how deep the sub-queries: a limit keeps a hostile text from
     /// overflowing the stack.
     depth: usize,
@@ -1045,7 +1047,75 @@ impl<'a> Parser<'a> {
     }
 
     /// After `INTO` in a `SELECT`: `INTO @a, @b`.
+    fn outfile_string(&mut self) -> Result<String> {
+        match self.advance() {
+            Tok::Str(s) => Ok(s),
+            _ => {
+                self.pos -= 1;
+                Err(self.unexpected("a string in quotes"))
+            }
+        }
+    }
+
     fn select_into_tail(&mut self) -> Result<()> {
+        if self.peek_kw("INTO") && (self.peek_kw_at(1, "OUTFILE") || self.peek_kw_at(1, "DUMPFILE")) {
+            self.advance();
+            let dump = self.peek_kw("DUMPFILE");
+            self.advance();
+            let path = self.outfile_string()?;
+            let mut spec = OutfileSpec {
+                path,
+                dump,
+                fields_terminated: "\t".into(),
+                enclosed: None,
+                optionally: false,
+                escaped: Some('\\'),
+                lines_starting: String::new(),
+                lines_terminated: "\n".into(),
+            };
+            if self.eat_kw("CHARACTER") {
+                self.expect_kw("SET")?;
+                self.advance();
+            } else if self.eat_kw("CHARSET") {
+                self.advance();
+            }
+            if self.eat_kw("FIELDS") || self.eat_kw("COLUMNS") {
+                loop {
+                    if self.eat_kw("TERMINATED") {
+                        self.expect_kw("BY")?;
+                        spec.fields_terminated = self.outfile_string()?;
+                    } else if self.eat_kw("OPTIONALLY") {
+                        self.expect_kw("ENCLOSED")?;
+                        self.expect_kw("BY")?;
+                        spec.optionally = true;
+                        spec.enclosed = self.outfile_string()?.chars().next();
+                    } else if self.eat_kw("ENCLOSED") {
+                        self.expect_kw("BY")?;
+                        spec.enclosed = self.outfile_string()?.chars().next();
+                    } else if self.eat_kw("ESCAPED") {
+                        self.expect_kw("BY")?;
+                        spec.escaped = self.outfile_string()?.chars().next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if self.eat_kw("LINES") {
+                loop {
+                    if self.eat_kw("STARTING") {
+                        self.expect_kw("BY")?;
+                        spec.lines_starting = self.outfile_string()?;
+                    } else if self.eat_kw("TERMINATED") {
+                        self.expect_kw("BY")?;
+                        spec.lines_terminated = self.outfile_string()?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.outfile = Some(spec);
+            return Ok(());
+        }
         if self.peek_kw("INTO") && matches!(self.peek_at(1), Tok::Param(_)) {
             self.advance();
             loop {
@@ -1938,6 +2008,15 @@ impl<'a> Parser<'a> {
                 return Ok(Statement::Ignored(word.to_string()));
             }
         }
+        if self.peek_kw("DO") && !matches!(self.peek_at(1), Tok::Str(_) | Tok::Eof | Tok::Sym(";")) && !self.peek_kw_at(1, "LANGUAGE") {
+            // MySQL: DO expr, ...
+            self.advance();
+            let mut exprs = vec![self.expr()?];
+            while self.eat_sym(",") {
+                exprs.push(self.expr()?);
+            }
+            return Ok(Statement::Do(exprs));
+        }
         if self.peek_kw("DECLARE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
             return self.declare_cursor();
         }
@@ -1962,6 +2041,9 @@ impl<'a> Parser<'a> {
             self.into_vars.clear();
             let select = self.select()?;
             self.select_into_tail()?;
+            if let Some(spec) = self.outfile.take() {
+                return Ok(Statement::SelectOutfile { select: Box::new(select), spec });
+            }
             if !self.into_vars.is_empty() {
                 return Ok(Statement::SelectInto { select: Box::new(select), vars: std::mem::take(&mut self.into_vars) });
             }
@@ -2193,7 +2275,8 @@ impl<'a> Parser<'a> {
             }
             // ISOLATION LEVEL ..., READ ONLY / READ WRITE, [NOT] DEFERRABLE: there is one isolation level
             while matches!(self.peek(), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(),
-                "ISOLATION" | "LEVEL" | "READ" | "WRITE" | "ONLY" | "NOT" | "DEFERRABLE" | "SERIALIZABLE" | "REPEATABLE" | "COMMITTED" | "UNCOMMITTED"))
+                "ISOLATION" | "LEVEL" | "READ" | "WRITE" | "ONLY" | "NOT" | "DEFERRABLE" | "SERIALIZABLE" | "REPEATABLE" | "COMMITTED" | "UNCOMMITTED" | "CONSISTENT" | "SNAPSHOT"))
+                || (self.peek_kw("WITH") && self.peek_kw_at(1, "CONSISTENT"))
                 || self.peek_sym(",")
             {
                 self.advance();
@@ -3310,6 +3393,17 @@ impl<'a> Parser<'a> {
             let create = Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() };
             return Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: vec![other], partition_by: None, partition_of: None })));
         }
+        // CREATE TABLE t ENGINE=x ROW_FORMAT=y SELECT ...: table options before the query
+        if !self.peek_sym("(") {
+            let before_options = self.pos;
+            let mut any = false;
+            while self.table_option()? {
+                any = true;
+            }
+            if any && !(self.peek_kw("AS") || self.peek_kw("SELECT") || self.peek_kw("IGNORE") || self.peek_kw("REPLACE")) {
+                self.pos = before_options;
+            }
+        }
         // CREATE TABLE t (a, b) AS SELECT ...: names for the columns of the query
         let mut column_names: Vec<String> = Vec::new();
         if self.peek_sym("(") {
@@ -3901,6 +3995,19 @@ impl<'a> Parser<'a> {
             if self.skip_constraint_option() {
                 continue;
             }
+            if self.eat_kw("SRID") {
+                self.advance(); // GEOMETRY ... SRID 4326: spatial reference systems are not kept
+                continue;
+            }
+            if self.peek_kw("AS") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                // MySQL: col type AS (expression) [VIRTUAL | STORED]
+                def.expression = Some(self.calculated_expression(&def.name)?);
+                def.data_type = DataType::Calculated;
+                if !self.eat_kw("STORED") {
+                    self.eat_kw("VIRTUAL");
+                }
+                continue;
+            }
             if self.eat_kw("CONSTRAINT") {
                 // A name for the constraint that follows; only CHECK uses it.
                 self.ident()?;
@@ -3982,6 +4089,10 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+        }
+        // BIGINT UNSIGNED reads as a BIGNUM, which cannot count: an AUTO_INCREMENT counts in 64 bits
+        if def.autonumber && def.data_type == DataType::Bignum {
+            def.data_type = DataType::Integer;
         }
         if let Some(extra) = type_check {
             def.check = Some(match def.check.take() {
@@ -4475,6 +4586,7 @@ impl<'a> Parser<'a> {
         self.expect_kw("VALUES")?;
         let mut rows = Vec::new();
         loop {
+            self.eat_kw("ROW"); // MySQL: VALUES ROW(1, 2), ROW(3, 4)
             self.expect_sym("(")?;
             let mut row = vec![self.expr()?];
             while self.eat_sym(",") {
@@ -5092,10 +5204,22 @@ impl<'a> Parser<'a> {
     }
 
     fn or_expr(&mut self) -> Result<Expr> {
-        let mut left = self.and_expr()?;
+        let mut left = self.xor_expr()?;
         while self.eat_kw("OR") {
-            let right = self.and_expr()?;
+            let right = self.xor_expr()?;
             left = Expr::Binary { op: BinOp::Or, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok(left)
+    }
+
+    /// `a XOR b` (MySQL), between AND and OR: true when exactly one is true, NULL when either is NULL.
+    fn xor_expr(&mut self) -> Result<Expr> {
+        let mut left = self.and_expr()?;
+        while self.eat_kw("XOR") {
+            let right = self.and_expr()?;
+            let either = Expr::Binary { op: BinOp::Or, left: Box::new(left.clone()), right: Box::new(right.clone()) };
+            let both = Expr::Binary { op: BinOp::And, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Binary { op: BinOp::And, left: Box::new(either), right: Box::new(Expr::Not(Box::new(both))) };
         }
         Ok(left)
     }
@@ -5139,6 +5263,13 @@ impl<'a> Parser<'a> {
                     distinct: false,
                     star: false,
                 };
+                continue;
+            }
+            if self.peek_sym("<=>") {
+                // MySQL's null-safe equality
+                self.advance();
+                let right = self.concat()?;
+                left = distinct_from(left, right, true);
                 continue;
             }
             if let Tok::Sym(s @ ("~" | "~*" | "!~" | "!~*")) = self.peek().clone() {
@@ -5760,6 +5891,17 @@ impl<'a> Parser<'a> {
         let mut args = Vec::new();
         let mut distinct = false;
         let mut star = false;
+        // TIMESTAMPDIFF(DAY, a, b) / TIMESTAMPADD(DAY, n, d): the unit is a bare word
+        let mut unit_word: Option<String> = None;
+        if (name.eq_ignore_ascii_case("TIMESTAMPDIFF") || name.eq_ignore_ascii_case("TIMESTAMPADD"))
+            && matches!(self.peek(), Tok::Ident(_))
+            && matches!(self.peek_at(1), Tok::Sym(","))
+        {
+            if let Tok::Ident(u) = self.advance() {
+                unit_word = Some(u.to_ascii_lowercase());
+            }
+            self.advance();
+        }
         if self.eat_sym("*") {
             star = true;
         } else if !self.peek_sym(")") {
@@ -5778,6 +5920,24 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(")")?;
         let up = name.to_ascii_uppercase();
+        if let Some(unit) = unit_word {
+            if up == "TIMESTAMPADD" {
+                let code = match unit.as_str() {
+                    "second" => "s",
+                    "minute" => "n",
+                    "hour" => "h",
+                    "day" => "d",
+                    "week" => "ww",
+                    "month" => "m",
+                    "quarter" => "q",
+                    "year" => "yyyy",
+                    other => return Err(Error::syntax(format!("TIMESTAMPADD does not know the unit '{other}'"))),
+                };
+                args.insert(0, Expr::Literal(Value::text(code)));
+                return Ok(Expr::Function { name: "DATEADD".into(), args, distinct: false, star: false });
+            }
+            args.insert(0, Expr::Literal(Value::text(&unit)));
+        }
         if matches!(up.as_str(), "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE") && args.len() == 2 {
             if let Expr::Function { name: n, .. } = &args[1] {
                 if n == "__INTERVAL" {
@@ -5917,6 +6077,11 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
+        // CHARSET x, CHARACTER SET x, COLLATE x, ASCII, UNICODE, BINARY: the text here is one kind
+        while self.eat_kw("CHARSET") || self.eat_kw("COLLATE") || (self.peek_kw("CHARACTER") && self.peek_kw_at(1, "SET") && self.eat_kw("CHARACTER") && self.eat_kw("SET")) {
+            self.advance();
+        }
+        while self.eat_kw("ASCII") || self.eat_kw("UNICODE") || self.eat_kw("BINARY") {}
         self.expect_sym(")")?;
         Ok(make_cast(e, ty, &hints))
     }

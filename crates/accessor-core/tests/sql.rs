@@ -5756,3 +5756,88 @@ fn strict_numeric_sizes_with_a_negative_scale_or_more_scale_than_digits() {
     assert!(db.execute("INSERT INTO n (thousandths) VALUES (1.5)").is_err());
     assert!(db.execute("INSERT INTO n (millions) VALUES (1000000000)").is_err());
 }
+
+#[test]
+fn mysql_small_forms_null_safe_equals_xor_do_values_row_srid_generated_columns_cast_charset() {
+    let mut db = Database::in_memory();
+    // <=>, XOR
+    assert_eq!(rows(&db, "SELECT 1 <=> 1, NULL <=> NULL, 1 <=> NULL, NULL <=> 1, 2 <=> 3"), [["Yes", "Yes", "No", "No", "No"]]);
+    assert_eq!(rows(&db, "SELECT 1 XOR 1, 1 XOR 0, 0 XOR 1, 0 XOR 0, NULL XOR 1, 1 XOR NULL"), [["No", "Yes", "Yes", "No", "", ""]]);
+    assert_eq!(rows(&db, "SELECT 1 OR 1 XOR 1, 0 XOR 1 AND 1"), [["Yes", "Yes"]]);
+    // VALUES ROW(...)
+    assert_eq!(rows(&db, "VALUES ROW(1, 'a'), ROW(2, 'b')"), [["1", "a"], ["2", "b"]]);
+    // DO evaluates and gives nothing
+    let r = db.execute("DO 1 + 1, 2").unwrap();
+    assert!(r.rows.is_empty() && r.columns.is_empty());
+    // START TRANSACTION modes
+    db.execute("START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT").unwrap();
+    db.execute("COMMIT").unwrap();
+    // GEOMETRY ... SRID, generated columns without GENERATED ALWAYS, VECTOR, BIGINT UNSIGNED AUTO_INCREMENT
+    for sql in [
+        "CREATE TABLE g (id INT NOT NULL AUTO_INCREMENT, c GEOMETRY NOT NULL SRID 0, PRIMARY KEY (id))",
+        "CREATE TABLE gen (a INT, b INT AS (a + 1) VIRTUAL, c INT AS (a * 2) STORED)",
+        "CREATE TABLE v (pk INT, embedding VECTOR(4))",
+        "CREATE TABLE ai (c1 BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (c1)) ENGINE=MyISAM",
+    ] {
+        db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.execute("INSERT INTO gen (a) VALUES (5)").unwrap();
+    assert_eq!(rows(&db, "SELECT b, c FROM gen"), [["6", "10"]]);
+    db.execute("INSERT INTO ai VALUES ()").unwrap();
+    assert_eq!(rows(&db, "SELECT c1 FROM ai"), [["1"]]);
+    // CREATE TABLE with options before the query
+    db.execute("CREATE TABLE src (x INT); INSERT INTO src VALUES (1), (2)").unwrap();
+    db.execute("CREATE TABLE copy1 ENGINE=InnoDB ROW_FORMAT=DYNAMIC SELECT x FROM src").unwrap();
+    db.execute("CREATE TABLE copy2 engine=archive AS SELECT * FROM src").unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM copy1"), [["2"]]);
+    // CAST ... CHARSET / CHARACTER SET / COLLATE
+    assert_eq!(rows(&db, "SELECT CAST('ab' AS CHAR CHARSET binary), CAST('cd' AS CHAR CHARACTER SET utf8mb4), CAST('ef' AS CHAR COLLATE utf8mb4_bin)"), [["ab", "cd", "ef"]]);
+}
+
+#[test]
+fn select_into_outfile_and_dumpfile_write_a_file() {
+    let dir = std::env::temp_dir().join(format!("accessor_outfile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |n: &str| dir.join(n).to_string_lossy().replace('\\', "/");
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a INT, b TEXT); INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'tab\there')").unwrap();
+    let plain = path("plain.txt");
+    let r = db.execute(&format!("SELECT a, b FROM t ORDER BY a INTO OUTFILE '{plain}'")).unwrap();
+    assert_eq!(r.affected, 3);
+    // NULL is \N, and the tab inside a value has the escape character in front
+    assert_eq!(std::fs::read_to_string(&plain).unwrap(), "1\tx\n2\t\\N\n3\ttab\\\there\n");
+    // the file must not exist
+    assert!(db.execute(&format!("SELECT a FROM t INTO OUTFILE '{plain}'")).is_err());
+    let csv = path("t.csv");
+    db.execute(&format!("SELECT a, b FROM t ORDER BY a INTO OUTFILE '{csv}' FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '\"' LINES TERMINATED BY ';'")).unwrap();
+    assert_eq!(std::fs::read_to_string(&csv).unwrap(), "1,\"x\";2,\\N;3,\"tab\there\";");
+    let dump = path("one.bin");
+    db.execute(&format!("SELECT b FROM t WHERE a = 1 INTO DUMPFILE '{dump}'")).unwrap();
+    assert_eq!(std::fs::read_to_string(&dump).unwrap(), "x");
+    assert!(db.execute(&format!("SELECT b FROM t INTO DUMPFILE '{}'", path("two.bin"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mysql_time_functions_strcmp_bit_count_and_the_bit_aggregates() {
+    let mut db = Database::in_memory();
+    assert_eq!(rows(&db, "SELECT STRCMP('a', 'b'), STRCMP('b', 'a'), STRCMP('A', 'a'), STRCMP(NULL, 'a')"), [["-1", "1", "0", ""]]);
+    assert_eq!(rows(&db, "SELECT MAKETIME(12, 15, 30), MAKETIME(-2, 5, 6), MAKETIME(100, 0, 0), MAKETIME(1, 60, 0)"), [["12:15:30", "-02:05:06", "100:00:00", ""]]);
+    assert_eq!(rows(&db, "SELECT ADDTIME('01:00:00', '02:30:00'), SUBTIME('05:00:00', '01:30:00'), ADDTIME('23:59:59', '00:00:02')"), [["03:30:00", "03:30:00", "24:00:01"]]);
+    assert_eq!(rows(&db, "SELECT ADDTIME('2020-01-01 10:00:00', '02:00:00'), SUBTIME('2020-01-01 01:00:00', '02:00:00')"), [["2020-01-01 12:00:00", "2019-12-31 23:00:00"]]);
+    assert_eq!(rows(&db, "SELECT TIMEDIFF('2020-01-02 00:00:00', '2020-01-01 12:00:00'), TIMEDIFF('10:00:00', '12:30:00')"), [["12:00:00", "-02:30:00"]]);
+    assert_eq!(
+        rows(&db, "SELECT TIMESTAMPDIFF(DAY, '2020-01-01', '2020-01-10'), TIMESTAMPDIFF(HOUR, '2020-01-01 00:00:00', '2020-01-01 05:59:59'), TIMESTAMPDIFF(WEEK, '2020-01-01', '2020-01-20')"),
+        [["9", "5", "2"]]
+    );
+    // a month is whole only when the day has come round, forwards and backwards
+    assert_eq!(rows(&db, "SELECT TIMESTAMPDIFF(MONTH, '2020-01-31', '2020-02-29'), TIMESTAMPDIFF(MONTH, '2020-01-15', '2020-03-15'), TIMESTAMPDIFF(MONTH, '2020-03-15', '2020-01-16')"), [["0", "2", "-1"]]);
+    assert_eq!(rows(&db, "SELECT TIMESTAMPDIFF(YEAR, '2000-06-15', '2020-06-14'), TIMESTAMPDIFF(QUARTER, '2020-01-01', '2020-12-31')"), [["19", "3"]]);
+    assert_eq!(rows(&db, "SELECT TIMESTAMPADD(DAY, 10, '2020-01-01'), TIMESTAMPADD(MONTH, 1, '2020-01-31'), TIMESTAMPADD(HOUR, 5, '2020-01-01 00:00:00')"), [["2020-01-11", "2020-02-29", "2020-01-01 05:00:00"]]);
+    assert_eq!(rows(&db, "SELECT CONVERT_TZ('2020-01-01 12:00:00', '+00:00', '+05:30'), CONVERT_TZ('2020-06-01 12:00:00', 'UTC', 'America/New_York'), CONVERT_TZ('2020-01-01 12:00:00', 'nonsense', 'UTC')"), [["2020-01-01 17:30:00", "2020-06-01 08:00:00", ""]]);
+    assert_eq!(rows(&db, "SELECT BIT_COUNT(0), BIT_COUNT(255), BIT_COUNT(-1), BIT_COUNT(10)"), [["0", "8", "64", "2"]]);
+    assert_eq!(rows(&db, "SELECT LOAD_FILE('/this/file/does/not/exist')"), [[""]]);
+    db.execute("CREATE TABLE b (g INT, x INT); INSERT INTO b VALUES (1, 12), (1, 10), (2, 5), (2, 3), (3, NULL)").unwrap();
+    assert_eq!(rows(&db, "SELECT g, BIT_AND(x), BIT_OR(x), BIT_XOR(x) FROM b GROUP BY g ORDER BY g"), [["1", "8", "14", "6"], ["2", "1", "7", "6"], ["3", "18446744073709551615", "0", "0"]]);
+    assert_eq!(rows(&db, "SELECT BIT_AND(x) FROM b WHERE g = 99"), [["18446744073709551615"]]);
+}

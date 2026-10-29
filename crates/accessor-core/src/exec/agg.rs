@@ -24,6 +24,9 @@ pub enum AggFn {
     Every,
     AnyTrue,
     JsonArrayAgg,
+    BitAnd,
+    BitOr,
+    BitXor,
 }
 
 impl AggFn {
@@ -45,6 +48,9 @@ impl AggFn {
             "EVERY" | "BOOL_AND" => AggFn::Every,
             "BOOL_OR" => AggFn::AnyTrue,
             "JSON_ARRAYAGG" | "JSON_AGG" => AggFn::JsonArrayAgg,
+            "BIT_AND" => AggFn::BitAnd,
+            "BIT_OR" => AggFn::BitOr,
+            "BIT_XOR" => AggFn::BitXor,
             _ => return None,
         })
     }
@@ -66,6 +72,9 @@ impl AggFn {
             AggFn::Every => "Every",
             AggFn::AnyTrue => "AnyTrue",
             AggFn::JsonArrayAgg => "JsonArrayAgg",
+            AggFn::BitAnd => "BitAnd",
+            AggFn::BitOr => "BitOr",
+            AggFn::BitXor => "BitXor",
         }
     }
 }
@@ -90,6 +99,8 @@ pub struct AggState {
     sep: String,
     mean: f64,
     m2: f64,
+    /// The bits of `BIT_AND` / `BIT_OR` / `BIT_XOR`: all ones to start with for the first, zero for the others.
+    bits: u64,
 }
 
 impl AggState {
@@ -103,6 +114,7 @@ impl AggState {
             sep: spec.sep.clone().unwrap_or_else(|| ",".into()),
             mean: 0.0,
             m2: 0.0,
+            bits: if spec.func == AggFn::BitAnd { u64::MAX } else { 0 },
         }
     }
 
@@ -178,6 +190,19 @@ impl AggState {
                 self.mean += delta / self.count as f64;
                 self.m2 += delta * (x - self.mean);
             }
+            AggFn::BitAnd | AggFn::BitOr | AggFn::BitXor => {
+                let n = v
+                    .num_lenient()
+                    .and_then(|n| n.rounded_int())
+                    .ok_or_else(|| Error::type_err(format!("cannot take the bits of '{v}'")))?;
+                use num_traits::ToPrimitive;
+                let b = n.to_i64().map(|i| i as u64).or_else(|| n.to_u64()).ok_or_else(|| Error::type_err(format!("'{v}' is out of range for a bit operation")))?;
+                match self.func {
+                    AggFn::BitAnd => self.bits &= b,
+                    AggFn::BitOr => self.bits |= b,
+                    _ => self.bits ^= b,
+                }
+            }
             AggFn::Every | AggFn::AnyTrue => {
                 let t = tri(v)?.unwrap_or(false);
                 self.acc = Some(Value::Bool(match (&self.acc, self.func) {
@@ -225,6 +250,14 @@ impl AggState {
                 }
                 let r = if matches!(self.func, AggFn::StddevPop | AggFn::StddevSamp) { var.sqrt() } else { var };
                 Value::from_f64(r).unwrap_or(Value::Null)
+            }
+            AggFn::BitAnd | AggFn::BitOr | AggFn::BitXor => {
+                // unsigned 64 bits, as MySQL's are
+                if self.bits <= i64::MAX as u64 {
+                    Value::Int(self.bits as i64)
+                } else {
+                    Value::Big(num_bigint::BigInt::from(self.bits))
+                }
             }
             _ => self.acc.unwrap_or(Value::Null),
         }

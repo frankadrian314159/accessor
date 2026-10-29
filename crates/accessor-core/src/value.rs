@@ -307,7 +307,7 @@ impl DataType {
             "XID" | "XID8" | "OID8" | "MEDIUMINT" | "INT1" | "INT3" | "YEAR" => (DataType::Integer, false),
             // MySQL's text and binary families are all text here
             "TINYTEXT" | "MEDIUMTEXT" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BLOB" | "VARBINARY" | "BINARY" | "GEOMETRY" | "GEOMETRYCOLLECTION"
-            | "LINESTRING" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "ENUM" | "SET" => (DataType::Text, false),
+            | "LINESTRING" | "MULTIPOINT" | "MULTILINESTRING" | "MULTIPOLYGON" | "ENUM" | "SET" | "VECTOR" => (DataType::Text, false),
             "DEC" | "FIXED" => (DataType::Decimal, false),
             "TIMETZ" => (DataType::TimestampTz, false),
             "CALCULATED" => (DataType::Calculated, false),
