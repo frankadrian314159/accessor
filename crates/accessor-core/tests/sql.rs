@@ -5541,6 +5541,9 @@ fn a_real_column_compared_with_text_reads_the_text_as_real() {
     assert_eq!(rows(&db, "SELECT f1 FROM f4 WHERE f1 = '1004.3'"), [["1004.3"]]);
     assert_eq!(rows(&db, "SELECT f1 FROM f4 WHERE '0.1' = f1"), [["0.1"]]);
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM f4 WHERE f1 < '100'"), [["2"]]);
+    // text beyond the range of a single-precision float is compared as the double it is
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM f4 WHERE f1 > '-2.225073858507201383e-308'"), [["3"]]);
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM f4 WHERE f1 < '2.225073858507201383e-308'"), [["0"]]);
     // a double literal is a double: the single-precision value is not equal to it
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM f4 WHERE f1 = 1004.3"), [["0"]]);
     // an index finds it too

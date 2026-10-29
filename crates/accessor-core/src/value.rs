@@ -361,8 +361,11 @@ pub(crate) enum Kind {
 /// compared with a `real` column), so `WHERE f1 = '1004.3'` finds the row that holds the nearest single-precision value.
 fn as_real_for(x: Value, other: &Value) -> Value {
     if matches!(other, Value::Float(_)) {
-        if let Some(f) = x.as_f32() {
-            return Value::Float(f);
+        // only when the number is one a single-precision float can hold: one beyond its range (1e-308) stays a double
+        if let (Some(f), Some(d)) = (x.as_f32(), x.as_f64()) {
+            if f.is_finite() && !(f == 0.0 && d != 0.0) {
+                return Value::Float(f);
+            }
         }
     }
     x
