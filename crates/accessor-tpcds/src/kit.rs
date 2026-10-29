@@ -1,7 +1,7 @@
 //! TPC-DS as the benchmark's own tools produce it: the data written by `dsdgen`, the 99 qualification queries written by
 //! `dsqgen`, and the answer sets the kit ships for scale factor 1 (see `scripts/tpcds-kit.sh`, which builds the tools from the
 //! `third_party/tpcds-kit` submodule). Each query must run, and its result must equal the answer set.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -110,12 +110,34 @@ fn token(t: &str) -> String {
 /// Splits a row into whitespace-separated tokens (the answer sets are fixed-width text, so values with spaces cannot be told apart
 /// from neighbours; both sides are compared as token lists).
 fn row_key(fields: &[&str]) -> String {
-    fields.iter().flat_map(|f| f.split_whitespace()).filter(|t| *t != "NULL").map(token).collect::<Vec<_>>().join(" ")
+    // `last_name || ', ' || first_name` of a CHAR(30) column has its padding in the answer files: `Carter , Rodney`
+    fields.iter().flat_map(|f| f.split_whitespace()).filter(|t| *t != "NULL").map(token).collect::<Vec<_>>().join(" ").replace(" ,", ",")
+}
+
+/// A row as its values, whitespace separated, without the NULLs and with the padding before a comma gone, but with the numbers as
+/// written: the answer files print them to as many digits as the column is wide.
+fn raw_row(fields: &[&str]) -> String {
+    fields.iter().flat_map(|f| f.split_whitespace()).filter(|t| *t != "NULL").collect::<Vec<_>>().join(" ").replace(" ,", ",")
+}
+
+/// Whether `mine` is `answer` with each number rounded to the digits the answer prints: the files are fixed-width text, so
+/// a 10-character column holds `132885062` or `20390161.4` for what is 132885061.65 or 20390161.37.
+fn rounded_equal(answer: &str, mine: &str) -> bool {
+    let (a, m): (Vec<&str>, Vec<&str>) = (answer.split_whitespace().collect(), mine.split_whitespace().collect());
+    let number = |t: &str| t.parse::<f64>().ok().filter(|_| t.chars().any(|c| c.is_ascii_digit()) && !t.contains(['e', 'E']));
+    a.len() == m.len()
+        && a.iter().zip(&m).all(|(x, y)| match (number(x), number(y)) {
+            (Some(p), Some(q)) => {
+                let decimals = x.split_once('.').map_or(0, |(_, f)| f.len()) as i32;
+                (p - q).abs() <= 0.5 * 10f64.powi(-decimals) + 1e-9
+            }
+            _ => x == y,
+        })
 }
 
 /// The rows of an answer set: after the header and its dashed line. The files are fixed-width text, tab-padded text, or
 /// split by `|`; a NULL is an empty field.
-fn answer_rows(text: &str) -> Vec<String> {
+fn answer_rows(text: &str) -> Vec<(String, String)> {
     let dashes = |l: &str| l.contains('-') && l.chars().all(|c| matches!(c, '-' | ' ' | '\t' | '|'));
     let mut rows = Vec::new();
     let mut seen_header = false;
@@ -142,15 +164,15 @@ fn answer_rows(text: &str) -> Vec<String> {
         if dashes(l) || l.trim_end().ends_with("rows selected.") {
             continue;
         }
-        // query 44's answers print a NULL product name as a lone `%`
+        // query 44's answers print a NULL product name as a lone `%`, query 73's NULL salutation as a lone `-`
         let spaced = l.replace('|', " ");
-        let line: Vec<&str> = spaced.split_whitespace().map(|t| if t == "%" { "NULL" } else { t }).collect();
+        let line: Vec<&str> = spaced.split_whitespace().map(|t| if t == "%" || t == "-" { "NULL" } else { t }).collect();
         let key = row_key(&[&line.join(" ")]);
         // the header again, between the result sets of a query with several statements
         if header.as_ref() == Some(&key) {
             continue;
         }
-        rows.push(key);
+        rows.push((key, raw_row(&[&line.join(" ")])));
     }
     rows
 }
@@ -166,15 +188,61 @@ fn check_answer(dir: &Path, n: u32, rows: &[Vec<String>]) -> String {
     if files.is_empty() {
         return "no answer set".into();
     }
-    let mut mine: Vec<String> = rows.iter().map(|r| row_key(&r.iter().map(String::as_str).collect::<Vec<_>>())).collect();
-    mine.sort();
+    let mut mine_rows: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| {
+            let fields: Vec<&str> = r.iter().map(String::as_str).collect();
+            (row_key(&fields), raw_row(&fields))
+        })
+        .collect();
+    mine_rows.sort();
+    let mine: Vec<String> = mine_rows.iter().map(|(k, _)| k.clone()).collect();
     let mut best = String::new();
     for name in files {
         let text = String::from_utf8_lossy(&std::fs::read(dir.join(&name)).unwrap_or_default()).into_owned();
-        let mut want = answer_rows(&text);
-        want.sort();
+        let mut want_rows = answer_rows(&text);
+        want_rows.sort();
+        let want: Vec<String> = want_rows.iter().map(|(k, _)| k.clone()).collect();
         if want == mine {
             return "matches the answer set".into();
+        }
+        // the rows that differ, matched again with the numbers rounded to the digits the answer prints
+        let mut unused: HashMap<&str, usize> = HashMap::new();
+        for k in &mine {
+            *unused.entry(k).or_default() += 1;
+        }
+        let want_left: Vec<&str> = want_rows
+            .iter()
+            .filter(|(k, _)| match unused.get_mut(k.as_str()) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    false
+                }
+                _ => true,
+            })
+            .map(|(_, raw)| raw.as_str())
+            .collect();
+        let mut mine_left: Vec<Option<&str>> = Vec::new();
+        for (k, raw) in &mine_rows {
+            match unused.get_mut(k.as_str()) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    mine_left.push(Some(raw.as_str()));
+                }
+                _ => {}
+            }
+        }
+        if want_left.len() == mine_left.len() && want_left.len() <= 5000 {
+            let all_found = want_left.iter().all(|w| match mine_left.iter().position(|m| m.is_some_and(|m| rounded_equal(w, m))) {
+                Some(i) => {
+                    mine_left[i] = None;
+                    true
+                }
+                None => false,
+            });
+            if all_found {
+                return "matches the answer set (numbers as rounded in the answer file)".into();
+            }
         }
         if std::env::var_os("TPCDS_DEBUG").is_some() {
             for w in want.iter().filter(|w| !mine.contains(w)).take(3) {
@@ -191,7 +259,7 @@ fn check_answer(dir: &Path, n: u32, rows: &[Vec<String>]) -> String {
 }
 
 /// Returns the number of queries that failed or differ.
-pub fn main(dir: &str, db_file: Option<&str>, only: &[u32], indexes: bool, timeout: u64, explain: bool, extra: &[String], repl: bool) -> usize {
+pub fn main(dir: &str, db_file: Option<&str>, only: &[u32], indexes: bool, timeout: u64, explain: bool, extra: &[String], repl: bool, settings: &[String]) -> usize {
     let dir = Path::new(dir);
     // with a database file the data is loaded once and kept there for the runs that follow
     let loaded = db_file.is_some_and(|f| Path::new(f).exists());
@@ -228,6 +296,10 @@ pub fn main(dir: &str, db_file: Option<&str>, only: &[u32], indexes: bool, timeo
         println!("opened the database file in {:.1}s", started.elapsed().as_secs_f64());
     }
     let _ = db.execute(&format!("SET statement_timeout = '{timeout}s'"));
+    // the answer sets were made by servers that divide whole numbers exactly (queries 73, 78, 83) and round a tie away from zero (78)
+    for st in settings {
+        db.execute(st).unwrap_or_else(|e| panic!("{st}: {e}"));
+    }
     std::panic::set_hook(Box::new(|_| {}));
     // statements given with `--sql` run instead of the queries
     if !extra.is_empty() {
@@ -353,5 +425,33 @@ fn session(db: &mut Database, dir: &Path, queries: &[(u32, Vec<String>)]) {
             other => println!("unknown command {other}: run, explain, sql, timeout, quit"),
         }
         println!("done");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_match_to_the_digits_the_answer_prints() {
+        assert!(rounded_equal("catalog channel 1 132885062 2050279.74", "catalog channel 1 132885061.65 2050279.74"));
+        assert!(rounded_equal("20390161.4 -9133254.7", "20390161.37 -9133254.66"));
+        assert!(!rounded_equal("132885062", "132885060.9"));
+        assert!(!rounded_equal("2050279.74", "2050279.75"));
+        assert!(!rounded_equal("a b", "a c"));
+    }
+
+    #[test]
+    fn padding_before_a_comma_does_not_matter() {
+        assert_eq!(row_key(&["Carter , Rodney"]), row_key(&["Carter, Rodney"]));
+        assert_eq!(raw_row(&["Carter   , Rodney"]), "Carter, Rodney");
+    }
+
+    #[test]
+    fn answer_files_print_nulls_as_dashes_and_percent_signs() {
+        let text = "A B C\n- - -\nGreene - N\nx % y\n";
+        let rows = answer_rows(text);
+        assert_eq!(rows[0].0, row_key(&["Greene N"]));
+        assert_eq!(rows[1].0, row_key(&["x y"]));
     }
 }

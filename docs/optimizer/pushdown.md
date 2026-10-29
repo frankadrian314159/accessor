@@ -17,6 +17,14 @@ It is done only when that cannot change the answer: the inner query has no `DIST
 
 `ON (a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.z = 4)` cannot be split into per-table conditions, but it says that `a` must have `x = 1` or `x = 3`, and `b` must have `y = 2` or `z = 4`. Those are used to filter each table before the join (and can use an index); the whole `OR` is still checked on the pairs that remain. A table that some branch of the `OR` says nothing about is not filtered.
 
+## Into grouped derived tables, and through joins
+
+A condition on a **grouping column** of a derived table moves under the grouping: `SELECT * FROM (SELECT yr, item, SUM(q) s FROM t GROUP BY yr, item) x WHERE yr = 2000` groups only the rows of 2000, since a condition on the grouping columns keeps or drops whole groups. A condition on an aggregate (`s > 10`) stays outside, and so does any condition when the inner query has `ROLLUP`, `CUBE` or `GROUPING SETS` (the rows of a dropped key would still count in the totals), `DISTINCT`, `LIMIT` or a window function.
+
+Constants are also carried across the equalities of inner and left joins. With `FROM ss LEFT JOIN ws ON ws.yr = ss.yr WHERE ss.yr = 2000`, a row of `ws` with another year could only match a row of `ss` that the `WHERE` removes, so `ws.yr = 2000` is a condition `ws` can be built under too. The `WHERE` itself is unchanged: this only keeps rows that could never match from being built.
+
+A CTE that the statement reads **once**, in the `FROM` clause of the main query, is read there as a derived table, so the rules above apply to it. A CTE used twice, or inside a sub-query (which may run many times), is run once and kept, as before. TPC-DS query 78 builds three yearly summaries of the sales channels and uses one year; reading them under `year = 2000` cut it from more than 100 s to 9 s.
+
 ## Conditions every branch of an OR shares
 
 `WHERE (a.k = b.k AND a.x = 1) OR (a.k = b.k AND a.x = 2)` repeats the join condition `a.k = b.k` in each branch. The optimizer moves what every branch has in common out of the `OR`: `a.k = b.k AND (a.x = 1 OR a.x = 2)`. The two are equal, including when a value is NULL, and the shared condition is now a condition of the query itself, so it can be used to join `a` and `b` and to filter them. Without this, a query such as TPC-DS 13, which writes its join conditions inside every branch of an `OR`, saw no condition linking its tables and built every combination of their rows. It is done for the `WHERE` condition, at the top level and inside `AND`.

@@ -53,7 +53,8 @@ join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out .
 9. **Statistics.** Distinct counts, common values and histograms of unindexed columns, worked out on demand, sharpen the estimates behind the choices above. See [estimates.md](estimates.md).
 10. **Stored functions are expanded.** A call of a `CREATE FUNCTION` function is replaced by its body, so it can be folded to a constant, use an index, or become a semi-join. See [../sql/routines.md](../sql/routines.md).
 11. **Shared conditions of an OR.** Conditions that every branch of an `OR` repeats, join conditions especially, are moved out of it. See [pushdown.md](pushdown.md#conditions-every-branch-of-an-or-shares).
-12. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
+12. **Narrow rows.** In a join, a plain table is read with only the columns the statement mentions, so the rows built are as narrow as the query needs. See [join-order.md](join-order.md#narrow-rows).
+13. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
 
 And what it deliberately does not do, so that you are not surprised:
 

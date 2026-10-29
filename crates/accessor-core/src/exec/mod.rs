@@ -58,6 +58,13 @@ impl Database {
         Ok(last)
     }
 
+    /// `SET integer_division = off`: until the guard is dropped, `/` of whole numbers keeps the fraction.
+    /// `SET round_half_even = off`: and `Round` sends a tie away from zero.
+    fn division_guard(&self) -> (crate::numeric::DivisionGuard, crate::decimal::TiesGuard) {
+        let off = |name: &str| self.settings.get(name).is_some_and(|v| v == "off");
+        (crate::numeric::exact_whole_division(off("integer_division")), crate::decimal::ties_away_from_zero(off("round_half_even")))
+    }
+
     /// Runs a single read-only SELECT.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
         self.enter_session();
@@ -68,6 +75,7 @@ impl Database {
     /// Runs statements that [`is_pure_read`](Database::is_pure_read) has accepted (or any one SELECT).
     pub(crate) fn run_read(&self, parsed: &[Statement]) -> Result<QueryResult> {
         self.enter_session();
+        let _division = self.division_guard();
         self.admit()?;
         match parsed {
             [] => Err(Error::syntax("empty statement")),
@@ -110,6 +118,7 @@ impl Database {
     fn run_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         self.enter_session();
         let _timeout = self.settings.get("statement_timeout").and_then(|t| budget::parse_timeout(t)).map(budget::limit);
+        let _division = self.division_guard();
         if !matches!(st, Statement::Begin | Statement::Commit | Statement::Rollback) {
             self.admit()?;
             if matches!(st, Statement::Select(_) | Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Upsert { .. } | Statement::Returning { .. } | Statement::Exec { .. }) {

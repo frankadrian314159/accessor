@@ -376,7 +376,7 @@ pub(crate) fn probe_pays(t: &Table, fanout: f64, left: f64) -> bool {
     left * fanout <= t.estimated_len() as f64 + left
 }
 
-/// `(this source's column, another source's column)` for each equality of two plain columns.
+/// `(this source's table column, another source's column)` for each equality of two plain columns.
 type JoinPairs = Vec<(usize, usize)>;
 
 /// How a source is reached from the rows already joined, the pairs of columns it is joined on, and (when an index is
@@ -401,9 +401,10 @@ fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs
         };
         linked = true;
         if let BExpr::Col(c) = &**mine {
-            cols.push(*c - offs[s]);
+            // (the columns of the table, which the indexes and statistics are about)
+            cols.push(source.tcol(*c - offs[s]));
             if let BExpr::Col(oc) = &**theirs {
-                pairs.push((*c - offs[s], *oc));
+                pairs.push((source.tcol(*c - offs[s]), *oc));
             }
         }
     }
@@ -445,7 +446,7 @@ fn join_distinct(sources: &[Source<'_>], s: usize, pairs: &JoinPairs, offs: &[us
         // table keep 0.5% of an inventory), where counting only the remaining keys would keep all of it.
         let _ = (mine_rows, other_rows);
         let dm = mt.column_stats(mc).distinct;
-        let dn = ot.column_stats(oc - offs[other]).distinct;
+        let dn = ot.column_stats(sources[other].tcol(oc - offs[other])).distinct;
         let d = dm.max(dn).max(1.0);
         best = Some(best.map_or(d, |b: f64| b.max(d)));
     }

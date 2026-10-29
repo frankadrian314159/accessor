@@ -5397,3 +5397,129 @@ fn exists_with_a_residual_comparison_becomes_a_semi_join() {
 {plan}");
     }
 }
+
+#[test]
+fn integer_division_setting_makes_slash_exact_for_whole_numbers() {
+    let mut db = Database::in_memory();
+    assert_eq!(rows(&db, "SELECT 7 / 2, 1 / 3, 7 / 2.0"), [["3", "0", "3.5"]]);
+    db.execute("SET integer_division = off").unwrap();
+    assert_eq!(rows(&db, "SELECT 7 / 2, 7 / 2.0, 6 / 3")[0][..2], ["3.5", "3.5"]);
+    assert_eq!(rows(&db, "SELECT CASE WHEN 3 / 2 > 1 THEN 'yes' ELSE 'no' END"), [["yes"]]);
+    assert_eq!(db.execute("SHOW integer_division").unwrap().rows[0][0].to_string(), "off");
+    db.execute("RESET integer_division").unwrap();
+    assert_eq!(rows(&db, "SELECT 7 / 2"), [["3"]]);
+    assert!(db.execute("SET integer_division = maybe").is_err());
+}
+
+#[test]
+fn joins_of_wide_tables_leave_out_the_columns_they_do_not_use() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE w1 (id INTEGER PRIMARY KEY, k INTEGER, a1 TEXT, a2 TEXT, a3 TEXT, a4 TEXT, a5 TEXT, a6 TEXT, a7 INTEGER, a8 INTEGER);
+         CREATE TABLE w2 (id INTEGER PRIMARY KEY, k INTEGER, b1 TEXT, b2 TEXT, b3 TEXT, b4 TEXT, b5 TEXT, b6 TEXT, b7 INTEGER, b8 INTEGER);
+         CREATE INDEX w2_k ON w2 (k);",
+    )
+    .unwrap();
+    for i in 0..60 {
+        db.execute(&format!("INSERT INTO w1 VALUES ({i}, {}, 'a{i}', 'x', 'y', 'z', 'u', 'v', {}, {})", i % 7, i * 3, i % 5)).unwrap();
+        db.execute(&format!("INSERT INTO w2 VALUES ({i}, {}, 'b{i}', 'x', 'y', 'z', 'u', 'v', {}, {})", i % 11, i * 2, i % 3)).unwrap();
+    }
+    let queries = [
+        // an index probe, a hash join, a join with a condition on each side
+        "SELECT w1.id, w2.id FROM w1, w2 WHERE w1.k = w2.k AND w2.b7 > 20 ORDER BY 1, 2",
+        "SELECT w1.a1, w2.b1 FROM w1 JOIN w2 ON w1.id = w2.id AND w1.a8 = w2.b8 ORDER BY 1",
+        "SELECT w1.a1, w2.b1 FROM w1, w2 WHERE w1.a7 = w2.b7 ORDER BY 1, 2",
+        // outer joins, with a WHERE condition on the padded side
+        "SELECT w1.id, w2.b1 FROM w1 LEFT JOIN w2 ON w1.k = w2.k AND w2.b8 = 1 ORDER BY 1, 2",
+        "SELECT w1.id FROM w1 LEFT JOIN w2 ON w1.id = w2.id + 50 WHERE w2.id IS NULL ORDER BY 1",
+        "SELECT w1.id, w2.id FROM w1 RIGHT JOIN w2 ON w1.id = w2.id + 55 ORDER BY 2",
+        // a self join
+        "SELECT x.id, y.id FROM w1 x, w1 y WHERE x.k = y.k AND x.id < y.id AND x.a8 = 0 ORDER BY 1, 2",
+        // USING, grouping, a window function, DISTINCT, HAVING
+        "SELECT k, COUNT(*) FROM w1 JOIN w2 USING (k) GROUP BY k ORDER BY k",
+        "SELECT w1.k, SUM(w2.b7), COUNT(DISTINCT w2.b8) FROM w1, w2 WHERE w1.k = w2.k GROUP BY w1.k HAVING SUM(w2.b7) > 100 ORDER BY 1",
+        "SELECT w1.id, RANK() OVER (PARTITION BY w1.k ORDER BY w2.b7 DESC) FROM w1, w2 WHERE w1.id = w2.id ORDER BY 1",
+        "SELECT DISTINCT w1.a8, w2.b8 FROM w1, w2 WHERE w1.k = w2.k ORDER BY 1, 2",
+        // sub-queries that read the outer tables' columns
+        "SELECT w1.id FROM w1, w2 WHERE w1.id = w2.id AND EXISTS (SELECT 1 FROM w2 z WHERE z.k = w1.k AND z.b7 > w2.b7) ORDER BY 1",
+        "SELECT w1.id, (SELECT MAX(z.b7) FROM w2 z WHERE z.k = w2.k) FROM w1, w2 WHERE w1.id = w2.id ORDER BY 1",
+        // a column used only in ORDER BY or only in the select list
+        "SELECT w1.a1 FROM w1, w2 WHERE w1.id = w2.id ORDER BY w2.b2, w1.id",
+        "SELECT w2.b6 FROM w1, w2 WHERE w1.id = w2.id AND w1.k = 3 ORDER BY 1",
+        // `*` and `t.*` keep every column
+        "SELECT * FROM w1, w2 WHERE w1.id = w2.id AND w1.id < 3 ORDER BY w1.id",
+        "SELECT w1.*, w2.b1 FROM w1, w2 WHERE w1.id = w2.id AND w1.id < 3 ORDER BY w1.id",
+    ];
+    for sql in queries {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        let off = rows(&db, sql);
+        assert_eq!(on, off, "{sql}");
+        assert!(!on.is_empty() || sql.contains("RIGHT") || sql.contains("IS NULL"), "{sql}");
+    }
+}
+
+#[test]
+fn conditions_move_into_grouped_derived_tables_and_single_use_ctes() {
+    let mut db = Database::in_memory();
+    db.execute(
+        "CREATE TABLE sales (yr INTEGER, item INTEGER, qty INTEGER);
+         CREATE TABLE rets (yr INTEGER, item INTEGER, qty INTEGER);",
+    )
+    .unwrap();
+    for y in 1998..2003 {
+        for item in 0..20 {
+            db.execute(&format!("INSERT INTO sales VALUES ({y}, {item}, {})", (item * 7 + y) % 13)).unwrap();
+            if item % 3 == 0 {
+                db.execute(&format!("INSERT INTO rets VALUES ({y}, {item}, {})", (item + y) % 5)).unwrap();
+            }
+        }
+    }
+    let queries = [
+        // a condition on a grouping column goes under the grouping
+        "SELECT * FROM (SELECT yr, item, SUM(qty) q FROM sales GROUP BY yr, item) t WHERE yr = 2000 ORDER BY item",
+        "SELECT * FROM (SELECT yr AS y, SUM(qty) q FROM sales GROUP BY yr HAVING SUM(qty) > 0) t WHERE y BETWEEN 1999 AND 2001 ORDER BY y",
+        // a condition on an aggregate stays outside
+        "SELECT * FROM (SELECT yr, SUM(qty) q FROM sales GROUP BY yr) t WHERE q > 100 ORDER BY yr",
+        // not under ROLLUP: the totals would change
+        "SELECT * FROM (SELECT yr, SUM(qty) q FROM sales GROUP BY ROLLUP (yr)) t WHERE yr = 2000 ORDER BY yr",
+        // a single-use CTE, a constant carried across a LEFT JOIN
+        "WITH s AS (SELECT yr, item, SUM(qty) q FROM sales GROUP BY yr, item), r AS (SELECT yr, item, SUM(qty) q FROM rets GROUP BY yr, item) \
+         SELECT s.yr, s.item, s.q, r.q FROM s LEFT JOIN r ON r.yr = s.yr AND r.item = s.item WHERE s.yr = 2001 ORDER BY 2",
+        "WITH s AS (SELECT yr, item, SUM(qty) q FROM sales GROUP BY yr, item), r AS (SELECT yr, item, SUM(qty) q FROM rets GROUP BY yr, item) \
+         SELECT s.yr, s.item, s.q, r.q FROM s LEFT JOIN r ON r.yr = s.yr AND r.item = s.item WHERE s.yr = 2001 AND r.q IS NULL ORDER BY 2",
+        "WITH s AS (SELECT yr, item, SUM(qty) q FROM sales GROUP BY yr, item), r AS (SELECT yr, item, SUM(qty) q FROM rets GROUP BY yr, item) \
+         SELECT s.item, s.q, COALESCE(r.q, 0) FROM s JOIN r ON r.yr = s.yr AND r.item = s.item WHERE r.yr = 1999 ORDER BY 1",
+        // a CTE read twice is run once and read twice
+        "WITH s AS (SELECT yr, SUM(qty) q FROM sales GROUP BY yr) SELECT a.yr, b.yr FROM s a, s b WHERE a.yr = b.yr + 1 AND a.yr = 2002 ORDER BY 1, 2",
+        // a CTE read inside a sub-query stays a CTE
+        "WITH s AS (SELECT yr, SUM(qty) q FROM sales GROUP BY yr) SELECT yr FROM s WHERE q > (SELECT AVG(q) FROM s) ORDER BY 1",
+    ];
+    for sql in queries {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        let off = rows(&db, sql);
+        assert_eq!(on, off, "{sql}");
+        assert!(!on.is_empty(), "{sql}");
+    }
+    db.set_optimizer(true);
+    // the condition reached the grouped table, and the constant reached the CTE on the other side of the left join
+    let plan = plan_text(
+        &db,
+        "WITH s AS (SELECT yr, item, SUM(qty) q FROM sales GROUP BY yr, item), r AS (SELECT yr, item, SUM(qty) q FROM rets GROUP BY yr, item) \
+         SELECT s.item, r.q FROM s LEFT JOIN r ON r.yr = s.yr AND r.item = s.item WHERE s.yr = 2001",
+    );
+    assert!(plan.contains("conditions on s moved into its query") && plan.contains("conditions on r moved into its query"), "{plan}");
+}
+
+#[test]
+fn round_half_even_setting_sends_ties_away_from_zero_when_off() {
+    let mut db = Database::in_memory();
+    assert_eq!(rows(&db, "SELECT Round(2.125, 2), Round(2.5), Round(-2.5), Round(CAST(2.125 AS DOUBLE), 2)"), [["2.12", "2", "-2", "2.12"]]);
+    db.execute("SET round_half_even = off").unwrap();
+    assert_eq!(rows(&db, "SELECT Round(2.125, 2), Round(2.5), Round(-2.5), Round(CAST(2.125 AS DOUBLE), 2)"), [["2.13", "3", "-3", "2.13"]]);
+    db.execute("RESET round_half_even").unwrap();
+    assert_eq!(rows(&db, "SELECT Round(2.125, 2)"), [["2.12"]]);
+}

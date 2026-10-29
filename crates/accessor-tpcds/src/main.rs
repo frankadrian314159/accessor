@@ -3,7 +3,7 @@
 //! dimensions, and a selection of the benchmark's queries (see `queries.rs`). Each query must run, finish in time, and
 //! (with `--compare`) give the same rows with the optimizer off and on data without indexes.
 //! With `--kit DIR` it instead loads the data of the official `dsdgen`, runs the 99 queries of `dsqgen` and compares each result with
-//! the kit's answer set (see `kit.rs`). Usage: `accessor-tpcds [--kit DIR [--db FILE]] [--sf 0.01] [--seed N] [--compare] [--only 3,7] [--no-indexes] [--explain] [--timeout SECONDS] [--repl]`.
+//! the kit's answer set (see `kit.rs`). Usage: `accessor-tpcds [--kit DIR [--db FILE]] [--sf 0.01] [--seed N] [--compare] [--only 3,7] [--no-indexes] [--explain] [--timeout SECONDS] [--repl] [--exact-division] [--round-half-away]`.
 mod kit;
 mod queries;
 
@@ -447,6 +447,7 @@ pub(crate) fn run(db: &mut Database, sql: &str) -> Result<(Vec<String>, Duration
 fn main() {
     let mut explain = false;
     let mut repl = false;
+    let mut settings: Vec<String> = Vec::new();
     let mut kit: Option<String> = None;
     let mut db_file: Option<String> = None;
     let mut extra: Vec<String> = Vec::new();
@@ -460,6 +461,8 @@ fn main() {
             "--compare" => compare = true,
             "--explain" => explain = true,
             "--repl" => repl = true,
+            "--exact-division" => settings.push("SET integer_division = off".to_string()),
+            "--round-half-away" => settings.push("SET round_half_even = off".to_string()),
             "--db" => db_file = Some(it.next().expect("--db FILE").clone()),
             "--kit" => kit = Some(it.next().expect("--kit DIR").clone()),
             "--sql" => extra.push(it.next().expect("--sql QUERY").clone()),
@@ -470,7 +473,7 @@ fn main() {
         }
     }
     if let Some(dir) = kit {
-        let bad = kit::main(&dir, db_file.as_deref(), &only, indexes, timeout, explain, &extra, repl);
+        let bad = kit::main(&dir, db_file.as_deref(), &only, indexes, timeout, explain, &extra, repl, &settings);
         std::process::exit(if bad > 0 { 1 } else { 0 });
     }
     let mut db = Database::in_memory();

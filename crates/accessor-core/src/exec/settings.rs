@@ -47,6 +47,8 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("extra_float_digits", "1", 't'),
     ("from_collapse_limit", "8", 't'),
     ("geqo", "on", 'b'),
+    ("integer_division", "on", 'b'),
+    ("round_half_even", "on", 'b'),
     ("geqo_threshold", "12", 't'),
     ("gin_fuzzy_search_limit", "0", 't'),
     ("hash_mem_multiplier", "2", 't'),

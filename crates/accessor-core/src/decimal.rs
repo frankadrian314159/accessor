@@ -33,6 +33,24 @@ fn pow10(n: u32) -> BigInt {
     BigInt::from(10u32).pow(n)
 }
 
+thread_local! {
+    static TIES_AWAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes [`Decimal::round`] (and so `Round`) send a tie away from zero, as most servers do, until the guard is dropped;
+/// the default sends it to the even digit. The statement being run sets this from the `round_half_even` setting.
+pub(crate) struct TiesGuard(bool);
+
+pub(crate) fn ties_away_from_zero(on: bool) -> TiesGuard {
+    TiesGuard(TIES_AWAY.with(|t| t.replace(on)))
+}
+
+impl Drop for TiesGuard {
+    fn drop(&mut self) {
+        TIES_AWAY.with(|t| t.set(self.0));
+    }
+}
+
 impl Decimal {
     /// Builds `mant × 10^-scale`, in canonical form. A negative scale means
     /// a multiple of a power of ten.
@@ -238,7 +256,7 @@ impl Decimal {
         Decimal { mant: self.mant.div_floor(&pow10(self.scale)), scale: 0 }
     }
 
-    /// Rounds to `digits` places after the point, ties to even.
+    /// Rounds to `digits` places after the point, ties to even (away from zero when `round_half_even` is off).
     pub fn round(&self, digits: u32) -> Decimal {
         if self.scale <= digits {
             return self.clone();
@@ -248,7 +266,7 @@ impl Decimal {
         let twice = r.abs() * 2u32;
         let away = match twice.cmp(&unit) {
             Ordering::Greater => true,
-            Ordering::Equal => q.is_odd(),
+            Ordering::Equal => TIES_AWAY.with(|t| t.get()) || q.is_odd(),
             Ordering::Less => false,
         };
         if away {
@@ -399,6 +417,18 @@ mod tests {
         assert_eq!(d("-7").rem(&d("4")).unwrap(), d("-3"));
         assert_eq!(d("7.5").rem(&d("2")).unwrap(), d("1.5"));
         assert!(d("1").rem(&d("0")).is_none());
+    }
+
+    #[test]
+    fn ties_go_away_from_zero_when_asked() {
+        assert_eq!(d("2.125").round(2).to_string(), "2.12");
+        {
+            let _away = ties_away_from_zero(true);
+            assert_eq!(d("2.125").round(2).to_string(), "2.13");
+            assert_eq!(d("-2.125").round(2).to_string(), "-2.13");
+            assert_eq!(d("2.124").round(2).to_string(), "2.12");
+        }
+        assert_eq!(d("2.125").round(2).to_string(), "2.12");
     }
 
     #[test]

@@ -39,7 +39,7 @@ There are three kinds of division, so that each of the results people expect is 
 
 | Expression | Result |
 | --- | --- |
-| `INTEGER` or `BIGNUM` `/` the same | a whole number, truncated toward zero: `7 / 2` is 3, `-7 / 2` is -3, `1 / 3` is 0 |
+| `INTEGER` or `BIGNUM` `/` the same | a whole number, truncated toward zero: `7 / 2` is 3, `-7 / 2` is -3, `1 / 3` is 0. With `SET integer_division = off` the quotient is exact, as `DIV` gives it: `7 / 2` is the `DECIMAL` 3.5 (`RESET integer_division` or `SET integer_division = on` for the default). Queries written for Oracle, where `/` never drops the fraction, need it (`hd_dep_count / hd_vehicle_count > 1` in TPC-DS query 73) |
 | anything with a `DECIMAL`, `CURRENCY` or `RATIONAL` operand | a `DOUBLE`: `7 / 2.0` is 3.5, `1 / 3.0` is 0.3333333333333333 |
 | a `FLOAT` with a `FLOAT` or whole number | a `FLOAT` |
 | a `DOUBLE` with anything | a `DOUBLE` |

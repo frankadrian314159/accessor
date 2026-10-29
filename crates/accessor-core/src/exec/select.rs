@@ -44,6 +44,9 @@ enum LateralKind {
 }
 
 pub(crate) struct Source<'a> {
+    /// For a table whose unused columns were left out (see [`narrow_sources`]): the table's column behind each column
+    /// of the source. Conditions and keys that are run on the table's own rows are in the table's columns.
+    pub(crate) keep: Option<Vec<usize>>,
     pub(crate) data: SourceData<'a>,
     /// Conditions that belong to the source itself (a merged view's `WHERE`), written for its columns.
     pub(crate) intrinsic: Vec<BExpr>,
@@ -54,6 +57,17 @@ pub(crate) struct Source<'a> {
 impl Source<'_> {
     pub(crate) fn ncols(&self) -> usize {
         self.names.len()
+    }
+    /// The table's column behind column `local` of this source.
+    pub(crate) fn tcol(&self, local: usize) -> usize {
+        self.keep.as_ref().map_or(local, |k| k[local])
+    }
+    /// Appends the columns of a table row that this source has.
+    fn append_to(&self, out: &mut Row, row: &Row) {
+        match &self.keep {
+            Some(k) => out.extend(k.iter().map(|&c| row[c].clone())),
+            None => out.extend_from_slice(row),
+        }
     }
     fn slot_count(&self) -> usize {
         match &self.data {
@@ -78,7 +92,7 @@ impl Database {
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
                 if let Some(view) = name.strip_prefix("information_schema.") {
                     let (names, rows) = self.information_schema(view)?;
-                    return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
                 if !*only && self.table(name).is_some() && self.has_children(name) {
                     return self.family_source(name, alias, depth);
@@ -98,10 +112,10 @@ impl Database {
                             }
                         }
                         let names = schema.columns.iter().map(|c| c.name.clone()).collect();
-                        return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                        return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
                     }
                     let names = t.schema().columns.iter().map(|c| c.name.clone()).collect();
-                    return Ok(Source { intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
                 }
                 if self.view_sql(name).is_some() {
                     self.require_privilege(name, "select")?;
@@ -112,7 +126,7 @@ impl Database {
                         )));
                     }
                     let res = self.without_privileges(|| self.run_select_depth(&q, depth + 1))?;
-                    return Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
@@ -154,7 +168,7 @@ impl Database {
                         res.columns[heads.len() + i] = l.clone();
                     }
                 }
-                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names: res.columns })
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names: res.columns })
             }
             TableFactor::Unpivot { source, value_col, name_col, columns, include_nulls, alias } => {
                 let inner = self.resolve_factor(source, depth)?;
@@ -186,7 +200,7 @@ impl Database {
                         out.push(r);
                     }
                 }
-                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(out), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(out), alias: alias.clone(), names })
             }
             TableFactor::Function { name, args, alias, columns } => {
                 let scope = Scope::default();
@@ -196,7 +210,7 @@ impl Database {
                 }
                 let (cols, rows) = self.table_function(name, &vals)?;
                 let names = rename_columns(cols, columns, alias)?;
-                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
             }
             TableFactor::Derived { query, alias, columns, lateral } => {
                 // conditions of the outer WHERE on this table's columns are applied inside it, before it is built
@@ -210,10 +224,10 @@ impl Database {
                 }
                 let res = self.run_select_depth(pushed.as_ref().unwrap_or(query), depth + 1)?;
                 let names = rename_columns(res.columns, columns, alias)?;
-                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
             TableFactor::Materialized { rows, columns, alias } => {
-                Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
             }
         }
     }
@@ -245,7 +259,7 @@ impl Database {
                 probe.limit = Some(0);
                 let probed = self.unlogged(|| self.run_select_depth(&probe, depth + 1))?;
                 let names = rename_columns(probed.columns, columns, alias)?;
-                Ok(Source { intrinsic: Vec::new(), data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
             }
             TableFactor::Function { name, args, alias, columns } => {
                 let mut a = args.clone();
@@ -256,6 +270,7 @@ impl Database {
                 let cols = self.table_function_columns(name)?;
                 let names = rename_columns(cols, columns, alias)?;
                 Ok(Source {
+                    keep: None,
                     intrinsic: Vec::new(),
                     data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Func(name.clone(), a), outer })),
                     alias: alias.clone(),
@@ -490,7 +505,7 @@ impl Database {
         }
 
         // 1. Resolve sources and build the name scope.
-        let _hint = super::inherit::prune_guard(sel.filter.clone());
+        let _hint = super::inherit::prune_guard(if self.optimizer_on { super::pushdown::with_implied(sel) } else { sel.filter.clone() });
         let mut sources = Vec::new();
         let mut scope = Scope::default();
         if let Some(from) = &sel.from {
@@ -503,6 +518,14 @@ impl Database {
                     scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: n.starts_with(super::viewdml::HIDDEN_COLUMN) });
                 }
                 sources.push(src);
+            }
+        }
+        if self.optimizer_on && narrow_sources(sel, &mut sources) {
+            scope.cols.clear();
+            for src in &sources {
+                for n in &src.names {
+                    scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: n.starts_with(super::viewdml::HIDDEN_COLUMN) });
+                }
             }
         }
         let join_ons = match &sel.from {
@@ -965,7 +988,7 @@ impl Database {
                 }
                 SourceData::Table(t) => {
                     self.note(depth, || scan_note(base, t, conj));
-                    scan_table(t, conj, filter, limit)?
+                    scan_table(t, conj, filter, limit, None)?
                 }
                 SourceData::Rows(all) => {
                     let mut out = Vec::new();
@@ -1101,14 +1124,14 @@ impl Database {
                 let s = p.mask.trailing_zeros() as usize;
                 if !p.from_where || !nullable(&kinds, s) {
                     let off = offs[s];
-                    pre[s].push(p.expr.map_cols(&move |i| i - off));
+                    pre[s].push(p.expr.map_cols(&|i| sources[s].tcol(i - off)));
                     p.used = true;
                 } else if null_rejecting(&p.expr) {
                     // A WHERE condition on the outer-joined side that NULL cannot satisfy: rows of that side it rejects
                     // would be thrown away after the join anyway, so they are dropped first. The condition stays for
                     // the null-extended rows.
                     let off = offs[s];
-                    pre[s].push(p.expr.map_cols(&move |i| i - off));
+                    pre[s].push(p.expr.map_cols(&|i| sources[s].tcol(i - off)));
                 }
             }
         }
@@ -1572,7 +1595,7 @@ impl Database {
             SourceData::Table(t) => {
                 let refs: Vec<&BExpr> = pre.iter().collect();
                 self.note(depth, || scan_note(src, t, &refs));
-                scan_table(t, &refs, filter.as_ref(), None)?
+                scan_table(t, &refs, filter.as_ref(), None, src.keep.as_deref())?
             }
             SourceData::Rows(all) => {
                 self.note(depth, || format!("scan {} (computed rows)", src.alias));
@@ -1623,6 +1646,56 @@ fn scan_note(src: &Source<'_>, t: &Table, conj: &[&BExpr]) -> String {
 // ---------------------------------------------------------------------------
 // Select list
 // ---------------------------------------------------------------------------
+
+/// Leaves out of the tables of a join the columns the query never mentions, so that the rows the joins build are as
+/// narrow as the query needs: a self-join of a 34-column table of which the query reads three builds rows of six values
+/// and not 68, which is the difference between a few million rows fitting in memory and not. A column is kept if its
+/// name appears anywhere in the statement (a superset of what is read). Only plain tables are narrowed, in queries of
+/// at least two sources without `*`, `NATURAL` joins, `LATERAL`, named windows or locking. Returns whether any was.
+fn narrow_sources(sel: &Select, sources: &mut [Source<'_>]) -> bool {
+    use crate::sql::walk::walk_select;
+    let Some(from) = &sel.from else { return false };
+    if sources.len() < 2
+        || !sel.windows.is_empty()
+        || sel.crosstab.is_some()
+        || sel.lock.is_some()
+        || sel.items.iter().any(|i| !matches!(i, SelectItem::Expr { .. }))
+        || from.joins.iter().any(|j| j.natural)
+        || sources.iter().any(|s| matches!(s.data, SourceData::Lateral(_)))
+    {
+        return false;
+    }
+    let mut used: HashSet<String> = from.joins.iter().flat_map(|j| j.using.iter().map(|u| u.to_ascii_lowercase())).collect();
+    let mut copy = sel.clone();
+    if walk_select(&mut copy, &mut |x| {
+        if let Expr::Column { name, .. } = x {
+            used.insert(name.to_ascii_lowercase());
+        }
+        Ok(())
+    })
+    .is_err()
+    {
+        return false;
+    }
+    let mut any = false;
+    for src in sources.iter_mut() {
+        let SourceData::Table(t) = &src.data else { continue };
+        if src.keep.is_some() || !src.intrinsic.is_empty() || src.names.len() != t.schema().columns.len() || src.names.len() < 8 {
+            continue;
+        }
+        let mut keep: Vec<usize> = (0..src.names.len()).filter(|&c| used.contains(&src.names[c].to_ascii_lowercase())).collect();
+        if keep.is_empty() {
+            keep.push(0);
+        }
+        if keep.len() == src.names.len() {
+            continue;
+        }
+        src.names = keep.iter().map(|&c| src.names[c].clone()).collect();
+        src.keep = Some(keep);
+        any = true;
+    }
+    any
+}
 
 pub(crate) fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, Expr)>> {
     let mut out = Vec::new();
@@ -1860,7 +1933,7 @@ fn index_walk(def: &IndexDef, start: usize, want: &[bool]) -> Option<bool> {
     }
 }
 
-pub(crate) fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>, limit: Option<usize>) -> Result<Vec<Row>> {
+pub(crate) fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>, limit: Option<usize>, keep: Option<&[usize]>) -> Result<Vec<Row>> {
     let mut out = Vec::new();
     if limit == Some(0) {
         return Ok(out);
@@ -1872,7 +1945,10 @@ pub(crate) fn scan_table(table: &Table, conj: &[&BExpr], filter: Option<&BExpr>,
                 continue;
             }
         }
-        out.push(row.clone());
+        out.push(match keep {
+            Some(k) => k.iter().map(|&c| row[c].clone()).collect(),
+            None => row.clone(),
+        });
         if limit.is_some_and(|l| out.len() >= l) {
             break;
         }
@@ -1957,7 +2033,7 @@ fn join_step(
     // pairs (usable with indexes) and general key expressions (hashable).
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut keyed: Vec<(BExpr, BExpr)> = Vec::new();
-    let shift = move |i: usize| i - lw;
+    let shift = |i: usize| right.tcol(i - lw);
     for c in &conj {
         let BExpr::Bin(BinOp::Eq, a, b) = c else { continue };
         let side = |e: &BExpr| match e.col_bounds() {
@@ -1971,7 +2047,7 @@ fn join_step(
             _ => continue,
         };
         if let (BExpr::Col(x), BExpr::Col(y)) = (l, r) {
-            pairs.push((*x, *y - lw));
+            pairs.push((*x, right.tcol(*y - lw)));
         }
         keyed.push((l.clone(), r.map_cols(&shift)));
     }
@@ -2154,7 +2230,7 @@ fn join_step(
                 for &i in hits {
                     scratch.clear();
                     scratch.extend_from_slice(&left[i]);
-                    scratch.extend_from_slice(r);
+                    right.append_to(&mut scratch, r);
                     if let Some(p) = residual {
                         if !p.eval_bool(&scratch)? {
                             continue;
@@ -2220,7 +2296,7 @@ fn join_step(
             }
             scratch.clear();
             scratch.extend_from_slice(l);
-            scratch.extend_from_slice(r);
+            right.append_to(&mut scratch, r);
             if let Some(p) = residual {
                 if !p.eval_bool(&scratch)? {
                     continue;
@@ -2247,7 +2323,7 @@ fn join_step(
             }
             if let Some(r) = right.get(slot) {
                 let mut row = vec![Value::Null; lw];
-                row.extend_from_slice(r);
+                right.append_to(&mut row, r);
                 out.push(row);
             }
         }
@@ -2502,6 +2578,46 @@ fn subst_cte(s: &mut Select, name: &str, rows: &Arc<Vec<Row>>, cols: &[String]) 
     });
 }
 
+/// Replaces the references to the CTE `name` in `s` (sub-queries included) with what `make` gives for the alias each was
+/// used under, and returns how many it replaced. A reference replaced is not found again, so nothing is counted twice.
+fn replace_cte(s: &mut Select, name: &str, make: &mut dyn FnMut(String) -> TableFactor) -> usize {
+    fn factor(f: &mut TableFactor, name: &str, make: &mut dyn FnMut(String) -> TableFactor) -> usize {
+        match f {
+            TableFactor::Named { name: n, alias, .. } if n.eq_ignore_ascii_case(name) => {
+                let alias = alias.clone().unwrap_or_else(|| n.clone());
+                *f = make(alias);
+                1
+            }
+            TableFactor::Derived { query, .. } => replace_cte(query, name, make),
+            TableFactor::Pivot { source, .. } | TableFactor::Unpivot { source, .. } => factor(source, name, make),
+            _ => 0,
+        }
+    }
+    let mut n = 0;
+    if let Some(w) = &mut s.with {
+        for c in &mut w.ctes {
+            n += replace_cte(&mut c.query, name, make);
+        }
+    }
+    if let Some(from) = &mut s.from {
+        n += factor(&mut from.first, name, make);
+        for j in &mut from.joins {
+            n += factor(&mut j.factor, name, make);
+        }
+    }
+    for u in &mut s.unions {
+        n += replace_cte(&mut u.select, name, make);
+    }
+    let mut inner = 0;
+    let _ = crate::sql::walk::walk_select(s, &mut |e| {
+        if let Expr::Subquery(q) | Expr::Exists { query: q, .. } | Expr::InSelect { query: q, .. } = e {
+            inner += replace_cte(q, name, make);
+        }
+        Ok(())
+    });
+    n + inner
+}
+
 fn mentions_table(s: &Select, name: &str) -> bool {
     let mut copy = s.clone();
     subst_cte(&mut copy, name, &Arc::new(Vec::new()), &[]);
@@ -2516,10 +2632,31 @@ impl Database {
         let mut body = sel.clone();
         body.with = None;
         let mut done: Vec<(String, Arc<Vec<Row>>, Vec<String>)> = Vec::new();
-        for cte in &with.ctes {
+        for (i, cte) in with.ctes.iter().enumerate() {
             let mut q = cte.query.clone();
             for (n, rows, cols) in &done {
                 subst_cte(&mut q, n, rows, cols);
+            }
+            // A CTE that the rest of the statement reads once, in the FROM clause of the main query, is read there as a
+            // derived table: the conditions of the main query can then move into it (and into what it groups).
+            if self.optimizer_on && !with.recursive {
+                let top = body.from.as_ref().map_or(0, |f| {
+                    std::iter::once(&f.first).chain(f.joins.iter().map(|j| &j.factor)).filter(|t| matches!(t, TableFactor::Named { name, .. } if name.eq_ignore_ascii_case(&cte.name))).count()
+                });
+                let mut dry = |_: String| TableFactor::Materialized { rows: Arc::new(Vec::new()), columns: Vec::new(), alias: String::new() };
+                let mut elsewhere = replace_cte(&mut body.clone(), &cte.name, &mut dry);
+                for later in &with.ctes[i + 1..] {
+                    elsewhere += replace_cte(&mut later.query.clone(), &cte.name, &mut dry);
+                }
+                if top == 1 && elsewhere == 1 {
+                    let (columns, query) = (cte.columns.clone(), Box::new(q));
+                    let mut make = Some((columns, query));
+                    replace_cte(&mut body, &cte.name, &mut |alias| {
+                        let (columns, query) = make.take().expect("one reference");
+                        TableFactor::Derived { query, alias, columns, lateral: false }
+                    });
+                    continue;
+                }
             }
             let (cols, rows) = if with.recursive && mentions_table(&q, &cte.name) {
                 self.run_recursive(cte, &q, depth)?

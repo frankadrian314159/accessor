@@ -522,7 +522,7 @@ impl Database {
                 rows.push(map.iter().map(|i| i.map_or(Value::Null, |i| row[i].clone())).collect());
             }
         }
-        Ok(Source { intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names })
+        Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names })
     }
 
     pub(crate) fn dml_members(&self, table: &str, filter: Option<&Expr>) -> Vec<String> {

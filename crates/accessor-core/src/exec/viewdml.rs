@@ -272,6 +272,7 @@ impl Database {
             None => Vec::new(),
         };
         Ok(Some(Source {
+            keep: None,
             intrinsic,
             data: SourceData::Table(base),
             alias: alias.to_string(),

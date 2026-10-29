@@ -14,7 +14,7 @@ SELECT Abs(-2.50);                    -- 2.5
 
 ## Round
 
-`Round(x [, digits])` rounds to `digits` places after the point (default 0; `digits` can be 0 to 10000). **Halves round to the even digit** ("banker's rounding"), so `Round(2.5)` is 2 and `Round(3.5)` is 4. The result keeps the type of `x`. A float is rounded by its shortest decimal form, so `Round(2.675, 2)` is 2.68 whatever the type.
+`Round(x [, digits])` rounds to `digits` places after the point (default 0; `digits` can be 0 to 10000). **Halves round to the even digit** ("banker's rounding"), so `Round(2.5)` is 2 and `Round(3.5)` is 4. (`SET round_half_even = off` sends a half away from zero instead, as most servers do: `Round(2.125, 2)` is 2.13 and `Round(2.5)` is 3; the default is `on`.) The result keeps the type of `x`. A float is rounded by its shortest decimal form, so `Round(2.675, 2)` is 2.68 whatever the type.
 
 ```sql
 SELECT Round(3.14159, 2);             -- 3.14

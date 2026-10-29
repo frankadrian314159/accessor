@@ -209,11 +209,33 @@ fn add_sub_mul(op: BinOp, x: &Value, y: &Value) -> Result<Value> {
     })
 }
 
-/// `/`: whole numbers divide without the fraction (toward zero); anything else divides in floating point.
+thread_local! {
+    static EXACT_WHOLE_DIVISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Puts `/` of two whole numbers into exact division (as `DIV`, a `DECIMAL`) until the guard is dropped, or back to the
+/// default, which drops the fraction. The statement being run does this from the `integer_division` setting.
+pub(crate) struct DivisionGuard(bool);
+
+pub(crate) fn exact_whole_division(on: bool) -> DivisionGuard {
+    DivisionGuard(EXACT_WHOLE_DIVISION.with(|d| d.replace(on)))
+}
+
+impl Drop for DivisionGuard {
+    fn drop(&mut self) {
+        EXACT_WHOLE_DIVISION.with(|d| d.set(self.0));
+    }
+}
+
+/// `/`: whole numbers divide without the fraction (toward zero), unless `integer_division` is off, when they divide
+/// exactly like `DIV`; anything else divides in floating point.
 /// `FLOAT` operands give a `FLOAT`; the rest is done in `DOUBLE`.
 fn slash_divide(x: &Value, y: &Value) -> Result<Value> {
     if y.is_zero() {
         return Err(division_by_zero());
+    }
+    if matches!(x, Value::Int(_) | Value::Big(_)) && matches!(y, Value::Int(_) | Value::Big(_)) && EXACT_WHOLE_DIVISION.with(|d| d.get()) {
+        return divide(x, y);
     }
     if matches!(x, Value::Int(_) | Value::Big(_)) && matches!(y, Value::Int(_) | Value::Big(_)) {
         if let (Value::Int(p), Value::Int(q)) = (x, y) {
@@ -612,6 +634,21 @@ mod tests {
         }
         // Zero divided by anything is zero, in the type the rules give.
         is(op(ExactDiv, &Value::Int(0), &Value::Int(5)), "DECIMAL", "0");
+    }
+
+    #[test]
+    fn slash_divides_whole_numbers_exactly_when_integer_division_is_off() {
+        is(op(Div, &Value::Int(7), &Value::Int(2)), "INTEGER", "3");
+        {
+            let _off = exact_whole_division(true);
+            is(op(Div, &Value::Int(7), &Value::Int(2)), "DECIMAL", "3.5");
+            let q = op(Div, &Value::Int(34), &Value::Int(73));
+            assert!(q.to_string().starts_with("0.465753424657534"), "{q}");
+            // the rest is unchanged
+            is(op(Div, &Value::Int(7), &dec("2")), "DOUBLE", "3.5");
+            assert!(arith(Div, &Value::Int(1), &Value::Int(0)).unwrap().is_null());
+        }
+        is(op(Div, &Value::Int(7), &Value::Int(2)), "INTEGER", "3");
     }
 
     #[test]

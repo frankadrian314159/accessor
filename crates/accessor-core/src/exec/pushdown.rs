@@ -61,14 +61,69 @@ fn substitute(c: &Expr, alias: &str, map: &HashMap<String, Expr>) -> Option<Expr
     }
 }
 
+/// The `WHERE` of `sel` with the conditions it implies for other columns through the equalities of its joins: with
+/// `WHERE a = 2000` and `... LEFT JOIN t ON t.y = a`, rows of `t` with another `y` can never be matched, so `t.y = 2000` is
+/// a condition `t` can be read under, as a derived table or a partitioned table. Only equalities of inner and left joins
+/// (and of the `WHERE`) are used, and only to carry constants.
+pub(crate) fn with_implied(sel: &Select) -> Option<Expr> {
+    use crate::sql::ast::JoinKind;
+    let filter = sel.filter.clone()?;
+    let from = sel.from.as_ref()?;
+    let mut all = Vec::new();
+    conjuncts(&filter, &mut all);
+    let mut equalities: Vec<(Expr, Expr)> = Vec::new();
+    let mut ons = Vec::new();
+    for j in &from.joins {
+        if let (Some(on), JoinKind::Inner | JoinKind::Left) = (&j.on, j.kind) {
+            conjuncts(on, &mut ons);
+        }
+    }
+    for c in all.iter().chain(ons.iter()) {
+        if let Expr::Binary { op: BinOp::Eq, left, right } = c {
+            if matches!(**left, Expr::Column { .. }) && matches!(**right, Expr::Column { .. }) && left != right {
+                equalities.push(((**left).clone(), (**right).clone()));
+            }
+        }
+    }
+    if equalities.is_empty() {
+        return Some(filter);
+    }
+    let mut known = all.clone();
+    for _ in 0..4 {
+        let mut found = Vec::new();
+        for c in &known {
+            let Expr::Binary { op: BinOp::Eq, left, right } = c else { continue };
+            let (col, val) = match (&**left, &**right) {
+                (col @ Expr::Column { .. }, val @ Expr::Literal(_)) | (val @ Expr::Literal(_), col @ Expr::Column { .. }) => (col, val),
+                _ => continue,
+            };
+            for (a, b) in &equalities {
+                let other = if a == col { b } else if b == col { a } else { continue };
+                let implied = Expr::Binary { op: BinOp::Eq, left: Box::new(other.clone()), right: Box::new(val.clone()) };
+                if !known.contains(&implied) && !found.contains(&implied) {
+                    found.push(implied);
+                }
+            }
+        }
+        if found.is_empty() {
+            break;
+        }
+        known.extend(found);
+    }
+    known.into_iter().reduce(|a, b| Expr::Binary { op: BinOp::And, left: Box::new(a), right: Box::new(b) })
+}
+
 /// The derived table's query with the conditions of `outer_filter` that can move into it, or `None` if none can.
 pub(crate) fn push_into_derived(inner: &Select, alias: &str, outer_filter: &Expr) -> Option<Select> {
+    // A grouped query takes conditions on its grouping columns: they keep or drop whole groups, so they can run before
+    // the grouping, on the rows. (Not with ROLLUP, CUBE or GROUPING SETS, where the rows of a dropped key still count in the totals.)
+    let grouped = !inner.group_by.is_empty();
     if inner.distinct
         || inner.top.is_some()
         || inner.limit.is_some()
         || inner.offset.is_some()
-        || !inner.group_by.is_empty()
-        || inner.having.is_some()
+        || !inner.group_sets.is_empty()
+        || (inner.having.is_some() && !grouped)
         || !inner.unions.is_empty()
         || inner.with.is_some()
         || inner.crosstab.is_some()
@@ -80,7 +135,12 @@ pub(crate) fn push_into_derived(inner: &Select, alias: &str, outer_filter: &Expr
     let mut map: HashMap<String, Expr> = HashMap::new();
     for item in &inner.items {
         let SelectItem::Expr { expr, alias: a } = item else { return None };
-        if !plain(expr) {
+        if grouped {
+            // only a grouping column can be conditioned: what an aggregate or another expression gives is known after the grouping
+            if !plain(expr) || !inner.group_by.contains(expr) {
+                continue;
+            }
+        } else if !plain(expr) {
             return None;
         }
         let name = match (a, expr) {
