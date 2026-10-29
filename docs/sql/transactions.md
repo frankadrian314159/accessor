@@ -66,3 +66,5 @@ CLOSE name | CLOSE ALL
 The numbers [sequences](sequences.md) hand out are not part of a transaction: rolling back does not give them back.
 
 `MERGE` uses a transaction and a savepoint internally so that it is atomic.
+
+MySQL's `START TRANSACTION` inside a transaction commits the open one first and starts another (`BEGIN` inside one is still an error).

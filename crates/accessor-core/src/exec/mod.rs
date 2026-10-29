@@ -13,7 +13,7 @@ mod check;
 mod ddl;
 mod merge;
 mod seq;
-mod settings;
+pub(crate) mod settings;
 mod routine;
 mod reports;
 mod infoschema;
@@ -130,7 +130,7 @@ impl Database {
         self.enter_session();
         let _timeout = self.settings.get("statement_timeout").and_then(|t| budget::parse_timeout(t)).map(budget::limit);
         let _division = self.division_guard();
-        if !matches!(st, Statement::Begin | Statement::Commit | Statement::Rollback) {
+        if !matches!(st, Statement::Begin | Statement::StartTransaction | Statement::Commit | Statement::Rollback) {
             self.admit()?;
             if matches!(st, Statement::Select(_) | Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Upsert { .. } | Statement::Returning { .. } | Statement::Exec { .. }) {
                 if let Some(rewritten) = self.run_block_functions(st)? {
@@ -144,7 +144,11 @@ impl Database {
             }
             Statement::SetTimeZone(name) => self.set_time_zone(name).map(|_| QueryResult::default()),
             Statement::Select(s) if s.lock.is_some() => self.exec_locking_select(s),
-            Statement::Select(s) => self.run_select(s),
+            Statement::Select(s) => {
+                let r = self.run_select(s)?;
+                crate::expr::myfuncs::set_found_rows(r.rows.len());
+                Ok(r)
+            }
             Statement::Insert { table, .. } | Statement::Update { table, .. } | Statement::Delete { table, .. }
                 if self.table(table).is_none() && self.view_sql(table).is_some() =>
             {
@@ -343,6 +347,12 @@ impl Database {
             // as in MySQL and PostgreSQL, ending a transaction that is not there does nothing
             Statement::Commit | Statement::Rollback if !self.in_transaction() => Ok(QueryResult::default()),
             Statement::Begin => self.begin().map(|_| QueryResult::default()),
+            Statement::StartTransaction => {
+                if self.in_transaction() {
+                    self.commit()?;
+                }
+                self.begin().map(|_| QueryResult::default())
+            }
             Statement::Commit => {
                 self.commit()?;
                 self.drop_cursors(false);

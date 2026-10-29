@@ -44,6 +44,7 @@ pub(crate) fn build_row(schema: &TableSchema, positions: &[usize], vals: Vec<Val
         match row[a] {
             Value::Null => {
                 row[a] = Value::Int(*next_auto);
+                crate::expr::myfuncs::set_last_insert_id(*next_auto);
                 *next_auto += 1;
             }
             Value::Int(n) => *next_auto = (*next_auto).max(n.saturating_add(1)),
@@ -216,7 +217,7 @@ impl Database {
         let ops = {
             let t = self.table_checked(table)?;
             let schema = t.schema();
-            let positions: Vec<usize> = match columns {
+            let mut positions: Vec<usize> = match columns {
                 _ if matches!(source, InsertSource::DefaultValues) => Vec::new(),
                 Some(cols) => cols.iter().map(|c| column_pos(schema, c)).collect::<Result<_>>()?,
                 // Without a field list, the values are for the fields you can set.
@@ -255,6 +256,12 @@ impl Database {
                 InsertSource::DefaultValues => vec![Vec::new()],
                 InsertSource::Select(sel) => {
                     let res = self.run_select(sel)?;
+                    if columns.is_none() && res.columns.len() < positions.len() {
+                        // CREATE TABLE t (a, b, c) SELECT 1 AS b, 2 AS c: the query's columns go to the fields of their names
+                        if let Some(by_name) = res.columns.iter().map(|c| schema.column_index(c)).collect::<Option<Vec<usize>>>() {
+                            positions = by_name;
+                        }
+                    }
                     if res.columns.len() != positions.len() {
                         return Err(Error::runtime(format!(
                             "INSERT ... SELECT returns {} columns for {} targets",

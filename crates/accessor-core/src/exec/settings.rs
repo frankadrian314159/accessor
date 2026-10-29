@@ -102,7 +102,7 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("role", "", 't'),
 ];
 
-fn known(name: &str) -> Option<(&'static str, char)> {
+pub(crate) fn known(name: &str) -> Option<(&'static str, char)> {
     if let Some(&(_, d, k)) = PARAMETERS.iter().find(|(n, _, _)| *n == name) {
         return Some((d, k));
     }

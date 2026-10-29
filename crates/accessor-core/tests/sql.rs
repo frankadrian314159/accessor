@@ -5872,3 +5872,44 @@ fn mysql_rollup_rename_index_empty_insert_base64() {
     assert_eq!(rows(&db, "SELECT id, v FROM e"), [["1", "7"]]);
     assert_eq!(rows(&db, "SELECT TO_BASE64('Hello'), FROM_BASE64('SGVsbG8='), TO_BASE64('ab'), FROM_BASE64('YWI=')"), [["SGVsbG8=", "Hello", "YWI=", "ab"]]);
 }
+
+#[test]
+fn mysql_default_in_check_hash_comments_server_variables_week_and_friends() {
+    let mut db = Database::in_memory();
+    // DEFAULT(col) in a CHECK
+    db.execute("CREATE TABLE d (f1 INT DEFAULT 5 CHECK (f1 = default(f1)))").unwrap();
+    db.execute("INSERT INTO d VALUES (5)").unwrap();
+    assert!(db.execute("INSERT INTO d VALUES (6)").is_err());
+    // # starts a comment unless a date literal closes on the line
+    assert_eq!(rows(&db, "SELECT 1 # a comment\n + 1"), [["2"]]);
+    assert_eq!(rows(&db, "SELECT #2020-01-02# = #2020-01-02#"), [["Yes"]]);
+    // a server variable of MySQL that is not known here is kept
+    db.execute("SET GLOBAL some_new_variable = 7; SET @@session.other_one := 1; SET SESSION third = default").unwrap();
+    assert!(db.execute("SET nosuch = 1").is_err());
+    // START TRANSACTION inside a transaction commits it first; BEGIN still refuses
+    db.execute("START TRANSACTION").unwrap();
+    db.execute("INSERT INTO d VALUES (5)").unwrap();
+    db.execute("START TRANSACTION").unwrap();
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM d"), [["2"]]);
+    db.execute("BEGIN").unwrap();
+    assert!(db.execute("BEGIN").is_err());
+    db.execute("ROLLBACK").unwrap();
+    // WEEK, EXPORT_SET, TIME_FORMAT
+    assert_eq!(rows(&db, "SELECT WEEK('2008-02-20'), WEEK('2008-02-20', 1), WEEK('2008-12-31', 1), WEEK('2000-01-01'), WEEK('2000-01-01', 2)"), [["7", "8", "53", "0", "52"]]);
+    assert_eq!(rows(&db, "SELECT EXPORT_SET(5, 'Y', 'N', ',', 4), EXPORT_SET(6, '1', '0', '', 5), TIME_FORMAT('10:30:00', '%H.%i')"), [["Y,N,Y,N", "01100", "10.30"]]);
+    // LAST_INSERT_ID, FOUND_ROWS
+    db.execute("CREATE TABLE ai (id INT AUTO_INCREMENT PRIMARY KEY, v INT); INSERT INTO ai (v) VALUES (1), (2)").unwrap();
+    assert_eq!(rows(&db, "SELECT LAST_INSERT_ID()"), [["2"]]);
+    db.execute("SELECT * FROM ai").unwrap();
+    assert_eq!(rows(&db, "SELECT FOUND_ROWS()"), [["2"]]);
+}
+
+#[test]
+fn create_table_select_matches_columns_by_name_and_components_have_dotted_variables() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t1 (a INT, b INT, c INT) SELECT 1 AS b, 2 AS c").unwrap();
+    assert_eq!(rows(&db, "SELECT a, b, c FROM t1"), [["", "1", "2"]]);
+    db.execute("SET GLOBAL validate_password.length = 8").unwrap();
+    assert_eq!(rows(&db, "SELECT @@global.validate_password.length"), [["8"]]);
+}

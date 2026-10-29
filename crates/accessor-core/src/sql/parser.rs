@@ -1197,16 +1197,22 @@ impl<'a> Parser<'a> {
                     out.push(Statement::SetVar { name: p, expr });
                 }
                 _ => {
+                    let mut mysql_style = scoped;
                     let name = match self.peek().clone() {
                         Tok::Param(p) => {
                             self.advance();
+                            mysql_style = true;
                             p[2..].to_ascii_lowercase()
                         }
                         _ => self.parameter_name()?,
                     };
-                    if !self.eat_kw("TO") && !self.eat_sym(":=") {
-                        self.expect_sym("=")?;
+                    if !self.eat_kw("TO") {
+                        if !self.eat_sym(":=") {
+                            self.expect_sym("=")?;
+                        }
                     }
+                    // a MySQL server variable this engine has no use for is kept, not refused
+                    let name = if mysql_style && !name.contains('.') && crate::exec::settings::known(&name).is_none() { format!("mysql.{name}") } else { name };
                     if self.eat_kw("DEFAULT") {
                         out.push(Statement::SetParameter { name, value: None, local });
                     } else {
@@ -2272,7 +2278,8 @@ impl<'a> Parser<'a> {
         if self.eat_kw("RAISE") {
             return Ok(Statement::Raise(self.expr()?));
         }
-        if self.eat_kw("BEGIN") || (self.peek_kw("START") && self.peek_kw_at(1, "TRANSACTION") && self.eat_kw("START")) {
+        let start = self.peek_kw("START") && self.peek_kw_at(1, "TRANSACTION");
+        if self.eat_kw("BEGIN") || (start && self.eat_kw("START")) {
             if !self.eat_kw("TRANSACTION") {
                 self.eat_kw("WORK");
             }
@@ -2284,7 +2291,7 @@ impl<'a> Parser<'a> {
             {
                 self.advance();
             }
-            return Ok(Statement::Begin);
+            return Ok(if start { Statement::StartTransaction } else { Statement::Begin });
         }
         if self.eat_kw("COMMIT") || (self.peek_kw("END") && matches!(self.peek_at(1), Tok::Sym(";") | Tok::Eof | Tok::Ident(_)) && self.eat_kw("END")) {
             if !self.eat_kw("TRANSACTION") {
@@ -3003,6 +3010,7 @@ impl<'a> Parser<'a> {
         if matches!(
             st,
             Statement::Begin
+                | Statement::StartTransaction
                 | Statement::Commit
                 | Statement::Rollback
                 | Statement::Savepoint(_)

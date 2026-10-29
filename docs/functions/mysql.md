@@ -21,6 +21,11 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `MD5(s)`, `SHA2(s, 256)` | hash as hexadecimal text (`SHA2` with other sizes gives NULL) |
 | `UUID()` | a random version-4 UUID; a new one each call |
 | `STR_TO_DATE(s, fmt)` | the date-time `s` is written as in `fmt` (`%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %p %b %M %a %W %T %j %f %%`); NULL if it does not fit |
+| `TIME_FORMAT(t, fmt)` | a time (or the time of a date and time) by `fmt`; the hours wrap at 24 |
+| `WEEK(d [, mode])` | the week of the year, modes 0 to 7 as in MySQL (default 0: Sunday first, 0 to 53) |
+| `EXPORT_SET(bits, on, off [, sep [, n]])` | one `on` or `off` text for each of the low `n` (default 64) bits, joined by `sep` (default a comma) |
+| `LAST_INSERT_ID()` | the last AutoNumber value given to a row, by this program (a row of several gets the last, not the first) |
+| `FOUND_ROWS()` | the number of rows the last query returned (`SQL_CALC_FOUND_ROWS` is not known, so a `LIMIT` counts) |
 | `DATE_FORMAT(d, fmt)` | the date as text by `fmt` (the same specifiers, and `%r %w`) |
 | `UNIX_TIMESTAMP([d])` | seconds since 1970-01-01 (now, without an argument) |
 | `FROM_UNIXTIME(n [, fmt])` | the date-time (or its text by `fmt`) |

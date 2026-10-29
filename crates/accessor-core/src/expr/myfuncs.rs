@@ -65,6 +65,11 @@ pub enum MyFn {
     LoadFile,
     ToBase64,
     FromBase64,
+    TimeFormat,
+    Week,
+    ExportSet,
+    FoundRows,
+    LastInsertId,
 }
 
 pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
@@ -121,6 +126,11 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "CONVERT_TZ" => (ConvertTz, 3, 3),
         "BIT_COUNT" => (BitCount, 1, 1),
         "LOAD_FILE" => (LoadFile, 1, 1),
+        "TIME_FORMAT" => (TimeFormat, 2, 2),
+        "WEEK" => (Week, 1, 2),
+        "EXPORT_SET" => (ExportSet, 3, 5),
+        "FOUND_ROWS" => (FoundRows, 0, 0),
+        "LAST_INSERT_ID" => (LastInsertId, 0, 1),
         "TO_BASE64" => (ToBase64, 1, 1),
         "FROM_BASE64" => (FromBase64, 1, 1),
         _ => return None,
@@ -135,7 +145,7 @@ impl MyFn {
 
     /// Functions that give a different answer each time.
     pub fn is_volatile(self) -> bool {
-        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp)
+        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::LastInsertId)
     }
 }
 
@@ -664,6 +674,31 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::DateTime(to.to_local(from.to_utc(local)))
         }
         BitCount => Value::Int(int(v(0)).map_or(0, |n| (n as u64).count_ones() as i64)),
+        TimeFormat => match temporal(v(0)) {
+            Some((secs, _)) => {
+                let day = chrono::DateTime::from_timestamp(secs.rem_euclid(86_400), 0).map(|d| d.naive_utc());
+                day.map_or(Value::Null, |d| Value::text(&format_date(d, &text(v(1)))))
+            }
+            None => Value::Null,
+        },
+        Week => match datetime_of(v(0)) {
+            Some(d) => Value::Int(mysql_week(d.date(), vals.get(1).and_then(|m| int(m)).unwrap_or(0))),
+            None => Value::Null,
+        },
+        ExportSet => {
+            let bits = int(v(0)).unwrap_or(0) as u64;
+            let sep = if vals.len() > 3 { text(v(3)) } else { ",".to_string() };
+            let n = if vals.len() > 4 { int(v(4)).unwrap_or(64).clamp(0, 64) } else { 64 };
+            let parts: Vec<String> = (0..n).map(|i| if bits >> i & 1 == 1 { text(v(1)) } else { text(v(2)) }).collect();
+            Value::text(&parts.join(&sep))
+        }
+        FoundRows => Value::Int(FOUND_ROWS.with(|c| c.get())),
+        LastInsertId => {
+            if let Some(x) = vals.first().and_then(|x| int(x)) {
+                LAST_INSERT_ID.with(|c| c.set(x));
+            }
+            Value::Int(LAST_INSERT_ID.with(|c| c.get()))
+        }
         ToBase64 => Value::text(&to_base64(text(v(0)).as_bytes())),
         FromBase64 => match from_base64(&text(v(0))) {
             Some(bytes) => Value::text(&String::from_utf8_lossy(&bytes)),
@@ -746,4 +781,59 @@ fn from_base64(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+thread_local! {
+    static FOUND_ROWS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Remembers the number of rows of the last query, for `FOUND_ROWS()`.
+pub(crate) fn set_found_rows(n: usize) {
+    FOUND_ROWS.with(|c| c.set(n as i64));
+}
+
+/// Remembers the last number an AutoNumber column was given, for `LAST_INSERT_ID()`.
+pub(crate) fn set_last_insert_id(n: i64) {
+    LAST_INSERT_ID.with(|c| c.set(n));
+}
+
+/// `WEEK(date, mode)`, MySQL's `calc_week` (modes 0 to 7).
+fn mysql_week(d: chrono::NaiveDate, mode: i64) -> i64 {
+    use chrono::Datelike;
+    let mut fmt = (mode & 7) as u32;
+    if fmt & 1 == 0 {
+        fmt ^= 4;
+    }
+    let (monday_first, mut week_year, first_weekday) = (fmt & 1 != 0, fmt & 2 != 0, fmt & 4 != 0);
+    // MySQL's day numbers: 0001-01-01 is 366
+    let daynr = d.num_days_from_ce() as i64 + 365;
+    let year = d.year() as i64;
+    let jan1 = chrono::NaiveDate::from_ymd_opt(year as i32, 1, 1).expect("january 1").num_days_from_ce() as i64 + 365;
+    let mut first_daynr = jan1;
+    let mut weekday = (first_daynr + 5 + if monday_first { 0 } else { 1 }) % 7;
+    let in_year = |y: i64| if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+    let mut y = year;
+    if d.month() == 1 && (d.day() as i64) <= 7 - weekday {
+        if !week_year && ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)) {
+            return 0;
+        }
+        week_year = true;
+        y -= 1;
+        let days = in_year(y);
+        first_daynr -= days;
+        weekday = (weekday + 53 * 7 - days) % 7;
+    }
+    let days = if (first_weekday && weekday != 0) || (!first_weekday && weekday >= 4) {
+        daynr - (first_daynr + (7 - weekday))
+    } else {
+        daynr - (first_daynr - weekday)
+    };
+    if week_year && days >= 52 * 7 {
+        weekday = (weekday + in_year(y)) % 7;
+        if (!first_weekday && weekday < 4) || (first_weekday && weekday == 0) {
+            return 1;
+        }
+    }
+    days / 7 + 1
 }

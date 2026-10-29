@@ -21,6 +21,8 @@ impl Database {
         let real = t.name().to_string();
         let schema = t.schema().clone();
 
+        // MySQL: DEFAULT(col) is the column's default value
+        let expr = &default_calls(expr, &schema);
         let mut parsed = parse_expression(expr)?;
         let mut unsupported = None;
         walk_expr(&mut parsed, &mut |e| {
@@ -108,4 +110,20 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// `expr` with each `DEFAULT(col)` replaced by the default value of the column, as a literal (NULL when it has none).
+fn default_calls(expr: &str, schema: &crate::schema::TableSchema) -> String {
+    use crate::value::Value;
+    let re = regex::Regex::new(r#"(?i)\bdefault\s*\(\s*[\[`"]?(\w+)[\]`"]?\s*\)"#).expect("a valid pattern");
+    re.replace_all(expr, |caps: &regex::Captures| {
+        let Some(i) = schema.column_index(&caps[1]) else { return caps[0].to_string() };
+        match &schema.columns[i].default {
+            None | Some(Value::Null) => "NULL".to_string(),
+            Some(Value::Text(t)) => format!("'{}'", t.replace('\'', "''")),
+            Some(v @ (Value::Int(_) | Value::Big(_) | Value::Dec(_) | Value::Float(_))) => v.to_string(),
+            Some(other) => format!("'{}'", other.to_string().replace('\'', "''")),
+        }
+    })
+    .into_owned()
 }

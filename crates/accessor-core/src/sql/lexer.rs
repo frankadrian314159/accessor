@@ -243,6 +243,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                     i += 1;
                 }
                 end = chars.get(i).map_or(src.len(), |&(p, _)| p);
+                // a component's variable: @@global.component.name
+                while at(i) == Some('.') && at(i + 1).is_some_and(is_ident_part) {
+                    i += 1;
+                    while at(i).is_some_and(is_ident_part) {
+                        i += 1;
+                    }
+                    end = chars.get(i).map_or(src.len(), |&(p, _)| p);
+                }
             }
             out.push(Token { tok: Tok::Param(format!("@@{}", &src[chars[start].0..end])), pos });
         } else if c == '[' {
@@ -281,6 +289,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             i += 1;
             out.push(Token { tok: Tok::Str(s), pos });
+        } else if c == '#' && !closes_as_date(&at, i) {
+            // MySQL: `# ...` is a comment to the end of the line (a #date# literal has its closing # on the same line)
+            while at(i).is_some_and(|ch| ch != '\n') {
+                i += 1;
+            }
         } else if c == '#' {
             let mut s = String::new();
             i += 1;
@@ -368,5 +381,19 @@ mod number_literals {
         assert_eq!(one("1e3"), Tok::Float(1000.0));
         assert_eq!(one("2.5E-1"), Tok::Float(0.25));
         assert!(lex("1e999").is_err(), "an infinite literal is refused");
+    }
+}
+
+/// Does the `#` at `i` open a `#date#` literal: a closing `#` on the same line, around a date?
+fn closes_as_date(at: &dyn Fn(usize) -> Option<char>, i: usize) -> bool {
+    let mut s = String::new();
+    let mut j = i + 1;
+    loop {
+        match at(j) {
+            Some('#') => return datetime::parse(&s).is_some(),
+            Some('\n') | None => return false,
+            Some(ch) => s.push(ch),
+        }
+        j += 1;
     }
 }

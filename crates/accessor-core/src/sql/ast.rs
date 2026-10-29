@@ -594,6 +594,8 @@ pub enum Statement {
     /// `CLOSE name`, or `CLOSE ALL` (no name)
     CloseCursor(Option<String>),
     Begin,
+    /// MySQL's `START TRANSACTION`: commits a transaction that is open, then starts one.
+    StartTransaction,
     Commit,
     Rollback,
     Savepoint(String),
