@@ -226,6 +226,11 @@ fn boolean(value: &str) -> Option<&'static str> {
 }
 
 impl Database {
+    /// Is MySQL's `ONLY_FULL_GROUP_BY` in the `sql_mode` (it is in the default one)?
+    pub(crate) fn only_full_group_by(&self) -> bool {
+        self.settings.get("sql_mode").is_none_or(|m| m.to_ascii_uppercase().contains("ONLY_FULL_GROUP_BY"))
+    }
+
     fn unrecognized(name: &str) -> Error {
         Error::runtime(format!("unrecognized configuration parameter \"{name}\""))
     }

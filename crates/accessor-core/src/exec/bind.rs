@@ -335,11 +335,14 @@ impl<'a> Binder<'a> {
 
     /// If `q` reads columns of the enclosing query, returns it with those
     /// columns turned into parameters, and the outer positions they come from.
-    fn correlate(&self, q: &Select) -> Result<Option<(Select, Vec<(String, usize)>)>> {
+    fn correlate(&mut self, q: &Select) -> Result<Option<(Select, Vec<(String, usize)>)>> {
         let mut rewritten = q.clone();
-        let mut c = Correlator { db: self.db, outer: self.scope, depth: self.depth + 1, frames: Vec::new(), found: Vec::new() };
-        c.select(&mut rewritten)?;
-        if c.found.is_empty() {
+        let found_raw = {
+            let mut c = Correlator { db: self.db, outer: self.scope, depth: self.depth + 1, frames: Vec::new(), found: Vec::new() };
+            c.select(&mut rewritten)?;
+            c.found
+        };
+        if found_raw.is_empty() {
             return Ok(None);
         }
         if !self.allow_corr {
@@ -347,20 +350,31 @@ impl<'a> Binder<'a> {
                 "a sub-query that refers to the outer query is only allowed in the select list, WHERE clause, GROUP BY, HAVING or ORDER BY of a query",
             ));
         }
-        // In a grouped query the sub-query reads the group, so it may only use the grouping columns.
-        let found = match &self.group {
-            None => c.found,
-            Some(g) => c
-                .found
-                .into_iter()
-                .map(|(param, pos)| {
-                    g.exprs
-                        .iter()
-                        .position(|x| *x == BExpr::Col(pos))
-                        .map(|k| (param, k))
-                        .ok_or_else(|| Error::runtime("a sub-query in a grouped query may refer only to columns that are in the GROUP BY"))
-                })
-                .collect::<Result<Vec<_>>>()?,
+        // In a grouped query the sub-query reads the group, so it reads the grouping columns; any other column of the
+        // outer query is taken from one row of the group, as `ANY_VALUE(column)` would give it (MySQL without ONLY_FULL_GROUP_BY).
+        let found = if self.group.is_none() {
+            found_raw
+        } else {
+            let mut out = Vec::with_capacity(found_raw.len());
+            for (param, pos) in found_raw {
+                let known = self.group.as_ref().and_then(|g| g.exprs.iter().position(|x| *x == BExpr::Col(pos)));
+                let k = match known {
+                    Some(k) => k,
+                    None if self.db.only_full_group_by() => {
+                        return Err(Error::runtime("a sub-query in a grouped query may refer only to columns that are in the GROUP BY"))
+                    }
+                    None => {
+                        let col = &self.scope.cols[pos];
+                        let e = Expr::Column { table: Some(col.table.clone()), name: col.name.clone() };
+                        match self.bind_agg(AggFn::First, std::slice::from_ref(&e), false, false)? {
+                            BExpr::Col(k) => k,
+                            _ => return Err(Error::runtime("a sub-query in a grouped query may refer only to columns that are in the GROUP BY")),
+                        }
+                    }
+                };
+                out.push((param, k));
+            }
+            out
         };
         Ok(Some((rewritten, found)))
     }

@@ -5913,3 +5913,32 @@ fn create_table_select_matches_columns_by_name_and_components_have_dotted_variab
     db.execute("SET GLOBAL validate_password.length = 8").unwrap();
     assert_eq!(rows(&db, "SELECT @@global.validate_password.length"), [["8"]]);
 }
+
+#[test]
+fn mysql_dual_empty_rows_insert_function_sounds_like_unnamed_keys_and_multi_drop() {
+    let mut db = Database::in_memory();
+    assert_eq!(rows(&db, "SELECT 1 FROM DUAL WHERE 1 < ANY (SELECT 2)"), [["1"]]);
+    assert_eq!(rows(&db, "SELECT INSERT('Quadratic', 3, 4, 'What'), INSERT('abc', 9, 1, 'x'), BIT_LENGTH('ab'), 'Hello' SOUNDS LIKE 'Hallo'"), [["QuWhattic", "abc", "16", "Yes"]]);
+    db.execute("CREATE TABLE k (n INT NOT NULL, KEY(n), KEY(n), KEY(n))").unwrap();
+    db.execute("INSERT IGNORE INTO k VALUES (),()").unwrap_err(); // NOT NULL without a default still refuses
+    db.execute("CREATE TABLE e (id INT AUTO_INCREMENT PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO e VALUES (),(),()").unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM e"), [["3"]]);
+    db.execute("CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p(id))").unwrap();
+    db.execute("DROP TABLE p, c").unwrap();
+    assert!(db.table_names().iter().all(|n| *n != "p" && *n != "c"));
+}
+
+#[test]
+fn a_subquery_in_a_grouped_query_may_read_a_column_that_is_not_grouped() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (g INT, v INT); INSERT INTO t VALUES (1, 1), (1, 1), (2, 2)").unwrap();
+    // refused while ONLY_FULL_GROUP_BY is in the sql_mode, which it is by default
+    db.execute("SELECT a.g, (SELECT COUNT(*) FROM t b WHERE b.g = a.v) FROM t a GROUP BY a.g").unwrap_err();
+    db.execute("SET sql_mode = 'NO_ENGINE_SUBSTITUTION'").unwrap();
+    // the column v is not in the GROUP BY: its value comes from one row of the group, as ANY_VALUE(v) would
+    assert_eq!(
+        rows(&db, "SELECT a.g, (SELECT COUNT(*) FROM t b WHERE b.g = a.v) FROM t a GROUP BY a.g ORDER BY a.g"),
+        [["1", "2"], ["2", "1"]]
+    );
+}

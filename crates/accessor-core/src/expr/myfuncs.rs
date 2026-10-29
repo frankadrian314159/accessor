@@ -65,6 +65,8 @@ pub enum MyFn {
     LoadFile,
     ToBase64,
     FromBase64,
+    InsertStr,
+    BitLength,
     TimeFormat,
     Week,
     ExportSet,
@@ -126,6 +128,8 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "CONVERT_TZ" => (ConvertTz, 3, 3),
         "BIT_COUNT" => (BitCount, 1, 1),
         "LOAD_FILE" => (LoadFile, 1, 1),
+        "INSERT" => (InsertStr, 4, 4),
+        "BIT_LENGTH" => (BitLength, 1, 1),
         "TIME_FORMAT" => (TimeFormat, 2, 2),
         "WEEK" => (Week, 1, 2),
         "EXPORT_SET" => (ExportSet, 3, 5),
@@ -674,6 +678,22 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::DateTime(to.to_local(from.to_utc(local)))
         }
         BitCount => Value::Int(int(v(0)).map_or(0, |n| (n as u64).count_ones() as i64)),
+        BitLength => Value::Int(text(v(0)).len() as i64 * 8),
+        InsertStr => {
+            // INSERT(str, pos, len, new): `len` characters from the 1-based `pos` are replaced; a `pos` outside gives `str`
+            let (s0, pos, len) = (text(v(0)), int(v(1)).unwrap_or(0), int(v(2)).unwrap_or(0));
+            let chars: Vec<char> = s0.chars().collect();
+            if pos < 1 || pos as usize > chars.len() {
+                Value::text(&s0)
+            } else {
+                let start = pos as usize - 1;
+                let end = if len < 0 { chars.len() } else { (start + len as usize).min(chars.len()) };
+                let mut out: String = chars[..start].iter().collect();
+                out.push_str(&text(v(3)));
+                out.extend(chars[end..].iter());
+                Value::text(&out)
+            }
+        }
         TimeFormat => match temporal(v(0)) {
             Some((secs, _)) => {
                 let day = chrono::DateTime::from_timestamp(secs.rem_euclid(86_400), 0).map(|d| d.naive_utc());

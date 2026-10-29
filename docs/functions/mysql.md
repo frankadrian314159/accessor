@@ -21,6 +21,9 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `MD5(s)`, `SHA2(s, 256)` | hash as hexadecimal text (`SHA2` with other sizes gives NULL) |
 | `UUID()` | a random version-4 UUID; a new one each call |
 | `STR_TO_DATE(s, fmt)` | the date-time `s` is written as in `fmt` (`%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %p %b %M %a %W %T %j %f %%`); NULL if it does not fit |
+| `INSERT(s, pos, len, new)` | `s` with `len` characters from the 1-based `pos` replaced by `new` (`s` itself when `pos` is outside) |
+| `BIT_LENGTH(s)` | the length of the text in bits (8 for each byte of UTF-8) |
+| `a SOUNDS LIKE b` | `SOUNDEX(a) = SOUNDEX(b)` |
 | `TIME_FORMAT(t, fmt)` | a time (or the time of a date and time) by `fmt`; the hours wrap at 24 |
 | `WEEK(d [, mode])` | the week of the year, modes 0 to 7 as in MySQL (default 0: Sunday first, 0 to 53) |
 | `EXPORT_SET(bits, on, off [, sep [, n]])` | one `on` or `off` text for each of the low `n` (default 64) bits, joined by `sep` (default a comma) |

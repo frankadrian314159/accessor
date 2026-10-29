@@ -2466,6 +2466,7 @@ impl<'a> Parser<'a> {
             columns = Some(self.ident_list()?);
             self.expect_sym(")")?;
         }
+        let mut empty_rows = 0;
         let source = if self.peek_kw("DEFAULT") && self.peek_kw_at(1, "VALUES") {
             self.advance();
             self.advance();
@@ -2484,8 +2485,9 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            if rows.len() == 1 && rows[0].is_empty() {
-                // MySQL: INSERT INTO t VALUES ()
+            if rows.iter().all(|r| r.is_empty()) {
+                // MySQL: INSERT INTO t VALUES () and VALUES (), (): one row of defaults for each
+                empty_rows = rows.len();
                 InsertSource::DefaultValues
             } else {
                 InsertSource::Values(rows)
@@ -2495,7 +2497,8 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.unexpected("VALUES or SELECT"));
         };
-        Ok(Statement::Insert { table, columns, source })
+        let insert = Statement::Insert { table, columns, source };
+        Ok(if empty_rows > 1 { Statement::Batch(vec![insert; empty_rows]) } else { insert })
     }
 
     fn update(&mut self) -> Result<Statement> {
@@ -3506,8 +3509,17 @@ impl<'a> Parser<'a> {
         if let Some(q) = trailing_select {
             all.push(Statement::Insert { table: table_name.clone(), columns: None, source: InsertSource::Select(q) });
         }
+        let mut used: Vec<String> = Vec::new();
         for (n, cols, descending, unique) in indexes {
-            let name = n.unwrap_or_else(|| format!("{}_{}_idx", table_name.replace('.', "_"), cols.join("_")));
+            let mut name = n.unwrap_or_else(|| format!("{}_{}_idx", table_name.replace('.', "_"), cols.join("_")));
+            // MySQL allows the same unnamed key twice: the later ones are numbered
+            let base = name.clone();
+            let mut k = 1;
+            while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+                k += 1;
+                name = format!("{base}_{k}");
+            }
+            used.push(name.clone());
             all.push(Statement::CreateIndex { name, table: table_name.clone(), columns: cols, descending, unique });
         }
         Ok(Statement::Batch(all))
@@ -4682,7 +4694,12 @@ impl<'a> Parser<'a> {
         }
         self.select_into_tail()?;
         if self.eat_kw("FROM") {
-            sel.from = Some(self.from_clause()?);
+            if self.peek_kw("DUAL") && !matches!(self.peek_at(1), Tok::Sym(".") | Tok::Sym("(") | Tok::Sym(",")) && !self.peek_kw_at(1, "JOIN") {
+                // MySQL and Oracle: FROM DUAL is no table at all
+                self.advance();
+            } else {
+                sel.from = Some(self.from_clause()?);
+            }
         }
         if self.eat_kw("WHERE") {
             sel.filter = Some(self.expr()?);
@@ -5293,6 +5310,15 @@ impl<'a> Parser<'a> {
                 };
                 continue;
             }
+            if self.peek_kw("SOUNDS") && self.peek_kw_at(1, "LIKE") {
+                // MySQL: a SOUNDS LIKE b is SOUNDEX(a) = SOUNDEX(b)
+                self.advance();
+                self.advance();
+                let right = self.concat()?;
+                let soundex = |e: Expr| Expr::Function { name: "SOUNDEX".into(), args: vec![e], distinct: false, star: false };
+                left = Expr::Binary { op: BinOp::Eq, left: Box::new(soundex(left)), right: Box::new(soundex(right)) };
+                continue;
+            }
             if self.peek_sym("<=>") {
                 // MySQL's null-safe equality
                 self.advance();
@@ -5869,7 +5895,7 @@ impl<'a> Parser<'a> {
                     _ => {}
                 }
                 // LEFT and RIGHT are join keywords but also string functions.
-                let callable = !RESERVED.contains(&up.as_str()) || matches!(up.as_str(), "LEFT" | "RIGHT" | "MOD");
+                let callable = !RESERVED.contains(&up.as_str()) || matches!(up.as_str(), "LEFT" | "RIGHT" | "MOD" | "INSERT");
                 if matches!(self.peek_at(1), Tok::Sym("(")) && callable {
                     self.advance();
                     self.advance();

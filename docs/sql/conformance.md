@@ -69,7 +69,7 @@ These parts of the standard are not available. Using one gives a syntax error or
 * Ordered-set and hypothetical-set aggregates (`WITHIN GROUP`: `PERCENTILE_CONT`, `LISTAGG ... WITHIN GROUP`); `ARRAY_AGG`; `GROUP BY DISTINCT`.
 * `SEARCH` and `CYCLE` clauses of recursive queries.
 * Row pattern recognition (`MATCH_RECOGNIZE`), polymorphic table functions, property graph queries (SQL/PGQ).
-* Correlated sub-queries in join conditions and `INSERT ... VALUES`; in a grouped query they may read only the grouping columns.
+* Correlated sub-queries in join conditions and `INSERT ... VALUES`; in a grouped query they may read only the grouping columns (unless `ONLY_FULL_GROUP_BY` is out of the `sql_mode`).
 * Cursors (`DECLARE CURSOR`, `FETCH`, positioned update and delete), `EXECUTE IMMEDIATE`, embedded SQL. (`PREPARE`, `EXEC` and `DEALLOCATE` exist, with `@name` parameters rather than `?` or `$1`.)
 
 ### Definitions and data changes

@@ -434,6 +434,34 @@ impl Database {
 
     /// `DROP TABLE a, b [CASCADE]`.
     pub(crate) fn exec_drop_tables(&mut self, names: &[String], cascade: bool, if_exists: bool) -> Result<QueryResult> {
+        if !cascade && names.len() > 1 {
+            // the tables go as one: a table that another one in the list refers to is dropped after it
+            let mut pending: Vec<&String> = Vec::new();
+            for n in names {
+                if self.table(n).is_none() {
+                    if if_exists {
+                        continue;
+                    }
+                    return Err(Error::catalog(format!("the table '{n}' does not exist")));
+                }
+                pending.push(n);
+            }
+            while !pending.is_empty() {
+                let mut later = Vec::new();
+                let mut first_error = None;
+                for n in &pending {
+                    if let Err(e) = self.exec_drop_table(n) {
+                        first_error.get_or_insert(e);
+                        later.push(*n);
+                    }
+                }
+                if later.len() == pending.len() {
+                    return Err(first_error.expect("a drop failed"));
+                }
+                pending = later;
+            }
+            return Ok(QueryResult::default());
+        }
         for n in names {
             if self.table(n).is_none() {
                 if if_exists {

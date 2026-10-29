@@ -215,4 +215,6 @@ Replaces the saved query or trigger of that name, or creates it if there is none
 
 ## IF EXISTS and IF NOT EXISTS
 
+`DROP TABLE a, b` drops the tables as one: a table that another one in the list refers to goes after it.
+
 `CREATE TABLE | INDEX | VIEW | QUERY IF NOT EXISTS` does nothing when the object already exists, and `DROP TABLE | VIEW | QUERY | TRIGGER | INDEX IF EXISTS` does nothing when it does not. Neither checks that an existing object has the same definition.

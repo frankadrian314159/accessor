@@ -159,6 +159,8 @@ The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `S
 
 `DEFAULT(col)` in a `CHECK` is the column's default value (written in when the check is made). A `#` that is not the start of a `#date#` literal on the same line begins a comment to the end of the line, as in MySQL. `CREATE TABLE t (a, b, c) SELECT 1 AS b, 2 AS c` puts the query's columns in the fields of their names.
 
+`SELECT ... FROM DUAL` is a query with no table. `INSERT INTO t VALUES (), ()` inserts a row of defaults for each `()`. The same unnamed `KEY (c)` written twice in `CREATE TABLE` makes two indexes (numbered `_2`, `_3`).
+
 ## Catalog views
 
 `INFORMATION_SCHEMA` has the standard columns beside the engine's own: `TABLES` and `COLUMNS` add `TABLE_CATALOG`, `TABLE_SCHEMA`, `ENGINE`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA`, `CHARACTER_SET_NAME` and `COLLATION_NAME`, and these views are added: `SCHEMATA`, `STATISTICS` (the indexes), `CHARACTER_SETS`, `COLLATIONS`, `ENGINES`, `PARTITIONS`, `CHECK_CONSTRAINTS`, and, with the right columns and no rows, `PROCESSLIST`, `COLUMN_STATISTICS`, `USER_PRIVILEGES`, `SCHEMA_PRIVILEGES`, `TABLE_PRIVILEGES`, `COLUMN_PRIVILEGES`, `EVENTS`, `OPTIMIZER_TRACE`, `RESOURCE_GROUPS`, `FILES`, `TABLESPACES`, `PLUGINS`, `VIEW_TABLE_USAGE`, `KEYWORDS` and a few more. See [information-schema.md](information-schema.md).
