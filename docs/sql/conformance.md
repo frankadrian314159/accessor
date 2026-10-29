@@ -77,6 +77,7 @@ These parts of the standard are not available. Using one gives a syntax error or
 * Catalogs, and schemas as namespaces: `CREATE SCHEMA` and `schema.table` exist, but a schema is a prefix of the table's name with no search path ([schemas-and-types.md](schemas-and-types.md)). `INFORMATION_SCHEMA` exists with the views listed in [information-schema.md](information-schema.md), which is the one schema, with no `catalog` or `schema` columns; the standard's views for privileges, domains, collations and so on are absent.
 * `CREATE ASSERTION`, collations and character sets (`COLLATE`). `CREATE DOMAIN` is there, with its rules copied into the columns that use it.
 * Table inheritance and declarative partitioning (`INHERITS`, `PARTITION BY`) exist as extensions, without partition pruning ([inheritance-and-partitioning.md](inheritance-and-partitioning.md)).
+* `DECLARE CURSOR` that sees later changes (cursors here are insensitive), cursors positioned `UPDATE ... WHERE CURRENT OF`.
 * `CREATE OR REPLACE TABLE`, `CREATE TABLE ... AS`, `CREATE TABLE ... LIKE`, temporary tables, materialised views, recursive views, views updatable by the standard's fuller rules (joins, aggregates), `WITH LOCAL/CASCADED CHECK OPTION`.
 * `ALTER TABLE` actions `ADD PRIMARY KEY` and `ADD UNIQUE` (use `CREATE UNIQUE INDEX`).
 * Deferrable `UNIQUE`, `PRIMARY KEY` and `CHECK` constraints (only foreign keys can be deferred); `MATCH FULL/PARTIAL`; sequence options `AS type` and `CACHE` are accepted and ignored; `OWNED BY`.

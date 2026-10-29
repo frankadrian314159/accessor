@@ -51,6 +51,16 @@ COMMIT;                               -- verified here: fine
 
 A `COMMIT` that finds a deferred relationship broken rolls back the whole transaction and reports the first broken record. The check reads the rows of the tables whose relationships were deferred, using the parent's index for each; it is one pass over the child rows, so deferring in a transaction that touches millions of rows costs a scan of them at the end.
 
+## Cursors
+
+```sql
+DECLARE name [BINARY] [INSENSITIVE] [[NO] SCROLL] CURSOR [{WITH | WITHOUT} HOLD] FOR query
+FETCH [direction] [FROM | IN] name         -- or MOVE, which only moves
+CLOSE name | CLOSE ALL
+```
+
+`DECLARE` runs the query and keeps its rows: the cursor does not see changes made to the tables afterwards (PostgreSQL's *insensitive* cursor, which is what an unmarked one is there too). The cursor stands before the first row, on a row, or after the last, and `FETCH` moves it. The direction is `NEXT` (the default), `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n` (from the end if `n` is negative), `RELATIVE n`, a count `n` (forward; a negative count goes backward), `ALL`, or `FORWARD` / `BACKWARD` with a count or `ALL`; backward rows come last row first. Beyond either end a fetch gives no row and the cursor stays outside the rows. `MOVE` takes the same directions and gives no rows. A cursor not declared `WITH HOLD` is closed by `COMMIT` and `ROLLBACK`. Every cursor can scan both ways (`SCROLL` is read and not needed), and a cursor can be declared outside a transaction.
+
 ## Sequences
 
 The numbers [sequences](sequences.md) hand out are not part of a transaction: rolling back does not give them back.

@@ -581,6 +581,12 @@ pub enum Statement {
     /// `DROP ... IF EXISTS` (`missing_ok`) or `CREATE ... IF NOT EXISTS`.
     Guarded { missing_ok: bool, stmt: Box<Statement> },
     Merge(Box<MergeDef>),
+    /// `DECLARE name [SCROLL] CURSOR [WITH HOLD] FOR query`
+    DeclareCursor { name: String, query: Box<Select>, hold: bool },
+    /// `FETCH direction FROM name`, or `MOVE ...` (`move_only`: the position changes, no rows come back)
+    Fetch { name: String, direction: FetchDirection, move_only: bool },
+    /// `CLOSE name`, or `CLOSE ALL` (no name)
+    CloseCursor(Option<String>),
     Begin,
     Commit,
     Rollback,
@@ -678,4 +684,19 @@ pub enum HandlerAction {
     Close,
     /// `direction` is `first`, `next`, `prev` or `last`.
     Read { direction: &'static str, filter: Option<Expr>, limit: usize },
+}
+
+/// Where `FETCH` / `MOVE` goes from the cursor's position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchDirection {
+    Next,
+    Prior,
+    First,
+    Last,
+    Absolute(i64),
+    Relative(i64),
+    /// The next `n` rows (`None`: all the rest)
+    Forward(Option<i64>),
+    /// The previous `n` rows, last first (`None`: all of them)
+    Backward(Option<i64>),
 }

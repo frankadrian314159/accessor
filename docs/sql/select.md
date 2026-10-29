@@ -42,7 +42,7 @@ FROM (SELECT ...) AS D (a, b)           -- with names for its columns
 FROM (VALUES (1, 'a'), (2, 'b')) AS V (n, s)
 ```
 
-Each source can be a table, a saved query (view), or a parenthesised query. A derived table may omit its alias, as in PostgreSQL 16; give it one to refer to its columns by name.
+`TABLE name` is `SELECT * FROM name`, and `FROM parent *` reads a table with the tables that inherit from it, as `FROM parent` does here. Each source can be a table, a saved query (view), or a parenthesised query. A derived table may omit its alias, as in PostgreSQL 16; give it one to refer to its columns by name.
 
 ### Join types
 

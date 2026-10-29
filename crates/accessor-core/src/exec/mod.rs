@@ -19,6 +19,8 @@ mod reports;
 mod infoschema;
 mod returning;
 mod prepared;
+mod cursor;
+pub(crate) use cursor::Cursor;
 mod decorrelate;
 mod viewdml;
 pub(crate) mod optimizer;
@@ -339,8 +341,19 @@ impl Database {
             // as in MySQL and PostgreSQL, ending a transaction that is not there does nothing
             Statement::Commit | Statement::Rollback if !self.in_transaction() => Ok(QueryResult::default()),
             Statement::Begin => self.begin().map(|_| QueryResult::default()),
-            Statement::Commit => self.commit().map(|_| QueryResult::default()),
-            Statement::Rollback => self.rollback().map(|_| QueryResult::default()),
+            Statement::Commit => {
+                self.commit()?;
+                self.drop_cursors(false);
+                Ok(QueryResult::default())
+            }
+            Statement::Rollback => {
+                self.rollback()?;
+                self.drop_cursors(false);
+                Ok(QueryResult::default())
+            }
+            Statement::DeclareCursor { name, query, hold } => self.declare_cursor(name, query, *hold),
+            Statement::Fetch { name, direction, move_only } => self.fetch_cursor(name, *direction, *move_only),
+            Statement::CloseCursor(name) => self.close_cursor(name.as_deref()),
             Statement::Savepoint(name) => self.savepoint(name).map(|_| QueryResult::default()),
             Statement::ReleaseSavepoint(name) => self.release(name).map(|_| QueryResult::default()),
             Statement::RollbackTo(name) => self.rollback_to(name).map(|_| QueryResult::default()),

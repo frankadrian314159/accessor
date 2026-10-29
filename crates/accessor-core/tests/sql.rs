@@ -5605,3 +5605,83 @@ fn views_read_with_options_and_a_schema_name_and_postfix_null_tests() {
     db.execute("CREATE TABLE ct (id, x) AS SELECT a, b FROM pk WHERE a NOTNULL").unwrap();
     assert_eq!(rows(&db, "SELECT id, x FROM ct ORDER BY id"), [["1", ""], ["2", "5"]]);
 }
+
+#[test]
+fn temporal_keys_exclude_constraints_and_table_not_null_are_read() {
+    let mut db = Database::in_memory();
+    db.execute("SET lenient_types = on").unwrap();
+    for sql in [
+        "CREATE TABLE temporal_rng (id int4range, valid_at daterange, name text, CONSTRAINT temporal_rng_pk PRIMARY KEY (id, valid_at WITHOUT OVERLAPS))",
+        "CREATE TABLE temporal_fk (id int, valid_at text, parent text, CONSTRAINT fk FOREIGN KEY (parent, PERIOD valid_at) REFERENCES temporal_rng (id, PERIOD valid_at))",
+        "CREATE TABLE excl (room int4range, speaker int4range, during tsrange, EXCLUDE USING gist (room WITH =, during WITH &&), CONSTRAINT e2 EXCLUDE (speaker WITH =) WHERE (room IS NULL))",
+        "CREATE TABLE nn (a int, b int, CONSTRAINT foo NOT NULL a, NOT NULL b NO INHERIT)",
+    ] {
+        db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // the primary key is a key, and NOT NULL is kept
+    db.execute("INSERT INTO temporal_rng VALUES ('1', '[2000,2001)', 'a')").unwrap();
+    assert!(db.execute("INSERT INTO temporal_rng VALUES ('1', '[2000,2001)', 'b')").is_err());
+    assert!(db.execute("INSERT INTO nn VALUES (NULL, 1)").is_err());
+    assert!(db.execute("INSERT INTO nn VALUES (1, NULL)").is_err());
+    db.execute("INSERT INTO nn VALUES (1, 2)").unwrap();
+}
+
+#[test]
+fn small_postgresql_forms_table_shorthand_inheritance_star_drop_trigger_on_and_alter_constraint() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE a_star (a INT); INSERT INTO a_star VALUES (1), (2)").unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM a_star* ORDER BY a"), [["1"], ["2"]]);
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM a_star * WHERE a > 1"), [["1"]]);
+    let st = db.execute("TABLE a_star").unwrap();
+    assert_eq!(st.rows.len(), 2);
+    db.execute("CREATE TABLE tt (x INT, y INT); CREATE TRIGGER trg BEFORE INSERT ON tt BEGIN SELECT 1; END").unwrap();
+    db.execute("DROP TRIGGER trg ON tt").unwrap();
+    db.execute("DROP TRIGGER IF EXISTS trg ON tt").unwrap();
+    db.execute("ALTER TABLE tt ADD CONSTRAINT cc CHECK (x > 0)").unwrap();
+    db.execute("ALTER TABLE tt ALTER CONSTRAINT cc NOT ENFORCED").unwrap();
+    db.execute("ALTER TABLE tt ALTER CONSTRAINT cc DEFERRABLE INITIALLY DEFERRED").unwrap();
+    // multiplication after a table name is still multiplication
+    assert_eq!(rows(&db, "SELECT 2 * 3"), [["6"]]);
+}
+
+#[test]
+fn cursors_declare_fetch_move_and_close() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1), (2), (3), (4), (5)").unwrap();
+    let fetch = |db: &mut Database, sql: &str| -> Vec<String> { db.execute(sql).unwrap().rows.iter().map(|r| r[0].to_string()).collect() };
+    db.execute("BEGIN").unwrap();
+    db.execute("DECLARE c SCROLL CURSOR FOR SELECT n FROM t ORDER BY n").unwrap();
+    assert_eq!(fetch(&mut db, "FETCH NEXT FROM c"), ["1"]);
+    assert_eq!(fetch(&mut db, "FETCH 2 FROM c"), ["2", "3"]);
+    assert_eq!(fetch(&mut db, "FETCH PRIOR FROM c"), ["2"]);
+    assert_eq!(fetch(&mut db, "FETCH BACKWARD 5 FROM c"), ["1"]);
+    assert_eq!(fetch(&mut db, "FETCH PRIOR FROM c"), Vec::<String>::new()); // before the first
+    assert_eq!(fetch(&mut db, "FETCH FIRST FROM c"), ["1"]);
+    assert_eq!(fetch(&mut db, "FETCH LAST FROM c"), ["5"]);
+    assert_eq!(fetch(&mut db, "FETCH NEXT FROM c"), Vec::<String>::new()); // after the last
+    assert_eq!(fetch(&mut db, "FETCH PRIOR FROM c"), ["5"]);
+    assert_eq!(fetch(&mut db, "FETCH ABSOLUTE 3 FROM c"), ["3"]);
+    assert_eq!(fetch(&mut db, "FETCH ABSOLUTE -2 FROM c"), ["4"]);
+    assert_eq!(fetch(&mut db, "FETCH RELATIVE -2 FROM c"), ["2"]);
+    assert_eq!(fetch(&mut db, "FETCH RELATIVE 0 FROM c"), ["2"]);
+    assert_eq!(fetch(&mut db, "FETCH FORWARD ALL FROM c"), ["3", "4", "5"]);
+    assert_eq!(fetch(&mut db, "FETCH BACKWARD ALL FROM c"), ["5", "4", "3", "2", "1"]);
+    db.execute("MOVE FORWARD 2 IN c").unwrap();
+    assert_eq!(fetch(&mut db, "FETCH c"), ["3"]);
+    assert_eq!(fetch(&mut db, "FETCH -1 FROM c"), ["2"]);
+    // the cursor does not see what happens to the table after it was declared
+    db.execute("INSERT INTO t VALUES (6)").unwrap();
+    assert_eq!(fetch(&mut db, "FETCH LAST FROM c"), ["5"]);
+    assert_eq!(db.execute("FETCH NEXT FROM c").unwrap().columns, ["n"]);
+    assert!(db.execute("DECLARE c CURSOR FOR SELECT 1").is_err());
+    db.execute("DECLARE kept CURSOR WITH HOLD FOR SELECT n FROM t ORDER BY n").unwrap();
+    db.execute("COMMIT").unwrap();
+    // a cursor without HOLD ends with the transaction
+    assert!(db.execute("FETCH NEXT FROM c").is_err());
+    assert_eq!(fetch(&mut db, "FETCH ALL FROM kept"), ["1", "2", "3", "4", "5", "6"]);
+    db.execute("CLOSE kept").unwrap();
+    assert!(db.execute("CLOSE kept").is_err());
+    db.execute("DECLARE a CURSOR FOR SELECT 1; DECLARE b CURSOR FOR SELECT 2").unwrap();
+    db.execute("CLOSE ALL").unwrap();
+    assert!(db.execute("FETCH a").is_err());
+}

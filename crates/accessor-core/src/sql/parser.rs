@@ -1505,6 +1505,11 @@ impl<'a> Parser<'a> {
                 return Err(Error::syntax("an index on an expression is not supported; index the column"));
             }
             cols.push(self.ident()?);
+            if self.peek_kw("WITHOUT") && self.peek_kw_at(1, "OVERLAPS") {
+                // `valid_at WITHOUT OVERLAPS`: a temporal key; the column is a key column, and ranges are not compared for overlap
+                self.advance();
+                self.advance();
+            }
             if self.peek_sym("(") {
                 self.skip_parens()?; // a prefix length
             }
@@ -1860,6 +1865,69 @@ impl<'a> Parser<'a> {
         Ok(st)
     }
 
+    /// `DECLARE name [BINARY] [INSENSITIVE] [[NO] SCROLL] CURSOR [{WITH | WITHOUT} HOLD] FOR query`
+    fn declare_cursor(&mut self) -> Result<Statement> {
+        self.advance();
+        let name = self.ident()?;
+        while self.eat_kw("BINARY") || self.eat_kw("INSENSITIVE") || self.eat_kw("ASENSITIVE") || self.eat_kw("SCROLL") || (self.peek_kw("NO") && self.peek_kw_at(1, "SCROLL") && self.eat_kw("NO") && self.eat_kw("SCROLL")) {}
+        self.expect_kw("CURSOR")?;
+        let mut hold = false;
+        if self.eat_kw("WITH") {
+            self.expect_kw("HOLD")?;
+            hold = true;
+        } else if self.eat_kw("WITHOUT") {
+            self.expect_kw("HOLD")?;
+        }
+        self.expect_kw("FOR")?;
+        let query = Box::new(self.select()?);
+        Ok(Statement::DeclareCursor { name, query, hold })
+    }
+
+    /// `FETCH | MOVE [direction] [FROM | IN] cursor`
+    fn fetch_cursor(&mut self) -> Result<Statement> {
+        let move_only = self.peek_kw("MOVE");
+        self.advance();
+        let number = |p: &mut Parser| -> Result<Option<i64>> {
+            if matches!(p.peek(), Tok::Int(_)) || p.peek_sym("-") {
+                Ok(Some(p.signed_int()?))
+            } else {
+                Ok(None)
+            }
+        };
+        let direction = if self.eat_kw("NEXT") {
+            FetchDirection::Next
+        } else if self.eat_kw("PRIOR") {
+            FetchDirection::Prior
+        } else if self.eat_kw("FIRST") {
+            FetchDirection::First
+        } else if self.eat_kw("LAST") {
+            FetchDirection::Last
+        } else if self.eat_kw("ABSOLUTE") {
+            FetchDirection::Absolute(self.signed_int()?)
+        } else if self.eat_kw("RELATIVE") {
+            FetchDirection::Relative(self.signed_int()?)
+        } else if self.eat_kw("ALL") {
+            FetchDirection::Forward(None)
+        } else if self.eat_kw("FORWARD") {
+            if self.eat_kw("ALL") { FetchDirection::Forward(None) } else { FetchDirection::Forward(Some(number(self)?.unwrap_or(1))) }
+        } else if self.eat_kw("BACKWARD") {
+            if self.eat_kw("ALL") { FetchDirection::Backward(None) } else { FetchDirection::Backward(Some(number(self)?.unwrap_or(1))) }
+        } else if let Some(n) = number(self)? {
+            match n {
+                0 => FetchDirection::Relative(0),
+                n if n > 0 => FetchDirection::Forward(Some(n)),
+                n => FetchDirection::Backward(Some(-n)),
+            }
+        } else {
+            FetchDirection::Next
+        };
+        if !self.eat_kw("FROM") {
+            self.eat_kw("IN");
+        }
+        let name = self.ident()?;
+        Ok(Statement::Fetch { name, direction, move_only })
+    }
+
     fn statement_inner(&mut self) -> Result<Statement> {
         for word in ["VACUUM", "ANALYZE", "ANALYSE", "LOCK", "UNLOCK", "COMMENT", "CHECKPOINT", "DISCARD", "CLUSTER", "LISTEN", "UNLISTEN", "NOTIFY", "SECURITY"] {
             if self.peek_kw(word) {
@@ -1869,6 +1937,26 @@ impl<'a> Parser<'a> {
                 }
                 return Ok(Statement::Ignored(word.to_string()));
             }
+        }
+        if self.peek_kw("DECLARE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            return self.declare_cursor();
+        }
+        if self.peek_kw("FETCH") || (self.peek_kw("MOVE") && !matches!(self.peek_at(1), Tok::Sym(_))) {
+            return self.fetch_cursor();
+        }
+        if self.peek_kw("CLOSE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            self.advance();
+            if self.eat_kw("ALL") {
+                return Ok(Statement::CloseCursor(None));
+            }
+            return Ok(Statement::CloseCursor(Some(self.ident()?)));
+        }
+        if self.peek_kw("TABLE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            // TABLE name: SELECT * FROM name
+            self.advance();
+            let name = self.table_ident()?;
+            let from = From { first: TableFactor::Named { name, alias: None, only: false }, joins: Vec::new() };
+            return Ok(Statement::Select(Select { items: vec![SelectItem::Wildcard], from: Some(from), ..Select::default() }));
         }
         if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_kw("TRANSFORM") || self.peek_sym("(") {
             self.into_vars.clear();
@@ -3489,8 +3577,38 @@ impl<'a> Parser<'a> {
         let mut uniques = Vec::new();
         let mut foreign_keys = Vec::new();
         let mut checks: Vec<(Option<String>, String)> = Vec::new();
+        let mut not_null_columns: Vec<String> = Vec::new();
         loop {
-            if self.peek_kw("CONSTRAINT") && self.peek_kw_at(2, "CHECK") {
+            let named = usize::from(self.peek_kw("CONSTRAINT")) * 2;
+            if self.peek_kw_at(named, "EXCLUDE") && (self.peek_kw_at(named + 1, "USING") || matches!(self.peek_at(named + 1), Tok::Sym("("))) {
+                // EXCLUDE [USING method] (element WITH operator, ...) [options] [WHERE (...)]: read, and not kept
+                if named > 0 {
+                    self.advance();
+                    self.advance();
+                }
+                self.advance();
+                if self.eat_kw("USING") {
+                    self.ident()?;
+                }
+                self.skip_parens()?;
+                while self.skip_constraint_option() {}
+                if self.eat_kw("WITH") {
+                    self.skip_parens()?;
+                }
+                if self.eat_kw("WHERE") {
+                    self.skip_parens()?;
+                }
+            } else if self.peek_kw_at(named, "NOT") && self.peek_kw_at(named + 1, "NULL") && matches!(self.peek_at(named + 2), Tok::Ident(_) | Tok::Quoted(_)) {
+                // [CONSTRAINT name] NOT NULL column [NO INHERIT]
+                if named > 0 {
+                    self.advance();
+                    self.advance();
+                }
+                self.advance();
+                self.advance();
+                not_null_columns.push(self.ident()?);
+                while self.skip_constraint_option() {}
+            } else if self.peek_kw("CONSTRAINT") && self.peek_kw_at(2, "CHECK") {
                 self.advance();
                 let cname = self.ident()?;
                 checks.push((Some(cname), self.check_clause()?));
@@ -3513,6 +3631,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_sym(")")?;
+        for n in &not_null_columns {
+            if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(n)) {
+                col.not_null = true;
+            }
+        }
         for c in &mut columns {
             if let Some(text) = c.check.take() {
                 checks.push((None, text));
@@ -3521,13 +3644,28 @@ impl<'a> Parser<'a> {
         Ok((Statement::CreateTable { name, columns, primary_key, uniques, foreign_keys, checks }, likes, indexes))
     }
 
+    /// Column names, each of which may follow the word `PERIOD` (a temporal foreign key): the period column is an
+    /// ordinary column here.
+    fn period_ident_list(&mut self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        loop {
+            if self.peek_kw("PERIOD") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+                self.advance();
+            }
+            out.push(self.ident()?);
+            if !self.eat_sym(",") {
+                return Ok(out);
+            }
+        }
+    }
+
     /// `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES ...`
     fn table_foreign_key(&mut self) -> Result<ForeignKeyDef> {
         let name = if self.eat_kw("CONSTRAINT") { Some(self.ident()?) } else { None };
         self.expect_kw("FOREIGN")?;
         self.expect_kw("KEY")?;
         self.expect_sym("(")?;
-        let columns = self.ident_list()?;
+        let columns = self.period_ident_list()?;
         self.expect_sym(")")?;
         self.expect_kw("REFERENCES")?;
         self.references_clause(name, columns)
@@ -3538,7 +3676,7 @@ impl<'a> Parser<'a> {
         let ref_table = self.table_ident()?;
         let mut ref_columns = Vec::new();
         if self.eat_sym("(") {
-            ref_columns = self.ident_list()?;
+            ref_columns = self.period_ident_list()?;
             self.expect_sym(")")?;
         }
         if self.eat_kw("MATCH") {
@@ -4030,6 +4168,13 @@ impl<'a> Parser<'a> {
             self.expect_kw("TO")?;
             AlterAction::RenameColumn { from, to: self.ident()? }
         } else if self.eat_kw("ALTER") {
+            if self.peek_kw("CONSTRAINT") {
+                // ALTER CONSTRAINT name [NOT] DEFERRABLE | [NOT] ENFORCED | INITIALLY ...: the constraints keep their kind here
+                self.advance();
+                self.ident()?;
+                while self.skip_constraint_option() {}
+                return Ok(Statement::Ignored("ALTER TABLE".into()));
+            }
             self.eat_kw("COLUMN");
             let name = self.ident()?;
             if self.peek_kw("SET") && self.peek_kw_at(1, "DATA") {
@@ -4173,7 +4318,13 @@ impl<'a> Parser<'a> {
             Ok(Statement::DropSequence(self.ident()?))
         } else if self.eat_kw("TRIGGER") {
             self.if_exists_clause(false, guarded)?;
-            Ok(Statement::DropTrigger(self.ident()?))
+            let name = self.ident()?;
+            if self.eat_kw("ON") {
+                self.table_ident()?; // PostgreSQL names the table too; a trigger's name is unique here
+            }
+            self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            Ok(Statement::DropTrigger(name))
         } else if self.eat_kw("INDEX") {
             self.if_exists_clause(false, guarded)?;
             let name = self.ident()?;
@@ -4874,6 +5025,10 @@ impl<'a> Parser<'a> {
             // MySQL's `t PARTITION (p1, p2)`: the partitions are not kept apart, so every row is read
             self.advance();
             self.skip_parens()?;
+        }
+        // `FROM parent *`: with the tables that inherit from it, which is what a query reads here anyway
+        if self.peek_sym("*") && !matches!(self.peek_at(1), Tok::Int(_) | Tok::Float(_) | Tok::Param(_)) {
+            self.advance();
         }
         self.skip_index_hints()?;
         let alias = if self.eat_kw("AS") || (!self.at_index_hint() && self.peek_is_alias()) { Some(self.ident()?) } else { default_alias };
