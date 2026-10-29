@@ -5572,3 +5572,36 @@ fn create_table_reads_the_constraint_options_and_types_of_postgresql() {
     // a partition key that is an expression is still refused
     assert!(db.execute("CREATE TABLE t7 (a text) PARTITION BY LIST (lower(a))").is_err());
 }
+
+#[test]
+fn lenient_types_keep_unknown_types_and_arrays_as_text() {
+    let mut db = Database::in_memory();
+    // refused by default
+    assert!(db.execute("CREATE TABLE n1 (x txid_snapshot)").is_err());
+    assert!(db.execute("CREATE TABLE n1 (x int[])").is_err());
+    db.execute("SET lenient_types = on").unwrap();
+    db.execute("CREATE TABLE n2 (x txid_snapshot, y int[], z text[][], w int8range[], q point, r int[3])").unwrap();
+    db.execute("INSERT INTO n2 VALUES ('1:2:3', '{1,2}', '{{a}}', '{}', '(1,2)', '{1,2,3}')").unwrap();
+    assert_eq!(rows(&db, "SELECT x, y, q FROM n2"), [["1:2:3", "{1,2}", "(1,2)"]]);
+    assert_eq!(rows(&db, "SELECT CAST('1:2' AS txid_snapshot)"), [["1:2"]]);
+    // a function takes them too
+    db.execute("CREATE FUNCTION f(a cstring) RETURNS integer AS 'SELECT 1' LANGUAGE sql").unwrap();
+    // and turned off again, the cache does not keep the lenient reading
+    db.execute("RESET lenient_types").unwrap();
+    assert!(db.execute("CREATE TABLE n3 (x txid_snapshot)").is_err());
+    assert!(db.execute("CREATE TABLE n3 (x int[])").is_err());
+}
+
+#[test]
+fn views_read_with_options_and_a_schema_name_and_postfix_null_tests() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE pk (a int, b int); INSERT INTO pk VALUES (1, NULL), (2, 5), (NULL, 7)").unwrap();
+    db.execute("CREATE VIEW v1 WITH (security_barrier = true) AS SELECT * FROM pk WHERE a > 0 WITH LOCAL CHECK OPTION").unwrap();
+    db.execute("CREATE VIEW v2 AS SELECT * FROM pk WITH CASCADED CHECK OPTION").unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM v1 ORDER BY 1"), [["1"], ["2"]]);
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM pk WHERE a ISNULL OR b ISNULL"), [["2"]]);
+    assert_eq!(rows(&db, "SELECT a FROM pk WHERE a NOTNULL AND b NOTNULL"), [["2"]]);
+    // CREATE TABLE t (names) AS query
+    db.execute("CREATE TABLE ct (id, x) AS SELECT a, b FROM pk WHERE a NOTNULL").unwrap();
+    assert_eq!(rows(&db, "SELECT id, x FROM ct ORDER BY id"), [["1", ""], ["2", "5"]]);
+}

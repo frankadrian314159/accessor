@@ -115,12 +115,20 @@ fn parameters_of(statements: &[Statement]) -> Vec<String> {
 impl Database {
     /// The statements of `sql`, read now or taken from the cache.
     pub(crate) fn parse_cached(&self, sql: &str) -> Result<Arc<Vec<Statement>>> {
-        if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
-            return Ok(Arc::clone(hit));
+        // what a lenient reading made of the text is not what a strict one would, so the cache is not used with it
+        let lenient = self.settings.get("lenient_types").is_some_and(|v| v == "on");
+        if !lenient {
+            if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+                return Ok(Arc::clone(hit));
+            }
         }
         crate::sql::usertypes::set_types(self.user_types());
-        let parsed = Arc::new(parse_script(sql)?);
-        if sql.len() <= CACHE_MAX_TEXT {
+        let parsed = {
+            let _lenient = crate::sql::usertypes::lenient_guard(lenient);
+            parse_script(sql)
+        };
+        let parsed = Arc::new(parsed?);
+        if sql.len() <= CACHE_MAX_TEXT && !lenient {
             let mut cache = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner());
             if cache.len() >= CACHE_ENTRIES {
                 cache.clear();

@@ -61,12 +61,14 @@ impl Database {
     /// `SET integer_division = off`: until the guard is dropped, `/` of whole numbers keeps the fraction.
     /// `SET round_half_even = off`: and `Round` sends a tie away from zero.
     /// `SET cast_truncates = off`: and `CAST(x AS INTEGER)` rounds, ties to even.
-    fn division_guard(&self) -> (crate::numeric::DivisionGuard, crate::decimal::TiesGuard, crate::expr::func::CastGuard) {
+    /// `SET lenient_types = on`: and a definition read while the statement runs (a routine's) reads unknown types as text.
+    fn division_guard(&self) -> (crate::numeric::DivisionGuard, crate::decimal::TiesGuard, crate::expr::func::CastGuard, crate::sql::usertypes::LenientGuard) {
         let off = |name: &str| self.settings.get(name).is_some_and(|v| v == "off");
         (
             crate::numeric::exact_whole_division(off("integer_division")),
             crate::decimal::ties_away_from_zero(off("round_half_even")),
             crate::expr::func::cast_truncates(!off("cast_truncates")),
+            crate::sql::usertypes::lenient_guard(self.settings.get("lenient_types").is_some_and(|v| v == "on")),
         )
     }
 

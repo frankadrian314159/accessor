@@ -27,6 +27,31 @@ pub struct UserType {
 
 thread_local! {
     static TYPES: RefCell<HashMap<String, UserType>> = RefCell::new(HashMap::new());
+    static LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// With `SET lenient_types = on` a type name the engine does not know is kept as `TEXT` instead of being refused, and so
+/// is an array of any type (`int[]`): a table of PostgreSQL's types can be made and the statements that follow it can run.
+pub(crate) struct LenientGuard(bool);
+
+/// Sets the flag until the guard is dropped, then puts back what it was.
+pub(crate) fn lenient_guard(on: bool) -> LenientGuard {
+    LenientGuard(LENIENT.with(|l| l.replace(on)))
+}
+
+impl Drop for LenientGuard {
+    fn drop(&mut self) {
+        LENIENT.with(|l| l.set(self.0));
+    }
+}
+
+pub(crate) fn lenient() -> bool {
+    LENIENT.with(|l| l.get())
+}
+
+/// The data type for a type name: a built-in one, or (when lenient) text.
+pub(crate) fn resolve(name: &str) -> Option<(crate::value::DataType, bool)> {
+    crate::value::DataType::from_sql_name(name).or_else(|| lenient().then_some((crate::value::DataType::Text, false)))
 }
 
 /// The types the parser knows now.

@@ -43,7 +43,7 @@ The names of the standard's features here are descriptive; they are not the feat
 | `CHECK` constraints | stored as a pair of `BEFORE` triggers | a constraint object |
 | `TRUNCATE` | same as `DELETE` without a `WHERE` (triggers fire, counters are kept) | does not fire row triggers; `RESTART IDENTITY` option |
 | `GENERATED ALWAYS AS IDENTITY` | the same as `BY DEFAULT`: a supplied value is accepted | a supplied value is refused |
-| Views | simple views take `INSERT`/`UPDATE`/`DELETE` (with `WITH CHECK OPTION`); the rest are read-only; `CREATE VIEW v (cols) AS` names columns; parameters through `CREATE QUERY` | updatable views by a fuller set of rules; `WITH LOCAL/CASCADED CHECK OPTION` |
+| Views | simple views take `INSERT`/`UPDATE`/`DELETE` (with `WITH CHECK OPTION`); the rest are read-only; `CREATE VIEW v (cols) AS` names columns; parameters through `CREATE QUERY` | updatable views by a fuller set of rules; `WITH LOCAL/CASCADED CHECK OPTION` is read as `WITH CHECK OPTION`, and `WITH (security_barrier = true)` is read and ignored |
 | Set operators | `MINUS` is accepted as `EXCEPT` | not standard |
 | Concurrency | a database file is open once (a file lock, [locking](../extern/locking.md)); connections in that process overlap their transactions under snapshot isolation, with first-committer-wins conflicts ([concurrency](../concurrency.md)) | many sessions with isolation levels |
 

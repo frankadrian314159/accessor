@@ -866,7 +866,7 @@ impl<'a> Parser<'a> {
             let mut t = match crate::sql::usertypes::lookup(&type_name) {
                 Some(base) => UserType { domain: true, ..base },
                 None => {
-                    DataType::from_sql_name(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
+                    crate::sql::usertypes::resolve(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
                     UserType { base: type_name, domain: true, ..Default::default() }
                 }
             };
@@ -1767,7 +1767,7 @@ impl<'a> Parser<'a> {
             // `FROM t WINDOW w AS (...)`: WINDOW starts a clause here, not an alias.
             Tok::Ident(s) if s.eq_ignore_ascii_case("WINDOW") && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_kw_at(2, "AS") => false,
             // `CREATE TABLE t AS SELECT ... FROM s WITH NO DATA`
-            Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && self.peek_kw_at(1, "NO") => false,
+            Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && (self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "CHECK") || self.peek_kw_at(1, "LOCAL") || self.peek_kw_at(1, "CASCADED")) => false,
             Tok::Ident(s) if s.eq_ignore_ascii_case("STRAIGHT_JOIN") => false,
             // `FROM t FOR UPDATE`, `FROM t LOCK IN SHARE MODE`: locking clauses
             Tok::Ident(s) if s.eq_ignore_ascii_case("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) => false,
@@ -2733,7 +2733,7 @@ impl<'a> Parser<'a> {
     fn data_type_name(&mut self) -> Result<DataType> {
         let tn = self.type_name()?;
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
-        let (ty, auto) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+        let (ty, auto) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         if auto || ty == DataType::Calculated {
             return Err(Error::syntax(format!("'{tn}' cannot be used as the type of a parameter")));
         }
@@ -3136,7 +3136,7 @@ impl<'a> Parser<'a> {
         }
         if !unique && (self.eat_kw("VIEW") || self.eat_kw("QUERY")) {
             self.if_exists_clause(true, guarded)?;
-            let name = self.ident()?;
+            let name = self.table_ident()?;
             // Parameters come either as `name(@a, @b) AS ...` or as a leading
             // `PARAMETERS @a, @b;`; both are stored in the latter form.
             let mut params = Vec::new();
@@ -3149,6 +3149,11 @@ impl<'a> Parser<'a> {
                     columns = self.ident_list()?;
                 }
                 self.expect_sym(")")?;
+            }
+            if self.peek_kw("WITH") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                // WITH (security_barrier = true, ...): nothing here depends on it
+                self.advance();
+                self.skip_parens()?;
             }
             self.expect_kw("AS")?;
             if self.peek_kw("EXEC") || self.peek_kw("EXECUTE") || self.peek_kw("CALL") {
@@ -3171,8 +3176,10 @@ impl<'a> Parser<'a> {
             self.select()?;
             let end = self.toks[self.pos].pos;
             let mut check = false;
-            if self.peek_kw("WITH") && self.peek_kw_at(1, "CHECK") {
+            if self.peek_kw("WITH") && (self.peek_kw_at(1, "CHECK") || ((self.peek_kw_at(1, "LOCAL") || self.peek_kw_at(1, "CASCADED")) && self.peek_kw_at(2, "CHECK"))) {
                 self.advance();
+                self.eat_kw("LOCAL");
+                self.eat_kw("CASCADED");
                 self.advance();
                 self.expect_kw("OPTION")?;
                 check = true;
@@ -3215,13 +3222,31 @@ impl<'a> Parser<'a> {
             let create = Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() };
             return Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: vec![other], partition_by: None, partition_of: None })));
         }
+        // CREATE TABLE t (a, b) AS SELECT ...: names for the columns of the query
+        let mut column_names: Vec<String> = Vec::new();
+        if self.peek_sym("(") {
+            let save_names = self.pos;
+            self.advance();
+            match self.ident_list() {
+                Ok(names) if self.eat_sym(")") && self.peek_kw("AS") => column_names = names,
+                _ => self.pos = save_names,
+            }
+        }
         if self.peek_kw("AS") || self.peek_kw("SELECT") || ((self.peek_kw("IGNORE") || self.peek_kw("REPLACE")) && self.peek_kw_at(1, "SELECT")) {
             if !self.peek_kw("SELECT") && !self.peek_kw("IGNORE") && !self.peek_kw("REPLACE") {
                 self.advance();
             } else if !self.peek_kw("SELECT") {
                 self.advance();
             }
-            let query = Box::new(self.select()?);
+            let mut query = Box::new(self.select()?);
+            if !column_names.is_empty() {
+                // the names are given to the columns of the query by a query around it
+                query = Box::new(Select {
+                    items: vec![SelectItem::Wildcard],
+                    from: Some(From { first: TableFactor::Derived { query, alias: "__q".into(), columns: column_names, lateral: false }, joins: Vec::new() }),
+                    ..Select::default()
+                });
+            }
             let mut with_data = true;
             if self.eat_kw("WITH") {
                 with_data = !self.eat_kw("NO");
@@ -3672,7 +3697,7 @@ impl<'a> Parser<'a> {
         }
         let (data_type, autonumber) = match &user {
             Some(u) => DataType::from_sql_name(&u.base).ok_or_else(|| Error::syntax(format!("unknown data type '{}'", u.base)))?,
-            None => DataType::from_sql_name(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?,
+            None => crate::sql::usertypes::resolve(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?,
         };
         let mut expression = None;
         if data_type == DataType::Calculated {
@@ -4046,7 +4071,7 @@ impl<'a> Parser<'a> {
             }
             self.eat_kw("TYPE");
             let type_name = self.type_name()?;
-            let (data_type, autonumber) = DataType::from_sql_name(&type_name)
+            let (data_type, autonumber) = crate::sql::usertypes::resolve(&type_name)
                 .ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
             if data_type == DataType::Calculated {
                 let expr = self.calculated_expression(&name)?;
@@ -4964,6 +4989,14 @@ impl<'a> Parser<'a> {
                 };
                 continue;
             }
+            if self.eat_kw("ISNULL") {
+                left = Expr::IsNull { expr: Box::new(left), negated: false };
+                continue;
+            }
+            if self.eat_kw("NOTNULL") {
+                left = Expr::IsNull { expr: Box::new(left), negated: true };
+                continue;
+            }
             if self.eat_kw("IS") {
                 let negated = self.eat_kw("NOT");
                 left = if self.eat_kw("DISTINCT") {
@@ -5665,6 +5698,17 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
+        // `int[]`, `text[][]`, `int[3]`: when lenient, an array is kept as text
+        if crate::sql::usertypes::lenient() {
+            let mut array = false;
+            while matches!(self.peek(), Tok::Quoted(q) if q.is_empty() || q.chars().all(|c| c.is_ascii_digit())) {
+                self.advance();
+                array = true;
+            }
+            if array {
+                return Ok("TEXT".into());
+            }
+        }
         Ok(first)
     }
 
@@ -5685,7 +5729,7 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
             return Ok(Expr::Function { name: "__TIMEOF".into(), args: vec![e], distinct: false, star: false });
         }
-        let (ty, _) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+        let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         let mut hints = Vec::new();
         if self.eat_sym("(") {
             while !self.peek_sym(")") && !self.at_eof() {
@@ -5703,7 +5747,7 @@ impl<'a> Parser<'a> {
     fn type_cast(&mut self, e: Expr) -> Result<Expr> {
         let tn = self.type_name()?;
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
-        let (ty, _) = DataType::from_sql_name(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+        let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         if ty == DataType::Calculated {
             return Err(Error::syntax("cannot cast to CALCULATED"));
         }

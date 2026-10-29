@@ -49,6 +49,7 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("geqo", "on", 'b'),
     ("cast_truncates", "on", 'b'),
     ("integer_division", "on", 'b'),
+    ("lenient_types", "off", 'b'),
     ("round_half_even", "on", 'b'),
     ("geqo_threshold", "12", 't'),
     ("gin_fuzzy_search_limit", "0", 't'),
