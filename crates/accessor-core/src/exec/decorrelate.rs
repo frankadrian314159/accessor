@@ -14,6 +14,7 @@
 //! anti-join). It also handles `IN (...)` and scalar sub-queries, including the common
 //! `(SELECT MAX(x) FROM t WHERE t.k = outer.k)`.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -36,6 +37,10 @@ pub(crate) struct Decorrelated {
     pub keys: Vec<Expr>,
     /// A scalar `COUNT`: a key with no rows counts 0, where other aggregates give NULL.
     pub counts: bool,
+    /// `EXISTS` only: conditions `inner OP outer value` that are not equalities (`<>`, `<`, ...), each as the comparison the
+    /// inner value makes with the outer value and the outer row position. The inner expressions follow the keys in the
+    /// query's columns, and a lookup keeps the rows for which every comparison holds.
+    pub residuals: Vec<(BinOp, usize)>,
 }
 
 fn split_and(e: Expr, out: &mut Vec<Expr>) {
@@ -107,6 +112,7 @@ pub(crate) fn decorrelate(spec: &CorrSpec) -> Option<Decorrelated> {
     let mut conjuncts = Vec::new();
     split_and(q.filter.clone()?, &mut conjuncts);
     let (mut keys, mut params, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut res_exprs, mut res_params): (Vec<Expr>, Vec<(BinOp, String)>) = (Vec::new(), Vec::new());
     for c in conjuncts {
         let split = match &c {
             Expr::Binary { op: BinOp::Eq, left, right } => match (&**left, &**right) {
@@ -115,12 +121,38 @@ pub(crate) fn decorrelate(spec: &CorrSpec) -> Option<Decorrelated> {
             },
             _ => None,
         };
-        match split {
-            Some((inner, p)) => {
+        // `inner <> outer`, `outer < inner`, ...: kept as a residual, tested on the rows a key finds
+        let residual = match &c {
+            Expr::Binary { op: op @ (BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), left, right }
+                if split.is_none() && matches!(spec.kind, CorrKind::Exists { .. }) =>
+            {
+                match (&**left, &**right) {
+                    (inner, Expr::Param(p)) if param_count(inner) == 0 => Some((inner.clone(), *op, p.clone())),
+                    (Expr::Param(p), inner) if param_count(inner) == 0 => {
+                        let flipped = match op {
+                            BinOp::Lt => BinOp::Gt,
+                            BinOp::Le => BinOp::Ge,
+                            BinOp::Gt => BinOp::Lt,
+                            BinOp::Ge => BinOp::Le,
+                            other => *other,
+                        };
+                        Some((inner.clone(), flipped, p.clone()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match (split, residual) {
+            (Some((inner, p)), _) => {
                 keys.push(inner);
                 params.push(p);
             }
-            None => rest.push(c),
+            (None, Some((inner, op, p))) => {
+                res_exprs.push(inner);
+                res_params.push((op, p));
+            }
+            (None, None) => rest.push(c),
         }
     }
     if keys.is_empty() {
@@ -135,12 +167,17 @@ pub(crate) fn decorrelate(spec: &CorrSpec) -> Option<Decorrelated> {
         }
         Ok(())
     });
-    if total != keys.len() {
+    if total != keys.len() + res_exprs.len() {
         return None;
     }
     let outer = params
         .iter()
         .map(|p| spec.outer.iter().find(|(n, _)| n == p).map(|(_, pos)| *pos))
+        .collect::<Option<Vec<_>>>()?;
+
+    let residuals = res_params
+        .iter()
+        .map(|(op, p)| spec.outer.iter().find(|(n, _)| n == p).map(|(_, pos)| (*op, *pos)))
         .collect::<Option<Vec<_>>>()?;
 
     let mut nq = q.clone();
@@ -151,12 +188,13 @@ pub(crate) fn decorrelate(spec: &CorrSpec) -> Option<Decorrelated> {
         .iter()
         .enumerate()
         .map(|(i, k)| SelectItem::Expr { expr: k.clone(), alias: Some(format!("__k{i}")) })
+        .chain(res_exprs.iter().enumerate().map(|(i, e)| SelectItem::Expr { expr: e.clone(), alias: Some(format!("__r{i}")) }))
         .chain(value.map(|v| SelectItem::Expr { expr: v, alias: Some("__v".into()) }))
         .collect();
     if aggregate {
         nq.group_by = keys.clone();
     }
-    Some(Decorrelated { query: nq, outer, keys, counts })
+    Some(Decorrelated { query: nq, outer, keys, counts, residuals })
 }
 
 /// What kind of value this is, for deciding whether a hash lookup agrees with `=`.
@@ -177,6 +215,9 @@ pub(crate) struct Hashed {
     outer: Vec<usize>,
     map: HashMap<Vec<Value>, Arc<Vec<Row>>>,
     empty: Arc<Vec<Row>>,
+    /// What a lookup gives when a row passes the residuals: one row without columns.
+    found: Arc<Vec<Row>>,
+    residuals: Vec<(BinOp, usize)>,
     /// The kind of each key in the inner rows (`None`: no rows; `Some(0)`: mixed kinds).
     families: Vec<Option<u8>>,
     pub inner_rows: usize,
@@ -197,6 +238,28 @@ impl Hashed {
             return Arc::clone(&self.empty);
         }
         self.map.get(key).map_or_else(|| Arc::clone(&self.empty), Arc::clone)
+    }
+
+    /// The answer for an outer row: what its key finds, and with residuals (`EXISTS` only) a row when some inner row
+    /// satisfies all of them against this outer row's values. A comparison with NULL is not satisfied.
+    pub(crate) fn lookup_for(&self, key: &[Value], row: &Row) -> Arc<Vec<Row>> {
+        let found = self.lookup(key);
+        if self.residuals.is_empty() || found.is_empty() {
+            return found;
+        }
+        let holds = |inner: &Row| {
+            self.residuals.iter().enumerate().all(|(j, &(op, pos))| match inner[j].sql_cmp(&row[pos]) {
+                None => false,
+                Some(ord) => match op {
+                    BinOp::Ne => ord != Ordering::Equal,
+                    BinOp::Lt => ord == Ordering::Less,
+                    BinOp::Le => ord != Ordering::Greater,
+                    BinOp::Gt => ord == Ordering::Greater,
+                    _ => ord != Ordering::Less,
+                },
+            })
+        };
+        if found.iter().any(holds) { Arc::clone(&self.found) } else { Arc::clone(&self.empty) }
     }
 }
 
@@ -248,6 +311,7 @@ impl Database {
         let inner_rows = res.rows.len();
         let map = grouped.into_iter().map(|(key, rows)| (key, Arc::new(rows))).collect();
         let empty = Arc::new(if d.counts { vec![vec![Value::Int(0)]] } else { Vec::new() });
-        Ok(Some(Hashed { outer: d.outer, map, empty, families, inner_rows }))
+        let found = Arc::new(vec![Vec::new()]);
+        Ok(Some(Hashed { outer: d.outer, map, empty, found, residuals: d.residuals, families, inner_rows }))
     }
 }

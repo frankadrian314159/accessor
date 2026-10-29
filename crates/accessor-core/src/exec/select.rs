@@ -52,7 +52,7 @@ pub(crate) struct Source<'a> {
 }
 
 impl Source<'_> {
-    fn ncols(&self) -> usize {
+    pub(crate) fn ncols(&self) -> usize {
         self.names.len()
     }
     fn slot_count(&self) -> usize {
@@ -529,10 +529,11 @@ impl Database {
             || sel.having.as_ref().is_some_and(contains_agg)
             || sel.order_by.iter().any(|o| contains_agg(&o.expr));
 
+        let source_aliases: Vec<String> = sources.iter().map(|s| s.alias.clone()).collect();
         let mut binder = Binder::new(self, &scope, depth);
         binder.allow_corr = true;
         binder.windows = sel.windows.clone();
-        let mut filter = sel.filter.as_ref().map(|f| binder.bind(f)).transpose()?;
+        let mut filter = sel.filter.as_ref().map(|f| binder.bind(&super::optimizer::factor_or(f))).transpose()?;
         // A merged view's own condition joins the query's when it reads a single source.
         if sources.len() == 1 && !sources[0].intrinsic.is_empty() {
             for extra in std::mem::take(&mut sources[0].intrinsic) {
@@ -543,8 +544,23 @@ impl Database {
             }
         }
         if is_agg {
-            let exprs = sel.group_by.iter().map(|g| binder.bind(g)).collect::<Result<Vec<_>>>()?;
-            binder.group = Some(GroupCtx { exprs, asts: sel.group_by.clone(), aggs: Vec::new() });
+            // GROUP BY 1, 2 names select items by position, and a name that is no column reads as the item of that alias
+            let asts: Vec<Expr> = sel
+                .group_by
+                .iter()
+                .map(|g| match g {
+                    Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= n_vis && !contains_agg(&out_items[*n as usize - 1].1) => {
+                        out_items[*n as usize - 1].1.clone()
+                    }
+                    Expr::Column { table: None, name } if binder.bind(g).is_err() => out_items
+                        .iter()
+                        .find(|(n, e)| n.eq_ignore_ascii_case(name) && !contains_agg(e))
+                        .map_or_else(|| g.clone(), |(_, e)| e.clone()),
+                    _ => g.clone(),
+                })
+                .collect();
+            let exprs = asts.iter().map(|g| binder.bind(g)).collect::<Result<Vec<_>>>()?;
+            binder.group = Some(GroupCtx { exprs, asts, aggs: Vec::new() });
         }
         binder.allow_win = true;
         let out_b = out_items.iter().map(|(_, e)| binder.bind(e)).collect::<Result<Vec<_>>>()?;
@@ -570,6 +586,14 @@ impl Database {
                             let mut e = other.clone();
                             let mut changed = false;
                             crate::sql::walk::walk_expr(&mut e, &mut |x| {
+                                // a qualifier that names no source (`FROM v2 ... ORDER BY v1.col`, which other servers
+                                // accept) is dropped, and the column is read by its name
+                                if let Expr::Column { table: Some(t), name } = x {
+                                    if !source_aliases.iter().any(|a| a.eq_ignore_ascii_case(t)) {
+                                        *x = Expr::Column { table: None, name: name.clone() };
+                                        changed = true;
+                                    }
+                                }
                                 if let Expr::Column { table: None, name } = x {
                                     if let Some((_, item)) = out_items.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
                                         *x = item.clone();
@@ -778,7 +802,7 @@ impl Database {
                 let key: Vec<Value> = spec.outer.iter().map(|(_, c)| row[*c].clone()).collect();
                 let fast = hash.as_ref().and_then(|h| {
                     let k = h.key_of(row);
-                    h.can_answer(&k).then(|| h.lookup(&k))
+                    h.can_answer(&k).then(|| h.lookup_for(&k, row))
                 });
                 let result = match fast {
                     Some(r) => {
@@ -995,6 +1019,26 @@ impl Database {
 
         // Inner and cross joins may be done in any order; outer joins keep theirs.
         let reorder = optimize && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross));
+        // `a LEFT JOIN b ON .. , c, d`: when the ON conditions of the left joins read only the tables that are not
+        // null-extended and their own table, those tables can be joined in any order first and the left joins done last,
+        // in the order written. A left join only adds columns to rows it keeps, so the result is the same, and the
+        // tables that filter `a` no longer wait behind a join of all of `a`.
+        let mut null_ext: SourceMask = 0;
+        for (k, kind) in kinds.iter().enumerate() {
+            if *kind == JoinKind::Left {
+                null_ext |= bit(k + 1);
+            }
+        }
+        let hoist = optimize
+            && !reorder
+            && null_ext != 0
+            && m <= 64
+            && kinds.iter().all(|k| matches!(k, JoinKind::Inner | JoinKind::Cross | JoinKind::Left))
+            && !sources.iter().any(|s| matches!(s.data, SourceData::Lateral(_)))
+            && on_b.iter().enumerate().all(|(k, ob)| {
+                let mask = ob.as_ref().map_or(0, |ob| source_mask(ob, &offs));
+                if kinds[k] == JoinKind::Left { mask & null_ext & !bit(k + 1) == 0 } else { mask & null_ext == 0 }
+            });
 
         // The conditions, each with the sources it reads.
         let mut preds: Vec<Pred> = Vec::new();
@@ -1009,10 +1053,19 @@ impl Database {
                     }
                 }
             } else {
+                if hoist {
+                    for (k, ob) in on_b.iter().enumerate() {
+                        if let (Some(ob), true) = (ob, kinds[k] != JoinKind::Left) {
+                            for c in split_and(ob) {
+                                preds.push(Pred { expr: c.clone(), mask: source_mask(c, &offs), from_where: false, used: false });
+                            }
+                        }
+                    }
+                }
                 // A LEFT or INNER join's ON condition on the joined table alone can
                 // filter that table before the join.
                 for (k, ob) in on_b.iter().enumerate() {
-                    if let (Some(ob), true) = (ob, matches!(kinds[k], JoinKind::Inner | JoinKind::Left)) {
+                    if let (Some(ob), true) = (ob, matches!(kinds[k], JoinKind::Inner | JoinKind::Left) && !(hoist && kinds[k] == JoinKind::Inner)) {
                         for c in split_and(ob) {
                             if source_mask(c, &offs) == 1 << (k + 1) {
                                 preds.push(Pred { expr: c.clone(), mask: 1 << (k + 1), from_where: false, used: false });
@@ -1073,7 +1126,23 @@ impl Database {
                 est[s] = 1.0;
             }
         }
-        let order: Vec<usize> = if reorder { choose_order(sources, &est, &preds, &offs, &deps) } else { (0..m).collect() };
+        if hoist {
+            let core: SourceMask = (0..m).fold(0, |acc, s| acc | bit(s)) & !null_ext;
+            for s in 0..m {
+                if null_ext & bit(s) != 0 {
+                    deps[s] |= core;
+                }
+            }
+        }
+        let order: Vec<usize> = if reorder || hoist { choose_order(sources, &est, &preds, &offs, &deps, if hoist { null_ext } else { 0 }) } else { (0..m).collect() };
+        // the left joins keep the order written
+        let order: Vec<usize> = if hoist {
+            let mut o: Vec<usize> = order.into_iter().filter(|&s| null_ext & bit(s) == 0).collect();
+            o.extend((0..m).filter(|&s| null_ext & bit(s) != 0));
+            o
+        } else {
+            order
+        };
         let reordered = order.iter().enumerate().any(|(i, &s)| i != s);
         self.note(depth, || {
             let names: Vec<&str> = order.iter().map(|&s| sources[s].alias.as_str()).collect();
@@ -1119,7 +1188,9 @@ impl Database {
         for (step, &s) in order.iter().enumerate().skip(1) {
             let right = &sources[s];
             placed |= bit(s);
-            let (kind, on) = if reorder {
+            let (kind, on) = if hoist && null_ext & bit(s) != 0 {
+                (JoinKind::Left, on_b[s - 1].as_ref().map(|ob| ob.map_cols(&colmap)))
+            } else if reorder || hoist {
                 let ready: Vec<BExpr> = preds
                     .iter_mut()
                     .filter(|p| !p.used && p.mask != 0 && p.mask & !placed == 0)
@@ -1155,7 +1226,7 @@ impl Database {
             width += right.ncols();
         }
 
-        if reorder {
+        if reorder || hoist {
             if reordered {
                 let mut out = Vec::with_capacity(rows.len());
                 for r in &rows {
@@ -1167,14 +1238,17 @@ impl Database {
                 }
                 rows = out;
             }
-        } else if let Some(f) = filter {
-            let mut kept = Vec::with_capacity(rows.len());
-            for r in rows {
-                if f.eval_bool(&r)? {
-                    kept.push(r);
+        }
+        if !reorder {
+            if let Some(f) = filter {
+                let mut kept = Vec::with_capacity(rows.len());
+                for r in rows {
+                    if f.eval_bool(&r)? {
+                        kept.push(r);
+                    }
                 }
+                rows = kept;
             }
-            rows = kept;
         }
         Ok(rows)
     }

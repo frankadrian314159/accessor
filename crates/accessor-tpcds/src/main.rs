@@ -2,7 +2,9 @@
 //! values differ from the official answers) for the three sales channels with their returns, the inventory and the
 //! dimensions, and a selection of the benchmark's queries (see `queries.rs`). Each query must run, finish in time, and
 //! (with `--compare`) give the same rows with the optimizer off and on data without indexes.
-//! Usage: `accessor-tpcds [--sf 0.01] [--seed N] [--compare] [--only 3,7] [--no-indexes] [--explain] [--timeout SECONDS]`.
+//! With `--kit DIR` it instead loads the data of the official `dsdgen`, runs the 99 queries of `dsqgen` and compares each result with
+//! the kit's answer set (see `kit.rs`). Usage: `accessor-tpcds [--kit DIR [--db FILE]] [--sf 0.01] [--seed N] [--compare] [--only 3,7] [--no-indexes] [--explain] [--timeout SECONDS] [--repl]`.
+mod kit;
 mod queries;
 
 use std::fmt::Write as _;
@@ -107,7 +109,7 @@ CREATE TABLE web_returns (wr_returned_date_sk INTEGER, wr_item_sk INTEGER NOT NU
   PRIMARY KEY (wr_item_sk, wr_order_number));
 CREATE TABLE inventory (inv_date_sk INTEGER NOT NULL, inv_item_sk INTEGER NOT NULL, inv_warehouse_sk INTEGER NOT NULL, inv_quantity_on_hand INTEGER, PRIMARY KEY (inv_date_sk, inv_item_sk, inv_warehouse_sk));";
 
-const INDEXES: &str = "
+pub(crate) const INDEXES: &str = "
 CREATE INDEX d_year ON date_dim (d_year, d_moy);
 CREATE INDEX d_month_seq ON date_dim (d_month_seq);
 CREATE INDEX d_date ON date_dim (d_date);
@@ -121,6 +123,8 @@ CREATE INDEX ss_store ON store_sales (ss_store_sk);
 CREATE INDEX sr_ticket ON store_returns (sr_customer_sk, sr_item_sk, sr_ticket_number);
 CREATE INDEX cs_date ON catalog_sales (cs_sold_date_sk);
 CREATE INDEX cs_customer ON catalog_sales (cs_bill_customer_sk, cs_item_sk);
+CREATE INDEX cs_order ON catalog_sales (cs_order_number);
+CREATE INDEX ws_order ON web_sales (ws_order_number);
 CREATE INDEX ws_date ON web_sales (ws_sold_date_sk);
 CREATE INDEX ws_customer ON web_sales (ws_bill_customer_sk);
 CREATE INDEX inv_item ON inventory (inv_item_sk);";
@@ -148,7 +152,7 @@ fn load(db: &mut Database, sf: f64, seed: u64) -> Sizes {
     let n_wh = 5;
     let n_site = 6;
     let n_reason = 35;
-    let mut put = |db: &mut Database, table: &str, csv: &mut String| {
+    let put = |db: &mut Database, table: &str, csv: &mut String| {
         import_csv(db, table, csv, false).unwrap_or_else(|e| panic!("loading {table}: {e}"));
         csv.clear();
     };
@@ -431,7 +435,7 @@ fn rows_of(n: usize) -> i64 {
     n as i64
 }
 
-fn run(db: &mut Database, sql: &str) -> Result<(Vec<String>, Duration), String> {
+pub(crate) fn run(db: &mut Database, sql: &str) -> Result<(Vec<String>, Duration), String> {
     let t = Instant::now();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.execute(sql))) {
         Err(_) => Err("PANIC".into()),
@@ -442,6 +446,9 @@ fn run(db: &mut Database, sql: &str) -> Result<(Vec<String>, Duration), String> 
 
 fn main() {
     let mut explain = false;
+    let mut repl = false;
+    let mut kit: Option<String> = None;
+    let mut db_file: Option<String> = None;
     let mut extra: Vec<String> = Vec::new();
     let (mut sf, mut seed, mut compare, mut only, mut indexes, mut timeout) = (0.01f64, 1u64, false, Vec::<u32>::new(), true, 120u64);
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -452,12 +459,19 @@ fn main() {
             "--seed" => seed = it.next().and_then(|v| v.parse().ok()).expect("--seed N"),
             "--compare" => compare = true,
             "--explain" => explain = true,
+            "--repl" => repl = true,
+            "--db" => db_file = Some(it.next().expect("--db FILE").clone()),
+            "--kit" => kit = Some(it.next().expect("--kit DIR").clone()),
             "--sql" => extra.push(it.next().expect("--sql QUERY").clone()),
             "--no-indexes" => indexes = false,
             "--timeout" => timeout = it.next().and_then(|v| v.parse().ok()).expect("--timeout SECONDS"),
             "--only" => only = it.next().expect("--only 1,2").split(',').filter_map(|v| v.parse().ok()).collect(),
             other => panic!("unknown argument {other}"),
         }
+    }
+    if let Some(dir) = kit {
+        let bad = kit::main(&dir, db_file.as_deref(), &only, indexes, timeout, explain, &extra, repl);
+        std::process::exit(if bad > 0 { 1 } else { 0 });
     }
     let mut db = Database::in_memory();
     let started = Instant::now();

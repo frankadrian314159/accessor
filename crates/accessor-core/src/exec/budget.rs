@@ -14,22 +14,32 @@ pub(crate) const EXPIRED: &str = "canceling statement due to statement timeout";
 thread_local! {
     static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
     static TICKS: Cell<u32> = const { Cell::new(0) };
+    static VALUES: Cell<usize> = const { Cell::new(MIN_VALUES) };
 }
 
+/// The smallest and the largest join result (values: rows times columns) that [`rows`] lets a statement under a time limit build.
+const MIN_VALUES: usize = 16_000_000;
+const MAX_VALUES: usize = 200_000_000;
+
 /// Puts the statement under a limit until the guard is dropped (the sooner of this and any limit already in force).
-pub(crate) struct Guard(Option<Instant>);
+pub(crate) struct Guard(Option<Instant>, usize);
 
 pub(crate) fn limit(after: Duration) -> Guard {
     let new = Instant::now() + after;
     let old = DEADLINE.with(|d| d.get());
     DEADLINE.with(|d| d.set(Some(old.map_or(new, |o| o.min(new)))));
-    Guard(old)
+    // the longer a statement may run, the larger a result it may build: 4 million values for each second
+    let old_values = VALUES.with(|v| v.get());
+    let values = (after.as_secs() as usize).saturating_mul(4_000_000).clamp(MIN_VALUES, MAX_VALUES);
+    VALUES.with(|v| v.set(if old.is_some() { old_values.min(values) } else { values }));
+    Guard(old, old_values)
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         let old = self.0;
         DEADLINE.with(|d| d.set(old));
+        VALUES.with(|v| v.set(self.1));
     }
 }
 
@@ -51,11 +61,11 @@ pub(crate) fn tick() -> Result<()> {
     Ok(())
 }
 
-/// Under a time limit, a result with this many values (rows times columns) is not worth waiting for either, and may not fit
+/// Under a time limit, a result with too many values (rows times columns) is not worth waiting for either, and may not fit
 /// in memory: it ends like a timeout. Wide rows reach it sooner, so a join of a few million narrow rows, as in TPC-H at a scale
-/// factor of 0.5, still runs.
+/// factor of 0.5, still runs. The limit is 16 million values for a short budget and grows with the time given (see [`limit`]).
 pub(crate) fn rows(n: usize, width: usize) -> Result<()> {
-    if n >= 262_144 && n & 0xFFFF == 0 && n.saturating_mul(width.max(1)) >= 16_000_000 && DEADLINE.with(|d| d.get()).is_some() {
+    if n >= 262_144 && n & 0xFFFF == 0 && n.saturating_mul(width.max(1)) >= VALUES.with(|v| v.get()) && DEADLINE.with(|d| d.get()).is_some() {
         return Err(Error::runtime(EXPIRED));
     }
     Ok(())

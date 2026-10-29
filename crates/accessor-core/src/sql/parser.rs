@@ -75,6 +75,21 @@ fn is_interval_unit(u: &str) -> bool {
     matches!(u.to_ascii_uppercase().as_str(), "MICROSECOND" | "SECOND" | "MINUTE" | "HOUR" | "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR")
 }
 
+/// The unit of a labelled duration, `date + 30 days` (Db2, and the TPC-DS query templates): the plural word only, so that
+/// `x + 1 day` still names a column `day`.
+fn duration_unit(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_uppercase().as_str() {
+        "DAYS" => "DAY",
+        "WEEKS" => "WEEK",
+        "MONTHS" => "MONTH",
+        "YEARS" => "YEAR",
+        "HOURS" => "HOUR",
+        "MINUTES" => "MINUTE",
+        "SECONDS" => "SECOND",
+        _ => return None,
+    })
+}
+
 /// `date + INTERVAL n unit` (or `-`) as `DATEADD`.
 fn interval_add(date: Expr, interval: Expr, subtract: bool) -> Expr {
     let Expr::Function { mut args, .. } = interval else { return date };
@@ -4709,8 +4724,8 @@ impl<'a> Parser<'a> {
             self.advance();
             let query = Box::new(self.select()?);
             self.expect_sym(")")?;
-            self.eat_kw("AS");
-            let alias = self.ident()?;
+            // the alias is optional, as in PostgreSQL 16 and the TPC-DS queries
+            let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { format!("__sub{}", self.pos) };
             let columns = if self.eat_sym("(") {
                 let c = self.ident_list()?;
                 self.expect_sym(")")?;
@@ -5019,7 +5034,15 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.advance();
-            let right = self.multiplicative()?;
+            let mut right = self.multiplicative()?;
+            let unit = match self.peek() {
+                Tok::Ident(w) => duration_unit(w),
+                _ => None,
+            };
+            if let Some(unit) = unit {
+                self.advance();
+                right = Expr::Function { name: "__INTERVAL".into(), args: vec![right, Expr::Literal(Value::text(unit))], distinct: false, star: false };
+            }
             let is_iv = |e: &Expr| matches!(e, Expr::Function { name, .. } if name == "__INTERVAL");
             left = if is_iv(&right) {
                 interval_add(left, right, op == BinOp::Sub)

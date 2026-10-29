@@ -32,9 +32,13 @@ SELECT O.CustID FROM Orders O WHERE O.Total > 100
 
 The correlation may be several equalities (`O.A = C.A AND O.B = C.B`); the inner side of each may be any expression that reads only the sub-query's own tables. The sub-query may have other conditions, joins and sub-queries of its own.
 
+### A comparison besides the equalities
+
+An `EXISTS` or `NOT EXISTS` may also have comparisons `<>`, `<`, `<=`, `>` or `>=` between an inner expression and an outer column, as in `EXISTS (SELECT * FROM catalog_sales cs2 WHERE cs1.order_no = cs2.order_no AND cs1.warehouse <> cs2.warehouse)` ("another warehouse shipped part of this order"). The sub-query is still run once, keyed on the equalities, and also selects the inner side of each comparison. An outer row then looks up its key and keeps the answer if some inner row passes every comparison against that row's own values. A comparison with NULL does not pass. Before this, such a sub-query ran once per outer key with a scan of the inner table each time: TPC-DS query 16 took 362 s, and takes 8.5 s without an index and under a second with one on the order number.
+
 It is **not** used (the one-run-per-key method is kept) when
 
-* a correlated condition is not an equality (`O.Total > C.Credit`), or an outer column is used anywhere but in such an equality (in the select list, a join condition, a nested sub-query);
+* a correlated condition is not an equality, or in an `EXISTS` a comparison of an inner expression with an outer column (`O.Total > C.Credit` is such a comparison; `O.Total > C.Credit * 2` is not), or an outer column is used anywhere else (in the select list, a join condition, a nested sub-query), or a comparison is used in an `IN` or scalar sub-query;
 * the sub-query has `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `TOP`, a window function, a set operator, or an aggregate mixed into a larger expression;
 * an equality compares values of different kinds, such as a number with text. The two are compared by converting, which a hash lookup cannot do, so those rows use the one-at-a-time method;
 * it would not pay.

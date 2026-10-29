@@ -11,11 +11,16 @@ For inner and cross joins any order is allowed, so the optimizer picks one.
 | The `FROM` clause has... | Order |
 | --- | --- |
 | only `INNER JOIN`, `JOIN`, `CROSS JOIN`, comma joins, `USING` and `NATURAL` joins | chosen by the optimizer |
-| any `LEFT`, `RIGHT` or `FULL` join | as written |
+| `LEFT` joins whose `ON` condition reads only the table it joins and tables that no left join pads with NULLs, mixed with inner and cross joins | the other tables in the order chosen by the optimizer, then the left joins last, in the order written ([below](#left-joins-go-last)) |
+| any `RIGHT` or `FULL` join, or a `LEFT` join whose `ON` reads another left-joined table | as written |
 | more than 128 tables | as written (and without the optimizer's pushdown, so the conditions are applied after all the joins: keep such queries small) |
 | the optimizer switched off | as written |
 
-Outer joins are left alone because moving a table across an outer join can change which rows are padded with NULLs.
+Outer joins are otherwise left alone because moving a table across an outer join can change which rows are padded with NULLs.
+
+### Left joins go last
+
+`FROM catalog_sales LEFT JOIN catalog_returns ON (...), warehouse, item, date_dim WHERE ...` keeps every `catalog_sales` row and adds the matching return, if any. A left join only adds columns to the rows it keeps, so it can be done after the tables that filter `catalog_sales`, with the same result. The optimizer does that: the inner and cross joins are ordered as usual, using the `WHERE` and their own `ON` conditions, and each left join follows, in the order written, probing or hashing the small set of rows that is left instead of the whole first table. This applies when the `ON` condition of every left join reads only the joined table and tables that no left join pads. A `WHERE` condition on a padded table is applied after the joins, as before. Without it, such a query joined all of its first table to the padded table before any filter ran: TPC-DS query 40 failed after 27 s, and query 49 took more than ten minutes; both now run in seconds.
 
 The order you write has no effect on a reorderable query, and neither does the choice between `ON` and `WHERE` for the join conditions ([pushdown.md](pushdown.md#inner-joins-on-and-where-are-the-same)). The columns of `SELECT *` and the order of qualified names are still those of the tables as you wrote them: the rows are built in the join order and then rearranged back to the written column layout before the rest of the query sees them.
 
@@ -24,19 +29,19 @@ The order you write has no effect on a reorderable query, and neither does the c
 The optimizer works greedily, one table at a time:
 
 1. **Estimate each table.** For every table it estimates how many rows remain after that table's own pushed-down conditions ([estimates.md](estimates.md)).
-2. **Start with the smallest.** The table with the fewest estimated rows goes first. Ties go to the table written first.
+2. **Try each table as the start.** The greedy steps below are run once from every table (for up to 16 tables; with more, only from the smallest). Each order is costed by the values it builds: the rows after each step times the width of those rows. The table with the fewest estimated rows is the usual start, and it is kept unless another start costs less than half as much. Starting from the smallest table is wrong when it links only to the largest one: a 5-row `warehouse` joined first to a 12-million-row `inventory` builds all 12 million rows before the date filter on a third table is applied, whereas starting from the filtered `date_dim` reads only the weeks in range. Left-joined tables that go last ([above](#left-joins-go-last)) are not part of the choice.
 3. **Add the cheapest next table.** For each table not yet placed, it asks how that table can be reached from the tables already joined:
 
    | Reach | Meaning | Estimated rows out | Work |
    | --- | --- | --- | --- |
-   | **unique** | an equality links it to the joined tables and a unique index covers the linked columns, so each row matches at most one | the rows so far (no growth) | one lookup per row |
-   | **index** | an equality links it and some index starts with a linked column, and probing it is [worth it](#when-an-index-is-not-worth-probing) | the equality-join estimate below | one lookup per row |
+   | **unique** | an equality links it to the joined tables and a unique index covers the linked columns, so each row matches at most one | the rows so far, times the share of the table that its own conditions leave | one lookup per row |
+   | **index** | an equality links it and some index starts with linked columns, and probing it is [worth it](#when-an-index-is-not-worth-probing) | the rows so far × the rows one probe finds (the table's rows over the distinct values of the linked index columns) × the share of the table that its own conditions leave | one lookup per row |
    | **hash** | an equality links it but no index helps | the equality-join estimate below | rows so far + the table's rows |
    | **cross** | no equality links it to the joined tables | the product of the two | the product |
 
    It picks the table with the **fewest rows out**, using the work as the tie-break and then the written order. A table with no join condition to the rest is therefore left until last, so that Cartesian products are done on the smallest possible inputs.
 
-The equality-join estimate is rows so far × the table's rows ÷ the larger distinct count of the two join columns, from the [column statistics](estimates.md#the-estimate-for-a-join). For a foreign key joined to its primary key that is about as many rows as the many side has; for two columns with few distinct values it is a large multiple, which is why such a join is left until the other tables have thinned the inputs. Without statistics for both columns (a derived table, say) the estimate is the larger of the two inputs. It is a guess, not a measurement.
+The equality-join estimate (for a **hash** reach) is rows so far × the table's rows ÷ the larger distinct count of the two join columns, from the [column statistics](estimates.md#the-estimate-for-a-join), counted over the whole table, not only the rows its conditions leave. For a foreign key joined to its primary key that is about as many rows as the many side has; for two columns with few distinct values it is a large multiple, which is why such a join is left until the other tables have thinned the inputs. Without statistics for both columns (a derived table, say) the estimate is the larger of the two inputs. It is a guess, not a measurement.
 
 Each step applies the join conditions that have just become available ([pushdown.md](pushdown.md)).
 

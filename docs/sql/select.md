@@ -42,7 +42,7 @@ FROM (SELECT ...) AS D (a, b)           -- with names for its columns
 FROM (VALUES (1, 'a'), (2, 'b')) AS V (n, s)
 ```
 
-Each source can be a table, a saved query (view), or a parenthesised query. A derived table needs an alias.
+Each source can be a table, a saved query (view), or a parenthesised query. A derived table may omit its alias, as in PostgreSQL 16; give it one to refer to its columns by name.
 
 ### Join types
 
@@ -94,6 +94,8 @@ ORDER BY Mean DESC;
 The argument of an aggregate may hold a sub-query that reads columns of the row it is computed for: `SUM(CASE WHEN EXISTS (SELECT 1 FROM T s WHERE s.k = T.k AND s.id <> T.id) THEN 1 ELSE 0 END)`.
 
 A column in the select list (or in `HAVING` or `ORDER BY`) that is neither a `GROUP BY` expression nor inside an aggregate is allowed, as in SQLite and MySQL: it has the value it has in the **first row** of the group, exactly as `ANY_VALUE(column)` would give it. Which row that is depends on the order the rows are read in, so use it only when the value is the same for the whole group (a column that depends on the grouped one), or write `ANY_VALUE` to say so. (The SQL standard, PostgreSQL and SQL Server refuse such a query.) An aggregate query with no `GROUP BY` forms one group, and returns exactly one row even over no input. The aggregate functions are listed in [../functions/aggregate.md](../functions/aggregate.md).
+
+`GROUP BY` can name a select item by its position (`GROUP BY 1, 2`) or by its output alias when no column has that name. In an `ORDER BY` expression, a column qualified by a name that is not in the `FROM` clause (`... FROM v2 ORDER BY v1.s_store_name`, as written in TPC-DS queries 47 and 57) is read by its name alone, as other servers do.
 
 ### ROLLUP, CUBE and GROUPING SETS
 

@@ -5371,3 +5371,29 @@ fn constraint_names_belong_to_a_table_and_column_renames_need_no_keyword() {
     assert_eq!(db.execute("SELECT b FROM c1").unwrap().rows[0][0].to_string(), "1");
     db.execute("CREATE DATABASE d1; DROP DATABASE IF EXISTS d1 WITH (FORCE)").unwrap();
 }
+
+#[test]
+fn exists_with_a_residual_comparison_becomes_a_semi_join() {
+    let mut db = big_customers();
+    let queries = [
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total <> c.ID) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total > c.ID) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND c.ID <= o.Total) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total < c.ID AND o.Total <> 40) ORDER BY ID",
+        "SELECT ID FROM Cust c WHERE NOT EXISTS (SELECT 1 FROM Ord o WHERE o.CustID = c.ID AND o.Total <> c.ID) ORDER BY ID",
+    ];
+    for sql in queries {
+        db.set_optimizer(true);
+        let on = rows(&db, sql);
+        db.set_optimizer(false);
+        let off = rows(&db, sql);
+        assert_eq!(on, off, "{sql}");
+    }
+    db.set_optimizer(true);
+    // The inner query ran once, and the residual was tested on what each key found.
+    for sql in queries {
+        let plan = plan_text(&db, sql);
+        assert!(plan.contains("semi-join") && plan.contains(", 0 separate run(s)"), "{sql}
+{plan}");
+    }
+}

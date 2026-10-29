@@ -28,9 +28,66 @@ use super::select::{choose_access, Access, Source, SourceData};
 use crate::database::Database;
 use crate::expr::BExpr;
 use crate::schema::IndexDef;
-use crate::sql::ast::{BinOp, JoinKind};
+use crate::sql::ast::{BinOp, Expr, JoinKind};
 use crate::storage::Table;
 use crate::value::Value;
+
+/// Factors the conditions every branch of an `OR` shares out of it: `(a AND x) OR (a AND y)` becomes `a AND (x OR y)`.
+/// The two are equal in three-valued logic, and the shared conditions, join keys among them, are then conditions of the
+/// query itself, so the joins can use them instead of building every combination of rows first (TPC-DS 13, 48).
+pub(crate) fn factor_or(e: &Expr) -> Expr {
+    fn split(e: &Expr, op: BinOp, out: &mut Vec<Expr>) {
+        match e {
+            Expr::Binary { op: o, left, right } if *o == op => {
+                split(left, op, out);
+                split(right, op, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    fn join(mut parts: Vec<Expr>, op: BinOp) -> Option<Expr> {
+        let last = parts.pop()?;
+        Some(parts.into_iter().rev().fold(last, |acc, x| Expr::Binary { op, left: Box::new(x), right: Box::new(acc) }))
+    }
+    match e {
+        Expr::Binary { op: BinOp::And, left, right } => {
+            Expr::Binary { op: BinOp::And, left: Box::new(factor_or(left)), right: Box::new(factor_or(right)) }
+        }
+        Expr::Binary { op: BinOp::Or, .. } => {
+            let mut branches = Vec::new();
+            split(e, BinOp::Or, &mut branches);
+            let mut parts: Vec<Vec<Expr>> = branches
+                .iter()
+                .map(|b| {
+                    let mut v = Vec::new();
+                    split(b, BinOp::And, &mut v);
+                    v
+                })
+                .collect();
+            let mut common: Vec<Expr> = Vec::new();
+            for c in &parts[0] {
+                if !common.contains(c) && parts[1..].iter().all(|p| p.contains(c)) {
+                    common.push(c.clone());
+                }
+            }
+            if common.is_empty() {
+                return e.clone();
+            }
+            for p in &mut parts {
+                p.retain(|c| !common.contains(c));
+            }
+            // a branch with nothing left is true, and so is the whole OR
+            let rest = if parts.iter().any(Vec::is_empty) {
+                None
+            } else {
+                join(parts.into_iter().filter_map(|p| join(p, BinOp::And)).collect(), BinOp::Or)
+            };
+            common.extend(rest);
+            join(common, BinOp::And).expect("a shared condition")
+        }
+        other => other.clone(),
+    }
+}
 
 /// More sources than this are joined in the order written, without pushdown.
 /// Which of a query's sources (tables, subqueries, ...) a condition reads: one bit each.
@@ -322,7 +379,9 @@ pub(crate) fn probe_pays(t: &Table, fanout: f64, left: f64) -> bool {
 /// `(this source's column, another source's column)` for each equality of two plain columns.
 type JoinPairs = Vec<(usize, usize)>;
 
-fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs: &[usize], left: f64) -> (Reach, JoinPairs) {
+/// How a source is reached from the rows already joined, the pairs of columns it is joined on, and (when an index is
+/// probed) the fewest rows one probe finds.
+fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs: &[usize], left: f64) -> (Reach, JoinPairs, Option<f64>) {
     let me: SourceMask = 1 << s;
     let mut cols: Vec<usize> = Vec::new();
     let mut pairs: JoinPairs = Vec::new();
@@ -349,22 +408,25 @@ fn reach(source: &Source<'_>, s: usize, placed: SourceMask, preds: &[Pred], offs
         }
     }
     if !linked {
-        return (Reach::Cross, pairs);
+        return (Reach::Cross, pairs, None);
     }
     if let SourceData::Table(t) = &source.data {
         let mut best = Reach::Hash;
+        let mut fan: Option<f64> = None;
         for def in t.index_defs() {
             let k = def.columns.iter().take_while(|c| cols.contains(c)).count();
             if k > 0 && probe_pays(t, probe_fanout(t, def, k), left) {
                 best = best.max(Reach::Index);
+                let f = probe_fanout(t, def, k);
+                fan = Some(fan.map_or(f, |g: f64| g.min(f)));
             }
             if def.unique && def.columns.iter().all(|c| cols.contains(c)) {
                 best = Reach::Unique;
             }
         }
-        return (best, pairs);
+        return (best, pairs, fan);
     }
-    (Reach::Hash, pairs)
+    (Reach::Hash, pairs, None)
 }
 
 /// How many different values the join columns of an equality join have, taking the most selective
@@ -378,33 +440,65 @@ fn join_distinct(sources: &[Source<'_>], s: usize, pairs: &JoinPairs, offs: &[us
     for &(mc, oc) in pairs {
         let other = offs.partition_point(|&o| o <= oc).saturating_sub(1);
         let (Some(mt), Some(ot)) = (table(s), table(other)) else { continue };
-        let dm = mt.column_stats(mc).distinct.min(mine_rows.max(1.0));
-        let dn = ot.column_stats(oc - offs[other]).distinct.min(other_rows.max(1.0));
-        let d = dm.max(dn);
+        // The distinct values of the whole table, not of the rows left after its conditions: the rows that remain are a
+        // share of the key domain, and a join with them keeps that share of the other side (365 days of a 73,049-day
+        // table keep 0.5% of an inventory), where counting only the remaining keys would keep all of it.
+        let _ = (mine_rows, other_rows);
+        let dm = mt.column_stats(mc).distinct;
+        let dn = ot.column_stats(oc - offs[other]).distinct;
+        let d = dm.max(dn).max(1.0);
         best = Some(best.map_or(d, |b: f64| b.max(d)));
     }
     best
 }
 
-/// The order to join the sources in: start from the smallest filtered source,
-/// then keep adding the one that leaves the smallest intermediate result, one that is linked
-/// to the rows already joined before any that would be a cross product.
-pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], offs: &[usize], deps: &[SourceMask]) -> Vec<usize> {
+/// The order to join the sources in. The greedy order from each possible first source is costed by the values (rows times
+/// the width of the rows) it builds, and the cheapest wins: starting from the smallest source is not always best, when it
+/// links only to the largest table (a 5-row warehouse and a 12-million-row inventory, with the date filter on a third table).
+/// The usual start, the smallest filtered source, is kept unless another one costs less than half as much.
+pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], offs: &[usize], deps: &[SourceMask], late: SourceMask) -> Vec<usize> {
     let m = sources.len();
-    let start = (0..m)
-        .filter(|&s| deps[s] == 0)
-        .min_by(|&a, &b| est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)))
-        .expect("at least one source");
+    let mut starts: Vec<usize> = (0..m).filter(|&s| deps[s] == 0 && late & bit(s) == 0).collect();
+    starts.sort_by(|&a, &b| est[a].partial_cmp(&est[b]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    assert!(!starts.is_empty(), "at least one source");
+    let tried = if m <= 16 { starts.len() } else { 1 };
+    let mut best: Option<(Vec<usize>, f64)> = None;
+    for &start in starts.iter().take(tried) {
+        let (order, cost) = greedy_order(sources, est, preds, offs, deps, late, start);
+        if std::env::var_os("ACCESSOR_ORDER_DEBUG").is_some() {
+            let names: Vec<&str> = order.iter().map(|&s| sources[s].alias.as_str()).collect();
+            eprintln!("order from {}: cost {cost:.0}: {}", sources[start].alias, names.join(" -> "));
+        }
+        if best.as_ref().is_none_or(|(_, c)| cost < c * 0.5) {
+            best = Some((order, cost));
+        }
+    }
+    best.expect("an order").0
+}
+
+/// Starting from `start`, keeps adding the source that leaves the smallest intermediate result, one that is linked
+/// to the rows already joined before any that would be a cross product. Returns the order and its cost in values built.
+fn greedy_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], offs: &[usize], deps: &[SourceMask], late: SourceMask, start: usize) -> (Vec<usize>, f64) {
+    // the `late` sources (null-extended by a left join) are joined after all the others, in the order written: they are
+    // not part of the choice, and their cost is the same for every order
+    let m = sources.len() - late.count_ones() as usize;
     let mut order = vec![start];
     let mut placed: SourceMask = 1 << start;
     let mut current = est[start];
+    let mut width = sources[start].ncols() as f64;
+    let mut cost = current * width;
     while order.len() < m {
         let mut best: Option<(usize, f64, f64, bool)> = None; // (source, result rows, work, a cross product)
-        for s in 0..m {
-            if placed & (1 << s) != 0 || deps[s] & !placed != 0 {
+        for s in 0..sources.len() {
+            if placed & (1 << s) != 0 || deps[s] & !placed != 0 || late & bit(s) != 0 {
                 continue;
             }
-            let (r, pairs) = reach(&sources[s], s, placed, preds, offs, current);
+            let (r, pairs, fan) = reach(&sources[s], s, placed, preds, offs, current);
+            // the share of the table that its own conditions leave: a probe finds rows of the whole table, and that share of them stays
+            let share = match &sources[s].data {
+                SourceData::Table(t) => (est[s] / (t.estimated_len() as f64).max(1.0)).min(1.0),
+                _ => 1.0,
+            };
             // About |A|·|B| / (the larger number of distinct join values), or the larger input when
             // nothing is known (the foreign-key-to-key pattern).
             let joined = || match join_distinct(sources, s, &pairs, offs, est[s], current) {
@@ -412,8 +506,8 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
                 None => current.max(est[s]),
             };
             let (out, work) = match r {
-                Reach::Unique => (current, current),
-                Reach::Index => (joined(), current),
+                Reach::Unique => ((current * share).max(1.0), current),
+                Reach::Index => (fan.map_or_else(joined, |f| (current * f * share).max(1.0)), current),
                 Reach::Hash => (joined(), current + est[s]),
                 Reach::Cross => (current * est[s], current * est[s]),
             };
@@ -429,12 +523,17 @@ pub(crate) fn choose_order(sources: &[Source<'_>], est: &[f64], preds: &[Pred], 
                 best = Some((s, out, work, cross));
             }
         }
-        let (s, out, _, _) = best.expect("a source remains");
+        let (s, out, work, cross) = best.expect("a source remains");
+        if std::env::var_os("ACCESSOR_ORDER_DEBUG2").is_some() && sources[start].alias.starts_with(['d', 'w']) {
+            eprintln!("  from {}: add {} -> {out:.0} rows (work {work:.0}{}), table est {:.0}", sources[start].alias, sources[s].alias, if cross { ", CROSS" } else { "" }, est[s]);
+        }
         order.push(s);
         placed |= 1 << s;
         current = out;
+        width += sources[s].ncols() as f64;
+        cost += current * width;
     }
-    order
+    (order, cost)
 }
 
 /// A one-line description of a literal key, for plan notes.

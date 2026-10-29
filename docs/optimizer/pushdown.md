@@ -17,6 +17,10 @@ It is done only when that cannot change the answer: the inner query has no `DIST
 
 `ON (a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.z = 4)` cannot be split into per-table conditions, but it says that `a` must have `x = 1` or `x = 3`, and `b` must have `y = 2` or `z = 4`. Those are used to filter each table before the join (and can use an index); the whole `OR` is still checked on the pairs that remain. A table that some branch of the `OR` says nothing about is not filtered.
 
+## Conditions every branch of an OR shares
+
+`WHERE (a.k = b.k AND a.x = 1) OR (a.k = b.k AND a.x = 2)` repeats the join condition `a.k = b.k` in each branch. The optimizer moves what every branch has in common out of the `OR`: `a.k = b.k AND (a.x = 1 OR a.x = 2)`. The two are equal, including when a value is NULL, and the shared condition is now a condition of the query itself, so it can be used to join `a` and `b` and to filter them. Without this, a query such as TPC-DS 13, which writes its join conditions inside every branch of an `OR`, saw no condition linking its tables and built every combination of their rows. It is done for the `WHERE` condition, at the top level and inside `AND`.
+
 ## LATERAL
 
 The rows a `LATERAL` item produces for one value of the outer columns are remembered, and when the join condition has equalities between the outer columns and the item's columns, they are looked up through a hash instead of being compared one by one.
