@@ -28,6 +28,10 @@ SELECT to_date('March 5, 2024', 'Month DD, YYYY');                          -- 2
 | `make_date(year, month, day)` | a date |
 | `make_timestamp(year, month, day, hour, minute, second)` | a `DATETIME` |
 | `make_timestamptz(year, month, day, hour, minute, second [, zone])` | a `TIMESTAMPTZ`, read in the session zone or `zone` |
+| `split_part(text, delimiter, n)` | the n-th piece (a negative n counts from the end; '' if there is none) |
+| `date_bin(stride, source, origin)` | the start of the `stride`-wide bin, counted from `origin`, that contains `source` (the stride may have days and less, not months) |
+| `jsonb_set(target, '{a,b}', value [, create_if_missing])`, `jsonb_insert(target, '{a,0}', value [, insert_after])` | the document with the value put at the path |
+| `json_strip_nulls(doc [, strip_in_arrays])`, `jsonb_strip_nulls` | the document without the object members that are null |
 | `date_trunc(unit, value [, zone])` | the start of the `microseconds`, `milliseconds`, `second`, `minute`, `hour`, `day`, `week` (Monday), `month`, `quarter`, `year`, `decade`, `century` or `millennium` that contains `value` |
 | `isfinite(value)` | always true: there are no infinite dates |
 

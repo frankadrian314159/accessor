@@ -230,6 +230,12 @@ impl Database {
         serde_json::from_str(text).ok()
     }
 
+    /// Is the table a partition of another (a child with a bound)?
+    pub(crate) fn is_partition(&self, table: &str) -> bool {
+        let t = key(table);
+        self.inherit_links().any(|(c, _, text)| c == t && !text.is_empty())
+    }
+
     pub(crate) fn is_partitioned(&self, table: &str) -> bool {
         self.catalog.contains_key(&("part".to_string(), key(table)))
     }
@@ -325,7 +331,7 @@ impl Database {
             }
             if let Some((method, cols)) = &ext.partition_by {
                 let text = serde_json::to_string(&PartKey { method: method.clone(), columns: cols.clone() }).expect("json");
-                for c in cols {
+                for c in cols.iter().filter(|c| is_column_name(c)) {
                     if db.table_checked(name)?.schema().column_index(c).is_none() {
                         return Err(Error::catalog(format!("column \"{c}\" named in partition key does not exist")));
                     }
@@ -343,6 +349,9 @@ impl Database {
         let link = format!("{}|{}", key(&child_name), key(&parent_name));
         match bound {
             Some(b) => {
+                if self.family(&child_name).iter().any(|t| t.eq_ignore_ascii_case(&parent_name)) {
+                    return Err(Error::catalog(format!("circular inheritance not allowed: \"{child_name}\" cannot be a partition of \"{parent_name}\"")));
+                }
                 if !self.is_partitioned(&parent_name) {
                     return Err(Error::catalog(format!("\"{parent_name}\" is not partitioned")));
                 }
@@ -450,6 +459,10 @@ impl Database {
                 let mut later = Vec::new();
                 let mut first_error = None;
                 for n in &pending {
+                    // a partition goes with its parent, even when it is named later in the list
+                    if self.table(n).is_none() {
+                        continue;
+                    }
                     if let Err(e) = self.exec_drop_table(n) {
                         first_error.get_or_insert(e);
                         later.push(*n);
@@ -656,38 +669,13 @@ impl Database {
 
     /// The table that takes `row` of partitioned `table`, going down through partitioned partitions.
     fn route(&self, table: &str, row: &Row) -> Result<String> {
-        let Some(pk) = self.part_key(table) else { return Ok(table.to_string()) };
-        let schema = self.table_checked(table)?.schema().clone();
-        let keys: Vec<Value> = pk
-            .columns
-            .iter()
-            .map(|c| schema.column_index(c).map(|i| row[i].clone()).ok_or_else(|| Error::catalog(format!("partition key column \"{c}\" is missing"))))
-            .collect::<Result<_>>()?;
+        let Some(keys) = self.part_keys(table, row)? else { return Ok(table.to_string()) };
         let bounds = self.bounds_of(table)?;
         let mut default = None;
         for (child, b) in &bounds {
-            let hit = match b {
-                Bound::Range { from, to } => {
-                    !keys.iter().any(Value::is_null) && tuple_cmp(&keys, from) != Ordering::Less && tuple_cmp(&keys, to) == Ordering::Less
-                }
-                Bound::List(vs) => vs.iter().any(|v| match (&keys[0], v) {
-                    (a, b) if a.is_null() || b.is_null() => a.is_null() && b.is_null(),
-                    (a, b) => a.sql_cmp(b) == Some(Ordering::Equal),
-                }),
-                Bound::Hash { modulus, remainder } => {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    for k in &keys {
-                        k.hash(&mut h);
-                    }
-                    *modulus != 0 && h.finish() % modulus == *remainder
-                }
-                Bound::Default => {
-                    default = Some(child.clone());
-                    false
-                }
-            };
-            if hit {
+            if matches!(b, Bound::Default) {
+                default = Some(child.clone());
+            } else if bound_hit(b, &keys) {
                 return self.route(child, row);
             }
         }
@@ -695,6 +683,50 @@ impl Database {
             Some(d) => self.route(&d, row),
             None => Err(Error::constraint(format!("no partition of relation \"{table}\" found for row"))),
         }
+    }
+
+    /// A row put straight into a partition must satisfy the bounds of the partition and of the tables above it.
+    pub(crate) fn check_partition_bound(&self, table: &str, row: &Row) -> Result<()> {
+        let t = key(table);
+        let Some((_, parent)) = self.inherit_links().find(|(c, p, text)| *c == t && !text.is_empty() && self.is_partitioned(p)).map(|(c, p, _)| (c.to_string(), p.to_string())) else {
+            return Ok(());
+        };
+        if let Some(keys) = self.part_keys(&parent, row)? {
+            if let Some((_, b)) = self.bounds_of(&parent)?.into_iter().find(|(c, _)| *c == t) {
+                let ok = match b {
+                    Bound::Default => !self.bounds_of(&parent)?.iter().any(|(c, o)| *c != t && !matches!(o, Bound::Default) && bound_hit(o, &keys)),
+                    other => bound_hit(&other, &keys),
+                };
+                if !ok {
+                    let name = self.table(table).map(|t| t.name().to_string()).unwrap_or_else(|| table.to_string());
+                    return Err(Error::constraint(format!("new row for relation \"{name}\" violates partition constraint")));
+                }
+            }
+        }
+        self.check_partition_bound(&parent, row)
+    }
+
+    /// The values of the partition key of `table` in `row` (`None` if the table is not partitioned).
+    fn part_keys(&self, table: &str, row: &Row) -> Result<Option<Vec<Value>>> {
+        let Some(pk) = self.part_key(table) else { return Ok(None) };
+        let schema = self.table_checked(table)?.schema().clone();
+        let keys: Vec<Value> = pk
+            .columns
+            .iter()
+            .map(|c| match schema.column_index(c) {
+                Some(i) => Ok(row[i].clone()),
+                None if is_column_name(c) => Err(Error::catalog(format!("partition key column \"{c}\" is missing"))),
+                // an expression of the columns
+                None => {
+                    let scope = super::bind::Scope {
+                        cols: schema.columns.iter().map(|k| super::bind::ScopeCol { table: schema.name.clone(), name: k.name.clone(), hidden: false }).collect(),
+                    };
+                    let bound = super::bind::Binder::new(self, &scope, 0).bind(&crate::sql::parse_expression(c)?)?;
+                    bound.eval(row).map(|v| v.into_owned())
+                }
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(keys))
     }
 
     /// Sends the inserts planned for partitioned `table` to the partitions that take them.
@@ -714,5 +746,30 @@ impl Database {
             out.push(Op::Insert { table: t.name().to_string(), id, row });
         }
         Ok(out)
+    }
+}
+
+/// Is the entry of a partition key a column name, rather than an expression kept as text?
+fn is_column_name(c: &str) -> bool {
+    c.chars().all(|ch| ch.is_alphanumeric() || ch == '_') || (c.starts_with('"') && c.ends_with('"') && !c.contains('('))
+}
+
+/// Does a row with these partition key values belong to a partition with this bound (a default partition takes what the others do not)?
+fn bound_hit(b: &Bound, keys: &[Value]) -> bool {
+    match b {
+        Bound::Range { from, to } => !keys.iter().any(Value::is_null) && tuple_cmp(keys, from) != Ordering::Less && tuple_cmp(keys, to) == Ordering::Less,
+        Bound::List(vs) => vs.iter().any(|v| match (&keys[0], v) {
+            (a, b) if a.is_null() || b.is_null() => a.is_null() && b.is_null(),
+            (a, b) => a.sql_cmp(b) == Some(Ordering::Equal),
+        }),
+        Bound::Hash { modulus, remainder } => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for k in keys {
+                k.hash(&mut h);
+            }
+            *modulus != 0 && h.finish() % modulus == *remainder
+        }
+        Bound::Default => false,
     }
 }

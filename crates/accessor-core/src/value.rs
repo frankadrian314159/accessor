@@ -20,6 +20,7 @@ use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::datetime;
+use crate::dialect::Dialect;
 use crate::interval::Interval;
 use crate::tz;
 use crate::decimal::Decimal;
@@ -711,6 +712,8 @@ impl Value {
                 Err(_) => Ordering::Less,
             },
             (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+            // false < true; asql keeps Access's, where Yes is -1 and so Yes < No
+            (Value::Bool(a), Value::Bool(b)) if crate::dialect::current() != Dialect::Asql => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Json(a), Value::Text(t)) => match crate::json::canonical(t) {
                 Some(c) => (**a).cmp(c.as_str()),
@@ -994,8 +997,14 @@ impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Null => Ok(()),
-            Value::Bool(true) => f.write_str("Yes"),
-            Value::Bool(false) => f.write_str("No"),
+            Value::Bool(b) => f.write_str(match (crate::dialect::current(), b) {
+                (Dialect::Asql, true) => "Yes",
+                (Dialect::Asql, false) => "No",
+                (Dialect::Postgresql, true) => "true",
+                (Dialect::Postgresql, false) => "false",
+                (Dialect::Mysql, true) => "1",
+                (Dialect::Mysql, false) => "0",
+            }),
             Value::Int(i) => write!(f, "{i}"),
             Value::Big(b) => write!(f, "{b}"),
             Value::Float(x) => write!(f, "{x}"),

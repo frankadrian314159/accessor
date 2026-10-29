@@ -802,7 +802,9 @@ fn run_test(root: &Path, name: &str, progress: Option<&Path>, skip: &[(String, u
     let mut run = Runner {
         db: {
             accessor_core::schema::set_lenient(false);
-            Database::in_memory()
+            let mut db = Database::in_memory();
+            db.set_dialect(accessor_core::dialect::Dialect::Mysql);
+            db
         },
         root,
         name: name.to_string(),

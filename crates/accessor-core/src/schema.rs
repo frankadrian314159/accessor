@@ -208,7 +208,8 @@ impl TableSchema {
 
     /// Checks structural rules and fills in implied indexes' invariants.
     pub fn validate(&self) -> Result<()> {
-        if self.columns.is_empty() {
+        // PostgreSQL has tables without columns; Access and MySQL do not
+        if self.columns.is_empty() && crate::dialect::current() != crate::dialect::Dialect::Postgresql {
             return Err(Error::catalog(format!("table '{}' must have at least one column", self.name)));
         }
         for (i, c) in self.columns.iter().enumerate() {

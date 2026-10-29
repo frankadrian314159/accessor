@@ -49,6 +49,11 @@ pub enum PgFn {
     JsonPathFirst,
     JsonPathExists,
     JsonPathMatch,
+    SplitPart,
+    DateBin,
+    JsonbSet,
+    JsonbInsert,
+    JsonStripNulls,
 }
 
 pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
@@ -83,6 +88,11 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "JSONB_PATH_QUERY_FIRST" | "JSONB_PATH_QUERY_FIRST_TZ" => (JsonPathFirst, 2, 4),
         "JSONB_PATH_EXISTS" | "JSONB_PATH_EXISTS_TZ" => (JsonPathExists, 2, 4),
         "JSONB_PATH_MATCH" | "JSONB_PATH_MATCH_TZ" => (JsonPathMatch, 2, 4),
+        "SPLIT_PART" => (SplitPart, 3, 3),
+        "DATE_BIN" => (DateBin, 3, 3),
+        "JSONB_SET" => (JsonbSet, 3, 4),
+        "JSONB_INSERT" => (JsonbInsert, 3, 4),
+        "JSON_STRIP_NULLS" | "JSONB_STRIP_NULLS" => (JsonStripNulls, 1, 2),
         "ENCODE" => (Encode, 2, 2),
         "DECODE" => (Decode, 2, 2),
         "PG_RELATION_SIZE" | "PG_TOTAL_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" => (Zero, 1, 2),
@@ -156,6 +166,71 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::Bool(Value::text(&text(v(0))).coerce_to(ty).is_ok())
         }
         TypeOf => Value::text(type_label(v(0))),
+        SplitPart => {
+            let (s, d, n) = (text(v(0)), text(v(1)), int(v(2))?);
+            if n == 0 {
+                return Err(Error::runtime("field position must not be zero"));
+            }
+            let parts: Vec<&str> = if d.is_empty() { vec![&*s] } else { s.split(&*d).collect() };
+            let at = if n > 0 { usize::try_from(n - 1).ok() } else { parts.len().checked_sub(usize::try_from(-n).unwrap_or(usize::MAX)) };
+            Value::text(at.and_then(|i| parts.get(i)).copied().unwrap_or(""))
+        }
+        DateBin => {
+            let stride = match v(0) {
+                Value::Interval(i) => i.clone(),
+                other => crate::interval::Interval::parse(&text(other), None).map_err(Error::runtime)?,
+            };
+            if stride.months != 0 {
+                return Err(Error::runtime("timestamps cannot be binned into intervals containing months or years"));
+            }
+            let secs = stride.days.saturating_mul(86_400).saturating_add(stride.secs);
+            if secs <= 0 {
+                return Err(Error::runtime("stride must be greater than zero"));
+            }
+            let get = |x: &Value| match x.coerce_to(DataType::DateTime)? {
+                Value::DateTime(t) => Ok(t),
+                _ => Err(Error::type_err("a date or time was expected")),
+            };
+            let (src, origin) = (get(v(1))?, get(v(2))?);
+            let bin = origin + (src - origin).div_euclid(secs) * secs;
+            Value::DateTime(bin)
+        }
+        JsonStripNulls => {
+            fn strip(j: &mut serde_json::Value, arrays_too: bool) {
+                match j {
+                    serde_json::Value::Object(m) => {
+                        m.retain(|_, x| !x.is_null());
+                        m.values_mut().for_each(|x| strip(x, arrays_too));
+                    }
+                    serde_json::Value::Array(a) => {
+                        if arrays_too {
+                            a.retain(|x| !x.is_null());
+                        }
+                        a.iter_mut().for_each(|x| strip(x, arrays_too));
+                    }
+                    _ => {}
+                }
+            }
+            let mut doc = crate::json::document(v(0))?;
+            strip(&mut doc, matches!(vals.get(1).map(|x| &**x), Some(Value::Bool(true))));
+            json_value(&doc)
+        }
+        JsonbSet | JsonbInsert => {
+            let steps: Vec<String> = text(v(1))
+                .trim()
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect();
+            let mut doc = crate::json::document(v(0))?;
+            let new = crate::json::document(v(2))?;
+            let flag = matches!(vals.get(3).map(|x| &**x), Some(Value::Bool(true)));
+            let (create, after) = if f == JsonbSet { (vals.get(3).is_none_or(|_| flag), false) } else { (true, flag) };
+            let ok = json_put(&mut doc, &steps, new, create, after, f == JsonbInsert)?;
+            let _ = ok;
+            json_value(&doc)
+        }
         Scale => match v(0).num_lenient().as_deref() {
             Some(Value::Dec(d)) | Some(Value::Currency(d)) => Value::Int(i64::from(d.scale())),
             Some(Value::Int(_)) | Some(Value::Big(_)) => Value::Int(0),
@@ -954,4 +1029,53 @@ pub(crate) fn json_path_args(vals: &[Cow<'_, Value>]) -> Result<(serde_json::Val
 /// A JSON value as a `JSON` value (a string stays quoted).
 pub(crate) fn json_value(j: &serde_json::Value) -> Value {
     Value::Json(j.to_string().into())
+}
+
+/// `jsonb_set` / `jsonb_insert`: puts `new` at the path `steps` (the elements of a `{a,b,0}` path) in `doc`.
+/// `set` replaces what is there (and, if `create`, adds a missing last key or array element); `insert` adds
+/// to an array (before the element, or after it) and refuses a key that exists.
+fn json_put(doc: &mut serde_json::Value, steps: &[String], new: serde_json::Value, create: bool, after: bool, insert: bool) -> Result<bool> {
+    use serde_json::Value as J;
+    let Some((head, rest)) = steps.split_first() else { return Ok(false) };
+    let last = rest.is_empty();
+    match doc {
+        J::Object(m) => {
+            if last {
+                if insert && m.contains_key(head) {
+                    return Err(Error::runtime("cannot replace existing key"));
+                }
+                if m.contains_key(head) || create {
+                    m.insert(head.clone(), new);
+                }
+                Ok(true)
+            } else if let Some(child) = m.get_mut(head) {
+                json_put(child, rest, new, create, after, insert)
+            } else {
+                Ok(false)
+            }
+        }
+        J::Array(a) => {
+            let n = a.len() as i64;
+            let Ok(mut i) = head.parse::<i64>() else { return Err(Error::runtime(format!("path element is not an integer: \"{head}\""))) };
+            if i < 0 {
+                i += n;
+            }
+            if last {
+                if insert {
+                    let at = (if after { i + 1 } else { i }).clamp(0, n) as usize;
+                    a.insert(at, new);
+                } else if (0..n).contains(&i) {
+                    a[i as usize] = new;
+                } else if create {
+                    if i < 0 { a.insert(0, new) } else { a.push(new) }
+                }
+                Ok(true)
+            } else if (0..n).contains(&i) {
+                json_put(&mut a[i as usize], rest, new, create, after, insert)
+            } else {
+                Ok(false)
+            }
+        }
+        _ => Err(Error::runtime("cannot set path in scalar")),
+    }
 }

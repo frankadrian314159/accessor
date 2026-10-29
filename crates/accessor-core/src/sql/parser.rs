@@ -2914,7 +2914,7 @@ impl<'a> Parser<'a> {
             (RoutineBody::Block(b), self.toks[self.pos - 1].pos + "END".len())
         };
         let sql = self.src[start..end].trim().to_string();
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, set_columns: Vec::new(), sql })))
     }
 
     /// A data type written as a name (`INTEGER`, `VARCHAR(20)`, `DOUBLE PRECISION`, ...).
@@ -3591,16 +3591,21 @@ impl<'a> Parser<'a> {
             return Err(Error::syntax("PARTITION BY takes RANGE, LIST or HASH"));
         }
         self.expect_sym("(")?;
-        let not_columns = || Error::syntax("a partition key must be made of column names");
         let mut columns = Vec::new();
         loop {
-            columns.push(self.ident().map_err(|_| not_columns())?);
-            // a collation or an operator class after the column (`a COLLATE "C"`, `a int4_ops`) is read and not used
-            if self.peek_sym("(") || self.peek_sym(".") {
-                return Err(not_columns());
-            }
-            while !self.peek_sym(",") && !self.peek_sym(")") && !self.at_eof() {
-                self.advance();
+            // a column (with a collation or an operator class after it, `a COLLATE "C"`, `a int4_ops`, which are
+            // read and not used), or an expression, which is kept as text
+            let plain = matches!(self.peek(), Tok::Ident(_)) && !matches!(self.peek_at(1), Tok::Sym(s) if *s != "," && *s != ")");
+            if plain {
+                columns.push(self.ident()?);
+                while !self.peek_sym(",") && !self.peek_sym(")") && !self.at_eof() {
+                    self.advance();
+                }
+            } else {
+                columns.push(self.expr_text()?);
+                while !self.peek_sym(",") && !self.peek_sym(")") && !self.at_eof() {
+                    self.advance();
+                }
             }
             if !self.eat_sym(",") {
                 break;
@@ -5925,6 +5930,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// An argument of a call: an expression, or `name => expression` (also `name := expression`), which is
+    /// kept as `__NAMED('name', expression)` for the binder to put in the place of the parameter.
+    fn call_arg(&mut self) -> Result<Expr> {
+        if let (Tok::Ident(n), true) = (self.peek().clone(), self.pos + 2 < self.toks.len()) {
+            let arrow = match (self.peek_at(1), self.peek_at(2)) {
+                (Tok::Sym("="), Tok::Sym(">")) => self.toks[self.pos + 2].pos == self.toks[self.pos + 1].pos + 1,
+                (Tok::Sym(":="), _) => true,
+                _ => false,
+            };
+            if arrow {
+                let two = matches!(self.peek_at(1), Tok::Sym("="));
+                self.advance();
+                self.advance();
+                if two {
+                    self.advance();
+                }
+                let e = self.expr()?;
+                return Ok(Expr::Function { name: "__NAMED".into(), args: vec![Expr::Literal(Value::text(&n)), e], distinct: false, star: false });
+            }
+        }
+        self.expr()
+    }
+
     fn function_call(&mut self, name: String) -> Result<Expr> {
         if name.eq_ignore_ascii_case("CONVERT") {
             // CONVERT(x, type) is CAST(x AS type); CONVERT(x USING charset) is x
@@ -5963,9 +5991,9 @@ impl<'a> Parser<'a> {
             if !distinct {
                 self.eat_kw("ALL"); // `Count(ALL x)`: the default, written out
             }
-            args.push(self.expr()?);
+            args.push(self.call_arg()?);
             while self.eat_sym(",") {
-                args.push(self.expr()?);
+                args.push(self.call_arg()?);
             }
             // GROUP_CONCAT(x ORDER BY y [DESC], ... SEPARATOR 'x'): the separator is the second argument,
             // the order trails as `__AGG_ORDER(key, descending)`

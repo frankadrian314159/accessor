@@ -32,6 +32,7 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("cpu_tuple_cost", "0.01", 't'),
     ("cursor_tuple_fraction", "0.1", 't'),
     ("datestyle", "ISO, MDY", 't'),
+    ("dialect", "asql", 't'),
     ("deadlock_timeout", "1s", 't'),
     ("debug_parallel_query", "off", 't'),
     ("default_statistics_target", "100", 't'),
@@ -226,6 +227,21 @@ fn boolean(value: &str) -> Option<&'static str> {
 }
 
 impl Database {
+    /// The SQL dialect of the session: `asql` (the default), `postgresql` or `mysql`.
+    pub fn dialect(&self) -> crate::dialect::Dialect {
+        self.settings.get("dialect").and_then(|d| crate::dialect::Dialect::parse(d)).unwrap_or_default()
+    }
+
+    /// Chooses the dialect (the same as `SET dialect = '...'`).
+    pub fn set_dialect(&mut self, dialect: crate::dialect::Dialect) {
+        if dialect == crate::dialect::Dialect::Asql {
+            self.settings.remove("dialect");
+        } else {
+            self.settings.insert("dialect".to_string(), dialect.name().to_string());
+        }
+        crate::dialect::set_session(dialect);
+    }
+
     /// Is MySQL's `ONLY_FULL_GROUP_BY` in the `sql_mode` (it is in the default one)?
     pub(crate) fn only_full_group_by(&self) -> bool {
         self.settings.get("sql_mode").is_none_or(|m| m.to_ascii_uppercase().contains("ONLY_FULL_GROUP_BY"))
@@ -242,6 +258,12 @@ impl Database {
         if name == "timezone" {
             self.set_time_zone(value)?;
             self.settings.insert(name, value.to_string());
+            return Ok(());
+        }
+        if name == "dialect" {
+            let d = crate::dialect::Dialect::parse(value)
+                .ok_or_else(|| Error::runtime(format!("invalid value for parameter \"dialect\": \"{value}\" (use asql, postgresql or mysql)")))?;
+            self.set_dialect(d);
             return Ok(());
         }
         let shown = match known(&name) {
@@ -266,7 +288,8 @@ impl Database {
     /// `RESET name` (or `RESET ALL`).
     pub(crate) fn reset_parameter(&mut self, name: Option<&str>) -> Result<()> {
         let Some(name) = name else {
-            let names: Vec<String> = self.settings.keys().cloned().collect();
+            // the dialect is how the session reads and shows SQL, not a tuning knob: RESET ALL leaves it
+            let names: Vec<String> = self.settings.keys().filter(|k| *k != "dialect").cloned().collect();
             for n in names {
                 self.reset_parameter(Some(&n))?;
             }
@@ -275,6 +298,9 @@ impl Database {
         let name = name.to_ascii_lowercase();
         match known(&name) {
             Some((default, _)) => {
+                if name == "dialect" {
+                    crate::dialect::set_session(crate::dialect::Dialect::Asql);
+                }
                 if name == "timezone" {
                     self.set_time_zone("UTC")?;
                 } else if name == "optimizer" {

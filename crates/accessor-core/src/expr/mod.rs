@@ -380,3 +380,20 @@ mod tests {
         }
     }
 }
+
+/// The parameter names of the built-in functions that PostgreSQL lets a call give by name (`name => value`).
+pub(crate) fn named_params(func: &str) -> Option<&'static [&'static str]> {
+    Some(match func.to_ascii_uppercase().as_str() {
+        "PARSE_IDENT" => &["str", "strict"],
+        "JSONB_PATH_QUERY_ARRAY" | "JSONB_PATH_QUERY_FIRST" | "JSONB_PATH_EXISTS" | "JSONB_PATH_MATCH" | "JSONB_PATH_QUERY_ARRAY_TZ" | "JSONB_PATH_QUERY_FIRST_TZ" | "JSONB_PATH_EXISTS_TZ" | "JSONB_PATH_MATCH_TZ" => {
+            &["target", "path", "vars", "silent"]
+        }
+        "JSONB_SET" => &["target", "path", "new_value", "create_if_missing"],
+        "JSONB_INSERT" => &["target", "path", "new_value", "insert_after"],
+        "JSON_STRIP_NULLS" | "JSONB_STRIP_NULLS" => &["target", "strip_in_arrays"],
+        "DATE_BIN" => &["stride", "source", "origin"],
+        "SPLIT_PART" => &["string", "delimiter", "n"],
+        "MAKE_DATE" => &["year", "month", "day"],
+        _ => return None,
+    })
+}

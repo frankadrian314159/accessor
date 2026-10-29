@@ -1078,6 +1078,7 @@ impl Database {
     /// Makes this database's zone the one values are read and shown in.
     pub(crate) fn enter_session(&self) {
         crate::tz::set_session(self.time_zone);
+        crate::dialect::set_session(self.dialect());
         crate::sequence::set_current(&self.seqs);
         // A connection reading for a transaction that is not the one the database has open says so.
         mvcc::set_view(mvcc::override_view().unwrap_or_else(|| self.view_of()));

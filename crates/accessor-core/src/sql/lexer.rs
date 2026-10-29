@@ -2,6 +2,7 @@
 //! `#date#` literals, and double-quoted strings.
 
 use crate::datetime;
+use crate::dialect::{self, Dialect};
 use num_bigint::BigInt;
 
 use crate::decimal::Decimal;
@@ -289,12 +290,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             i += 1;
             out.push(Token { tok: Tok::Str(s), pos });
-        } else if c == '#' && !closes_as_date(&at, i) {
+        } else if c == '#' && hash_comment(&at, i) {
             // MySQL: `# ...` is a comment to the end of the line (a #date# literal has its closing # on the same line)
             while at(i).is_some_and(|ch| ch != '\n') {
                 i += 1;
             }
-        } else if c == '#' {
+        } else if c == '#' && dialect::current() == Dialect::Asql {
             let mut s = String::new();
             i += 1;
             loop {
@@ -381,6 +382,16 @@ mod number_literals {
         assert_eq!(one("1e3"), Tok::Float(1000.0));
         assert_eq!(one("2.5E-1"), Tok::Float(0.25));
         assert!(lex("1e999").is_err(), "an infinite literal is refused");
+    }
+}
+
+/// Does the `#` at `i` start a comment? In `mysql` always; in `asql` unless it opens a `#date#` literal; in `postgresql`
+/// never (`#` is an operator there, which this does not read).
+fn hash_comment(at: &dyn Fn(usize) -> Option<char>, i: usize) -> bool {
+    match dialect::current() {
+        Dialect::Mysql => true,
+        Dialect::Asql => !closes_as_date(at, i),
+        Dialect::Postgresql => false,
     }
 }
 

@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use accessor_core::sql::lexer::lex;
+use accessor_core::dialect::Dialect;
 use accessor_core::{csv, Database, Durability, QueryResult, Value};
 
 const HELP: &str = "\
@@ -47,12 +48,16 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let mut path: Option<String> = None;
     let mut commands: Vec<String> = Vec::new();
+    let mut dialect = Dialect::Asql;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                println!("usage: accessor [FILE.adb] [-c SQL]... [-f SCRIPT]...\n\n{HELP}");
+                println!("usage: accessor [--asql|--postgresql|--mysql] [FILE.adb] [-c SQL]... [-f SCRIPT]...\n\n{HELP}");
                 return ExitCode::SUCCESS;
             }
+            "--asql" => dialect = Dialect::Asql,
+            "--postgresql" => dialect = Dialect::Postgresql,
+            "--mysql" => dialect = Dialect::Mysql,
             "-c" => match args.next() {
                 Some(c) => commands.push(c),
                 None => return usage_error("-c needs an argument"),
@@ -77,6 +82,8 @@ fn main() -> ExitCode {
         },
         None => Database::in_memory(),
     };
+    let mut db = db;
+    db.set_dialect(dialect);
     let mut sh = Shell { db, timer: false };
 
     if !commands.is_empty() {
@@ -102,7 +109,7 @@ fn main() -> ExitCode {
 }
 
 fn usage_error(msg: &str) -> ExitCode {
-    eprintln!("{msg}\nusage: accessor [FILE.adb] [-c SQL]... [-f SCRIPT]...");
+    eprintln!("{msg}\nusage: accessor [--asql|--postgresql|--mysql] [FILE.adb] [-c SQL]... [-f SCRIPT]...");
     ExitCode::from(2)
 }
 
@@ -444,7 +451,12 @@ fn print_result(res: &QueryResult) {
     }
     const MAX_WIDTH: usize = 60;
     let cell = |v: &Value| {
-        let s = if v.is_null() { "NULL".to_string() } else { v.to_string().replace('\n', "⏎") };
+        let s = match v {
+            Value::Null => "NULL".to_string(),
+            // psql shows a boolean as t or f
+            Value::Bool(b) if accessor_core::dialect::current() == Dialect::Postgresql => (if *b { "t" } else { "f" }).to_string(),
+            v => v.to_string().replace('\n', "⏎"),
+        };
         if s.chars().count() > MAX_WIDTH {
             format!("{}…", s.chars().take(MAX_WIDTH - 1).collect::<String>())
         } else {

@@ -558,6 +558,10 @@ impl<'a> Binder<'a> {
                         _ => Err(Error::runtime("pg_get_viewdef needs the name of a saved query in quotes")),
                     };
                 }
+                if args.iter().any(|a| matches!(a, Expr::Function { name, .. } if name == "__NAMED")) {
+                    let ordered = self.positional(name, args)?;
+                    return self.bind(&Expr::Function { name: name.clone(), args: ordered, distinct: false, star: false });
+                }
                 let Some((f, min, max)) = ScalarFn::lookup(name) else {
                     // A stored function: its body, with the arguments in place of the parameters.
                     let Some(def) = self.db.function_def(name) else {
@@ -606,6 +610,50 @@ impl<'a> Binder<'a> {
                 },
             },
         })
+    }
+
+    /// A call with `name => value` arguments, with the arguments in the order of the parameters.
+    fn positional(&self, func: &str, args: &[Expr]) -> Result<Vec<Expr>> {
+        let params: Vec<(String, Option<Expr>)> = match self.db.function_def(func) {
+            Some(def) => def.params.iter().map(|p| (p.name.clone(), p.default.clone())).collect(),
+            None => crate::expr::named_params(func)
+                .ok_or_else(|| Error::runtime(format!("{func} does not take named arguments")))?
+                .iter()
+                .map(|n| (n.to_string(), None))
+                .collect(),
+        };
+        let mut slots: Vec<Option<Expr>> = vec![None; params.len()];
+        let mut next = 0;
+        for a in args {
+            match a {
+                Expr::Function { name, args: pair, .. } if name == "__NAMED" => {
+                    let (Some(Expr::Literal(Value::Text(n))), Some(e)) = (pair.first(), pair.get(1)) else { unreachable!("the parser writes a name and an expression") };
+                    let at = params
+                        .iter()
+                        .position(|(p, _)| p.eq_ignore_ascii_case(n))
+                        .ok_or_else(|| Error::runtime(format!("function {func} has no parameter named \"{n}\"")))?;
+                    if slots[at].is_some() {
+                        return Err(Error::runtime(format!("argument name \"{n}\" used more than once")));
+                    }
+                    slots[at] = Some(e.clone());
+                }
+                other => {
+                    if slots.get(next).is_none() {
+                        return Err(Error::runtime(format!("too many arguments for {func}")));
+                    }
+                    slots[next] = Some(other.clone());
+                    next += 1;
+                }
+            }
+        }
+        // a gap before the last given argument takes the parameter's default; after it, the function does
+        let last = slots.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+        slots.truncate(last);
+        slots
+            .into_iter()
+            .zip(params)
+            .map(|(s, (p, d))| s.or(d).ok_or_else(|| Error::runtime(format!("{func} needs a value for \"{p}\""))))
+            .collect()
     }
 
     fn bind_window(&mut self, func: &Expr, spec: &crate::sql::ast::WindowSpec) -> Result<BExpr> {

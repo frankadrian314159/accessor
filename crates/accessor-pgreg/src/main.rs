@@ -614,6 +614,7 @@ fn child(args: &[String]) {
     }
     std::panic::set_hook(Box::new(|_| {}));
     let mut db = Database::in_memory();
+    db.set_dialect(accessor_core::dialect::Dialect::Postgresql);
     // PostgreSQL's reading of a few things Accessor does otherwise by default (docs/extern/testing.md)
     for st in POSTGRES_SETTINGS {
         let _ = db.execute(st);

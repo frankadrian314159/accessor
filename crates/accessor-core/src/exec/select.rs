@@ -281,6 +281,43 @@ impl Database {
         }
     }
 
+    /// A stored function that returns a set of rows (`RETURNS TABLE (...)`), by name.
+    fn set_function(&self, name: &str) -> Option<std::sync::Arc<crate::sql::ast::RoutineDef>> {
+        self.routine_def(name).filter(|d| !d.set_columns.is_empty())
+    }
+
+    /// Runs a stored function that returns a set of rows: its last statement, with the arguments for the parameters.
+    fn run_set_function(&self, def: &crate::sql::ast::RoutineDef, args: &[Value]) -> Result<(Vec<String>, Vec<Row>)> {
+        use crate::sql::ast::{ProcStmt, RoutineBody, Statement};
+        if args.len() > def.params.len() {
+            return Err(Error::runtime(format!("{} takes {} argument(s), not {}", def.name, def.params.len(), args.len())));
+        }
+        let mut values: HashMap<String, Value> = HashMap::new();
+        for (i, p) in def.params.iter().enumerate() {
+            let v = match (args.get(i), &p.default) {
+                (Some(v), _) => v.clone(),
+                (None, Some(d)) => self.eval_const(d)?,
+                (None, None) => return Err(Error::runtime(format!("{} needs a value for @{}", def.name, p.name))),
+            };
+            let v = match p.data_type {
+                Some(t) if !v.is_null() => v.coerce_to(t)?,
+                _ => v,
+            };
+            values.insert(p.name.to_ascii_lowercase(), v);
+        }
+        let RoutineBody::Block(body) = &def.body else { return Err(Error::catalog(format!("'{}' does not return rows", def.name))) };
+        let Some(ProcStmt::Sql(Statement::Select(sel))) = body.last() else {
+            return Err(Error::catalog(format!("'{}' must end with a SELECT", def.name)));
+        };
+        let mut sel = sel.clone();
+        crate::sql::walk::bind_params_select(&mut sel, &values)?;
+        let res = self.run_select(&sel)?;
+        if res.columns.len() != def.set_columns.len() {
+            return Err(Error::runtime(format!("{} returns {} column(s) but its query gives {}", def.name, def.set_columns.len(), res.columns.len())));
+        }
+        Ok((def.set_columns.clone(), res.rows))
+    }
+
     /// The column names a table function produces.
     pub(crate) fn table_function_columns(&self, name: &str) -> Result<Vec<String>> {
         Ok(match name.to_ascii_uppercase().as_str() {
@@ -288,6 +325,7 @@ impl Database {
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
             "JSON_EACH" => vec!["key".into(), "value".into()],
             "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => vec!["jsonb_path_query".into()],
+            other if self.set_function(other).is_some() => self.set_function(other).expect("checked").set_columns.clone(),
             other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES, SPLIT_STRING and JSON_EACH are available)"))),
         })
     }
@@ -295,6 +333,9 @@ impl Database {
     /// Runs a table function on already evaluated arguments.
     pub(crate) fn table_function(&self, name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Row>)> {
         const MAX_ROWS: usize = 10_000_000;
+        if let Some(def) = self.set_function(name) {
+            return self.run_set_function(&def, args);
+        }
         let cols = self.table_function_columns(name)?;
         let wrong = |n: &str| Error::runtime(format!("wrong number of arguments for {n}"));
         match name.to_ascii_uppercase().as_str() {

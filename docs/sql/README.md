@@ -21,6 +21,7 @@ ASQL is the SQL dialect of Accessor. It is a subset of standard SQL with the hab
 | [inheritance-and-partitioning.md](inheritance-and-partitioning.md) | `INHERITS`, `PARTITION BY`, `PARTITION OF`, `ONLY` |
 | [reports.md](reports.md) | `CREATE REPORT`: grouped, totalled, paged output as text, HTML, Markdown, CSV or PDF |
 | [../optimizer/](../optimizer/README.md) | the query optimizer and `EXPLAIN` |
+| [dialects.md](dialects.md) | `asql` (default), `postgresql` and `mysql`: `--postgresql`/`--mysql` flags, `SET dialect`, what each changes |
 | [session.md](session.md) | `SET TIME ZONE` and other session settings |
 | [expressions.md](expressions.md) | literals, operators, `NULL` logic, predicates, `LIKE`, `CASE`, `CAST` |
 | [conformance.md](conformance.md) | comparison with the SQL standard |

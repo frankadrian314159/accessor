@@ -249,7 +249,9 @@ impl Database {
         if def.function && !allow_function {
             return Err(Error::catalog(format!("'{name}' is a function; use it in an expression")));
         }
-        let RoutineBody::Block(body) = &def.body else { unreachable!("procedures have blocks") };
+        let RoutineBody::Block(body) = &def.body else {
+            return Err(Error::catalog(format!("'{}' has one expression for a body, so it cannot be run with CALL; write its statements between BEGIN and END", def.name)));
+        };
         if self.call_depth.load(Ordering::Relaxed) >= MAX_CALLS {
             return Err(Error::runtime("procedures are nested too deeply (does one call itself?)"));
         }

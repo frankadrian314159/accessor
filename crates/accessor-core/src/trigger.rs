@@ -172,6 +172,7 @@ impl Database {
                 returns: None,
                 body: crate::sql::ast::RoutineBody::Block(trigger.block.clone()),
                 trigger: true,
+                set_columns: Vec::new(),
                 sql: String::new(),
             };
             return self.run_trigger_def(trigger, &def, ctx, timing);

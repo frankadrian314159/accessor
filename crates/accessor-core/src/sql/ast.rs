@@ -404,6 +404,8 @@ pub struct RoutineDef {
     pub body: RoutineBody,
     /// `RETURNS trigger`: for `CREATE TRIGGER ... EXECUTE FUNCTION`.
     pub trigger: bool,
+    /// `RETURNS TABLE (...)` / `RETURNS SETOF type`: the names of the columns of the rows it returns (it is called in FROM).
+    pub set_columns: Vec<String>,
     pub sql: String,
 }
 

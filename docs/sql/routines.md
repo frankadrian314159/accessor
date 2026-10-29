@@ -2,6 +2,14 @@
 
 A **function** is a named expression with parameters that you can use anywhere an expression goes. A **procedure** is a named block of statements with variables and control flow, run with `CALL`. Both are stored in the database file and can be changed with `CREATE OR REPLACE`.
 
+## Arguments by name
+
+A call may name its arguments, `f(10, c => 1)` or `f(b := 3, a := 10)`, for functions you wrote and for a few built-in ones (`parse_ident`, `jsonb_path_*`, `jsonb_set`, `date_bin`, `split_part`...). Named arguments go after the positional ones; an argument left out takes its parameter's `DEFAULT`.
+
+## Functions that return a set of rows
+
+`CREATE FUNCTION above(n int) RETURNS TABLE (a int, b text) LANGUAGE sql AS $$ SELECT a, b FROM t WHERE a > n $$` (or `RETURNS SETOF int`, whose one column is named like the function) is called in `FROM`: `SELECT * FROM above(1)`, in a join, or inside a view. The body is one or more statements of which the last is the `SELECT` that gives the rows; the arguments replace the parameters. Only a `LANGUAGE sql` body can do this, and the arguments must be values the statement knows before it runs (not columns of other tables in the same `FROM`).
+
 ## Functions
 
 ```sql
@@ -144,7 +152,7 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays and records, set-returning functions (`RETURNS TABLE`, `SETOF`), event triggers, and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays and records, set-returning functions written in `plpgsql` (`RETURN NEXT`/`RETURN QUERY`; in `sql` they work, see below), event triggers, and every language except `sql` and `plpgsql`.
 
 ### Trigger functions
 

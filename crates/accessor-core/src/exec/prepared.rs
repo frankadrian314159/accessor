@@ -118,8 +118,12 @@ impl Database {
         // what a lenient reading made of the text is not what a strict one would, so the cache is not used with it
         let lenient = self.settings.get("lenient_types").is_some_and(|v| v == "on") || self.settings.get("strict_types").is_some_and(|v| v == "on");
         let strict = self.settings.get("strict_types").is_some_and(|v| v == "on");
+        // the text means different things in different dialects, so the cache is kept for the dialect of the session
+        let dialect = self.dialect();
+        crate::dialect::set_session(dialect);
+        let key: std::borrow::Cow<str> = if dialect == crate::dialect::Dialect::Asql { sql.into() } else { format!("{dialect}\0{sql}").into() };
         if !lenient {
-            if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+            if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&*key) {
                 return Ok(Arc::clone(hit));
             }
         }
@@ -135,7 +139,7 @@ impl Database {
             if cache.len() >= CACHE_ENTRIES {
                 cache.clear();
             }
-            cache.insert(sql.to_string(), Arc::clone(&parsed));
+            cache.insert(key.into_owned(), Arc::clone(&parsed));
         }
         Ok(parsed)
     }

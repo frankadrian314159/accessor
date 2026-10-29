@@ -89,6 +89,12 @@ impl Database {
         let mut ops = self.plan_insert(table, columns, source)?;
         if self.is_partitioned(table) {
             ops = self.route_partition_inserts(table, ops)?;
+        } else if self.is_partition(table) {
+            for op in &ops {
+                if let Op::Insert { row, .. } = op {
+                    self.check_partition_bound(table, row)?;
+                }
+            }
         }
         let n = ops.len();
         self.apply_all(ops)?;

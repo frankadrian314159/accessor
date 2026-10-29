@@ -43,7 +43,7 @@ CREATE TABLE h1 PARTITION OF h FOR VALUES WITH (MODULUS 2, REMAINDER 1);
 A partitioned table is a parent that is expected to hold no rows of its own. A partition has exactly the parent's columns, and `INSERT INTO parent` sends each row to the partition whose bound takes it (a partition may itself be partitioned, and the row goes down the levels). A row that no partition takes is refused: "no partition of relation "p" found for row". A `DEFAULT` partition takes what the others do not. Reads, `UPDATE`, `DELETE` and `DROP` are as for inheritance.
 
 * A range bound is `FROM (a) TO (b)`, from inclusive to exclusive, with `MINVALUE` and `MAXVALUE` for the ends; a key of several columns compares column by column. A `NULL` key fits no range partition.
-* The key is a list of **column names**; a key made of expressions is refused.
+* The key is a list of column names or expressions of the columns (`PARTITION BY LIST (lower(b))`, `RANGE ((a + 1))`). A row is routed by evaluating the expression; partition pruning only works on keys that are plain columns.
 * A hash partition's number comes from this engine's own hash, so rows land in different partitions than in PostgreSQL.
 * `CREATE TABLE ... (LIKE ...)`, `ATTACH PARTITION` and `DETACH PARTITION` are not available.
 

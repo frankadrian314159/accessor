@@ -158,9 +158,21 @@ impl<'a> Parser<'a> {
         self.expect_sym(")")?;
         let mut returns: Option<DataType> = None;
         let mut is_trigger = false;
+        let mut set_columns: Vec<String> = Vec::new();
         if self.eat_kw("RETURNS") {
-            if self.peek_kw("TABLE") || self.peek_kw("SETOF") {
-                return Err(Error::syntax("functions that return a set of rows are not supported; return a value, or write a query"));
+            if self.eat_kw("TABLE") {
+                self.expect_sym("(")?;
+                loop {
+                    set_columns.push(self.ident()?);
+                    self.pg_type()?;
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            } else if self.eat_kw("SETOF") {
+                self.pg_type()?;
+                set_columns.push(name.clone());
             } else if self.peek_kw("EVENT_TRIGGER") {
                 return Err(Error::syntax("event triggers are not supported"));
             } else if self.eat_kw("TRIGGER") {
@@ -255,10 +267,11 @@ impl<'a> Parser<'a> {
         }
         let routine_body = match language.as_str() {
             "sql" => sql_body(&body, &names, returns.is_some())?,
+            "plpgsql" if !set_columns.is_empty() => return Err(Error::syntax("a plpgsql function that returns a set of rows is not supported; write it in sql")),
             "plpgsql" => plpgsql_body(&body, names, returns.is_some())?,
             other => return Err(Error::syntax(format!("the language '{other}' is not available (use sql or plpgsql)"))),
         };
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, trigger: is_trigger, sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, trigger: is_trigger, set_columns, sql })))
     }
 
     /// `DROP FUNCTION name (argument types)`: the types are read and ignored (functions are known by name).
@@ -827,7 +840,7 @@ impl<'a> Parser<'a> {
             [ProcStmt::Return(Some(e))] if function => RoutineBody::Expr(e.clone()),
             _ => RoutineBody::Block(stmts),
         };
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, set_columns: Vec::new(), sql })))
     }
 
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`

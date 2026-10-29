@@ -4453,7 +4453,8 @@ fn postgres_sql_functions() {
     db.execute("DROP FUNCTION add(int, int)").unwrap();
     assert!(db.query("SELECT add(1, 2)").is_err());
     db.execute("DROP FUNCTION IF EXISTS add(int, int)").unwrap();
-    assert!(db.execute("CREATE FUNCTION s() RETURNS SETOF int AS $$ SELECT 1 $$ LANGUAGE sql").is_err());
+    // a function that returns a set of rows is called in FROM
+    db.execute("CREATE FUNCTION s() RETURNS SETOF int AS $$ SELECT 1 $$ LANGUAGE sql").unwrap();
     assert!(db.execute("CREATE FUNCTION x() RETURNS int AS $$ SELECT 1 $$ LANGUAGE perl").is_err());
 }
 
@@ -5573,7 +5574,8 @@ fn create_table_reads_the_constraint_options_and_types_of_postgresql() {
     db.execute("INSERT INTO t1 (d3) VALUES ('2020-01-02 03:04:05+00')").unwrap();
     assert_eq!(rows(&db, "SELECT TypeName(d3) FROM t1"), [["TIMESTAMPTZ"]]);
     // a partition key that is an expression is still refused
-    assert!(db.execute("CREATE TABLE t7 (a text) PARTITION BY LIST (lower(a))").is_err());
+    // a partition key may be an expression
+    db.execute("CREATE TABLE t7 (a text) PARTITION BY LIST (lower(a))").unwrap();
 }
 
 #[test]
@@ -5945,4 +5947,113 @@ fn a_subquery_in_a_grouped_query_may_read_a_column_that_is_not_grouped() {
         rows(&db, "SELECT a.g, (SELECT COUNT(*) FROM t b WHERE b.g = a.v) FROM t a GROUP BY a.g ORDER BY a.g"),
         [["1", "2"], ["2", "1"]]
     );
+}
+
+#[test]
+fn call_of_a_procedure_with_an_expression_body_is_an_error_not_a_panic() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE PROCEDURE p1(OUT a int, IN b int, IN c int) LANGUAGE SQL AS $$ SELECT b - c $$").unwrap();
+    db.execute("CALL p1(null, 7, 4)").unwrap_err();
+}
+
+#[test]
+fn the_dialect_changes_how_text_is_read_and_booleans_are_shown_and_compared() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    assert_eq!(db.dialect(), Dialect::Asql);
+    // asql: Access's Yes/No, Yes being -1, and # opens a #date# literal or a comment
+    assert_eq!(rows(&db, "SELECT true, true > false, #2024-01-02# = DATE '2024-01-02'"), [["Yes", "No", "Yes"]]);
+
+    db.execute("SET dialect = 'postgresql'").unwrap();
+    assert_eq!(rows(&db, "SELECT true, true > false, false < true"), [["true", "true", "true"]]);
+    // `#` is no comment in PostgreSQL
+    db.execute("SELECT 1 # comment").unwrap_err();
+    db.execute("RESET ALL").unwrap();
+    assert_eq!(db.dialect(), Dialect::Postgresql);
+
+    db.set_dialect(Dialect::Mysql);
+    assert_eq!(rows(&db, "SELECT true, true > false # trailing comment"), [["1", "1"]]);
+    assert_eq!(db.execute("SHOW dialect").unwrap().rows[0][0].to_string(), "mysql");
+    db.execute("SET dialect = 'nosuch'").unwrap_err();
+
+    db.execute("RESET dialect").unwrap();
+    assert_eq!(db.dialect(), Dialect::Asql);
+}
+
+#[test]
+fn arguments_can_be_given_by_name() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE FUNCTION sub3(a int, b int DEFAULT 2, c int DEFAULT 0) RETURNS int LANGUAGE sql AS $$ SELECT a - b - c $$").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT sub3(10, c => 1), sub3(b => 3, a => 10), sub3(10, 1, c := 5), sub3(a => 7)"),
+        [["7", "7", "4", "5"]]
+    );
+    db.execute("SELECT sub3(10, a => 1)").unwrap_err();
+    db.execute("SELECT sub3(10, nosuch => 1)").unwrap_err();
+    assert_eq!(rows(&db, "SELECT split_part(delimiter => ',', string => 'a,b,c', n => 2), split_part('a,b,c', ',', -1)"), [["b", "c"]]);
+    assert_eq!(rows(&db, "SELECT jsonb_set('{\"a\":{\"b\":1}}', '{a,b}', '2'), date_bin('15 minutes', TIMESTAMP '2020-02-11 15:44:17', TIMESTAMP '2001-01-01')").len(), 1);
+}
+
+#[test]
+fn postgresql_partitions_by_an_expression_and_has_tables_without_columns() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE z ()").unwrap_err();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TABLE z ()").unwrap();
+    db.execute("INSERT INTO z DEFAULT VALUES; INSERT INTO z DEFAULT VALUES").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM z"), [["2"]]);
+    db.execute("CREATE TABLE p (a int, b text) PARTITION BY LIST (lower(b))").unwrap();
+    db.execute("CREATE TABLE p_x PARTITION OF p FOR VALUES IN ('x'); CREATE TABLE p_y PARTITION OF p FOR VALUES IN ('y')").unwrap();
+    db.execute("INSERT INTO p VALUES (1, 'X'), (2, 'y'), (3, 'Y')").unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM p_x"), [["1"]]);
+    assert_eq!(rows(&db, "SELECT count(*) FROM p_y"), [["2"]]);
+    db.execute("INSERT INTO p VALUES (4, 'z')").unwrap_err();
+    db.execute("CREATE TABLE r (a int) PARTITION BY RANGE ((a + 1))").unwrap();
+    db.execute("CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (0) TO (10)").unwrap();
+    db.execute("INSERT INTO r VALUES (8)").unwrap();
+    db.execute("INSERT INTO r VALUES (9)").unwrap_err();
+}
+
+#[test]
+fn functions_that_return_a_set_of_rows_are_called_in_from() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a int, b text); INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')").unwrap();
+    db.execute("CREATE FUNCTION above(n int) RETURNS TABLE (a int, b text) LANGUAGE sql AS $$ SELECT a, b FROM t WHERE a > n ORDER BY a $$").unwrap();
+    db.execute("CREATE FUNCTION firsts(n int) RETURNS SETOF int LANGUAGE sql AS $$ SELECT a FROM t WHERE a <= n $$").unwrap();
+    assert_eq!(rows(&db, "SELECT * FROM above(1)"), [["2", "y"], ["3", "z"]]);
+    assert_eq!(rows(&db, "SELECT b FROM above(0) AS r WHERE r.a = 2"), [["y"]]);
+    assert_eq!(rows(&db, "SELECT sum(firsts) FROM firsts(2)"), [["3"]]);
+    assert_eq!(rows(&db, "SELECT x.a FROM t JOIN above(1) x ON x.a = t.a ORDER BY 1"), [["2"], ["3"]]);
+    db.execute("CREATE VIEW v AS SELECT * FROM above(2)").unwrap();
+    assert_eq!(rows(&db, "SELECT * FROM v"), [["3", "z"]]);
+}
+
+#[test]
+fn dropping_a_partitioned_table_drops_its_partitions() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE p (a int) PARTITION BY RANGE (a); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10)").unwrap();
+    db.execute("DROP TABLE p").unwrap();
+    assert!(db.table_names().iter().all(|n| *n != "p" && *n != "p1"));
+    // an ordinary parent still needs CASCADE
+    db.execute("CREATE TABLE a (x int); CREATE TABLE b () INHERITS (a)").ok();
+}
+
+#[test]
+fn a_row_put_straight_into_a_partition_must_fit_its_bound() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE p (a int, b int) PARTITION BY RANGE (a); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10); CREATE TABLE pd PARTITION OF p DEFAULT").unwrap();
+    db.execute("INSERT INTO p1 VALUES (5, 1)").unwrap();
+    db.execute("INSERT INTO p1 VALUES (15, 1)").unwrap_err();
+    db.execute("INSERT INTO pd VALUES (15, 1)").unwrap();
+    db.execute("INSERT INTO pd VALUES (5, 1)").unwrap_err();
+}
+
+#[test]
+fn a_table_cannot_become_a_partition_of_itself_or_of_its_own_partition() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE p (a int) PARTITION BY LIST (a); CREATE TABLE c (a int) PARTITION BY LIST (a); ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1)").unwrap();
+    db.execute("ALTER TABLE p ATTACH PARTITION p FOR VALUES IN (2)").unwrap_err();
+    db.execute("ALTER TABLE c ATTACH PARTITION p FOR VALUES IN (2)").unwrap_err();
+    db.execute("DROP TABLE p, c").unwrap();
 }
