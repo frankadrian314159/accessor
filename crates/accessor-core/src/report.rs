@@ -74,7 +74,7 @@ fn total_fn(t: ReportTotal) -> AggFn {
 }
 
 fn spec_of(t: ReportTotal) -> AggSpec {
-    AggSpec { func: total_fn(t), arg: None, distinct: false, sep: None }
+    AggSpec { func: total_fn(t), arg: None, distinct: false, sep: None, order: Vec::new() }
 }
 
 /// Checks a layout against the columns the query returns.

@@ -2406,7 +2406,12 @@ fn aggregate_set(
                 None => state.update(None)?,
                 Some(e) => {
                     let v = e.eval(row)?;
-                    state.update(Some(&v))?;
+                    if spec.order.is_empty() {
+                        state.update(Some(&v))?;
+                    } else {
+                        let keys = spec.order.iter().map(|(k, _)| k.eval(row).map(|v| v.into_owned())).collect::<Result<Vec<_>>>()?;
+                        state.update_ordered(Some(&v), keys)?;
+                    }
                 }
             }
         }

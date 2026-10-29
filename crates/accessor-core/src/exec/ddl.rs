@@ -203,6 +203,18 @@ impl Database {
                 self.add_check(&table, name.as_deref(), expr)?;
                 return Ok(QueryResult::default());
             }
+            AlterAction::RenameIndex { from, to } => {
+                let schema = self.table_checked(&table)?.schema();
+                let Some(def) = schema.indexes.iter().find(|i| i.name.eq_ignore_ascii_case(from)) else {
+                    return Err(Error::catalog(format!("no index named '{from}' on '{table}'")));
+                };
+                if schema.indexes.iter().any(|i| i.name.eq_ignore_ascii_case(to)) {
+                    return Err(Error::catalog(format!("index '{to}' already exists on '{table}'")));
+                }
+                let mut renamed = def.clone();
+                renamed.name = to.clone();
+                vec![Op::DropIndex { table: table.clone(), name: def.name.clone() }, Op::CreateIndex { table, def: renamed }]
+            }
             AlterAction::RenameTable(to) => vec![Op::RenameTable { from: table, to: to.clone() }],
             AlterAction::SetDefault { name, value } => {
                 vec![Op::SetDefault { table, name: name.clone(), value: value.clone() }]

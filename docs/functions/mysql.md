@@ -34,6 +34,7 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `STRCMP(a, b)` | -1, 0 or 1, ignoring case |
 | `BIT_COUNT(n)` | the number of 1 bits of the 64-bit number |
 | `LOAD_FILE(path)` | the text of the file, NULL if it cannot be read |
+| `TO_BASE64(s)`, `FROM_BASE64(s)` | base64 text of the text, and the text of base64 (NULL if it is not valid base64) |
 | `DAYNAME(d)`, `MONTHNAME(d)`, `LAST_DAY(d)`, `TO_DAYS(d)` | the name of the day, the name of the month, the last day of the month, days since year 0 |
 | `INET_ATON(s)`, `INET_NTOA(n)`, `IS_IPV4(s)`, `IS_IPV6(s)` | IPv4 address and number, and the checks (1 or 0) |
 | `JSON_CONTAINS_PATH(doc, 'one' or 'all', path, ...)` | 1 if the paths exist (in any / all) |

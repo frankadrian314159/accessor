@@ -654,7 +654,7 @@ impl Runner<'_> {
         if let Some(rest) = c.strip_prefix('!') {
             return !self.truthy(rest);
         }
-        c.parse::<f64>().map(|n| n != 0.0).unwrap_or(!c.is_empty() && !c.starts_with('$'))
+        c.parse::<f64>().map(|n| n != 0.0).unwrap_or(!c.is_empty() && !c.starts_with('$') && !c.eq_ignore_ascii_case("null"))
     }
 
     fn run(&mut self, units: &[Unit]) {
@@ -709,7 +709,7 @@ impl Runner<'_> {
                             let value = if v.starts_with('`') && v.ends_with('`') && v.len() > 1 {
                                 let q = subst(&v[1..v.len() - 1], &self.vars);
                                 match self.db.execute(&q) {
-                                    Ok(r) => r.rows.first().and_then(|r| r.first()).map(cell).unwrap_or_default(),
+                                    Ok(r) => r.rows.first().and_then(|r| r.first()).map(|v| if v.is_null() { "NULL".to_string() } else { cell(v) }).unwrap_or_default(),
                                     Err(_) => String::new(),
                                 }
                             } else {
@@ -735,6 +735,12 @@ impl Runner<'_> {
                     "echo" => {
                         let t = subst(rest, &self.vars);
                         self.echo_line(t.trim_matches(|c| c == '"' || c == '\''));
+                    }
+                    "remove_file" => {
+                        let path = subst(rest.trim().trim_end_matches(';'), &self.vars);
+                        if !has_unresolved(&path) {
+                            let _ = std::fs::remove_file(path.trim());
+                        }
                     }
                     "error" => self.expect_error = !rest.trim().starts_with('0') || rest.contains(','),
                     "sorted_result" => self.sorted_result = true,
@@ -923,9 +929,12 @@ fn main() {
         eprintln!("usage: accessor-mtr --mysql PATH-TO/mysql-test [--report FILE] [--stall SECONDS] [--timeout SECONDS] [--memory-mb N] [--only a,b,c]");
         std::process::exit(2);
     }
+    // the tests run in a folder of their own, so that the files they write (`INTO OUTFILE`) do not land in the one this was started in
+    let root = std::path::absolute(&root).unwrap_or(root);
     let exe = std::env::current_exe().expect("own path");
     let scratch = std::env::temp_dir().join(format!("accessor-mtr-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).expect("temporary folder");
+    let work = scratch.join("work");
+    std::fs::create_dir_all(&work).expect("temporary folder");
     let (results, progress) = (scratch.join("results"), scratch.join("progress"));
     let mut skip: Vec<(String, usize)> = Vec::new();
     let mut killers: Vec<(String, usize)> = Vec::new();
@@ -936,6 +945,7 @@ fn main() {
         let _ = std::fs::write(&progress, "");
         let _ = std::fs::write(&results, "");
         let mut cmd = std::process::Command::new(&exe);
+        cmd.current_dir(&work);
         cmd.arg("--child").arg("--mysql").arg(&root).arg("--results").arg(&results).arg("--progress").arg(&progress);
         cmd.arg("--cap").arg(cap.to_string());
         if !from.is_empty() {

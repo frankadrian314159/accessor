@@ -5041,7 +5041,7 @@ fn mysql_functions_and_forms() {
     assert_eq!(one(&mut db, "SELECT MONTHNAME('2024-03-05') & DAYNAME('2024-03-05')"), "MarchTuesday");
 
     db.execute("CREATE TABLE t (id int PRIMARY KEY AUTO_INCREMENT, a int DEFAULT 7, b text)").unwrap();
-    db.execute("INSERT INTO t VALUES (); INSERT INTO t () VALUES ()").unwrap_err();
+    db.execute("INSERT INTO t VALUES (); INSERT INTO t () VALUES ()").unwrap();
     db.execute("INSERT INTO t VALUES ()").unwrap();
     assert_eq!(one(&mut db, "SELECT a FROM t"), "7");
     db.execute("LOCK TABLES t WRITE; UNLOCK TABLES").unwrap();
@@ -5840,4 +5840,35 @@ fn mysql_time_functions_strcmp_bit_count_and_the_bit_aggregates() {
     db.execute("CREATE TABLE b (g INT, x INT); INSERT INTO b VALUES (1, 12), (1, 10), (2, 5), (2, 3), (3, NULL)").unwrap();
     assert_eq!(rows(&db, "SELECT g, BIT_AND(x), BIT_OR(x), BIT_XOR(x) FROM b GROUP BY g ORDER BY g"), [["1", "8", "14", "6"], ["2", "1", "7", "6"], ["3", "18446744073709551615", "0", "0"]]);
     assert_eq!(rows(&db, "SELECT BIT_AND(x) FROM b WHERE g = 99"), [["18446744073709551615"]]);
+}
+
+#[test]
+fn group_concat_takes_order_by_and_separator() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE g (k INT, v TEXT, n INT); INSERT INTO g VALUES (1, 'b', 2), (1, 'a', 3), (1, 'c', 1), (2, 'z', 9)").unwrap();
+    assert_eq!(rows(&db, "SELECT k, GROUP_CONCAT(v ORDER BY v) FROM g GROUP BY k ORDER BY k"), [["1", "a,b,c"], ["2", "z"]]);
+    assert_eq!(rows(&db, "SELECT GROUP_CONCAT(v ORDER BY n DESC SEPARATOR '-') FROM g WHERE k = 1"), [["a-b-c"]]);
+    assert_eq!(rows(&db, "SELECT GROUP_CONCAT(v SEPARATOR '|') FROM g WHERE k = 1 AND n < 3"), [["b|c"]]);
+    assert_eq!(rows(&db, "SELECT STRING_AGG(v, ';' ORDER BY v DESC) FROM g WHERE k = 1"), [["c;b;a"]]);
+}
+
+#[test]
+fn mysql_rollup_rename_index_empty_insert_base64() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE r (a INT, b INT, c INT, KEY USING BTREE (c)); INSERT INTO r VALUES (1, 1, 5), (1, 2, 6), (2, 1, 7)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT a, SUM(c) FROM r GROUP BY a WITH ROLLUP"),
+        [["1", "11"], ["2", "7"], ["", "18"]]
+    );
+    db.execute("CREATE INDEX ix ON r (a)").unwrap();
+    db.execute("ALTER TABLE r RENAME INDEX ix TO iy").unwrap();
+    db.execute("ALTER TABLE r RENAME KEY iy TO iz").unwrap();
+    assert!(db.execute("ALTER TABLE r RENAME INDEX ix TO q").is_err());
+    db.execute("ALTER TABLE r RENAME TO r2").unwrap();
+    db.execute("ALTER TABLE r2 RENAME AS r3").unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM r3"), [["3"]]);
+    db.execute("CREATE TABLE e (id INT AUTO_INCREMENT PRIMARY KEY, v INT DEFAULT 7)").unwrap();
+    db.execute("INSERT INTO e () VALUES ()").unwrap();
+    assert_eq!(rows(&db, "SELECT id, v FROM e"), [["1", "7"]]);
+    assert_eq!(rows(&db, "SELECT TO_BASE64('Hello'), FROM_BASE64('SGVsbG8='), TO_BASE64('ab'), FROM_BASE64('YWI=')"), [["SGVsbG8=", "Hello", "YWI=", "ab"]]);
 }

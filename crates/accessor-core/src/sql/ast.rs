@@ -281,6 +281,8 @@ pub enum AlterAction {
     /// `ALTER COLUMN c CALCULATED AS (expr)`: change a calculated field's expression.
     SetExpression { name: String, expr: String },
     RenameTable(String),
+    /// `RENAME INDEX a TO b` (MySQL also spells it `RENAME KEY`).
+    RenameIndex { from: String, to: String },
     /// `ALTER COLUMN c SET DEFAULT v` (`Some`) or `DROP DEFAULT` (`None`).
     SetDefault { name: String, value: Option<Value> },
     /// `ALTER COLUMN c SET NOT NULL` / `DROP NOT NULL`.

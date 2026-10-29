@@ -63,6 +63,8 @@ pub enum MyFn {
     ConvertTz,
     BitCount,
     LoadFile,
+    ToBase64,
+    FromBase64,
 }
 
 pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
@@ -119,6 +121,8 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "CONVERT_TZ" => (ConvertTz, 3, 3),
         "BIT_COUNT" => (BitCount, 1, 1),
         "LOAD_FILE" => (LoadFile, 1, 1),
+        "TO_BASE64" => (ToBase64, 1, 1),
+        "FROM_BASE64" => (FromBase64, 1, 1),
         _ => return None,
     })
 }
@@ -660,6 +664,11 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::DateTime(to.to_local(from.to_utc(local)))
         }
         BitCount => Value::Int(int(v(0)).map_or(0, |n| (n as u64).count_ones() as i64)),
+        ToBase64 => Value::text(&to_base64(text(v(0)).as_bytes())),
+        FromBase64 => match from_base64(&text(v(0))) {
+            Some(bytes) => Value::text(&String::from_utf8_lossy(&bytes)),
+            None => Value::Null,
+        },
         LoadFile => match std::fs::read(text(v(0))) {
             Ok(bytes) => Value::text(&String::from_utf8_lossy(&bytes)),
             Err(_) => Value::Null,
@@ -704,4 +713,37 @@ fn temporal(v: &Value) -> Option<(i64, bool)> {
         Value::Text(s) => time_secs(s).map(|t| (t, true)).or_else(|| crate::datetime::parse(s).map(|t| (t, false))),
         _ => None,
     }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn to_base64(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The bytes of base64 text (white space is skipped); `None` when it is not valid base64.
+fn from_base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for ch in s.bytes().filter(|b| !b.is_ascii_whitespace()).take_while(|&b| b != b'=') {
+        let v = B64.iter().position(|&b| b == ch)? as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits & 0xff) as u8);
+        }
+    }
+    Some(out)
 }

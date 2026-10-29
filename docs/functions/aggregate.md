@@ -40,7 +40,7 @@ The result is an `INTEGER`.
 
 ## STRING_AGG
 
-`STRING_AGG(expr [, separator])` joins the non-NULL values into one text, in the order the rows are read. The separator defaults to a comma and must be a text constant. `LISTAGG` and `GROUP_CONCAT` are the same function. The result is NULL when there are no values. `WITHIN GROUP (ORDER BY ...)` is not supported.
+`STRING_AGG(expr [, separator])` joins the non-NULL values into one text, in the order the rows are read. The separator defaults to a comma and must be a text constant. `LISTAGG` and `GROUP_CONCAT` are the same function. The result is NULL when there are no values. The values can be put in an order of their own with `ORDER BY` inside the call, and MySQL's `SEPARATOR` word names the separator: `GROUP_CONCAT(Name ORDER BY Hired DESC, Name SEPARATOR '; ')`; `STRING_AGG(Name, ', ' ORDER BY Name)` works too (the same goes for `JSON_ARRAYAGG`). `WITHIN GROUP (ORDER BY ...)` is not supported.
 
 ```sql
 SELECT Dept, STRING_AGG(Name, ', ') FROM Emp GROUP BY Dept;

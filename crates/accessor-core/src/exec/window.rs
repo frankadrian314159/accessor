@@ -315,7 +315,7 @@ fn partition(w: &WinSpecB, part: &[usize], argv: &[Vec<Value>], okeys: &[Vec<Val
             }
         }
         WinFn::Agg(func) => {
-            let spec = AggSpec { func, arg: None, distinct: w.distinct, sep: w.sep.clone() };
+            let spec = AggSpec { func, arg: None, distinct: w.distinct, sep: w.sep.clone(), order: Vec::new() };
             let feed = |st: &mut AggState, p: usize| -> Result<()> {
                 if w.star {
                     st.update(None)

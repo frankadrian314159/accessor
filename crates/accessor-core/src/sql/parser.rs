@@ -1610,6 +1610,9 @@ impl<'a> Parser<'a> {
     /// At `KEY` / `INDEX` inside a table definition or `ALTER TABLE`: MySQL's `KEY [name] [USING ..] (columns)`, rather than a
     /// column that happens to be called `key` (`key int`, `key varchar(10)`; an index column is a name, not a length).
     fn mysql_key_ahead(&self, k: usize) -> bool {
+        if self.peek_kw_at(k + 1, "USING") {
+            return true;
+        }
         match self.peek_at(k + 1) {
             Tok::Sym("(") => true,
             Tok::Ident(_) | Tok::Quoted(_) => {
@@ -1820,7 +1823,7 @@ impl<'a> Parser<'a> {
         if self.peek_kw("RENAME") && !self.peek_kw_at(1, "COLUMN") && !self.peek_kw_at(1, "KEY") && !self.peek_kw_at(1, "INDEX") && !self.peek_kw_at(1, "TO") && !self.peek_kw_at(2, "TO") {
             self.advance();
             self.eat_kw("AS");
-            return Ok(Some(Statement::AlterTable { table, action: AlterAction::RenameTable(self.ident()?) }));
+            return Ok(Some(Statement::AlterTable { table, action: AlterAction::RenameTable(self.table_ident()?) }));
         }
         Ok(None)
     }
@@ -2447,7 +2450,11 @@ impl<'a> Parser<'a> {
             return Ok(Statement::Insert { table, columns: Some(cols), source: InsertSource::Values(vec![row]) });
         }
         let mut columns = None;
-        if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") && !self.peek_kw_at(1, "WITH") {
+        if self.peek_sym("(") && matches!(self.peek_at(1), Tok::Sym(")")) {
+            // INSERT INTO t () VALUES (): no columns named
+            self.advance();
+            self.advance();
+        } else if self.peek_sym("(") && !self.peek_kw_at(1, "SELECT") && !self.peek_kw_at(1, "WITH") {
             self.advance();
             columns = Some(self.ident_list()?);
             self.expect_sym(")")?;
@@ -4294,8 +4301,13 @@ impl<'a> Parser<'a> {
                 AlterAction::DropColumn(self.ident()?)
             }
         } else if self.eat_kw("RENAME") {
-            if self.eat_kw("TO") {
-                return Ok(Statement::AlterTable { table, action: AlterAction::RenameTable(self.ident()?) });
+            if self.eat_kw("TO") || self.eat_kw("AS") {
+                return Ok(Statement::AlterTable { table, action: AlterAction::RenameTable(self.table_ident()?) });
+            }
+            if self.eat_kw("KEY") || self.eat_kw("INDEX") {
+                let from = self.ident()?;
+                self.expect_kw("TO")?;
+                return Ok(Statement::AlterTable { table, action: AlterAction::RenameIndex { from, to: self.ident()? } });
             }
             self.eat_kw("COLUMN");
             let from = self.ident()?;
@@ -4854,6 +4866,14 @@ impl<'a> Parser<'a> {
             if !self.eat_sym(",") {
                 break;
             }
+        }
+        if !special && self.peek_kw("WITH") && self.peek_kw_at(1, "ROLLUP") {
+            // MySQL: GROUP BY a, b WITH ROLLUP is ROLLUP (a, b)
+            self.advance();
+            self.advance();
+            let n = sel.group_by.len();
+            sets = (0..=n).rev().map(|k| (0..k).collect()).collect();
+            special = true;
         }
         if special {
             for s in &mut sets {
@@ -5913,6 +5933,32 @@ impl<'a> Parser<'a> {
             while self.eat_sym(",") {
                 args.push(self.expr()?);
             }
+            // GROUP_CONCAT(x ORDER BY y [DESC], ... SEPARATOR 'x'): the separator is the second argument,
+            // the order trails as `__AGG_ORDER(key, descending)`
+            let mut order = Vec::new();
+            if self.peek_kw("ORDER") {
+                self.advance();
+                self.expect_kw("BY")?;
+                loop {
+                    let key = self.expr()?;
+                    let desc = if self.eat_kw("DESC") {
+                        true
+                    } else {
+                        self.eat_kw("ASC");
+                        false
+                    };
+                    order.push(Expr::Function { name: "__AGG_ORDER".into(), args: vec![key, Expr::Literal(Value::Bool(desc))], distinct: false, star: false });
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+            }
+            if self.eat_kw("SEPARATOR") {
+                let sep = self.expr()?;
+                args.truncate(1);
+                args.push(sep);
+            }
+            args.extend(order);
             // CHAR(n, ... USING charset): the character set changes nothing here
             if self.eat_kw("USING") {
                 self.advance();
@@ -6006,7 +6052,8 @@ impl<'a> Parser<'a> {
                 if !self.eat_kw("INTEGER") {
                     self.eat_kw("INT");
                 }
-                return Ok("INTEGER".into());
+                // UNSIGNED reaches 18446744073709551615, beyond a 64-bit signed integer
+                return Ok(if up == "UNSIGNED" { "BIGNUM" } else { "INTEGER" }.into());
             }
             "BIT" if self.peek_kw("VARYING") => {
                 // no bit strings: the bits are kept as text

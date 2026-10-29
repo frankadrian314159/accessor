@@ -155,6 +155,8 @@ The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `S
 
 **`SELECT ... INTO OUTFILE 'file'`** writes the rows of the query to a file that does not exist yet (MySQL's "File 'x' already exists" otherwise), as the server would: a tab between fields, a newline after each row, `\N` for NULL, with `FIELDS TERMINATED BY`, `[OPTIONALLY] ENCLOSED BY`, `ESCAPED BY`, `LINES STARTING BY` and `LINES TERMINATED BY` to change that. A character that would end the field or the line, the enclosing character and the escape character itself get the escape character in front. `INTO DUMPFILE` writes one row, as it is. The path is relative to the directory the program was started in. The statement returns the number of rows written.
 
+`GROUP BY a, b WITH ROLLUP` is `GROUP BY ROLLUP (a, b)`. `INSERT INTO t () VALUES ()` inserts a row of defaults. An index may be written `KEY USING BTREE (c)`; `CAST(x AS UNSIGNED)` gives a number that can be as large as 18446744073709551615 (a `BIGNUM`).
+
 ## Catalog views
 
 `INFORMATION_SCHEMA` has the standard columns beside the engine's own: `TABLES` and `COLUMNS` add `TABLE_CATALOG`, `TABLE_SCHEMA`, `ENGINE`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA`, `CHARACTER_SET_NAME` and `COLLATION_NAME`, and these views are added: `SCHEMATA`, `STATISTICS` (the indexes), `CHARACTER_SETS`, `COLLATIONS`, `ENGINES`, `PARTITIONS`, `CHECK_CONSTRAINTS`, and, with the right columns and no rows, `PROCESSLIST`, `COLUMN_STATISTICS`, `USER_PRIVILEGES`, `SCHEMA_PRIVILEGES`, `TABLE_PRIVILEGES`, `COLUMN_PRIVILEGES`, `EVENTS`, `OPTIMIZER_TRACE`, `RESOURCE_GROUPS`, `FILES`, `TABLESPACES`, `PLUGINS`, `VIEW_TABLE_USAGE`, `KEYWORDS` and a few more. See [information-schema.md](information-schema.md).
@@ -165,4 +167,4 @@ The body has no `AS`. It is one statement, or `BEGIN ... END` with `DECLARE`, `S
 
 ## Not available
 
-`CREATE USER 'u'@'host'` and `GRANT` for such users, the effect of `LOCK TABLES` (it is read and ignored, like `UNLOCK TABLES`), `performance_schema`, optimizer hints other than as comments, `GROUP BY ... WITH ROLLUP`, full-text search (`MATCH ... AGAINST`), spatial functions (`ST_*`), `LAST_INSERT_ID()`, `FOUND_ROWS()`, and the MySQL functions that are not in [the MySQL functions](../functions/mysql.md) or the [function reference](../functions/README.md).
+`CREATE USER 'u'@'host'` and `GRANT` for such users, the effect of `LOCK TABLES` (it is read and ignored, like `UNLOCK TABLES`), `performance_schema`, optimizer hints other than as comments, full-text search (`MATCH ... AGAINST`), spatial functions (`ST_*`), `LAST_INSERT_ID()`, `FOUND_ROWS()`, and the MySQL functions that are not in [the MySQL functions](../functions/mysql.md) or the [function reference](../functions/README.md).

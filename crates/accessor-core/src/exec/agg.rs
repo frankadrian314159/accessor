@@ -87,6 +87,8 @@ pub struct AggSpec {
     pub distinct: bool,
     /// The separator of `STRING_AGG`.
     pub sep: Option<String>,
+    /// `ORDER BY` inside the call (`GROUP_CONCAT(x ORDER BY y DESC)`): the key and whether it is descending.
+    pub order: Vec<(BExpr, bool)>,
 }
 
 #[derive(Clone)]
@@ -96,6 +98,9 @@ pub struct AggState {
     count: i64,
     acc: Option<Value>,
     parts: Vec<String>,
+    /// The sort keys of each part, when the call has an `ORDER BY`.
+    keys: Vec<Vec<Value>>,
+    desc: Vec<bool>,
     sep: String,
     mean: f64,
     m2: f64,
@@ -111,11 +116,23 @@ impl AggState {
             count: 0,
             acc: None,
             parts: Vec::new(),
+            keys: Vec::new(),
+            desc: spec.order.iter().map(|o| o.1).collect(),
             sep: spec.sep.clone().unwrap_or_else(|| ",".into()),
             mean: 0.0,
             m2: 0.0,
             bits: if spec.func == AggFn::BitAnd { u64::MAX } else { 0 },
         }
+    }
+
+    /// Feeds one input value with the sort keys of its row (an aggregate with an `ORDER BY`).
+    pub fn update_ordered(&mut self, v: Option<&Value>, keys: Vec<Value>) -> Result<()> {
+        let before = self.parts.len();
+        self.update(v)?;
+        if self.parts.len() > before {
+            self.keys.push(keys);
+        }
+        Ok(())
     }
 
     /// Feeds one input value (`None` for `COUNT(*)`).
@@ -223,6 +240,26 @@ impl AggState {
                 match self.acc {
                     Some(sum) if self.count > 0 => arith(BinOp::ExactDiv, &sum, &Value::Int(self.count)).unwrap_or(Value::Null),
                     _ => Value::Null,
+                }
+            }
+            AggFn::StringAgg | AggFn::JsonArrayAgg if !self.keys.is_empty() => {
+                let mut at: Vec<usize> = (0..self.parts.len()).collect();
+                let (keys, desc) = (&self.keys, &self.desc);
+                at.sort_by(|&a, &b| {
+                    for (i, d) in desc.iter().enumerate() {
+                        let o = keys[a][i].cmp(&keys[b][i]);
+                        let o = if *d { o.reverse() } else { o };
+                        if o != std::cmp::Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                let parts: Vec<&String> = at.iter().map(|&i| &self.parts[i]).collect();
+                if self.func == AggFn::StringAgg {
+                    Value::text(&parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(&self.sep))
+                } else {
+                    Value::Json(format!("[{}]", parts.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(",")).as_str().into())
                 }
             }
             AggFn::StringAgg => {

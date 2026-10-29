@@ -647,8 +647,14 @@ impl<'a> Binder<'a> {
         Ok(BExpr::Col(WIN_BASE + self.wins.len() - 1))
     }
 
-    fn bind_agg(&mut self, func: AggFn, args: &[Expr], distinct: bool, star: bool) -> Result<BExpr> {
+    fn bind_agg(&mut self, func: AggFn, all_args: &[Expr], distinct: bool, star: bool) -> Result<BExpr> {
         let mut sep_text: Option<String> = None;
+        // `ORDER BY` inside the call arrives as trailing `__AGG_ORDER(key, descending)` arguments
+        let (args, order_args): (Vec<&Expr>, Vec<&Expr>) =
+            all_args.iter().partition(|a| !matches!(a, Expr::Function { name, .. } if name == "__AGG_ORDER"));
+        let args: Vec<Expr> = args.into_iter().cloned().collect();
+        let args = &args[..];
+        let mut order: Vec<(BExpr, bool)> = Vec::new();
         let arg = if star {
             if func != AggFn::Count {
                 return Err(Error::runtime("only COUNT accepts *"));
@@ -674,9 +680,28 @@ impl<'a> Binder<'a> {
                     _ => return Err(Error::runtime("the separator of STRING_AGG must be a text constant")),
                 }
             }
-            Some(r?)
+            let arg = r?;
+            let saved = self.group.take();
+            let win_ok = self.allow_win;
+            self.allow_win = false;
+            for o in &order_args {
+                if let Expr::Function { args: ka, .. } = o {
+                    let desc = matches!(ka.get(1), Some(Expr::Literal(Value::Bool(true))));
+                    match self.bind(&ka[0]) {
+                        Ok(k) => order.push((k, desc)),
+                        Err(e) => {
+                            self.allow_win = win_ok;
+                            self.group = saved;
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            self.allow_win = win_ok;
+            self.group = saved;
+            Some(arg)
         };
-        let spec = AggSpec { func, arg, distinct, sep: sep_text };
+        let spec = AggSpec { func, arg, distinct, sep: sep_text, order };
         let g = self.group.as_mut().expect("aggregate bound outside group context");
         let n = g.exprs.len();
         let slot = match g.aggs.iter().position(|a| *a == spec) {

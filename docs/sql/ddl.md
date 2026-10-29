@@ -175,6 +175,7 @@ ALTER TABLE t ALTER [COLUMN] column SET DEFAULT literal;
 ALTER TABLE t ALTER [COLUMN] column DROP DEFAULT;
 ALTER TABLE t ALTER [COLUMN] column SET NOT NULL;
 ALTER TABLE t ALTER [COLUMN] column DROP NOT NULL;
+ALTER TABLE t RENAME INDEX old TO new;   -- MySQL: RENAME KEY
 ALTER TABLE t RENAME TO new_name;      -- MySQL: RENAME TABLE a TO b, c TO d
 ```
 
@@ -185,7 +186,8 @@ ALTER TABLE t RENAME TO new_name;      -- MySQL: RENAME TABLE a TO b, c TO d
 * **DROP CONSTRAINT** removes a foreign key or a check by name.
 * **SET DEFAULT** / **DROP DEFAULT** change the value used when an insert leaves the column out. The literal is converted to the column's type at once, so a value that does not fit is refused. Existing records are not touched. Calculated and AutoNumber columns have no default.
 * **SET NOT NULL** makes the column required. It is refused, with the number of offending records, while any record has no value for it. **DROP NOT NULL** makes it optional (but not a primary key column).
-* **RENAME TO** renames the table. Relationships that refer to it, its triggers and checks, and saved queries that name it are rewritten to follow. In a saved query or trigger the name is recognised after `FROM`, `JOIN`, `INTO`, `UPDATE`, `ON` and `TABLE`, and as a prefix (`Old.Column`), so a column that happens to have the old table's name is left alone. The new name must not be a table or a query already.
+* **RENAME INDEX** (or `RENAME KEY`) gives an index another name; the index is dropped and made again with the new name.
+* **RENAME TO** (or `RENAME AS`, with a name that may carry a schema, `db.new_name`) renames the table. Relationships that refer to it, its triggers and checks, and saved queries that name it are rewritten to follow. In a saved query or trigger the name is recognised after `FROM`, `JOIN`, `INTO`, `UPDATE`, `ON` and `TABLE`, and as a prefix (`Old.Column`), so a column that happens to have the old table's name is left alone. The new name must not be a table or a query already.
 
 Schema changes take part in [transactions](transactions.md) and can be rolled back.
 
