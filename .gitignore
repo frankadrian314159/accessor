@@ -15,3 +15,6 @@ jdbc/build/
 .cpcache/
 .clj-kondo/.cache/
 hs_err_pid*.log
+
+# Python caches
+__pycache__/
