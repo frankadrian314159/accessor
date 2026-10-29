@@ -5926,6 +5926,10 @@ fn mysql_dual_empty_rows_insert_function_sounds_like_unnamed_keys_and_multi_drop
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM e"), [["3"]]);
     db.execute("CREATE TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT, pid INT, FOREIGN KEY (pid) REFERENCES p(id))").unwrap();
     db.execute("DROP TABLE p, c").unwrap();
+    // the tables that exist go even when another in the list does not
+    db.execute("CREATE TABLE q1 (a INT)").unwrap();
+    db.execute("DROP TABLE q1, nosuch").unwrap_err();
+    assert!(db.table_names().iter().all(|n| *n != "q1"));
     assert!(db.table_names().iter().all(|n| *n != "p" && *n != "c"));
 }
 

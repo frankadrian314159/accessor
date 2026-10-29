@@ -437,12 +437,12 @@ impl Database {
         if !cascade && names.len() > 1 {
             // the tables go as one: a table that another one in the list refers to is dropped after it
             let mut pending: Vec<&String> = Vec::new();
+            let mut missing: Option<&String> = None;
             for n in names {
                 if self.table(n).is_none() {
-                    if if_exists {
-                        continue;
-                    }
-                    return Err(Error::catalog(format!("the table '{n}' does not exist")));
+                    // as in MySQL, the tables that exist are dropped, and the one that does not is reported
+                    missing = missing.or(Some(n));
+                    continue;
                 }
                 pending.push(n);
             }
@@ -460,7 +460,10 @@ impl Database {
                 }
                 pending = later;
             }
-            return Ok(QueryResult::default());
+            return match missing {
+                Some(n) if !if_exists => Err(Error::catalog(format!("the table '{n}' does not exist"))),
+                _ => Ok(QueryResult::default()),
+            };
         }
         for n in names {
             if self.table(n).is_none() {
