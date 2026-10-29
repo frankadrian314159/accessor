@@ -81,4 +81,31 @@ impl Database {
         }
         Ok(())
     }
+
+    /// Dropping a column drops the CHECK constraints (the trigger pairs of `add_check`) that mention it, as PostgreSQL does.
+    pub(crate) fn drop_checks_on_column(&mut self, table: &str, column: &str) -> Result<()> {
+        let mut names: Vec<String> = Vec::new();
+        for (key, def) in &self.triggers {
+            if !def.table.eq_ignore_ascii_case(table) || !def.sql.contains("CHECK constraint failed on") {
+                continue;
+            }
+            let mut mentions = false;
+            if let Some(when) = &def.when {
+                let mut w = when.clone();
+                let _ = walk_expr(&mut w, &mut |e| {
+                    if let Expr::Column { table: Some(t), name } = e {
+                        mentions |= t.eq_ignore_ascii_case("NEW") && name.eq_ignore_ascii_case(column);
+                    }
+                    Ok(())
+                });
+            }
+            if mentions {
+                names.push(key.clone());
+            }
+        }
+        for key in names {
+            let _ = self.execute(&format!("DROP TRIGGER IF EXISTS [{key}]"));
+        }
+        Ok(())
+    }
 }

@@ -554,7 +554,7 @@ fn run_test(ctx: &mut Ctx, name: &str) {
 
 /// Settings the run starts with: PostgreSQL's casts of a float to an integer round, where Accessor's drop the fraction, and
 /// its types that Accessor lacks (and arrays) are kept as text, so that the tables that use them can be made.
-const POSTGRES_SETTINGS: &[&str] = &["SET cast_truncates = off", "SET lenient_types = on"];
+const POSTGRES_SETTINGS: &[&str] = &["SET cast_truncates = off", "SET lenient_types = on", "SET strict_types = on"];
 
 fn compare_rows(sql: &str, want: &[Vec<String>], got: &accessor_core::QueryResult) -> (String, String, String) {
     let ordered = sql.to_ascii_lowercase().contains("order by");

@@ -28,6 +28,25 @@ pub struct UserType {
 thread_local! {
     static TYPES: RefCell<HashMap<String, UserType>> = RefCell::new(HashMap::new());
     static LENIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct StrictGuard(bool);
+
+/// With `SET strict_types = on`, a column made with a size (`CHAR(5)`, `VARCHAR(10)`, `NUMERIC(5,2)`) or a narrow integer
+/// type (`SMALLINT`, `INT`) gets a `CHECK` that keeps its values to that size. Sets the flag until the guard is dropped.
+pub(crate) fn strict_guard(on: bool) -> StrictGuard {
+    StrictGuard(STRICT.with(|l| l.replace(on)))
+}
+
+impl Drop for StrictGuard {
+    fn drop(&mut self) {
+        STRICT.with(|l| l.set(self.0));
+    }
+}
+
+pub(crate) fn strict() -> bool {
+    STRICT.with(|l| l.get())
 }
 
 /// With `SET lenient_types = on` a type name the engine does not know is kept as `TEXT` instead of being refused, and so

@@ -51,6 +51,7 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("integer_division", "on", 'b'),
     ("lenient_types", "off", 'b'),
     ("round_half_even", "on", 'b'),
+    ("strict_types", "off", 'b'),
     ("geqo_threshold", "12", 't'),
     ("gin_fuzzy_search_limit", "0", 't'),
     ("hash_mem_multiplier", "2", 't'),

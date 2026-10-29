@@ -5685,3 +5685,71 @@ fn cursors_declare_fetch_move_and_close() {
     db.execute("CLOSE ALL").unwrap();
     assert!(db.execute("FETCH a").is_err());
 }
+
+#[test]
+fn strict_types_keep_declared_sizes_as_checks() {
+    let mut db = Database::in_memory();
+    // by default sizes are not enforced
+    db.execute("CREATE TABLE loose (c CHAR(2), s SMALLINT, i INT, n NUMERIC(5, 2), v VARCHAR(3))").unwrap();
+    db.execute("INSERT INTO loose VALUES ('abcde', 40000, 3000000000, 12345.678, 'abcdef')").unwrap();
+    db.execute("SET strict_types = on").unwrap();
+    db.execute("CREATE TABLE tight (c CHAR(2), s SMALLINT, i INT, n NUMERIC(5, 2), v VARCHAR(3), w CHARACTER VARYING(2), big BIGINT, t TEXT)").unwrap();
+    db.execute("INSERT INTO tight VALUES ('ab', 32767, 2147483647, 999.99, 'abc', 'xy', 9000000000, 'any length at all')").unwrap();
+    // spaces after the length are cut off in PostgreSQL, so they are allowed
+    db.execute("INSERT INTO tight (c, v) VALUES ('a   ', 'ab    ')").unwrap();
+    for bad in [
+        "INSERT INTO tight (c) VALUES ('abc')",
+        "INSERT INTO tight (v) VALUES ('abcd')",
+        "INSERT INTO tight (w) VALUES ('xyz')",
+        "INSERT INTO tight (s) VALUES (32768)",
+        "INSERT INTO tight (s) VALUES (-32769)",
+        "INSERT INTO tight (i) VALUES (2147483648)",
+        "INSERT INTO tight (n) VALUES (1000)",
+        "UPDATE tight SET s = 40000 WHERE c = 'ab'",
+    ] {
+        assert!(db.execute(bad).is_err(), "{bad}");
+    }
+    // NULL is no violation, and a column added later is checked too
+    db.execute("INSERT INTO tight (c) VALUES (NULL)").unwrap();
+    db.execute("ALTER TABLE tight ADD COLUMN z SMALLINT").unwrap();
+    assert!(db.execute("UPDATE tight SET z = 99999 WHERE c IS NULL").is_err());
+    // a table made before keeps no checks, and turning the setting off stops checking new tables
+    db.execute("INSERT INTO loose VALUES ('abcde', 40000, 3000000000, 1, 'abcdef')").unwrap();
+    db.execute("RESET strict_types").unwrap();
+    db.execute("CREATE TABLE loose2 (c CHAR(1))").unwrap();
+    db.execute("INSERT INTO loose2 VALUES ('abc')").unwrap();
+}
+
+#[test]
+fn a_column_added_with_a_check_keeps_the_check() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1)").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN b INT CHECK (b > 0)").unwrap();
+    assert!(db.execute("UPDATE t SET b = -1").is_err());
+    db.execute("UPDATE t SET b = 5").unwrap();
+}
+
+#[test]
+fn dropping_a_column_drops_the_checks_that_mention_it() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a INT CHECK (a > 0), b INT, c INT, CHECK (b < c))").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 2)").unwrap();
+    assert!(db.execute("INSERT INTO t VALUES (-1, 1, 2)").is_err());
+    db.execute("ALTER TABLE t DROP COLUMN a").unwrap();
+    // the check on a went with it, and the one on b and c stays
+    db.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    assert!(db.execute("INSERT INTO t VALUES (5, 2)").is_err());
+    db.execute("ALTER TABLE t DROP COLUMN c").unwrap();
+    db.execute("INSERT INTO t VALUES (99)").unwrap();
+}
+
+#[test]
+fn strict_numeric_sizes_with_a_negative_scale_or_more_scale_than_digits() {
+    let mut db = Database::in_memory();
+    db.execute("SET strict_types = on").unwrap();
+    db.execute("CREATE TABLE n (millions NUMERIC(3, -6), thousandths NUMERIC(3, 3), units NUMERIC(3, 0))").unwrap();
+    db.execute("INSERT INTO n VALUES (123000000, 0.123, 999)").unwrap();
+    assert!(db.execute("INSERT INTO n (units) VALUES (1000)").is_err());
+    assert!(db.execute("INSERT INTO n (thousandths) VALUES (1.5)").is_err());
+    assert!(db.execute("INSERT INTO n (millions) VALUES (1000000000)").is_err());
+}

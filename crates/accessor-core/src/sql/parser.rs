@@ -3838,15 +3838,26 @@ impl<'a> Parser<'a> {
             None => crate::sql::usertypes::resolve(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?,
         };
         let mut expression = None;
+        let mut size: Vec<i64> = Vec::new();
         if data_type == DataType::Calculated {
             expression = Some(self.calculated_expression(&name)?);
         } else if self.eat_sym("(") {
-            // Length / precision hints are accepted and ignored.
+            // Length / precision hints are accepted and ignored (kept as a CHECK under strict_types).
+            let mut minus = false;
             while !self.peek_sym(")") && !self.at_eof() {
-                self.advance();
+                match self.advance() {
+                    Tok::Int(i) => size.push(if minus { -i } else { i }),
+                    Tok::Sym("-") => {
+                        minus = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+                minus = false;
             }
             self.expect_sym(")")?;
         }
+        let type_check = if crate::sql::usertypes::strict() { strict_type_check(&name, &type_name, data_type, &size) } else { None };
         let mut unsigned = false;
         while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {
             unsigned |= matches!(self.toks[self.pos - 1].tok, Tok::Ident(ref w) if w.eq_ignore_ascii_case("UNSIGNED"));
@@ -3971,6 +3982,12 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+        }
+        if let Some(extra) = type_check {
+            def.check = Some(match def.check.take() {
+                Some(c) => format!("({c}) AND ({extra})"),
+                None => extra,
+            });
         }
         Ok(def)
     }
@@ -4144,11 +4161,17 @@ impl<'a> Parser<'a> {
                 AlterAction::AddForeignKey(self.table_foreign_key()?)
             } else {
                 self.eat_kw("COLUMN");
-                let def = self.column_def()?;
+                let mut def = self.column_def()?;
                 // MySQL: FIRST | AFTER column
                 if self.eat_kw("FIRST") {
                 } else if self.eat_kw("AFTER") {
                     self.ident()?;
+                }
+                // the column's CHECK is a constraint of the table, added with it
+                if let Some(expr) = def.check.take() {
+                    let add = Statement::AlterTable { table: table.clone(), action: AlterAction::AddColumn(def) };
+                    let check = Statement::AlterTable { table, action: AlterAction::AddCheck { name: None, expr } };
+                    return Ok(Statement::Batch(vec![add, check]));
                 }
                 AlterAction::AddColumn(def)
             }
@@ -6257,5 +6280,26 @@ fn make_cast(e: Expr, ty: DataType, hints: &[i64]) -> Expr {
             star: false,
         },
         _ => call,
+    }
+}
+
+/// Under `strict_types`: the `CHECK` that keeps the values of a column to the size it was declared with. A text of
+/// `n` characters may have spaces after them (PostgreSQL cuts those off); a `NUMERIC(p, s)` has `p - s` digits before the
+/// point; `SMALLINT` and `INT` have their 16 and 32 bits. Nothing for other types.
+fn strict_type_check(column: &str, type_name: &str, data_type: DataType, size: &[i64]) -> Option<String> {
+    let col = format!("[{column}]");
+    let up = type_name.to_ascii_uppercase();
+    match (data_type, up.as_str()) {
+        (DataType::Text, _) => size.first().map(|n| format!("Len(RTrim({col})) <= {n}")),
+        (DataType::Integer, "SMALLINT" | "INT2") => Some(format!("{col} BETWEEN -32768 AND 32767")),
+        (DataType::Integer, "INT" | "INTEGER" | "INT4") => Some(format!("{col} BETWEEN -2147483648 AND 2147483647")),
+        (DataType::Decimal, "NUMERIC" | "DECIMAL" | "DEC") => {
+            // p digits, s of them after the point (s may be negative, or more than p): the values are below 10^(p - s)
+            let (p, s) = (*size.first()?, size.get(1).copied().unwrap_or(0));
+            let digits = (p - s).clamp(-38, 38);
+            let limit = if digits >= 0 { format!("1{}", "0".repeat(digits as usize)) } else { format!("0.{}1", "0".repeat((-digits - 1) as usize)) };
+            Some(format!("Abs({col}) < {limit}"))
+        }
+        _ => None,
     }
 }

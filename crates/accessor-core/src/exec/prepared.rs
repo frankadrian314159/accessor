@@ -116,7 +116,8 @@ impl Database {
     /// The statements of `sql`, read now or taken from the cache.
     pub(crate) fn parse_cached(&self, sql: &str) -> Result<Arc<Vec<Statement>>> {
         // what a lenient reading made of the text is not what a strict one would, so the cache is not used with it
-        let lenient = self.settings.get("lenient_types").is_some_and(|v| v == "on");
+        let lenient = self.settings.get("lenient_types").is_some_and(|v| v == "on") || self.settings.get("strict_types").is_some_and(|v| v == "on");
+        let strict = self.settings.get("strict_types").is_some_and(|v| v == "on");
         if !lenient {
             if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
                 return Ok(Arc::clone(hit));
@@ -124,7 +125,8 @@ impl Database {
         }
         crate::sql::usertypes::set_types(self.user_types());
         let parsed = {
-            let _lenient = crate::sql::usertypes::lenient_guard(lenient);
+            let _lenient = crate::sql::usertypes::lenient_guard(self.settings.get("lenient_types").is_some_and(|v| v == "on"));
+            let _strict = crate::sql::usertypes::strict_guard(strict);
             parse_script(sql)
         };
         let parsed = Arc::new(parsed?);

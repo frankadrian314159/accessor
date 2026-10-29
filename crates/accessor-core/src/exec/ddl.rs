@@ -162,7 +162,10 @@ impl Database {
                 self.prospective_schema(&table, name, expr, true)?;
                 vec![Op::SetExpression { table, name: name.clone(), expr: expr.clone() }]
             }
-            AlterAction::DropColumn(name) => vec![Op::DropColumn { table, name: name.clone() }],
+            AlterAction::DropColumn(name) => {
+                self.drop_checks_on_column(&table, name)?;
+                vec![Op::DropColumn { table, name: name.clone() }]
+            }
             AlterAction::RenameColumn { from, to } => {
                 vec![Op::RenameColumn { table, from: from.clone(), to: to.clone() }]
             }
