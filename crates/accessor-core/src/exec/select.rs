@@ -409,6 +409,8 @@ impl Database {
             }
         }
         let mut indexes: HashMap<Vec<Value>, HashMap<Vec<Value>, Vec<usize>>> = HashMap::new();
+        const MAX_CACHED_ROWS: usize = 1_000_000;
+        let mut cached = 0usize;
         for l in &left {
             super::budget::tick()?;
             let key: Vec<Value> = outer.iter().map(|(_, c)| l[*c].clone()).collect();
@@ -435,6 +437,14 @@ impl Database {
                         }
                     };
                     let rc = Arc::new(rows);
+                    // the answers are kept for the outer values that come again, up to a number of rows: a lateral item of
+                    // 10,000 rows run for 10,000 different outer values would otherwise keep 100 million
+                    cached += rc.len();
+                    if cached > MAX_CACHED_ROWS {
+                        cache.clear();
+                        indexes.clear();
+                        cached = rc.len();
+                    }
                     cache.insert(key.clone(), Arc::clone(&rc));
                     rc
                 }
@@ -474,6 +484,7 @@ impl Database {
                 }
                 matched = true;
                 out.push(row);
+                super::budget::rows(out.len(), l.len() + rw)?;
             }
             if !matched && kind == JoinKind::Left {
                 let mut row = l.clone();
