@@ -5523,3 +5523,27 @@ fn round_half_even_setting_sends_ties_away_from_zero_when_off() {
     db.execute("RESET round_half_even").unwrap();
     assert_eq!(rows(&db, "SELECT Round(2.125, 2)"), [["2.12"]]);
 }
+
+#[test]
+fn cast_truncates_setting_makes_casts_round_when_off() {
+    let mut db = Database::in_memory();
+    assert_eq!(rows(&db, "SELECT CAST(-1.5 AS INTEGER), CAST(2.5 AS INTEGER), CAST(2.7 AS BIGINT), CInt(2.5)"), [["-1", "2", "2", "2"]]);
+    db.execute("SET cast_truncates = off").unwrap();
+    assert_eq!(rows(&db, "SELECT CAST(-1.5 AS INTEGER), CAST(-0.5 AS INTEGER), CAST(1.5 AS INTEGER), CAST(2.5 AS INTEGER), CAST(2.7 AS BIGINT)"), [["-2", "0", "2", "2", "3"]]);
+    db.execute("RESET cast_truncates").unwrap();
+    assert_eq!(rows(&db, "SELECT CAST(2.7 AS INTEGER)"), [["2"]]);
+}
+
+#[test]
+fn a_real_column_compared_with_text_reads_the_text_as_real() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE f4 (f1 REAL); INSERT INTO f4 VALUES ('1004.3'), ('34.84'), ('0.1')").unwrap();
+    assert_eq!(rows(&db, "SELECT f1 FROM f4 WHERE f1 = '1004.3'"), [["1004.3"]]);
+    assert_eq!(rows(&db, "SELECT f1 FROM f4 WHERE '0.1' = f1"), [["0.1"]]);
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM f4 WHERE f1 < '100'"), [["2"]]);
+    // a double literal is a double: the single-precision value is not equal to it
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM f4 WHERE f1 = 1004.3"), [["0"]]);
+    // an index finds it too
+    db.execute("CREATE INDEX f4_f1 ON f4 (f1)").unwrap();
+    assert_eq!(rows(&db, "SELECT f1 FROM f4 WHERE f1 = '1004.3'"), [["1004.3"]]);
+}

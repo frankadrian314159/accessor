@@ -29,6 +29,8 @@ SELECT CDbl(0.1) + CDbl(0.2) = CDbl(0.3);       -- No
 SELECT 0.1 + 0.2 = 0.3;                         -- Yes (DECIMAL arithmetic is exact)
 ```
 
+Text that reads as a number, compared with a `FLOAT` (`REAL`), is read as a `FLOAT` too, as PostgreSQL reads a literal: with `f1 REAL` holding `1004.3`, `f1 = '1004.3'` is true, because both are the nearest single-precision number to 1004.3; `f1 = 1004.3` compares with a double and is not.
+
 If you want to compare a float with a decimal as a person would, convert the float with `CDec`, which uses the float's shortest decimal text: `CDec(CDbl(0.1)) = 0.1` is true.
 
 ## Display

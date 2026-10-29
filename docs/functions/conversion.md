@@ -6,7 +6,7 @@
 CAST(expression AS type)
 ```
 
-Converts a value to a [data type](../sql/ddl.md#data-types): `CAST('12' AS INTEGER)`, `CAST(Total AS TEXT)`, `CAST(x AS DECIMAL(10, 2))`. Sizes are ignored, except that the scale of a `DECIMAL` or `CURRENCY` rounds the result (halves to the even digit). A NULL stays NULL. `CAST(x AS INTEGER)` and `CAST(x AS BIGNUM)` drop the fraction of a number toward zero (`CAST(2.7 AS INTEGER)` is 2; the function `CInt(2.7)` rounds to 3). A value that cannot be converted (`CAST('abc' AS INTEGER)`) is an error.
+Converts a value to a [data type](../sql/ddl.md#data-types): `CAST('12' AS INTEGER)`, `CAST(Total AS TEXT)`, `CAST(x AS DECIMAL(10, 2))`. Sizes are ignored, except that the scale of a `DECIMAL` or `CURRENCY` rounds the result (halves to the even digit). A NULL stays NULL. `CAST(x AS INTEGER)` and `CAST(x AS BIGNUM)` drop the fraction of a number toward zero (`CAST(2.7 AS INTEGER)` is 2; the function `CInt(2.7)` rounds to 3). `SET cast_truncates = off` makes them round instead, halves to the even digit, as PostgreSQL's casts do: `CAST(2.7 AS INTEGER)` is 3 and `CAST(-1.5 AS INTEGER)` is -2 (`on` is the default). A value that cannot be converted (`CAST('abc' AS INTEGER)`) is an error.
 
 `CAST` is the same as the conversion function for the type, listed next.
 

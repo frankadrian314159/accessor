@@ -552,6 +552,9 @@ fn run_test(ctx: &mut Ctx, name: &str) {
     }
 }
 
+/// Settings the run starts with: PostgreSQL's casts of a float to an integer round, where Accessor's drop the fraction.
+const POSTGRES_SETTINGS: &[&str] = &["SET cast_truncates = off"];
+
 fn compare_rows(sql: &str, want: &[Vec<String>], got: &accessor_core::QueryResult) -> (String, String, String) {
     let ordered = sql.to_ascii_lowercase().contains("order by");
     let mut g: Vec<Vec<String>> = got.rows.iter().map(|r| r.iter().map(cell).collect()).collect();
@@ -609,7 +612,12 @@ fn child(args: &[String]) {
         }
     }
     std::panic::set_hook(Box::new(|_| {}));
-    let mut ctx = Ctx { db: Database::in_memory(), vars: HashMap::new(), pg: pg.clone(), results: String::new(), progress, skip };
+    let mut db = Database::in_memory();
+    // PostgreSQL's reading of a few things Accessor does otherwise by default (docs/extern/testing.md)
+    for st in POSTGRES_SETTINGS {
+        let _ = db.execute(st);
+    }
+    let mut ctx = Ctx { db, vars: HashMap::new(), pg: pg.clone(), results: String::new(), progress, skip };
     for t in schedule(&pg) {
         if !only.is_empty() && !only.contains(&t) && t != "test_setup" {
             continue;

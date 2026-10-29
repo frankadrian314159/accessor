@@ -47,6 +47,7 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("extra_float_digits", "1", 't'),
     ("from_collapse_limit", "8", 't'),
     ("geqo", "on", 'b'),
+    ("cast_truncates", "on", 'b'),
     ("integer_division", "on", 'b'),
     ("round_half_even", "on", 'b'),
     ("geqo_threshold", "12", 't'),

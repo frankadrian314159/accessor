@@ -357,6 +357,17 @@ pub(crate) enum Kind {
 /// Reads a number from text: optional sign, `$` and thousands separators are
 /// tolerated, and so is an exponent (`1.5e3`). Whole numbers become `INTEGER`
 /// (or `BIGNUM` when too large), everything else `DECIMAL`.
+/// A number read from text, compared with `other`: against a `REAL` it is a `REAL` too (as PostgreSQL reads a literal
+/// compared with a `real` column), so `WHERE f1 = '1004.3'` finds the row that holds the nearest single-precision value.
+fn as_real_for(x: Value, other: &Value) -> Value {
+    if matches!(other, Value::Float(_)) {
+        if let Some(f) = x.as_f32() {
+            return Value::Float(f);
+        }
+    }
+    x
+}
+
 pub(crate) fn parse_num(s: &str) -> Option<Value> {
     let t = s.trim();
     if t.is_empty() {
@@ -707,11 +718,11 @@ impl Value {
                 None => (**t).cmp(&**b),
             },
             (Value::Text(t), n) => match (parse_num(t), n.num()) {
-                (Some(x), Some(y)) => num_cmp(&x, &y),
+                (Some(x), Some(y)) => num_cmp(&as_real_for(x, n), &y),
                 _ => Ordering::Greater,
             },
             (n, Value::Text(t)) => match (n.num(), parse_num(t)) {
-                (Some(x), Some(y)) => num_cmp(&x, &y),
+                (Some(x), Some(y)) => num_cmp(&x, &as_real_for(y, n)),
                 _ => Ordering::Less,
             },
             (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) => a.cmp(b),

@@ -1042,9 +1042,30 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
     })
 }
 
+thread_local! {
+    static CAST_TRUNCATES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Puts `CAST(x AS INTEGER)` of a number with a fraction into truncating (the default) or rounding (ties to even, as
+/// PostgreSQL's does) until the guard is dropped. The statement being run sets this from the `cast_truncates` setting.
+pub(crate) struct CastGuard(bool);
+
+pub(crate) fn cast_truncates(on: bool) -> CastGuard {
+    CastGuard(CAST_TRUNCATES.with(|t| t.replace(on)))
+}
+
+impl Drop for CastGuard {
+    fn drop(&mut self) {
+        CAST_TRUNCATES.with(|t| t.set(self.0));
+    }
+}
+
 /// A number with a fraction (a `FLOAT`, `DOUBLE`, `DECIMAL`, `CURRENCY` or `RATIONAL`) with the fraction
 /// dropped, toward zero; anything else as it is.
 fn truncated(v: &Value) -> Result<Value> {
+    if !CAST_TRUNCATES.with(|t| t.get()) {
+        return Ok(v.clone());
+    }
     match v {
         Value::Float(f) if !f.is_finite() => Ok(v.clone()),
         Value::Double(f) if !f.is_finite() => Ok(v.clone()),
