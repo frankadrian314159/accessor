@@ -25,6 +25,15 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `UNIX_TIMESTAMP([d])` | seconds since 1970-01-01 (now, without an argument) |
 | `FROM_UNIXTIME(n [, fmt])` | the date-time (or its text by `fmt`) |
 | `SEC_TO_TIME(n)` | `HH:MM:SS` text |
+| `MAKETIME(h, m, s)` | `HH:MM:SS` text, with a minus sign for negative hours (more than two digits of hours are kept); NULL if `m` or `s` is out of range |
+| `ADDTIME(t, t2)`, `SUBTIME(t, t2)` | `t` is a time (`HH:MM:SS`, the hours may pass 24; text) or a date and time; `t2` is a time. A time gives a time, a date and time gives a date and time. A fraction of a second is dropped |
+| `TIMEDIFF(a, b)` | `a - b` as a time, when both are times or both are dates and times |
+| `TIMESTAMPDIFF(unit, a, b)` | whole units from `a` to `b` (negative if `b` is earlier): `SECOND`, `MINUTE`, `HOUR`, `DAY`, `WEEK`, `MONTH`, `QUARTER`, `YEAR`; a month is whole only when its day and time have come round (January 31 to February 29 is 0 months) |
+| `TIMESTAMPADD(unit, n, d)` | `d` plus `n` of the unit, as `DateAdd` (the same units) |
+| `CONVERT_TZ(dt, from, to)` | the date and time in another zone: zones as `+05:30` or a region name (`America/New_York`); NULL for a zone it does not know |
+| `STRCMP(a, b)` | -1, 0 or 1, ignoring case |
+| `BIT_COUNT(n)` | the number of 1 bits of the 64-bit number |
+| `LOAD_FILE(path)` | the text of the file, NULL if it cannot be read |
 | `DAYNAME(d)`, `MONTHNAME(d)`, `LAST_DAY(d)`, `TO_DAYS(d)` | the name of the day, the name of the month, the last day of the month, days since year 0 |
 | `INET_ATON(s)`, `INET_NTOA(n)`, `IS_IPV4(s)`, `IS_IPV6(s)` | IPv4 address and number, and the checks (1 or 0) |
 | `JSON_CONTAINS_PATH(doc, 'one' or 'all', path, ...)` | 1 if the paths exist (in any / all) |

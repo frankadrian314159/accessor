@@ -69,6 +69,10 @@ They are computed in floating point and return a `DOUBLE`.
 
 `EVERY(condition)` (also `BOOL_AND`) is true when the condition is true for every row; `BOOL_OR(condition)` is true when it is true for at least one. A NULL condition counts as false. Both are NULL over no rows.
 
+## BIT_AND, BIT_OR and BIT_XOR
+
+`BIT_AND(x)`, `BIT_OR(x)` and `BIT_XOR(x)` combine the whole numbers of a group bit by bit, as unsigned 64-bit numbers, ignoring NULLs. Over no rows (or only NULLs) `BIT_AND` is 18446744073709551615 (every bit set) and the other two are 0, as in MySQL.
+
 ## GROUPING
 
 `GROUPING(expr [, ...])` is used with [`ROLLUP`, `CUBE` and `GROUPING SETS`](../sql/select.md#rollup-cube-and-grouping-sets). Each argument must be one of the `GROUP BY` expressions. For one argument it returns 1 in the rows where that expression was rolled up (shown as NULL), and 0 otherwise. For several it returns a number whose bits are those values, the first argument being the highest bit: `GROUPING(a, b)` is 0, 1, 2 or 3.
