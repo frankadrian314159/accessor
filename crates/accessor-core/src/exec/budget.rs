@@ -35,6 +35,11 @@ pub(crate) fn limit(after: Duration) -> Guard {
     Guard(old, old_values)
 }
 
+/// Lets the statement under the limit build no more than `values` values in a join result (the guard restores the old cap).
+pub(crate) fn cap_values(values: usize) {
+    VALUES.with(|v| v.set(v.get().min(values)));
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
         let old = self.0;

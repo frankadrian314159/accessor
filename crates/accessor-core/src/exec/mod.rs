@@ -103,6 +103,10 @@ impl Database {
     /// shows the plan as far as it got; `EXPLAIN ANALYZE` runs to the end.
     fn run_explain(&self, sel: &crate::sql::ast::Select, analyze: bool) -> Result<QueryResult> {
         let _limit = (!analyze).then(|| budget::limit(std::time::Duration::from_secs(4)));
+        if !analyze {
+            // a plan needs no huge join result: stop early rather than fill the memory with one
+            budget::cap_values(4_000_000);
+        }
         let (result, mut lines) = self.collect_plan(|| self.run_select(sel));
         let result = match result {
             Err(e) if !analyze && e.to_string().contains(budget::EXPIRED) => {
@@ -121,6 +125,9 @@ impl Database {
 
     pub fn execute_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         let result = self.run_statement(st);
+        for (name, value) in crate::expr::myfuncs::take_assignments() {
+            self.user_vars.insert(name, value);
+        }
         // Numbers handed out are logged even if the statement failed or its transaction is rolled back.
         self.flush_sequences()?;
         result

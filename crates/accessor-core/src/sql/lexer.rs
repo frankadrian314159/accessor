@@ -330,7 +330,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             let array_op = match dialect::current() {
                 Dialect::Mysql => None,
-                d => ["@>", "<@", "&&"].into_iter().find(|s| rest.starts_with(*s) && !(d == Dialect::Asql && *s == "<@" && rest[2..].starts_with(is_ident_start))),
+                // `&&` is a slip for `&` in asql (the error says so), so it means overlap in postgresql only
+                d => ["@>", "<@", "&&"].into_iter().find(|s| {
+                    rest.starts_with(*s) && !(d == Dialect::Asql && (*s == "&&" || (*s == "<@" && rest[2..].starts_with(is_ident_start))))
+                }),
             };
             if let Some(sym) = array_op {
                 i += 2;

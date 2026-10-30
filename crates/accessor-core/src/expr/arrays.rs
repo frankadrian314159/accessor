@@ -80,7 +80,7 @@ pub fn lookup(name: &str) -> Option<(ArrFn, usize, usize)> {
         "TRIM_ARRAY" => (Trim, 2, 2),
         "__ARRAY_CONTAINS" => (Contains, 2, 2),
         "__ARRAY_CONTAINED" => (ContainedBy, 2, 2),
-        "__ARRAY_OVERLAP" => (Overlap, 2, 2),
+        "__ARRAY_OVERLAP" | "ARRAY_OVERLAPS" => (Overlap, 2, 2),
         "__ANY" => (Quant(false), 3, 3),
         "__ALL" => (Quant(true), 3, 3),
         "JSON_ARRAY_APPEND" => (JsonArrayAppend, 3, usize::MAX),

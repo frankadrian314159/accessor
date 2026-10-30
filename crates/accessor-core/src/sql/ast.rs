@@ -163,6 +163,9 @@ pub struct Select {
     pub order_by: Vec<OrderItem>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// `LIMIT ?` / `OFFSET ?` (a prepared statement): the parameter, until it is given a value.
+    pub limit_param: Option<String>,
+    pub offset_param: Option<String>,
     /// `UNION [ALL]` members after this one. When present, `order_by`, `limit`
     /// and `offset` apply to the combined result, not to this member alone.
     pub unions: Vec<SetPart>,

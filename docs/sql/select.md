@@ -61,6 +61,8 @@ FROM ((Customers C INNER JOIN Orders O ON O.CustID = C.ID)
       INNER JOIN Lines L ON L.OrderID = O.ID)
 ```
 
+A list may also stand on the right of an inner join, `A JOIN (B JOIN C ON ..) ON ..`; it is read as the flat join with both conditions kept. An *outer* join inside such a list is not supported.
+
 ### USING and NATURAL
 
 ```sql
@@ -90,6 +92,8 @@ GROUP BY Dept
 HAVING COUNT(*) > 1
 ORDER BY Mean DESC;
 ```
+
+`HAVING` may name an output column (`SELECT a AS q ... HAVING q > 1`), and without `GROUP BY` or an aggregate it filters the rows like `WHERE`.
 
 The argument of an aggregate may hold a sub-query that reads columns of the row it is computed for: `SUM(CASE WHEN EXISTS (SELECT 1 FROM T s WHERE s.k = T.k AND s.id <> T.id) THEN 1 ELSE 0 END)`.
 

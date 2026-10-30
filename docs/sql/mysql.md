@@ -20,7 +20,7 @@ SELECT @@sql_mode, @@global.autocommit;
 SET NAMES utf8mb4;                  -- read and ignored (text is UTF-8)
 ```
 
-User variables belong to the open database and last until it is closed; `ROLLBACK` does not undo them. A user variable that was never set is an **error** here (MySQL gives NULL), because `@name` is also the parameter of a saved query. System variables are the run-time parameters of [session.md](session.md): about 50 MySQL names have defaults (`sql_mode`, `autocommit`, `version`, `character_set_*`, `collation_*`, `foreign_key_checks`, `sort_buffer_size`, `group_concat_max_len`, ...) and any name that starts like a MySQL variable (`innodb_`, `optimizer_`, `max_`, `sql_`, `default_`, ...) is accepted and only remembered; none of them changes how the engine works. `@@name` reads the value as a number when it is one.
+User variables belong to the open database and last until it is closed; `ROLLBACK` does not undo them. `@name := expr` inside an expression (`SELECT @a := 5`, `WHERE (@n := @n + 1) > 0`) gives the value of `expr`, and the variable has it when the statement is over: a later statement sees it, but another part of the *same* statement still reads the old value (the variables of a statement are filled in before it runs). A user variable that was never set is an **error** here (MySQL gives NULL), because `@name` is also the parameter of a saved query. System variables are the run-time parameters of [session.md](session.md): about 50 MySQL names have defaults (`sql_mode`, `autocommit`, `version`, `character_set_*`, `collation_*`, `foreign_key_checks`, `sort_buffer_size`, `group_concat_max_len`, ...) and any name that starts like a MySQL variable (`innodb_`, `optimizer_`, `max_`, `sql_`, `default_`, ...) is accepted and only remembered; none of them changes how the engine works. `@@name` reads the value as a number when it is one.
 
 ## CREATE TABLE
 
@@ -59,6 +59,7 @@ Several actions separated by commas run together. Accepted: `ADD [COLUMN] def [F
 | `SHOW DATABASES` or `SCHEMAS [LIKE]` | `information_schema`, `mysql`, `performance_schema`, `sys`, `test` and the schemas made |
 | `SHOW [FULL] COLUMNS` or `FIELDS FROM t`, `DESCRIBE t`, `DESC t` | `Field`, `Type`, `Null`, `Key`, `Default`, `Extra` (and `Collation`, `Privileges`, `Comment` with `FULL`); types are named as MySQL names them (`int`, `text`, `decimal(10,0)`, ...) without sizes |
 | `SHOW INDEX`, `INDEXES` or `KEYS FROM t` | one row per column of each index |
+| `SHOW CREATE PROCEDURE p`, `SHOW CREATE FUNCTION f` | one row with the text the routine was made with |
 | `SHOW CREATE TABLE t`, `SHOW CREATE VIEW v` | a statement that makes the table (columns, keys, `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`) |
 | `SHOW [GLOBAL or SESSION] VARIABLES [LIKE 'p']` | the system variables |
 | `SHOW TABLE STATUS`, `SHOW ENGINES`, `SHOW CHARACTER SET`, `SHOW COLLATION` | one row for each table; the one engine `InnoDB`; four character sets |
@@ -76,7 +77,7 @@ EXECUTE s USING @x, @y;
 DEALLOCATE PREPARE s;
 ```
 
-The placeholders are numbered in the order they are written. (`PREPARE name AS statement`, with `@name` parameters, is the other form: [queries and triggers](queries-and-triggers.md#prepared-statements).)
+The placeholders are numbered in the order they are written. `LIMIT ?` and `OFFSET ?` take a placeholder too (the value must be a non-negative whole number). (`PREPARE name AS statement`, with `@name` parameters, is the other form: [queries and triggers](queries-and-triggers.md#prepared-statements).)
 
 ## Functions and commands that do nothing
 

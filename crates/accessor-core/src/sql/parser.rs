@@ -331,7 +331,60 @@ fn row_compare(op: BinOp, a: &[Expr], b: &[Expr]) -> Result<Expr> {
 }
 
 /// `(a, b) [NOT] IN (query)` as an EXISTS over the query with its columns compared in turn.
-fn row_in_query(items: &[Expr], q: Select, negated: bool) -> Expr {
+fn row_in_query(items: &[Expr], mut q: Select, negated: bool) -> Expr {
+    // A plain query is searched directly, so that it can still refer to the outer query; one that groups, limits or
+    // combines is made a table of its own first.
+    let mut aggregates = false;
+    for item in &mut q.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            let _ = crate::sql::walk::walk_expr(expr, &mut |e| {
+                if matches!(e, Expr::Window { .. }) || matches!(e, Expr::Function { name, .. } if crate::exec::agg::AggFn::from_name(name).is_some()) {
+                    aggregates = true;
+                }
+                Ok(())
+            });
+        }
+    }
+    // the items are written for the outer query: unqualified columns would be read in the inner one
+    let mut bare = false;
+    for item in items {
+        let mut copy = item.clone();
+        let _ = crate::sql::walk::walk_expr(&mut copy, &mut |e| {
+            if matches!(e, Expr::Column { table: None, .. }) {
+                bare = true;
+            }
+            Ok(())
+        });
+    }
+    let plain = !aggregates
+        && !bare
+        && q.items.len() == items.len()
+        && q.items.iter().all(|i| matches!(i, SelectItem::Expr { .. }))
+        && q.group_by.is_empty()
+        && q.having.is_none()
+        && !q.distinct
+        && q.limit.is_none()
+        && q.offset.is_none()
+        && q.top.is_none()
+        && q.unions.is_empty()
+        && q.with.is_none()
+        && q.crosstab.is_none()
+        && q.from.is_some();
+    if plain {
+        let mut filter = q.filter.take();
+        for (item, sel) in items.iter().zip(&q.items) {
+            let SelectItem::Expr { expr, .. } = sel else { unreachable!("checked") };
+            let eq = Expr::Binary { op: BinOp::Eq, left: Box::new(item.clone()), right: Box::new(expr.clone()) };
+            filter = Some(match filter {
+                None => eq,
+                Some(prev) => Expr::Binary { op: BinOp::And, left: Box::new(prev), right: Box::new(eq) },
+            });
+        }
+        q.items = vec![SelectItem::Expr { expr: Expr::Literal(Value::Int(1)), alias: None }];
+        q.filter = filter;
+        q.order_by.clear();
+        return Expr::Exists { query: Box::new(q), negated };
+    }
     let columns: Vec<String> = (0..items.len()).map(|i| format!("__c{i}")).collect();
     let mut filter: Option<Expr> = None;
     for (i, item) in items.iter().enumerate() {
@@ -349,7 +402,7 @@ fn row_in_query(items: &[Expr], q: Select, negated: bool) -> Expr {
         query: Box::new(Select {
             items: vec![SelectItem::Expr { expr: Expr::Literal(Value::Int(1)), alias: None }],
             from: Some(From {
-                first: TableFactor::Derived { query: Box::new(q), alias: "__r".into(), columns, lateral: false },
+                first: TableFactor::Derived { query: Box::new(q), alias: "__r".into(), columns, lateral: true },
                 joins: Vec::new(),
             }),
             filter,
@@ -1865,6 +1918,26 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) => !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)),
             _ => false,
         }
+    }
+
+    /// The number after `LIMIT` (`limit`) or `OFFSET`: a literal, or a `?` / `@name` parameter given later.
+    fn limit_value(&mut self, sel: &mut Select, limit: bool) -> Result<()> {
+        if let Tok::Param(p) = self.peek().clone() {
+            self.advance();
+            if limit {
+                sel.limit_param = Some(p);
+            } else {
+                sel.offset_param = Some(p);
+            }
+            return Ok(());
+        }
+        let n = self.usize_literal()?;
+        if limit {
+            sel.limit = Some(n);
+        } else {
+            sel.offset = Some(n);
+        }
+        Ok(())
     }
 
     fn usize_literal(&mut self) -> Result<usize> {
@@ -4793,11 +4866,12 @@ impl<'a> Parser<'a> {
         }
         loop {
             if self.eat_kw("LIMIT") {
-                sel.limit = Some(self.usize_literal()?);
+                self.limit_value(sel, true)?;
                 if self.eat_sym(",") {
                     // MySQL: LIMIT offset, count
-                    sel.offset = sel.limit;
-                    sel.limit = Some(self.usize_literal()?);
+                    sel.offset = sel.limit.take();
+                    sel.offset_param = sel.limit_param.take();
+                    self.limit_value(sel, true)?;
                 }
             } else if self.peek_kw("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) {
                 // FOR UPDATE | SHARE | NO KEY UPDATE | KEY SHARE [OF t, ..] [NOWAIT | SKIP LOCKED]
@@ -4821,7 +4895,7 @@ impl<'a> Parser<'a> {
                 }
                 sel.lock = Some(LockClause::default());
             } else if self.eat_kw("OFFSET") {
-                sel.offset = Some(self.usize_literal()?);
+                self.limit_value(sel, false)?;
                 if !self.eat_kw("ROWS") {
                     self.eat_kw("ROW");
                 }
@@ -5016,6 +5090,35 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             };
+            // `a JOIN (b JOIN c ON ..) ON ..`: for an inner join the nested list reads the same as a flat one
+            let nested = if self.peek_sym("(") && matches!(kind, JoinKind::Inner | JoinKind::Cross) && !natural && self.parenthesised_join_ahead() {
+                Some(self.from_source()?).filter(|f| !f.joins.is_empty())
+            } else {
+                None
+            };
+            if let Some(inner) = nested {
+                if inner.joins.iter().any(|j| !matches!(j.kind, JoinKind::Inner | JoinKind::Cross)) {
+                    return Err(Error::syntax("an outer join inside a nested join list is not supported"));
+                }
+                let outer_on = if self.eat_kw("ON") { Some(self.expr()?) } else { None };
+                from.joins.push(Join { kind: JoinKind::Cross, factor: inner.first, on: None, using: Vec::new(), natural: false });
+                let last = inner.joins.len() - 1;
+                for (i, mut j) in inner.joins.into_iter().enumerate() {
+                    if i == last {
+                        if let Some(o) = outer_on.clone() {
+                            j.on = Some(match j.on.take() {
+                                Some(own) => Expr::Binary { op: BinOp::And, left: Box::new(own), right: Box::new(o) },
+                                None => o,
+                            });
+                            if j.kind == JoinKind::Cross {
+                                j.kind = JoinKind::Inner;
+                            }
+                        }
+                    }
+                    from.joins.push(j);
+                }
+                continue;
+            }
             let factor = self.table_factor()?;
             let mut on = None;
             let mut using = Vec::new();
@@ -5768,6 +5871,12 @@ impl<'a> Parser<'a> {
             }
             Tok::Param(p) => {
                 self.advance();
+                // MySQL: `@name := expr` sets the variable and gives the value
+                if !p.starts_with("@@") && self.peek_sym(":=") {
+                    self.advance();
+                    let value = self.expr()?;
+                    return Ok(Expr::Function { name: "__ASSIGN_VAR".into(), args: vec![Expr::Literal(Value::text(&p)), value], distinct: false, star: false });
+                }
                 Ok(Expr::Param(p))
             }
             Tok::Quoted(_) => self.column_ref(),

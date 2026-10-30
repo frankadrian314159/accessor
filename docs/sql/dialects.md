@@ -10,8 +10,7 @@ A session speaks one of three dialects. `asql` is the default and is what the re
 | a table with no columns | refused | `CREATE TABLE t ()` is allowed | refused |
 | `tableoid` | not a column | the name of the table a row was read from (also through a parent or a partitioned table) | not a column |
 | `NOT NULL` on a generated column | refused | allowed (a `DEFAULT` stands for it in `INSERT ... VALUES`) | refused |
-| arrays | `ARRAY[...]`, `int[]`, `a[i]`, `ANY (array)`, `@>`, `<@`, `&&` | the same | not read: MySQL's arrays are JSON (`MEMBER OF`, `JSON_ARRAY_APPEND`, `JSON_OVERLAPS`) |
-| arrays | `ARRAY[...]`, `int[]`, `a[i]`, `ANY (array)`, `@>`, `<@`, `&&` | the same | not read: MySQL's arrays are JSON (`MEMBER OF`, `JSON_ARRAY_APPEND`, `JSON_OVERLAPS`) |
+| arrays | `ARRAY[...]`, `int[]`, `a[i]`, `ANY (array)`, `@>`, `<@`, `ARRAY_OVERLAPS(a, b)` (`&&` is a slip for `&` here) | the same, with `a && b` for overlap | not read: MySQL's arrays are JSON (`MEMBER OF`, `JSON_ARRAY_APPEND`, `JSON_OVERLAPS`) |
 | comparing booleans | Access's: Yes is -1, so `TRUE > FALSE` is No | `FALSE < TRUE` | `FALSE < TRUE` |
 
 ## Choosing one

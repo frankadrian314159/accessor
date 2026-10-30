@@ -5583,7 +5583,7 @@ fn lenient_types_keep_unknown_types_and_arrays_as_text() {
     let mut db = Database::in_memory();
     // refused by default
     assert!(db.execute("CREATE TABLE n1 (x txid_snapshot)").is_err());
-    assert!(db.execute("CREATE TABLE n1 (x int[])").is_err());
+    // (arrays are a type of their own now, so int[] is not refused)
     db.execute("SET lenient_types = on").unwrap();
     db.execute("CREATE TABLE n2 (x txid_snapshot, y int[], z text[][], w int8range[], q point, r int[3])").unwrap();
     db.execute("INSERT INTO n2 VALUES ('1:2:3', '{1,2}', '{{a}}', '{}', '(1,2)', '{1,2,3}')").unwrap();
@@ -5594,7 +5594,6 @@ fn lenient_types_keep_unknown_types_and_arrays_as_text() {
     // and turned off again, the cache does not keep the lenient reading
     db.execute("RESET lenient_types").unwrap();
     assert!(db.execute("CREATE TABLE n3 (x txid_snapshot)").is_err());
-    assert!(db.execute("CREATE TABLE n3 (x int[])").is_err());
 }
 
 #[test]
@@ -6167,7 +6166,10 @@ fn arrays_have_literals_subscripts_functions_and_operators() {
         assert_eq!(one(&mut db, "SELECT string_to_array('a,b,c', ',')"), "{a,b,c}");
         assert_eq!(one(&mut db, "SELECT array_fill(7, ARRAY[3])"), "{7,7,7}");
         assert_eq!(one(&mut db, "SELECT ARRAY[1,2,3] @> ARRAY[2,3]"), if d == Dialect::Asql { "Yes" } else { "true" });
-        assert_eq!(one(&mut db, "SELECT ARRAY[1,2] && ARRAY[5,6]"), if d == Dialect::Asql { "No" } else { "false" });
+        assert_eq!(one(&mut db, "SELECT array_overlaps(ARRAY[1,2], ARRAY[5,6])"), if d == Dialect::Asql { "No" } else { "false" });
+        if d == Dialect::Postgresql {
+            assert_eq!(one(&mut db, "SELECT ARRAY[1,2] && ARRAY[2,6]"), "true");
+        }
         assert_eq!(one(&mut db, "SELECT 2 = ANY (ARRAY[1,2,3])"), if d == Dialect::Asql { "Yes" } else { "true" });
         assert_eq!(one(&mut db, "SELECT 5 > ALL (ARRAY[1,2,3])"), if d == Dialect::Asql { "Yes" } else { "true" });
         db.execute("CREATE TABLE t (id int, tags text[])").unwrap();
@@ -6197,4 +6199,37 @@ fn mysql_json_arrays_have_append_insert_overlaps_and_member_of() {
     assert_eq!(one(&mut db, "SELECT JSON_OVERLAPS('[1,3,5]', '[2,5]')"), "1");
     assert_eq!(one(&mut db, "SELECT 5 MEMBER OF('[1, 5, 7]')"), "1");
     assert_eq!(one(&mut db, "SELECT 6 MEMBER OF('[1, 5, 7]')"), "0");
+}
+
+#[test]
+fn mysql_forms_nested_joins_row_in_having_alias_user_assignment_and_limit_parameters() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute("CREATE TABLE t1 (a INT, b INT); CREATE TABLE t2 (a INT, b INT); CREATE TABLE t3 (a INT)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1,1),(2,2),(2,3); INSERT INTO t2 VALUES (1,1); INSERT INTO t3 VALUES (1)").unwrap();
+    let count = |db: &mut Database, sql: &str| db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).rows.len();
+    // a join list nested on the right of an inner join
+    assert_eq!(count(&mut db, "SELECT * FROM (t1 AS x JOIN (t2 AS y JOIN t3 ON t3.a = y.a) ON x.a = y.a)"), 1);
+    // a row value against a query that reads the outer query
+    assert_eq!(count(&mut db, "SELECT a FROM t1 WHERE (a, b) NOT IN (SELECT x.a, x.b FROM (t1 AS x JOIN t2 ON t2.a = x.a))"), 2);
+    let z = db.execute("SELECT a, (a, b) IN (SELECT a, b FROM t2 WHERE t2.a = t1.a) z FROM t1 ORDER BY a, b").unwrap();
+    assert_eq!(z.rows.iter().map(|r| r[1].to_string()).collect::<Vec<_>>(), ["1", "0", "0"]);
+    // HAVING names an output column, with or without GROUP BY
+    assert_eq!(count(&mut db, "SELECT a AS q FROM t1 GROUP BY a HAVING q > 1"), 1);
+    assert_eq!(count(&mut db, "SELECT a AS q FROM t1 HAVING q > 1"), 2);
+    // @var := expr gives the value, and the variable has it afterwards
+    assert_eq!(db.execute("SELECT @v := 7").unwrap().rows[0][0].to_string(), "7");
+    assert_eq!(db.execute("SELECT @v + 1").unwrap().rows[0][0].to_string(), "8");
+    // SHOW CREATE PROCEDURE / FUNCTION
+    db.execute("CREATE PROCEDURE p() SELECT 1").unwrap();
+    db.execute("CREATE FUNCTION f() RETURNS INT DETERMINISTIC RETURN 1").unwrap();
+    assert!(db.execute("SHOW CREATE PROCEDURE p").unwrap().rows[0][2].to_string().contains("PROCEDURE"));
+    assert!(db.execute("SHOW CREATE FUNCTION f").unwrap().rows[0][2].to_string().contains("FUNCTION"));
+    db.execute("SHOW CREATE FUNCTION p").unwrap_err();
+    // LIMIT ? and OFFSET ?
+    db.execute("PREPARE r FROM 'SELECT a FROM t1 ORDER BY a, b LIMIT ? OFFSET ?'").unwrap();
+    db.execute("SET @n = 1; SET @o = 1").unwrap();
+    let r = db.execute("EXECUTE r USING @n, @o").unwrap();
+    assert_eq!((r.rows.len(), r.rows[0][0].to_string()), (1, "2".to_string()));
 }

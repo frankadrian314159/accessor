@@ -231,6 +231,18 @@ impl Database {
                     .collect();
                 (cols(&["Name", "Engine", "Version", "Row_format", "Rows", "Avg_row_length", "Data_length", "Max_data_length", "Index_length", "Data_free", "Auto_increment", "Create_time", "Update_time", "Check_time", "Collation", "Checksum", "Create_options", "Comment"]), rows)
             }
+            "create procedure" | "create function" => {
+                let function = s.what == "create function";
+                let kind = if function { "FUNCTION" } else { "PROCEDURE" };
+                let def = self
+                    .routine_def(&target)
+                    .filter(|d| d.function == function)
+                    .ok_or_else(|| Error::catalog(format!("{kind} {target} does not exist")))?;
+                (
+                    cols(&[if function { "Function" } else { "Procedure" }, "sql_mode", if function { "Create Function" } else { "Create Procedure" }, "character_set_client", "collation_connection", "Database Collation"]),
+                    vec![vec![text(&def.name), text("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"), text(&def.sql), text("utf8mb4"), text("utf8mb4_0900_ai_ci"), text("utf8mb4_0900_ai_ci")]],
+                )
+            }
             other if other.starts_with("other ") => (cols(&["Name"]), Vec::new()),
             other => return Err(Error::runtime(format!("SHOW {other} is not available"))),
         })

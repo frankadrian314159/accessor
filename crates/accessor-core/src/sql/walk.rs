@@ -156,6 +156,20 @@ pub fn walk_select(s: &mut Select, f: &mut Visitor) -> Result<()> {
     }
     s.group_by.iter_mut().try_for_each(|e| walk_expr(e, f))?;
     s.order_by.iter_mut().try_for_each(|o| walk_expr(&mut o.expr, f))?;
+    // `LIMIT ?`: the visitor sees the parameter, and when it turns it into a number that is the limit
+    for (param, target) in [(&mut s.limit_param, &mut s.limit), (&mut s.offset_param, &mut s.offset)] {
+        if let Some(p) = param.clone() {
+            let mut e = Expr::Param(p);
+            f(&mut e)?;
+            if let Expr::Literal(v) = e {
+                *target = match v.coerce_to(crate::value::DataType::Integer)? {
+                    crate::value::Value::Int(n) if n >= 0 => Some(n as usize),
+                    _ => return Err(crate::error::Error::runtime("LIMIT and OFFSET take a non-negative whole number")),
+                };
+                *param = None;
+            }
+        }
+    }
     s.unions.iter_mut().try_for_each(|u| walk_select(&mut u.select, f))
 }
 

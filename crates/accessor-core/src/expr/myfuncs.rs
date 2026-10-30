@@ -71,6 +71,8 @@ pub enum MyFn {
     Week,
     ExportSet,
     FoundRows,
+    /// `@name := expr` inside an expression: the value, and the variable set when the statement is over.
+    AssignVar,
     LastInsertId,
 }
 
@@ -134,6 +136,7 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "WEEK" => (Week, 1, 2),
         "EXPORT_SET" => (ExportSet, 3, 5),
         "FOUND_ROWS" => (FoundRows, 0, 0),
+        "__ASSIGN_VAR" => (AssignVar, 2, 2),
         "LAST_INSERT_ID" => (LastInsertId, 0, 1),
         "TO_BASE64" => (ToBase64, 1, 1),
         "FROM_BASE64" => (FromBase64, 1, 1),
@@ -149,7 +152,7 @@ impl MyFn {
 
     /// Functions that give a different answer each time.
     pub fn is_volatile(self) -> bool {
-        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::LastInsertId)
+        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::LastInsertId)
     }
 }
 
@@ -713,6 +716,10 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::text(&parts.join(&sep))
         }
         FoundRows => Value::Int(FOUND_ROWS.with(|c| c.get())),
+        AssignVar => {
+            ASSIGNED.with(|a| a.borrow_mut().push((text(v(0)).to_ascii_lowercase(), v(1).clone())));
+            v(1).clone()
+        }
         LastInsertId => {
             if let Some(x) = vals.first().and_then(|x| int(x)) {
                 LAST_INSERT_ID.with(|c| c.set(x));
@@ -806,6 +813,12 @@ fn from_base64(s: &str) -> Option<Vec<u8>> {
 thread_local! {
     static FOUND_ROWS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static ASSIGNED: std::cell::RefCell<Vec<(String, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The user variables that `@name := expr` set while the last statement ran, in order.
+pub(crate) fn take_assignments() -> Vec<(String, Value)> {
+    ASSIGNED.with(|a| std::mem::take(&mut *a.borrow_mut()))
 }
 
 /// Remembers the number of rows of the last query, for `FOUND_ROWS()`.

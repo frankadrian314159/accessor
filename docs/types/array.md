@@ -28,7 +28,7 @@ SELECT t FROM post, unnest(tags) AS u(t);
 | `a[lo:hi]`, `a[:hi]`, `a[lo:]` | a slice, ends included |
 | `a \|\| b`, `a \|\| x`, `x \|\| a` | join two arrays, or add an element at either end |
 | `x = ANY (a)`, `x < ALL (a)` | compare `x` with each element (`SOME` is `ANY`); NULL elements make an unclear answer NULL |
-| `a @> b`, `a <@ b`, `a && b` | `a` contains all of `b`; `a` is inside `b`; they share an element (NULL elements never match) |
+| `a @> b`, `a <@ b`, `a && b` | `a` contains all of `b`; `a` is inside `b`; they share an element (NULL elements never match). In `asql`, `&&` is not read (it is a slip for `&`, the text join), so write `array_overlaps(a, b)`; `postgresql` has both |
 
 In `asql` a `[` that follows a name or `)` is a subscript or a type suffix (`tags[1]`, `integer[]`), and inside `ARRAY[ ]` it is always one; elsewhere `[name]` is still an Access identifier. A column whose name needs brackets takes a subscript after a space-free name or a double-quoted one: `"my col"[1]`.
 
@@ -64,4 +64,4 @@ With `--mysql` there is no `ARRAY` syntax. MySQL keeps lists in `JSON` columns, 
 | `JSON_OVERLAPS(a, b)` | 1 if two arrays share an element, two objects a key and value, or two scalars are equal |
 | `x MEMBER OF (json_array)` | 1 if `x` is an element |
 
-The operators `&&`, `@>` and `<@` are not read in `--mysql` (where `&&` is AND), and `--mysql` has no `ARRAY[ ]` values to apply the array functions to.
+The operators `&&`, `@>` and `<@` (and `ARRAY[ ]`) are not read in `--mysql` (where `&&` is AND), and `--mysql` has no `ARRAY[ ]` values to apply the array functions to.

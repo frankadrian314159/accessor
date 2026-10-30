@@ -683,7 +683,30 @@ impl Database {
         binder.allow_win = true;
         let out_b = out_items.iter().map(|(_, e)| binder.bind(e)).collect::<Result<Vec<_>>>()?;
         binder.allow_win = false;
-        let having = sel.having.as_ref().map(|h| binder.bind(h)).transpose()?;
+        let having = match sel.having.as_ref() {
+            None => None,
+            Some(h) => Some(match binder.bind(h) {
+                Ok(b) => b,
+                Err(first) => {
+                    // MySQL lets HAVING name an output column: `SELECT a AS q ... HAVING q > 1`
+                    let mut e = h.clone();
+                    let mut changed = false;
+                    crate::sql::walk::walk_expr(&mut e, &mut |x| {
+                        if let Expr::Column { table: None, name } = x {
+                            if let Some((_, item)) = out_items.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+                                *x = item.clone();
+                                changed = true;
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    if !changed {
+                        return Err(first);
+                    }
+                    binder.bind(&e).map_err(|_| first)?
+                }
+            }),
+        };
         binder.allow_win = true;
 
         // ORDER BY: ordinal, output alias, or arbitrary expression (hidden column).
@@ -832,6 +855,15 @@ impl Database {
                 }
                 rows = kept;
             }
+        } else if let Some(h) = &having {
+            // HAVING without GROUP BY or aggregates (MySQL) filters the rows like WHERE
+            let mut kept = Vec::with_capacity(rows.len());
+            for r in rows {
+                if h.eval_bool(&r)? {
+                    kept.push(r);
+                }
+            }
+            rows = kept;
         }
 
         if !wins.is_empty() {
