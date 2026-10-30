@@ -6248,3 +6248,20 @@ fn a_derived_table_may_read_the_outer_query() {
     assert_eq!(db.execute("SELECT rf FROM otr WHERE EXISTS (SELECT 1 FROM (SELECT * FROM itr WHERE itr.rf = otr.rf AND val > 6) d)").unwrap().rows.len(), 1);
     assert_eq!(col(&mut db, "SELECT rf, 5 = ALL (SELECT val FROM itr WHERE otr.rf = itr.rf) b FROM otr ORDER BY rf").len(), 2);
 }
+
+#[test]
+fn mysql_json_table_reads_a_document_as_rows() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let rows = |db: &mut Database, sql: &str| -> Vec<String> {
+        let r = db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")).collect()
+    };
+    let r = rows(&mut db, r#"SELECT * FROM JSON_TABLE('[{"a":1,"b":"x"},{"a":2}]', '$[*]' COLUMNS (n FOR ORDINALITY, a INT PATH '$.a', b VARCHAR(10) PATH '$.b' DEFAULT '"none"' ON EMPTY, e INT EXISTS PATH '$.b')) AS jt"#);
+    assert_eq!(r, ["1,1,x,1", "2,2,none,0"]);
+    // the document comes from another table, and a nested path gives a row for each of its matches
+    db.execute(r#"CREATE TABLE t (id INT, j JSON); INSERT INTO t VALUES (1, '{"k":[{"v":1},{"v":2}]}'), (2, '{"k":[]}')"#).unwrap();
+    let r = rows(&mut db, r#"SELECT t.id, jt.v FROM t, JSON_TABLE(t.j, '$' COLUMNS (NESTED PATH '$.k[*]' COLUMNS (v INT PATH '$.v'))) jt ORDER BY t.id, jt.v"#);
+    assert_eq!(r, ["1,1", "1,2", "2,"]);
+}

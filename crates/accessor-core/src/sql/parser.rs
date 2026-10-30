@@ -5344,6 +5344,9 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Sym("(")) {
             let name = self.ident()?.to_ascii_uppercase();
             self.expect_sym("(")?;
+            if name == "JSON_TABLE" {
+                return self.json_table();
+            }
             let mut args = Vec::new();
             if !self.peek_sym(")") {
                 args.push(self.expr()?);
@@ -6429,6 +6432,107 @@ impl<'a> Parser<'a> {
 
     /// `CAST(expr AS type)` after the opening parenthesis: the conversion
     /// function for the type, and a ROUND for `DECIMAL(p, s)`.
+    /// `JSON_TABLE(doc, path COLUMNS (..)) alias` after the parenthesis: a lateral query over the matches of `path`.
+    fn json_table(&mut self) -> Result<TableFactor> {
+        let doc = self.expr()?;
+        self.expect_sym(",")?;
+        let path = self.expr()?;
+        let tag = self.pos;
+        let query = self.json_table_columns(doc, path, tag)?;
+        self.expect_sym(")")?;
+        let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { "json_table".to_string() };
+        Ok(TableFactor::Derived { query: Box::new(query), alias, columns: Vec::new(), lateral: true })
+    }
+
+    /// `COLUMNS (name type PATH '..', name FOR ORDINALITY, NESTED PATH '..' COLUMNS (..), ..)` of a JSON_TABLE: the
+    /// query that reads one row per match of `path` in `doc`.
+    fn json_table_columns(&mut self, doc: Expr, path: Expr, tag: usize) -> Result<Select> {
+        let call = |name: &str, args: Vec<Expr>| Expr::Function { name: name.into(), args, distinct: false, star: false };
+        self.expect_kw("COLUMNS")?;
+        self.expect_sym("(")?;
+        let src = format!("__j{tag}");
+        let value = Expr::Column { table: Some(src.clone()), name: "v".into() };
+        let mut items = Vec::new();
+        let mut joins = Vec::new();
+        loop {
+            if self.eat_kw("NESTED") {
+                self.eat_kw("PATH");
+                let nested_path = self.expr()?;
+                let ntag = self.pos;
+                let sub = self.json_table_columns(value.clone(), nested_path, ntag)?;
+                let alias = format!("__n{ntag}");
+                for item in &sub.items {
+                    if let SelectItem::Expr { alias: Some(a), .. } = item {
+                        items.push(SelectItem::Expr { expr: Expr::Column { table: Some(alias.clone()), name: a.clone() }, alias: Some(a.clone()) });
+                    }
+                }
+                let always = Expr::Binary { op: BinOp::Eq, left: Box::new(Expr::Literal(Value::Int(1))), right: Box::new(Expr::Literal(Value::Int(1))) };
+                joins.push(Join { kind: JoinKind::Left, factor: TableFactor::Derived { query: Box::new(sub), alias, columns: Vec::new(), lateral: true }, on: Some(always), using: Vec::new(), natural: false });
+            } else {
+                let name = self.ident()?;
+                if self.eat_kw("FOR") {
+                    self.expect_kw("ORDINALITY")?;
+                    let number = Expr::Window { func: Box::new(call("row_number", Vec::new())), spec: WindowSpec::default() };
+                    items.push(SelectItem::Expr { expr: number, alias: Some(name) });
+                } else {
+                    let tn = self.type_name()?;
+                    let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+                    let mut hints = Vec::new();
+                    if self.eat_sym("(") {
+                        while !self.peek_sym(")") && !self.at_eof() {
+                            if let Tok::Int(i) = self.advance() {
+                                hints.push(i);
+                            }
+                        }
+                        self.expect_sym(")")?;
+                    }
+                    while self.eat_kw("CHARSET") || self.eat_kw("COLLATE") || (self.peek_kw("CHARACTER") && self.peek_kw_at(1, "SET") && self.eat_kw("CHARACTER") && self.eat_kw("SET")) {
+                        self.advance();
+                    }
+                    while self.eat_kw("ASCII") || self.eat_kw("UNICODE") || self.eat_kw("BINARY") {}
+                    let exists = self.eat_kw("EXISTS");
+                    self.expect_kw("PATH")?;
+                    let p = self.expr()?;
+                    // NULL | ERROR | DEFAULT value, ON EMPTY | ON ERROR: only a default changes the result
+                    let mut default = None;
+                    loop {
+                        if self.eat_kw("DEFAULT") {
+                            default = Some(self.expr()?);
+                        } else if !(self.eat_kw("NULL") || self.eat_kw("ERROR")) {
+                            break;
+                        }
+                        self.expect_kw("ON")?;
+                        if !(self.eat_kw("EMPTY") || self.eat_kw("ERROR")) {
+                            return Err(self.unexpected("EMPTY or ERROR"));
+                        }
+                    }
+                    let got = if exists {
+                        make_cast(call("JSON_CONTAINS_PATH", vec![value.clone(), Expr::Literal(Value::text("one")), p]), ty, &hints)
+                    } else if ty == DataType::Json {
+                        call("JSON_EXTRACT", vec![value.clone(), p])
+                    } else {
+                        make_cast(call("JSON_VALUE", vec![value.clone(), p]), ty, &hints)
+                    };
+                    let expr = match default {
+                        Some(Expr::Literal(d)) => {
+                            let text = d.to_string();
+                            let text = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(&text).to_string();
+                            call("COALESCE", vec![got, make_cast(Expr::Literal(Value::text(&text)), ty, &hints)])
+                        }
+                        _ => got,
+                    };
+                    items.push(SelectItem::Expr { expr, alias: Some(name) });
+                }
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        let source = TableFactor::Function { name: "JSONB_PATH_QUERY".into(), args: vec![doc, path], alias: src, columns: vec!["v".into()] };
+        Ok(Select { items, from: Some(From { first: source, joins }), ..Select::default() })
+    }
+
     fn cast_expr(&mut self) -> Result<Expr> {
         let e = self.expr()?;
         self.expect_kw("AS")?;

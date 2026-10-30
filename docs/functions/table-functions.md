@@ -15,6 +15,17 @@ The optimizer treats a table function with constant arguments as a small table c
 
 `UNNEST(array [, array ...])` returns one row for each element of the array (all dimensions, in order), in a column `unnest`; several arrays are read side by side, the shorter padded with NULLs, with a column for each (name them with `AS u(a, b)`). A NULL array gives no rows. `WITH ORDINALITY` after any table function adds a last column `ordinality` numbering the rows from 1: `SELECT * FROM unnest(ARRAY['a','b']) WITH ORDINALITY AS u(v, n)`. See [../types/array.md](../types/array.md).
 
+## JSON_TABLE
+
+`JSON_TABLE(doc, path COLUMNS (column, ...)) [AS] alias` (MySQL form) reads a JSON document as rows: one row for each match of `path` (a SQL/JSON path such as `$[*]` or `$.items[*]`), with the columns:
+
+* `name type PATH 'p' [DEFAULT 'v' ON EMPTY]`: the value at `p` below the row, converted to `type`. A `JSON` column keeps the JSON value. `NULL ON ERROR` / `ERROR ON ERROR` are read but every failure gives NULL (or the default).
+* `name type EXISTS PATH 'p'`: 1 if `p` exists below the row, else 0.
+* `name FOR ORDINALITY`: the number of the row, from 1.
+* `NESTED PATH 'p' COLUMNS (...)`: one row for each match of `p` below the row, joined to it; a row with no match is kept, with NULLs.
+
+The document may be a column of a table earlier in the FROM list: `FROM t, JSON_TABLE(t.j, '$.k[*]' COLUMNS (v INT PATH '$.v')) jt`. `FOR ORDINALITY` counts the rows of the whole result, nested ones included. It is a lateral query built from `JSONB_PATH_QUERY`, so the path language is the one in [json.md](json.md).
+
 ## GENERATE_SERIES
 
 `GENERATE_SERIES(start, stop [, step])` returns a column `generate_series` with `start`, `start + step`, ... while the value has not passed `stop`. The step defaults to 1 and may be negative; it must not be zero.
