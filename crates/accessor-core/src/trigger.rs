@@ -242,7 +242,10 @@ impl Database {
         vars.insert("tg_table_name".into(), text(&ctx.schema.name));
         vars.insert("tg_relname".into(), text(&ctx.schema.name));
         vars.insert("tg_table_schema".into(), text("public"));
-        vars.insert("tg_nargs".into(), Value::Int(0));
+        vars.insert("tg_nargs".into(), Value::Int(trigger.args.len() as i64));
+        for i in 0..6 {
+            vars.insert(format!("tg_argv_{i}"), trigger.args.get(i).map_or(Value::Null, |a| text(a)));
+        }
         vars.insert("new".into(), text("NEW"));
         vars.insert("old".into(), text("OLD"));
         for (i, c) in ctx.schema.columns.iter().enumerate() {

@@ -235,6 +235,16 @@ impl Database {
                     let mut binder = Binder::new(self, &scope, 0);
                     let mut out = Vec::with_capacity(rows.len());
                     for r in rows {
+                        // PostgreSQL: a generated column is in the list of a row, as DEFAULT
+                        let calc: Vec<usize> = (0..schema.columns.len()).filter(|&i| schema.columns[i].is_calculated()).collect();
+                        let is_default = |e: &Expr| matches!(e, Expr::Param(p) if p == crate::sql::parser::DEFAULT_MARK);
+                        let trimmed: Vec<Expr>;
+                        let r = if columns.is_none() && r.len() != positions.len() && r.len() == schema.columns.len() && !calc.is_empty() && calc.iter().all(|&i| is_default(&r[i])) {
+                            trimmed = r.iter().enumerate().filter(|(i, _)| !calc.contains(i)).map(|(_, e)| e.clone()).collect();
+                            &trimmed
+                        } else {
+                            r
+                        };
                         if r.len() != positions.len() {
                             return Err(Error::runtime(format!(
                                 "INSERT supplies {} values for {} columns",

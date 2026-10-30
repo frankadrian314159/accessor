@@ -31,10 +31,11 @@ impl Scope {
     pub fn resolve(&self, table: Option<&str>, name: &str) -> Result<usize> {
         let mut found = None;
         for (i, c) in self.cols.iter().enumerate() {
-            if c.hidden && table.is_none() {
+            let tableoid = c.name == crate::dialect::TABLEOID_COLUMN;
+            if c.hidden && table.is_none() && !tableoid {
                 continue;
             }
-            if c.name.eq_ignore_ascii_case(name) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t)) {
+            if (c.name.eq_ignore_ascii_case(name) || (tableoid && name.eq_ignore_ascii_case("tableoid"))) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t)) {
                 if found.is_some() {
                     return Err(Error::catalog(format!("column '{name}' is ambiguous; qualify it with a table name")));
                 }

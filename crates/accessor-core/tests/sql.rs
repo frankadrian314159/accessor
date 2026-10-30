@@ -6057,3 +6057,53 @@ fn a_table_cannot_become_a_partition_of_itself_or_of_its_own_partition() {
     db.execute("ALTER TABLE c ATTACH PARTITION p FOR VALUES IN (2)").unwrap_err();
     db.execute("DROP TABLE p, c").unwrap();
 }
+
+#[test]
+fn trigger_functions_read_their_arguments_from_tg_argv() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (s text); CREATE TABLE log (m text)").unwrap();
+    db.execute(
+        "CREATE FUNCTION chk() RETURNS trigger AS $$ BEGIN IF substr(new.s, 1, 2) != tg_argv[0] THEN RAISE EXCEPTION 'bad prefix, % args', tg_nargs; END IF; RETURN new; END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute("CREATE TRIGGER c BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION chk('ab', 'cd')").unwrap();
+    db.execute("INSERT INTO t VALUES ('abc')").unwrap();
+    let e = db.execute("INSERT INTO t VALUES ('xyz')").unwrap_err().to_string();
+    assert!(e.contains("2 args"), "{e}");
+}
+
+#[test]
+fn an_if_condition_may_carry_a_from_clause() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE room (n int); CREATE TABLE t (n int)").unwrap();
+    db.execute("INSERT INTO room VALUES (1)").unwrap();
+    db.execute(
+        "CREATE FUNCTION chk() RETURNS trigger AS $$ BEGIN IF count(*) = 0 FROM room WHERE n = new.n THEN RAISE EXCEPTION 'no such room'; END IF; RETURN new; END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    db.execute("CREATE TRIGGER c BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION chk()").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("INSERT INTO t VALUES (2)").unwrap_err();
+}
+
+#[test]
+fn postgresql_generated_columns_take_default_and_not_null() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TABLE g (a int, b int GENERATED ALWAYS AS (a * 2) STORED NOT NULL)").unwrap();
+    db.execute("INSERT INTO g VALUES (2, DEFAULT), (3, DEFAULT)").unwrap();
+    assert_eq!(rows(&db, "SELECT a, b FROM g ORDER BY a"), [["2", "4"], ["3", "6"]]);
+}
+
+#[test]
+fn postgresql_tableoid_names_the_table_a_row_is_in() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TABLE p (a int) PARTITION BY LIST (a); CREATE TABLE p1 PARTITION OF p FOR VALUES IN (1); CREATE TABLE p2 PARTITION OF p FOR VALUES IN (2)").unwrap();
+    db.execute("INSERT INTO p VALUES (1), (2), (2)").unwrap();
+    assert_eq!(rows(&db, "SELECT tableoid::regclass, a FROM p ORDER BY 1, 2"), [["p1", "1"], ["p2", "2"], ["p2", "2"]]);
+    // * does not show it
+    assert_eq!(rows(&db, "SELECT * FROM p1 WHERE tableoid = 'p1'"), [["1"]]);
+}

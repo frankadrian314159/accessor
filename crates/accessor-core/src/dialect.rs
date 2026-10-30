@@ -59,3 +59,19 @@ pub fn current() -> Dialect {
 pub(crate) fn set_session(d: Dialect) {
     CURRENT.with(|c| c.set(d));
 }
+
+thread_local! {
+    static TABLEOID: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The name of the hidden column that carries `tableoid`: the table a row of a scan came from.
+pub(crate) const TABLEOID_COLUMN: &str = "\u{1}tableoid";
+
+/// Does the statement being run mention `tableoid`? (Only then do the scans of PostgreSQL carry it.)
+pub(crate) fn wants_tableoid() -> bool {
+    TABLEOID.with(Cell::get)
+}
+
+pub(crate) fn set_wants_tableoid(on: bool) {
+    TABLEOID.with(|c| c.set(on));
+}

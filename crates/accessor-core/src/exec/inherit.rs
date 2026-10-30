@@ -556,14 +556,23 @@ impl Database {
             self.note(depth, || format!("scan {table}: {} of {total} tables (the others cannot hold a matching row)", members.len()));
         }
         let parent = self.table_checked(&members[0])?;
-        let names: Vec<String> = parent.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let mut names: Vec<String> = parent.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let tableoid = crate::dialect::wants_tableoid();
+        if tableoid {
+            names.push(crate::dialect::TABLEOID_COLUMN.to_string());
+        }
+        let width = names.len() - usize::from(tableoid);
         let mut rows: Vec<Row> = Vec::new();
         for m in &members {
             let t = self.table_checked(m)?;
             self.require_privilege(m, "select")?;
-            let map: Vec<Option<usize>> = names.iter().map(|n| t.schema().column_index(n)).collect();
+            let map: Vec<Option<usize>> = names[..width].iter().map(|n| t.schema().column_index(n)).collect();
             for (_, row) in t.iter() {
-                rows.push(map.iter().map(|i| i.map_or(Value::Null, |i| row[i].clone())).collect());
+                let mut r: Row = map.iter().map(|i| i.map_or(Value::Null, |i| row[i].clone())).collect();
+                if tableoid {
+                    r.push(Value::text(t.name()));
+                }
+                rows.push(r);
             }
         }
         Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names })

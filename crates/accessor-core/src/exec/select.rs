@@ -114,7 +114,20 @@ impl Database {
                         let names = schema.columns.iter().map(|c| c.name.clone()).collect();
                         return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
                     }
-                    let names = t.schema().columns.iter().map(|c| c.name.clone()).collect();
+                    let mut names: Vec<String> = t.schema().columns.iter().map(|c| c.name.clone()).collect();
+                    if crate::dialect::wants_tableoid() {
+                        // PostgreSQL: every row carries the table it is in
+                        names.push(crate::dialect::TABLEOID_COLUMN.to_string());
+                        let rows: Vec<Row> = t
+                            .iter()
+                            .map(|(_, row)| {
+                                let mut r = row.clone();
+                                r.push(Value::text(t.name()));
+                                r
+                            })
+                            .collect();
+                        return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                    }
                     return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
                 }
                 if self.view_sql(name).is_some() {

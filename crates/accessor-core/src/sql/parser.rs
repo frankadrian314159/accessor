@@ -2380,6 +2380,7 @@ impl<'a> Parser<'a> {
             body,
             block: Vec::new(),
             function: instead.then(|| INSTEAD_MARK.to_string()),
+            args: Vec::new(),
             sql,
         })))
     }
@@ -3090,10 +3091,20 @@ impl<'a> Parser<'a> {
                 self.expect_kw("PROCEDURE")?;
             }
             let function = Some(self.table_ident()?);
-            self.skip_parens()?;
+            let mut args = Vec::new();
+            self.expect_sym("(")?;
+            while !self.peek_sym(")") && !self.at_eof() {
+                match self.advance() {
+                    Tok::Str(s) | Tok::Ident(s) | Tok::Quoted(s) => args.push(s.to_string()),
+                    Tok::Int(i) => args.push(i.to_string()),
+                    Tok::Sym(",") => {}
+                    _ => return Err(Error::syntax("a trigger argument is a string, a name or a number")),
+                }
+            }
+            self.expect_sym(")")?;
             let end = self.toks[self.pos].pos;
             let sql = self.src[start..end].to_string();
-            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), block: Vec::new(), function, sql })));
+            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), block: Vec::new(), function, args, sql })));
         }
         if self.peek_kw("FOLLOWS") || self.peek_kw("PRECEDES") {
             self.advance();
@@ -3107,11 +3118,11 @@ impl<'a> Parser<'a> {
             let block = self.mysql_trigger_body()?;
             let end = self.toks[self.pos].pos;
             let sql = self.src[start..end].trim().to_string();
-            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), block, function: None, sql })));
+            return Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body: Vec::new(), block, function: None, args: Vec::new(), sql })));
         };
         let end = self.toks[self.pos - 1].pos + "END".len();
         let sql = self.src[start..end].to_string();
-        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, block: Vec::new(), function: None, sql })))
+        Ok(Statement::CreateTrigger(Box::new(TriggerDef { name, timing, events, update_of, each_statement, table, when, body, block: Vec::new(), function: None, args: Vec::new(), sql })))
     }
 
     fn asql_trigger_body(&mut self) -> Result<Vec<Statement>> {

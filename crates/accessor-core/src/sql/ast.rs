@@ -459,6 +459,8 @@ pub struct TriggerDef {
     pub block: Vec<ProcStmt>,
     /// `EXECUTE FUNCTION f()`: the body is that PL/pgSQL trigger function, and `body` is empty.
     pub function: Option<String>,
+    /// The arguments of `EXECUTE FUNCTION f('a', 'b')`: `TG_ARGV` in the function.
+    pub args: Vec<String>,
     pub sql: String,
 }
 

@@ -425,7 +425,9 @@ fn calculated_column(d: &ColumnDef) -> Result<Column> {
         .expression
         .as_ref()
         .ok_or_else(|| Error::syntax("a CALCULATED field needs an expression: CALCULATED AS (expression)"))?;
-    if d.not_null || d.primary_key || d.unique || d.autonumber || d.default.is_some() || d.references.is_some() {
+    // (PostgreSQL has NOT NULL on a generated column)
+    let required = d.not_null && crate::dialect::current() != crate::dialect::Dialect::Postgresql;
+    if required || d.primary_key || d.unique || d.autonumber || d.default.is_some() || d.references.is_some() {
         return Err(Error::catalog(format!(
             "the calculated field '{}' cannot be required, a key, unique, AutoNumber, have a default, or refer to another table",
             d.name

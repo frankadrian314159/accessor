@@ -121,6 +121,7 @@ impl Database {
         // the text means different things in different dialects, so the cache is kept for the dialect of the session
         let dialect = self.dialect();
         crate::dialect::set_session(dialect);
+        crate::dialect::set_wants_tableoid(dialect == crate::dialect::Dialect::Postgresql && sql.to_ascii_lowercase().contains("tableoid"));
         let key: std::borrow::Cow<str> = if dialect == crate::dialect::Dialect::Asql { sql.into() } else { format!("{dialect}\0{sql}").into() };
         if !lenient {
             if let Some(hit) = self.parse_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&*key) {

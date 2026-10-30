@@ -261,7 +261,7 @@ impl<'a> Parser<'a> {
             if language != "plpgsql" {
                 return Err(Error::syntax("a trigger function is written in plpgsql"));
             }
-            for v in ["tg_op", "tg_name", "tg_when", "tg_level", "tg_table_name", "tg_relname", "tg_table_schema", "tg_nargs"] {
+            for v in ["tg_op", "tg_name", "tg_when", "tg_level", "tg_table_name", "tg_relname", "tg_table_schema", "tg_nargs", "tg_argv_0", "tg_argv_1", "tg_argv_2", "tg_argv_3", "tg_argv_4", "tg_argv_5"] {
                 names.all.push(v.to_string());
             }
         }
@@ -305,6 +305,31 @@ impl<'a> Parser<'a> {
         let mut e = self.expr()?;
         names.expr(&mut e)?;
         Ok(e)
+    }
+
+    /// The condition of an `IF`: an expression, which PL/pgSQL lets carry the rest of a query
+    /// (`IF count(*) = 0 FROM t WHERE ... THEN`): then it is the value of that query.
+    fn pl_cond(&mut self, names: &Names) -> Result<Expr> {
+        let start = self.toks[self.pos].pos;
+        let e = self.pl_expr(names)?;
+        if !self.peek_kw("FROM") {
+            return Ok(e);
+        }
+        let mut depth = 0usize;
+        while !self.at_eof() && !(depth == 0 && self.peek_kw("THEN")) {
+            match self.advance() {
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let end = self.toks[self.pos].pos;
+        let mut statements = crate::sql::parse_script(&format!("SELECT {}", &self.src[start..end]))?;
+        let Some(Statement::Select(sel)) = statements.pop() else { return Err(Error::syntax("an IF condition with FROM is a query")) };
+        let mut st = Statement::Select(sel);
+        names.statement(&mut st)?;
+        let Statement::Select(sel) = st else { unreachable!("a SELECT stays one") };
+        Ok(Expr::Subquery(Box::new(sel)))
     }
 
     /// `[DECLARE ...] BEGIN ... END [;]`
@@ -388,13 +413,13 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("IF") {
             let mut branches = Vec::new();
-            let cond = self.pl_expr(names)?;
+            let cond = self.pl_cond(names)?;
             self.expect_kw("THEN")?;
             branches.push((cond, self.pl_stmts(names, &["ELSIF", "ELSEIF", "ELSE", "END"])?));
             let mut otherwise = Vec::new();
             loop {
                 if self.eat_kw("ELSIF") || self.eat_kw("ELSEIF") {
-                    let cond = self.pl_expr(names)?;
+                    let cond = self.pl_cond(names)?;
                     self.expect_kw("THEN")?;
                     branches.push((cond, self.pl_stmts(names, &["ELSIF", "ELSEIF", "ELSE", "END"])?));
                 } else if self.eat_kw("ELSE") {
@@ -699,6 +724,9 @@ fn sql_body(body: &str, names: &Names, value: bool) -> Result<RoutineBody> {
 
 /// The body of a `LANGUAGE plpgsql` function.
 fn plpgsql_body(body: &str, mut names: Names, value: bool) -> Result<RoutineBody> {
+    // TG_ARGV[n] is a variable of its own
+    let argv = regex::Regex::new(r"(?i)\btg_argv\s*\[\s*(\d+)\s*\]").expect("a valid pattern");
+    let body = &*argv.replace_all(body, "tg_argv_$1");
     let mut p = Parser { src: body, toks: lex(body)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
     let block = p.pl_block(&mut names)?;
     let value = value && !names.trigger;
