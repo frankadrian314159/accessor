@@ -19,12 +19,16 @@ The optimizer treats a table function with constant arguments as a small table c
 
 `JSON_TABLE(doc, path COLUMNS (column, ...)) [AS] alias` (MySQL form) reads a JSON document as rows: one row for each match of `path` (a SQL/JSON path such as `$[*]` or `$.items[*]`), with the columns:
 
-* `name type PATH 'p' [DEFAULT 'v' ON EMPTY]`: the value at `p` below the row, converted to `type`. A `JSON` column keeps the JSON value. `NULL ON ERROR` / `ERROR ON ERROR` are read but every failure gives NULL (or the default).
+* `name type PATH 'p' [DEFAULT 'v' ON EMPTY]`: the value at `p` below the row, converted to `type`. A `JSON` column keeps the JSON value. `ERROR ON EMPTY` raises an error when the path matches nothing; `ON ERROR` clauses are read but every failure gives NULL (or the default). In the postgresql dialect only one `FOR ORDINALITY` column is allowed and `EXISTS PATH` takes `int`, `bool`, `text`, `varchar` or `json(b)` columns.
 * `name type EXISTS PATH 'p'`: 1 if `p` exists below the row, else 0.
 * `name FOR ORDINALITY`: the number of the row, from 1.
 * `NESTED PATH 'p' COLUMNS (...)`: one row for each match of `p` below the row, joined to it; a row with no match is kept, with NULLs.
 
 The document may be a column of a table earlier in the FROM list: `FROM t, JSON_TABLE(t.j, '$.k[*]' COLUMNS (v INT PATH '$.v')) jt`. `FOR ORDINALITY` counts the rows of the whole result, nested ones included. It is a lateral query built from `JSONB_PATH_QUERY`, so the path language is the one in [json.md](json.md).
+
+## PG_INPUT_ERROR_INFO
+
+`pg_input_error_info(text, type)` tries to convert the text to the type and returns one row with the columns `message`, `detail`, `hint` and `sql_error_code`: the error that the conversion gives (the code is always `22P02`), or NULLs when it converts. `pg_input_is_valid(text, type)` gives only the yes or no. The type may carry a size, which is ignored.
 
 ## GENERATE_SERIES
 

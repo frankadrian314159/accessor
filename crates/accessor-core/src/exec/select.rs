@@ -338,6 +338,7 @@ impl Database {
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
             "JSON_EACH" => vec!["key".into(), "value".into()],
             "UNNEST" => vec!["unnest".into()],
+            "PG_INPUT_ERROR_INFO" => vec!["message".into(), "detail".into(), "hint".into(), "sql_error_code".into()],
             "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => vec!["jsonb_path_query".into()],
             other if self.set_function(other).is_some() => self.set_function(other).expect("checked").set_columns.clone(),
             other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES, SPLIT_STRING and JSON_EACH are available)"))),
@@ -380,6 +381,20 @@ impl Database {
             return Ok((names, rows));
         }
         let cols = self.table_function_columns(name)?;
+        if name.eq_ignore_ascii_case("PG_INPUT_ERROR_INFO") {
+            // the error that converting the text to the type gives, or a row of NULLs when it converts
+            if args.len() != 2 {
+                return Err(Error::runtime("wrong number of arguments for PG_INPUT_ERROR_INFO"));
+            }
+            let name = args[1].to_string().to_ascii_lowercase();
+            let name = name.split('(').next().unwrap_or("").trim().to_string();
+            let (ty, _) = crate::value::DataType::from_sql_name(&name).ok_or_else(|| Error::catalog(format!("type \"{name}\" does not exist")))?;
+            let row = match Value::text(&args[0].to_string()).coerce_to(ty) {
+                Ok(_) => vec![Value::Null; 4],
+                Err(e) => vec![Value::text(&e.to_string()), Value::Null, Value::Null, Value::text("22P02")],
+            };
+            return Ok((cols, vec![row]));
+        }
         let wrong = |n: &str| Error::runtime(format!("wrong number of arguments for {n}"));
         match name.to_ascii_uppercase().as_str() {
             "GENERATE_SERIES" => {

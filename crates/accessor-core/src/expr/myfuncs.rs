@@ -73,6 +73,8 @@ pub enum MyFn {
     FoundRows,
     /// `@name := expr` inside an expression: the value, and the variable set when the statement is over.
     AssignVar,
+    /// JSON_TABLE `ERROR ON EMPTY`: the value, or an error when the path matched nothing.
+    JsonTableRequire,
     LastInsertId,
 }
 
@@ -137,6 +139,7 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "EXPORT_SET" => (ExportSet, 3, 5),
         "FOUND_ROWS" => (FoundRows, 0, 0),
         "__ASSIGN_VAR" => (AssignVar, 2, 2),
+        "__JT_REQUIRE" => (JsonTableRequire, 2, 2),
         "LAST_INSERT_ID" => (LastInsertId, 0, 1),
         "TO_BASE64" => (ToBase64, 1, 1),
         "FROM_BASE64" => (FromBase64, 1, 1),
@@ -152,7 +155,7 @@ impl MyFn {
 
     /// Functions that give a different answer each time.
     pub fn is_volatile(self) -> bool {
-        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::LastInsertId)
+        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::JsonTableRequire | MyFn::LastInsertId)
     }
 }
 
@@ -716,6 +719,12 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::text(&parts.join(&sep))
         }
         FoundRows => Value::Int(FOUND_ROWS.with(|c| c.get())),
+        JsonTableRequire => {
+            if !matches!(v(0), Value::Bool(true) | Value::Int(1)) {
+                return Err(Error::runtime(format!("no SQL/JSON item found for specified path of column \"{}\"", text(v(1)))));
+            }
+            Value::Bool(true)
+        }
         AssignVar => {
             ASSIGNED.with(|a| a.borrow_mut().push((text(v(0)).to_ascii_lowercase(), v(1).clone())));
             v(1).clone()

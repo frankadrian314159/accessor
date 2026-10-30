@@ -6472,6 +6472,11 @@ impl<'a> Parser<'a> {
                 let name = self.ident()?;
                 if self.eat_kw("FOR") {
                     self.expect_kw("ORDINALITY")?;
+                    if crate::dialect::current() == crate::dialect::Dialect::Postgresql
+                        && items.iter().any(|i| matches!(i, SelectItem::Expr { expr: Expr::Window { .. }, .. }))
+                    {
+                        return Err(Error::syntax("only one FOR ORDINALITY column is allowed"));
+                    }
                     let number = Expr::Window { func: Box::new(call("row_number", Vec::new())), spec: WindowSpec::default() };
                     items.push(SelectItem::Expr { expr: number, alias: Some(name) });
                 } else {
@@ -6493,18 +6498,34 @@ impl<'a> Parser<'a> {
                     let exists = self.eat_kw("EXISTS");
                     self.expect_kw("PATH")?;
                     let p = self.expr()?;
+                    let p_clone = p.clone();
                     // NULL | ERROR | DEFAULT value, ON EMPTY | ON ERROR: only a default changes the result
                     let mut default = None;
+                    let mut error_on_empty = false;
                     loop {
-                        if self.eat_kw("DEFAULT") {
+                        let error = if self.eat_kw("DEFAULT") {
                             default = Some(self.expr()?);
-                        } else if !(self.eat_kw("NULL") || self.eat_kw("ERROR")) {
+                            false
+                        } else if self.eat_kw("ERROR") {
+                            true
+                        } else if self.eat_kw("NULL") {
+                            false
+                        } else {
                             break;
-                        }
+                        };
                         self.expect_kw("ON")?;
-                        if !(self.eat_kw("EMPTY") || self.eat_kw("ERROR")) {
+                        if self.eat_kw("EMPTY") {
+                            error_on_empty |= error;
+                        } else if !self.eat_kw("ERROR") {
                             return Err(self.unexpected("EMPTY or ERROR"));
                         }
+                    }
+                    // PostgreSQL gives the "false" of EXISTS as a boolean, which only some types take
+                    if exists
+                        && crate::dialect::current() == crate::dialect::Dialect::Postgresql
+                        && !["int", "int4", "integer", "bool", "boolean", "text", "varchar", "json", "jsonb"].contains(&tn.to_ascii_lowercase().as_str())
+                    {
+                        return Err(Error::syntax("could not coerce ON ERROR expression (FALSE) to the RETURNING type"));
                     }
                     let got = if exists {
                         make_cast(call("JSON_CONTAINS_PATH", vec![value.clone(), Expr::Literal(Value::text("one")), p]), ty, &hints)
@@ -6512,6 +6533,12 @@ impl<'a> Parser<'a> {
                         call("JSON_EXTRACT", vec![value.clone(), p])
                     } else {
                         make_cast(call("JSON_VALUE", vec![value.clone(), p]), ty, &hints)
+                    };
+                    let got = if error_on_empty && !exists {
+                        let present = call("JSON_CONTAINS_PATH", vec![value.clone(), Expr::Literal(Value::text("one")), p_clone]);
+                        call("IIF", vec![call("__JT_REQUIRE", vec![present, Expr::Literal(Value::text(&name))]), got, Expr::Literal(Value::Null)])
+                    } else {
+                        got
                     };
                     let expr = match default {
                         Some(Expr::Literal(d)) => {

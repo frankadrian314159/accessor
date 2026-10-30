@@ -6265,3 +6265,23 @@ fn mysql_json_table_reads_a_document_as_rows() {
     let r = rows(&mut db, r#"SELECT t.id, jt.v FROM t, JSON_TABLE(t.j, '$' COLUMNS (NESTED PATH '$.k[*]' COLUMNS (v INT PATH '$.v'))) jt ORDER BY t.id, jt.v"#);
     assert_eq!(r, ["1,1", "1,2", "2,"]);
 }
+
+#[test]
+fn postgresql_json_table_errors_and_pg_input_error_info() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let e = db.execute(r#"SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$.a' ERROR ON EMPTY)) jt"#).unwrap_err();
+    assert!(e.to_string().contains("no SQL/JSON item found for specified path of column \"a\""), "{e}");
+    let ok = db.execute(r#"SELECT * FROM JSON_TABLE(jsonb '{"a":3}', '$' COLUMNS (id FOR ORDINALITY, a int PATH '$.a' ERROR ON EMPTY)) jt"#).unwrap();
+    assert_eq!(ok.rows[0][1].to_string(), "3");
+    db.execute(r#"SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (id FOR ORDINALITY, id2 FOR ORDINALITY))"#).unwrap_err();
+    db.execute(r#"SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int2 EXISTS PATH '$.a'))"#).unwrap_err();
+    db.execute(r#"SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int EXISTS PATH '$.a'))"#).unwrap();
+    let bad = db.execute("SELECT * FROM pg_input_error_info('zed', 'integer')").unwrap();
+    assert_eq!(bad.columns, ["message", "detail", "hint", "sql_error_code"]);
+    assert_eq!(bad.rows[0][3].to_string(), "22P02");
+    assert!(!bad.rows[0][0].is_null());
+    let good = db.execute("SELECT * FROM pg_input_error_info('12', 'integer')").unwrap();
+    assert!(good.rows[0][0].is_null());
+}
