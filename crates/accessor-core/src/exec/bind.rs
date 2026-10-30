@@ -188,10 +188,29 @@ impl Correlator<'_> {
                 };
                 match named {
                     Some(n) => frame.push(n),
-                    None => {
-                        let src = self.db.resolve_factor(f, self.depth)?;
-                        frame.push((src.alias, src.names));
-                    }
+                    None => match self.db.resolve_factor(f, self.depth) {
+                        Ok(src) => frame.push((src.alias, src.names)),
+                        // a derived table that reads the outer query cannot be run alone: its columns are named by its items
+                        Err(e) => match f {
+                            TableFactor::Derived { query, alias, columns, .. } => {
+                                let names = if columns.is_empty() {
+                                    query
+                                        .items
+                                        .iter()
+                                        .map(|i| match i {
+                                            SelectItem::Expr { alias: Some(a), .. } => a.clone(),
+                                            SelectItem::Expr { expr: Expr::Column { name, .. }, .. } => name.clone(),
+                                            _ => String::new(),
+                                        })
+                                        .collect()
+                                } else {
+                                    columns.clone()
+                                };
+                                frame.push((alias.clone(), names));
+                            }
+                            _ => return Err(e),
+                        },
+                    },
                 }
             }
         }
@@ -234,7 +253,7 @@ impl Correlator<'_> {
                             self.expr(a)?;
                         }
                     }
-                    TableFactor::Derived { query, lateral: true, .. } => self.select(query)?,
+                    TableFactor::Derived { query, .. } => self.select(query)?,
                     _ => {}
                 }
             }

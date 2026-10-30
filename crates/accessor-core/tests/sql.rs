@@ -6233,3 +6233,14 @@ fn mysql_forms_nested_joins_row_in_having_alias_user_assignment_and_limit_parame
     let r = db.execute("EXECUTE r USING @n, @o").unwrap();
     assert_eq!((r.rows.len(), r.rows[0][0].to_string()), (1, "2".to_string()));
 }
+
+#[test]
+fn a_derived_table_may_read_the_outer_query() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE otr (rf INT); CREATE TABLE itr (rf INT, val INT)").unwrap();
+    db.execute("INSERT INTO otr VALUES (1),(2); INSERT INTO itr VALUES (1,5),(1,5),(2,6),(2,7)").unwrap();
+    let col = |db: &mut Database, sql: &str| db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).rows.iter().map(|r| r[1].to_string()).collect::<Vec<_>>();
+    assert_eq!(col(&mut db, "SELECT rf, (SELECT max(val) FROM (SELECT val FROM itr WHERE itr.rf = otr.rf) d) m FROM otr ORDER BY rf"), ["5", "7"]);
+    assert_eq!(db.execute("SELECT rf FROM otr WHERE EXISTS (SELECT 1 FROM (SELECT * FROM itr WHERE itr.rf = otr.rf AND val > 6) d)").unwrap().rows.len(), 1);
+    assert_eq!(col(&mut db, "SELECT rf, 5 = ALL (SELECT val FROM itr WHERE otr.rf = itr.rf) b FROM otr ORDER BY rf").len(), 2);
+}
