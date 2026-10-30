@@ -115,14 +115,7 @@ impl<'a> Parser<'a> {
     }
 
     fn pg_type(&mut self) -> Result<DataType> {
-        if self.peek_sym("[") {
-            return Err(Error::syntax("array types are not supported"));
-        }
-        let ty = self.data_type_name()?;
-        if self.peek_sym("[") {
-            return Err(Error::syntax("array types are not supported"));
-        }
-        Ok(ty)
+        self.data_type_name()
     }
 
     pub(super) fn pg_routine(&mut self, function: bool, start: usize) -> Result<Statement> {

@@ -11,6 +11,10 @@ Its arguments may be constants, or, written after `LATERAL` or following another
 
 The optimizer treats a table function with constant arguments as a small table computed once, which it can join in any order. One that reads earlier tables is evaluated per distinct set of values, with the answers remembered.
 
+## UNNEST
+
+`UNNEST(array [, array ...])` returns one row for each element of the array (all dimensions, in order), in a column `unnest`; several arrays are read side by side, the shorter padded with NULLs, with a column for each (name them with `AS u(a, b)`). A NULL array gives no rows. `WITH ORDINALITY` after any table function adds a last column `ordinality` numbering the rows from 1: `SELECT * FROM unnest(ARRAY['a','b']) WITH ORDINALITY AS u(v, n)`. See [../types/array.md](../types/array.md).
+
 ## GENERATE_SERIES
 
 `GENERATE_SERIES(start, stop [, step])` returns a column `generate_series` with `start`, `start + step`, ... while the value has not passed `stop`. The step defaults to 1 and may be negative; it must not be zero.

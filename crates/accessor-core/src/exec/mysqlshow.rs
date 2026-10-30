@@ -47,6 +47,7 @@ pub(crate) fn mysql_type(t: DataType) -> &'static str {
         DataType::TimestampTz => "timestamp",
         DataType::Interval => "time",
         DataType::Json => "json",
+        DataType::Array(_) => "json",
         DataType::Calculated => "text",
     }
 }

@@ -63,6 +63,8 @@ pub enum Value {
     Interval(Interval),
     /// `JSON`: a JSON document, kept as canonical text.
     Json(Arc<str>),
+    /// `ARRAY`: a list of values (PostgreSQL's arrays; a nested array is a further dimension).
+    Array(Arc<Vec<Value>>),
 }
 
 // ----- on-disk form ---------------------------------------------------------
@@ -89,6 +91,7 @@ enum Wire {
     TimestampTz(i64),
     Interval(Interval),
     Json(Arc<str>),
+    Array(Vec<Value>),
 }
 
 #[derive(Serialize)]
@@ -109,6 +112,7 @@ enum WireRef<'a> {
     TimestampTz(i64),
     Interval(&'a Interval),
     Json(&'a str),
+    Array(&'a [Value]),
 }
 
 impl From<Wire> for Value {
@@ -130,6 +134,7 @@ impl From<Wire> for Value {
             Wire::TimestampTz(t) => Value::TimestampTz(t),
             Wire::Interval(i) => Value::Interval(i),
             Wire::Json(s) => Value::Json(s),
+            Wire::Array(a) => Value::Array(Arc::new(a)),
         }
     }
 }
@@ -151,6 +156,7 @@ impl Serialize for Value {
             Value::TimestampTz(t) => WireRef::TimestampTz(*t),
             Value::Interval(i) => WireRef::Interval(i),
             Value::Json(s) => WireRef::Json(s),
+            Value::Array(a) => WireRef::Array(a),
         }
         .serialize(s)
     }
@@ -184,10 +190,74 @@ pub enum DataType {
     Interval,
     /// A JSON document.
     Json,
+    /// A list of values of one type (`INTEGER[]`, `TEXT[]`).
+    Array(ArrayOf),
     /// A field whose value is an expression over the other fields of the same
     /// record. The expression is kept in the column's `default`; see
     /// [`crate::schema::Column::expression`].
     Calculated,
+}
+
+/// The type of the elements of an `ARRAY` column.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArrayOf {
+    /// Any elements (an array of arrays, or of no stated type).
+    Any,
+    Integer,
+    Bignum,
+    Float,
+    Double,
+    Decimal,
+    Currency,
+    Rational,
+    Text,
+    YesNo,
+    DateTime,
+    TimestampTz,
+    Interval,
+    Json,
+}
+
+impl ArrayOf {
+    /// The element type of an array of `t`s.
+    pub fn of(t: DataType) -> ArrayOf {
+        match t {
+            DataType::Integer => ArrayOf::Integer,
+            DataType::Bignum => ArrayOf::Bignum,
+            DataType::Float => ArrayOf::Float,
+            DataType::Double => ArrayOf::Double,
+            DataType::Decimal => ArrayOf::Decimal,
+            DataType::Currency => ArrayOf::Currency,
+            DataType::Rational => ArrayOf::Rational,
+            DataType::Text => ArrayOf::Text,
+            DataType::YesNo => ArrayOf::YesNo,
+            DataType::DateTime => ArrayOf::DateTime,
+            DataType::TimestampTz => ArrayOf::TimestampTz,
+            DataType::Interval => ArrayOf::Interval,
+            DataType::Json => ArrayOf::Json,
+            DataType::Array(_) | DataType::Calculated => ArrayOf::Any,
+        }
+    }
+
+    /// The type elements are converted to, if one is stated.
+    pub fn element(self) -> Option<DataType> {
+        Some(match self {
+            ArrayOf::Any => return None,
+            ArrayOf::Integer => DataType::Integer,
+            ArrayOf::Bignum => DataType::Bignum,
+            ArrayOf::Float => DataType::Float,
+            ArrayOf::Double => DataType::Double,
+            ArrayOf::Decimal => DataType::Decimal,
+            ArrayOf::Currency => DataType::Currency,
+            ArrayOf::Rational => DataType::Rational,
+            ArrayOf::Text => DataType::Text,
+            ArrayOf::YesNo => DataType::YesNo,
+            ArrayOf::DateTime => DataType::DateTime,
+            ArrayOf::TimestampTz => DataType::TimestampTz,
+            ArrayOf::Interval => DataType::Interval,
+            ArrayOf::Json => DataType::Json,
+        })
+    }
 }
 
 /// File format of [`DataType`]; as for [`Wire`], the order must never change.
@@ -209,6 +279,7 @@ enum TypeWire {
     TimestampTz,
     Interval,
     Json,
+    Array(ArrayOf),
 }
 
 impl From<TypeWire> for DataType {
@@ -228,6 +299,7 @@ impl From<TypeWire> for DataType {
             TypeWire::TimestampTz => DataType::TimestampTz,
             TypeWire::Interval => DataType::Interval,
             TypeWire::Json => DataType::Json,
+            TypeWire::Array(a) => DataType::Array(a),
         }
     }
 }
@@ -249,6 +321,7 @@ impl From<DataType> for TypeWire {
             DataType::TimestampTz => TypeWire::TimestampTz,
             DataType::Interval => TypeWire::Interval,
             DataType::Json => TypeWire::Json,
+            DataType::Array(a) => TypeWire::Array(a),
         }
     }
 }
@@ -269,6 +342,22 @@ impl DataType {
             DataType::TimestampTz => "TIMESTAMPTZ",
             DataType::Interval => "INTERVAL",
             DataType::Json => "JSON",
+            DataType::Array(a) => match a {
+                ArrayOf::Any => "ARRAY",
+                ArrayOf::Integer => "INTEGER[]",
+                ArrayOf::Bignum => "BIGNUM[]",
+                ArrayOf::Float => "FLOAT[]",
+                ArrayOf::Double => "DOUBLE[]",
+                ArrayOf::Decimal => "DECIMAL[]",
+                ArrayOf::Currency => "CURRENCY[]",
+                ArrayOf::Rational => "RATIONAL[]",
+                ArrayOf::Text => "TEXT[]",
+                ArrayOf::YesNo => "YESNO[]",
+                ArrayOf::DateTime => "DATETIME[]",
+                ArrayOf::TimestampTz => "TIMESTAMPTZ[]",
+                ArrayOf::Interval => "INTERVAL[]",
+                ArrayOf::Json => "JSON[]",
+            },
             DataType::Calculated => "CALCULATED",
         }
     }
@@ -276,6 +365,9 @@ impl DataType {
     /// Parses a (case-insensitive) SQL type name. Returns the type and
     /// whether the name implies an AutoNumber column.
     pub fn from_sql_name(name: &str) -> Option<(DataType, bool)> {
+        if let Some(base) = name.strip_suffix("[]") {
+            return DataType::from_sql_name(base).map(|(t, _)| (DataType::Array(ArrayOf::of(t)), false));
+        }
         let n = name.to_ascii_uppercase();
         Some(match n.as_str() {
             "INTEGER" | "INT" | "LONG" | "SHORT" | "SMALLINT" | "BIGINT" | "BYTE" | "TINYINT" | "INT2" | "INT4" | "INT8" | "OID" => {
@@ -299,6 +391,7 @@ impl DataType {
             "TIMESTAMPTZ" => (DataType::TimestampTz, false),
             "INTERVAL" => (DataType::Interval, false),
             "JSON" | "JSONB" => (DataType::Json, false),
+            "ARRAY" => (DataType::Array(ArrayOf::Any), false),
             // PostgreSQL types with no counterpart here: the name is accepted and the value kept as text
             "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR" | "REGROLE" | "REGNAMESPACE" | "REGCONFIG"
             | "REGDICTIONARY" | "REGCOLLATION" | "BYTEA" | "TSVECTOR" | "TSQUERY" | "JSONPATH" | "INET" | "CIDR" | "MACADDR" | "MACADDR8"
@@ -547,6 +640,7 @@ impl Value {
             Value::TimestampTz(_) => DataType::TimestampTz,
             Value::Interval(_) => DataType::Interval,
             Value::Json(_) => DataType::Json,
+            Value::Array(a) => DataType::Array(a.iter().find_map(Value::data_type).map_or(ArrayOf::Any, ArrayOf::of)),
             Value::Text(_) => DataType::Text,
         })
     }
@@ -563,6 +657,7 @@ impl Value {
             Value::Text(_) => 4,
             Value::Interval(_) => 5,
             Value::Json(_) => 6,
+            Value::Array(_) => 7,
             _ => 2,
         }
     }
@@ -715,6 +810,15 @@ impl Value {
             // false < true; asql keeps Access's, where Yes is -1 and so Yes < No
             (Value::Bool(a), Value::Bool(b)) if crate::dialect::current() != Dialect::Asql => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Array(a), Value::Array(b)) => array_cmp(a, b),
+            (Value::Array(a), Value::Text(t)) => match Value::parse_array(t, ArrayOf::Any) {
+                Some(Value::Array(b)) => array_cmp(a, &b),
+                _ => Ordering::Less,
+            },
+            (Value::Text(t), Value::Array(b)) => match Value::parse_array(t, ArrayOf::Any) {
+                Some(Value::Array(a)) => array_cmp(&a, b),
+                _ => Ordering::Greater,
+            },
             (Value::Json(a), Value::Text(t)) => match crate::json::canonical(t) {
                 Some(c) => (**a).cmp(c.as_str()),
                 None => (**a).cmp(&**t),
@@ -801,8 +905,32 @@ impl Value {
                     None => Err(bad()),
                 },
             },
+            DataType::Array(of) => match self {
+                Array(a) => match of.element() {
+                    Some(t) => a.iter().map(|x| coerce_element(x, t)).collect::<Result<Vec<_>>>().map(|v| Array(Arc::new(v))),
+                    None => Ok(self.clone()),
+                },
+                Text(s) => Value::parse_array(s, of).ok_or_else(|| Error::type_err(format!("malformed array literal: \"{s}\""))),
+                Json(s) => match crate::json::parse(s).ok() {
+                    Some(serde_json::Value::Array(items)) => items
+                        .iter()
+                        .map(|j| {
+                            let x = crate::json::to_value(j);
+                            match of.element() {
+                                Some(t) => coerce_element(&x, t),
+                                None => Ok(x),
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .map(|v| Array(Arc::new(v))),
+                    _ => Err(bad()),
+                },
+                // a single value is not an array
+                _ => Err(bad()),
+            },
             DataType::Json => match self {
                 Json(_) => Ok(self.clone()),
+                Array(_) => Ok(Json(crate::json::to_text(&crate::json::from_value(self)).as_str().into())),
                 Text(s) => crate::json::canonical(s).map(|c| Json(c.as_str().into())).ok_or_else(bad),
                 Bool(_) | Int(_) | Big(_) | Dec(_) | Currency(_) | Float(_) | Double(_) | Rational(_) => {
                     Ok(Json(crate::json::to_text(&crate::json::from_value(self)).as_str().into()))
@@ -870,6 +998,115 @@ impl Value {
     }
 }
 
+/// Whether an array element written out must be in quotes.
+fn array_needs_quotes(s: &str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case("null") || s.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace())
+}
+
+/// Arrays compare element by element, a shorter array that starts the longer one first.
+fn array_cmp(a: &[Value], b: &[Value]) -> Ordering {
+    for (x, y) in a.iter().zip(b) {
+        let o = match x.sql_cmp(y) {
+            Some(o) => o,
+            // a NULL element sorts after the others, as in PostgreSQL
+            None => x.is_null().cmp(&y.is_null()),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn coerce_element(x: &Value, t: DataType) -> Result<Value> {
+    match x {
+        Value::Array(inner) => inner.iter().map(|y| coerce_element(y, t)).collect::<Result<Vec<_>>>().map(|v| Value::Array(Arc::new(v))),
+        other => other.coerce_to(t),
+    }
+}
+
+impl Value {
+    /// An array from its text form, `{1,2,"a b",NULL,{3,4}}`; the elements are converted to `of`'s type, or
+    /// read as numbers when they look like one (and text otherwise) if there is none.
+    pub fn parse_array(text: &str, of: ArrayOf) -> Option<Value> {
+        let chars: Vec<char> = text.trim().chars().collect();
+        let mut pos = 0;
+        let v = Self::parse_array_at(&chars, &mut pos, of)?;
+        (pos == chars.len()).then_some(v)
+    }
+
+    fn parse_array_at(c: &[char], pos: &mut usize, of: ArrayOf) -> Option<Value> {
+        if c.get(*pos) != Some(&'{') {
+            return None;
+        }
+        *pos += 1;
+        let mut items = Vec::new();
+        loop {
+            while c.get(*pos).is_some_and(|x| x.is_whitespace()) {
+                *pos += 1;
+            }
+            match c.get(*pos)? {
+                '}' if items.is_empty() => {
+                    *pos += 1;
+                    break;
+                }
+                '{' => items.push(Self::parse_array_at(c, pos, of)?),
+                '"' => {
+                    *pos += 1;
+                    let mut s = String::new();
+                    loop {
+                        match c.get(*pos)? {
+                            '\\' => {
+                                *pos += 1;
+                                s.push(*c.get(*pos)?);
+                            }
+                            '"' => break,
+                            x => s.push(*x),
+                        }
+                        *pos += 1;
+                    }
+                    *pos += 1;
+                    items.push(match of.element() {
+                        Some(t) => Value::text(&s).coerce_to(t).ok()?,
+                        None => Value::text(&s),
+                    });
+                }
+                _ => {
+                    let start = *pos;
+                    while c.get(*pos).is_some_and(|x| !matches!(x, ',' | '}')) {
+                        *pos += 1;
+                    }
+                    let raw: String = c[start..*pos].iter().collect();
+                    let raw = raw.trim();
+                    items.push(if raw.eq_ignore_ascii_case("null") {
+                        Value::Null
+                    } else {
+                        match of.element() {
+                            Some(t) => Value::text(raw).coerce_to(t).ok()?,
+                            None => match parse_num(raw) {
+                                Some(n) => n,
+                                None => Value::text(raw),
+                            },
+                        }
+                    });
+                }
+            }
+            while c.get(*pos).is_some_and(|x| x.is_whitespace()) {
+                *pos += 1;
+            }
+            match c.get(*pos)? {
+                ',' => *pos += 1,
+                '}' => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        Some(Value::Array(Arc::new(items)))
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -897,6 +1134,7 @@ impl Ord for Value {
             (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) => a.cmp(b),
             (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Array(a), Value::Array(b)) => a.iter().cmp(b.iter()),
             (Value::Text(a), Value::Text(b)) => ci_cmp(a, b),
             (Value::Null, Value::Null) => Ordering::Equal,
             (a, b) if a.is_numeric() && b.is_numeric() => num_cmp(a, b),
@@ -968,6 +1206,13 @@ impl Hash for Value {
                 6u8.hash(state);
                 s.hash(state);
             }
+            Value::Array(a) => {
+                7u8.hash(state);
+                a.len().hash(state);
+                for x in a.iter() {
+                    x.hash(state);
+                }
+            }
             Value::Text(s) => {
                 4u8.hash(state);
                 for b in s.bytes() {
@@ -1016,6 +1261,29 @@ impl fmt::Display for Value {
             Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
             Value::Interval(i) => write!(f, "{i}"),
             Value::Json(s) => f.write_str(s),
+            Value::Array(a) => {
+                f.write_str("{")?;
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(",")?;
+                    }
+                    match x {
+                        Value::Null => f.write_str("NULL")?,
+                        Value::Text(s) if array_needs_quotes(s) => {
+                            f.write_str("\"")?;
+                            for c in s.chars() {
+                                if c == '"' || c == '\\' {
+                                    f.write_str("\\")?;
+                                }
+                                write!(f, "{c}")?;
+                            }
+                            f.write_str("\"")?;
+                        }
+                        other => write!(f, "{other}")?,
+                    }
+                }
+                f.write_str("}")
+            }
             Value::Text(s) => f.write_str(s),
         }
     }

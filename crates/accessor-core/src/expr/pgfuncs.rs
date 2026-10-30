@@ -43,6 +43,8 @@ pub enum PgFn {
     Same,
     /// One of the functions of MySQL ([`super::myfuncs`]).
     My(super::myfuncs::MyFn),
+    /// One of the array functions ([`super::arrays`]).
+    Arr(super::arrays::ArrFn),
     /// A function that always gives the same text (`DATABASE()`, `VERSION()`, `CURRENT_USER()`).
     Text(&'static str),
     JsonPathArray,
@@ -97,7 +99,11 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "DECODE" => (Decode, 2, 2),
         "PG_RELATION_SIZE" | "PG_TOTAL_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" => (Zero, 1, 2),
         "TO_REGCLASS" | "TO_REGTYPE" | "TO_REGPROC" | "TO_REGROLE" | "TO_REGNAMESPACE" | "TO_REGPROCEDURE" | "TO_REGOPER" | "TO_REGDATABASE" => (Same, 1, 1),
-        _ => return super::myfuncs::lookup(name).map(|(m, a, b)| (My(m), a, b)),
+        _ => {
+            return super::arrays::lookup(name)
+                .map(|(m, a, b)| (Arr(m), a, b))
+                .or_else(|| super::myfuncs::lookup(name).map(|(m, a, b)| (My(m), a, b)))
+        }
     })
 }
 
@@ -106,6 +112,7 @@ impl PgFn {
     pub fn handles_null(self) -> bool {
         match self {
             PgFn::My(m) => m.handles_null(),
+            PgFn::Arr(a) => a.handles_null(),
             _ => matches!(self, PgFn::ConcatWs | PgFn::TypeOf | PgFn::Nothing),
         }
     }
@@ -319,6 +326,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             }
         }
         My(m) => return super::myfuncs::call(m, vals),
+        Arr(a) => return super::arrays::call(a, vals),
         Text(s) => Value::text(s),
         Zero => Value::Int(0),
         Same => v(0).clone(),

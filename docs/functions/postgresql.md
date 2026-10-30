@@ -59,10 +59,14 @@ SELECT to_date('March 5, 2024', 'Month DD, YYYY');                          -- 2
 
 `asinh(x)`, `acosh(x)`, `atanh(x)`; the arguments of the last two must be in range.
 
+## Arrays
+
+`array_length`, `array_append`, `array_cat`, `array_position`, `array_to_string`, `string_to_array`, `array_agg`, `unnest`, `cardinality` and the rest work on the `ARRAY` type: see [../types/array.md](../types/array.md).
+
 ## For a database with one user
 
 `has_table_privilege`, `has_schema_privilege`, `has_column_privilege`, `has_function_privilege`, `has_database_privilege`, `has_sequence_privilege`, `has_type_privilege`, `has_language_privilege`, `has_tablespace_privilege`, `has_server_privilege`, `has_foreign_data_wrapper_privilege`, `has_largeobject_privilege` and `has_parameter_privilege` are **always true** (NULL if an argument is NULL): they do not look at the roles of [roles-and-privileges.md](../sql/roles-and-privileges.md). `pg_sleep(seconds)` waits that long, at most a second. `pg_advisory_lock`, `pg_advisory_unlock` and `pg_stat_force_next_flush` do nothing and return NULL. `pg_get_viewdef('name')` is the text of a saved query (the name must be written in quotes in the statement).
 
 ## Not available
 
-Full-text search (`to_tsvector`, `to_tsquery`, `ts_*`), the SQL/JSON path functions (`jsonb_path_query` and its relatives), XML functions, ranges and multiranges, arrays (`string_to_array`, `regexp_matches`, `regexp_split_to_array`, `array_agg` and the rest), `encode`/`decode` and large objects (there is no `BLOB` type), and the statistical aggregates `corr`, `covar_pop`, `regr_slope` and their relatives.
+Full-text search (`to_tsvector`, `to_tsquery`, `ts_*`), the SQL/JSON path functions (`jsonb_path_query` and its relatives), XML functions, ranges and multiranges, `regexp_matches` and `regexp_split_to_array`, `encode`/`decode` and large objects (there is no `BLOB` type), and the statistical aggregates `corr`, `covar_pop`, `regr_slope` and their relatives.

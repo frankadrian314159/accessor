@@ -128,6 +128,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
         DataType::TimestampTz => "CTIMESTAMPTZ",
         DataType::Interval => "CINTERVAL",
         DataType::Json => "JSON_PARSE",
+        DataType::Array(of) => crate::expr::arrays::cast_name(of),
         DataType::Calculated => return None,
     })
 }
@@ -864,7 +865,12 @@ impl<'a> Parser<'a> {
             self.if_exists_clause(true, guarded)?;
             let name = self.ident()?;
             self.eat_kw("AS");
-            let type_name = self.type_name()?;
+            let mut type_name = self.type_name()?;
+            let before = self.pos;
+            self.array_suffix(DataType::Text);
+            if self.pos != before {
+                type_name.push_str("[]");
+            }
             let mut t = match crate::sql::usertypes::lookup(&type_name) {
                 Some(base) => UserType { domain: true, ..base },
                 None => {
@@ -2919,6 +2925,26 @@ impl<'a> Parser<'a> {
     }
 
     /// A data type written as a name (`INTEGER`, `VARCHAR(20)`, `DOUBLE PRECISION`, ...).
+    /// `[]`, `[n]` or `ARRAY` after a type name: the type is then an array of it.
+    pub(super) fn array_suffix(&mut self, ty: DataType) -> DataType {
+        let mut array = false;
+        loop {
+            if self.peek_sym("[") {
+                while !self.peek_sym("]") && !self.at_eof() {
+                    self.advance();
+                }
+                self.eat_sym("]");
+                array = true;
+            } else if self.peek_kw("ARRAY") && !matches!(self.peek_at(1), Tok::Sym("(")) {
+                self.advance();
+                array = true;
+            } else {
+                break;
+            }
+        }
+        if array { DataType::Array(crate::value::ArrayOf::of(ty)) } else { ty }
+    }
+
     fn data_type_name(&mut self) -> Result<DataType> {
         let tn = self.type_name()?;
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
@@ -2932,7 +2958,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
-        Ok(ty)
+        Ok(self.array_suffix(ty))
     }
 
     /// Procedure statements up to (not including) one of the `stops` keywords.
@@ -3994,6 +4020,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
+        let data_type = if data_type == DataType::Calculated { data_type } else { self.array_suffix(data_type) };
         let type_check = if crate::sql::usertypes::strict() { strict_type_check(&name, &type_name, data_type, &size) } else { None };
         let mut unsigned = false;
         while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {
@@ -5344,6 +5371,28 @@ impl<'a> Parser<'a> {
                 };
                 continue;
             }
+            if let Tok::Sym(s @ ("@>" | "<@" | "&&")) = self.peek().clone() {
+                // array (and JSON) containment, contained by, and overlap
+                self.advance();
+                let right = self.concat()?;
+                let name = match s {
+                    "@>" => "__ARRAY_CONTAINS",
+                    "<@" => "__ARRAY_CONTAINED",
+                    _ => "__ARRAY_OVERLAP",
+                };
+                left = Expr::Function { name: name.into(), args: vec![left, right], distinct: false, star: false };
+                continue;
+            }
+            if self.peek_kw("MEMBER") && self.peek_kw_at(1, "OF") && matches!(self.peek_at(2), Tok::Sym("(")) {
+                // MySQL: x MEMBER OF (json_array)
+                self.advance();
+                self.advance();
+                self.advance();
+                let right = self.expr()?;
+                self.expect_sym(")")?;
+                left = Expr::Function { name: "__MEMBER_OF".into(), args: vec![left, right], distinct: false, star: false };
+                continue;
+            }
             if self.peek_kw("SOUNDS") && self.peek_kw_at(1, "LIKE") {
                 // MySQL: a SOUNDS LIKE b is SOUNDEX(a) = SOUNDEX(b)
                 self.advance();
@@ -5601,6 +5650,19 @@ impl<'a> Parser<'a> {
 
     fn power(&mut self) -> Result<Expr> {
         let mut base = self.primary()?;
+        // `a[i]`, `a[lo:hi]`: an element or a slice of an array
+        while self.peek_sym("[") {
+            self.advance();
+            let null = || Expr::Literal(Value::Null);
+            let lo = if self.peek_sym(":") { None } else { Some(self.expr()?) };
+            base = if self.eat_sym(":") {
+                let hi = if self.peek_sym("]") { None } else { Some(self.expr()?) };
+                Expr::Function { name: "__SLICE".into(), args: vec![base, lo.unwrap_or_else(null), hi.unwrap_or_else(null)], distinct: false, star: false }
+            } else {
+                Expr::Function { name: "__SUBSCRIPT".into(), args: vec![base, lo.expect("a subscript")], distinct: false, star: false }
+            };
+            self.expect_sym("]")?;
+        }
         // `x::integer`, `'2024-01-01'::date`: PostgreSQL's cast, binding tighter than anything else
         while self.eat_sym("::") {
             base = self.type_cast(base)?;
@@ -5634,6 +5696,22 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Binary { op: BinOp::Pow, left: Box::new(base), right: Box::new(exp) });
         }
         Ok(base)
+    }
+
+    /// At `[` after `ARRAY` (or inside one): `[a, b, [c, d]]`.
+    fn array_literal(&mut self) -> Result<Expr> {
+        self.expect_sym("[")?;
+        let mut items = Vec::new();
+        if !self.peek_sym("]") {
+            loop {
+                items.push(if self.peek_sym("[") { self.array_literal()? } else { self.expr()? });
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        self.expect_sym("]")?;
+        Ok(Expr::Function { name: "__ARRAY".into(), args: items, distinct: false, star: false })
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -5812,6 +5890,26 @@ impl<'a> Parser<'a> {
                     }
                     // Any other type name before a string is a cast of that string: int4 '42', bool 't', float8 '1e3',
                     // numeric '1.50', text 'x', double precision '2.5'.
+                    "ARRAY" if matches!(self.peek_at(1), Tok::Sym("[")) => {
+                        self.advance();
+                        return self.array_literal();
+                    }
+                    "ARRAY" if matches!(self.peek_at(1), Tok::Sym("(")) && (self.peek_kw_at(2, "SELECT") || self.peek_kw_at(2, "WITH") || self.peek_kw_at(2, "VALUES")) => {
+                        self.advance();
+                        self.advance();
+                        let mut q = self.select()?;
+                        self.expect_sym(")")?;
+                        match q.items.as_mut_slice() {
+                            [SelectItem::Expr { alias, .. }] => *alias = Some("__q".into()),
+                            _ => return Err(Error::syntax("ARRAY(...) needs a sub-query with exactly one column")),
+                        }
+                        let agg = Expr::Function { name: "ARRAY_AGG".into(), args: vec![Expr::Column { table: Some("__t".into()), name: "__q".into() }], distinct: false, star: false };
+                        return Ok(Expr::Subquery(Box::new(Select {
+                            items: vec![SelectItem::Expr { expr: agg, alias: None }],
+                            from: Some(From { first: TableFactor::Derived { query: Box::new(q), alias: "__t".into(), columns: Vec::new(), lateral: false }, joins: Vec::new() }),
+                            ..Select::default()
+                        })));
+                    }
                     "DOUBLE" if self.peek_kw_at(1, "PRECISION") && matches!(self.peek_at(2), Tok::Str(_)) => {
                         self.advance();
                         self.advance();
@@ -6241,9 +6339,7 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
         }
-        if self.peek_sym("[") {
-            return Err(Error::syntax("array types are not supported"));
-        }
+        let ty = self.array_suffix(ty);
         Ok(make_cast(e, ty, &hints))
     }
 
@@ -6288,6 +6384,21 @@ impl<'a> Parser<'a> {
         let all = self.peek_kw("ALL");
         self.advance();
         self.expect_sym("(")?;
+        if !(self.peek_kw("SELECT") || self.peek_kw("VALUES") || self.peek_kw("WITH")) {
+            // `x = ANY (array)`: compared with each element
+            let array = self.expr()?;
+            self.expect_sym(")")?;
+            let text = match op {
+                BinOp::Eq => "=",
+                BinOp::Ne => "<>",
+                BinOp::Lt => "<",
+                BinOp::Le => "<=",
+                BinOp::Gt => ">",
+                BinOp::Ge => ">=",
+                _ => return Err(Error::syntax("unsupported quantified comparison")),
+            };
+            return Ok(Expr::Function { name: if all { "__ALL" } else { "__ANY" }.into(), args: vec![x, array, Expr::Literal(Value::text(text))], distinct: false, star: false });
+        }
         let mut q = self.select()?;
         self.expect_sym(")")?;
         if !all && op == BinOp::Eq {

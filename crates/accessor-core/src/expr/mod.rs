@@ -5,6 +5,7 @@ pub mod format;
 pub(crate) mod extra;
 pub mod func;
 pub mod like;
+pub mod arrays;
 pub mod myfuncs;
 pub mod pgfuncs;
 
@@ -112,6 +113,13 @@ impl BExpr {
                 }
                 BinOp::Concat => {
                     let (x, y) = (a.eval(row)?, b.eval(row)?);
+                    if matches!(&*x, Value::Array(_)) || matches!(&*y, Value::Array(_)) {
+                        return Ok(Cow::Owned(match (x.is_null(), y.is_null()) {
+                            (true, _) => y.into_owned(),
+                            (_, true) => x.into_owned(),
+                            _ => arrays::concat(&x, &y)?,
+                        }));
+                    }
                     let mut s = String::new();
                     for v in [&x, &y] {
                         match &**v {

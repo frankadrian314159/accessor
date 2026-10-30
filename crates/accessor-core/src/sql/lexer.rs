@@ -66,6 +66,8 @@ fn dollar_tag(chars: &[(usize, char)], i: usize) -> Option<String> {
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     let chars: Vec<(usize, char)> = src.char_indices().collect();
     let mut out = Vec::new();
+    // how many array brackets are open: inside them `[` is never the start of an [identifier]
+    let mut arrays = 0usize;
     let mut question = 0usize;
     let mut i = 0;
     while i < chars.len() {
@@ -254,6 +256,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 }
             }
             out.push(Token { tok: Tok::Param(format!("@@{}", &src[chars[start].0..end])), pos });
+        } else if c == '[' && (arrays > 0 || (i > 0 && at(i - 1).is_some_and(|p| is_ident_part(p) || matches!(p, ')' | ']' | '"')))) {
+            // an array subscript or type suffix (`a[1]`, `int[]`); `[name]` is an identifier unless it follows a name
+            i += 1;
+            arrays += 1;
+            out.push(Token { tok: Tok::Sym("["), pos });
+        } else if c == ']' {
+            i += 1;
+            arrays = arrays.saturating_sub(1);
+            out.push(Token { tok: Tok::Sym("]"), pos });
         } else if c == '[' {
             let mut name = String::new();
             i += 1;
@@ -315,6 +326,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             if rest.starts_with("||") {
                 i += 2;
                 out.push(Token { tok: Tok::Sym("&"), pos });
+                continue;
+            }
+            let array_op = match dialect::current() {
+                Dialect::Mysql => None,
+                d => ["@>", "<@", "&&"].into_iter().find(|s| rest.starts_with(*s) && !(d == Dialect::Asql && *s == "<@" && rest[2..].starts_with(is_ident_start))),
+            };
+            if let Some(sym) = array_op {
+                i += 2;
+                out.push(Token { tok: Tok::Sym(sym), pos });
                 continue;
             }
             let sym = SYMBOLS

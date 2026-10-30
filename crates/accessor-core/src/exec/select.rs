@@ -337,6 +337,7 @@ impl Database {
             "GENERATE_SERIES" => vec!["generate_series".into()],
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
             "JSON_EACH" => vec!["key".into(), "value".into()],
+            "UNNEST" => vec!["unnest".into()],
             "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => vec!["jsonb_path_query".into()],
             other if self.set_function(other).is_some() => self.set_function(other).expect("checked").set_columns.clone(),
             other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES, SPLIT_STRING and JSON_EACH are available)"))),
@@ -348,6 +349,35 @@ impl Database {
         const MAX_ROWS: usize = 10_000_000;
         if let Some(def) = self.set_function(name) {
             return self.run_set_function(&def, args);
+        }
+        if name.eq_ignore_ascii_case("UNNEST") {
+            // one column per array, the arrays side by side and the shorter ones padded with NULLs
+            fn flat(v: &Value, out: &mut Vec<Value>) {
+                match v {
+                    Value::Array(a) => a.iter().for_each(|x| flat(x, out)),
+                    other => out.push(other.clone()),
+                }
+            }
+            let mut columns: Vec<Vec<Value>> = Vec::new();
+            for a in args {
+                let mut items = Vec::new();
+                match a {
+                    Value::Null => {}
+                    Value::Array(_) => flat(a, &mut items),
+                    other => match other.coerce_to(crate::value::DataType::Array(crate::value::ArrayOf::Any))? {
+                        arr @ Value::Array(_) => flat(&arr, &mut items),
+                        _ => {}
+                    },
+                }
+                columns.push(items);
+            }
+            let n = columns.iter().map(Vec::len).max().unwrap_or(0);
+            if n > MAX_ROWS {
+                return Err(Error::runtime("UNNEST would produce too many rows"));
+            }
+            let rows = (0..n).map(|i| columns.iter().map(|c| c.get(i).cloned().unwrap_or(Value::Null)).collect()).collect();
+            let names = if columns.len() == 1 { vec!["unnest".to_string()] } else { (1..=columns.len()).map(|i| format!("unnest{i}")).collect() };
+            return Ok((names, rows));
         }
         let cols = self.table_function_columns(name)?;
         let wrong = |n: &str| Error::runtime(format!("wrong number of arguments for {n}"));

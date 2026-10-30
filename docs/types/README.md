@@ -18,6 +18,7 @@ Every column has one type, chosen when the table is created (`CREATE TABLE t (co
 | `TIMESTAMPTZ` | [timestamptz.md](timestamptz.md) | a moment in time, shown in a time zone |
 | `INTERVAL` | [interval.md](interval.md) | a length of time in months, days and seconds |
 | `JSON` | [json.md](json.md) | a JSON document |
+| `ARRAY` (`INTEGER[]`, `TEXT[]`...) | [array.md](array.md) | a list of values of one type |
 | `COUNTER` | [counter.md](counter.md) | an `INTEGER` that numbers itself |
 | `CALCULATED` | [calculated.md](calculated.md) | a value worked out from other columns |
 

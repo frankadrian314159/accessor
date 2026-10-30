@@ -55,6 +55,7 @@ pub(crate) fn from_value(v: &Value) -> J {
             v.to_f64().and_then(Number::from_f64).map_or(J::Null, J::Number)
         }
         Value::Json(s) => parse(s).unwrap_or(J::Null),
+        Value::Array(a) => J::Array(a.iter().map(from_value).collect()),
         other => J::String(other.to_string()),
     }
 }

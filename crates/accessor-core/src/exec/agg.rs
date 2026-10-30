@@ -24,6 +24,8 @@ pub enum AggFn {
     Every,
     AnyTrue,
     JsonArrayAgg,
+    /// `ARRAY_AGG`: the values (NULLs too) as an array.
+    ArrayAgg,
     BitAnd,
     BitOr,
     BitXor,
@@ -48,6 +50,7 @@ impl AggFn {
             "EVERY" | "BOOL_AND" => AggFn::Every,
             "BOOL_OR" => AggFn::AnyTrue,
             "JSON_ARRAYAGG" | "JSON_AGG" => AggFn::JsonArrayAgg,
+            "ARRAY_AGG" => AggFn::ArrayAgg,
             "BIT_AND" => AggFn::BitAnd,
             "BIT_OR" => AggFn::BitOr,
             "BIT_XOR" => AggFn::BitXor,
@@ -72,6 +75,7 @@ impl AggFn {
             AggFn::Every => "Every",
             AggFn::AnyTrue => "AnyTrue",
             AggFn::JsonArrayAgg => "JsonArrayAgg",
+            AggFn::ArrayAgg => "ArrayAgg",
             AggFn::BitAnd => "BitAnd",
             AggFn::BitOr => "BitOr",
             AggFn::BitXor => "BitXor",
@@ -98,6 +102,8 @@ pub struct AggState {
     count: i64,
     acc: Option<Value>,
     parts: Vec<String>,
+    /// The values of an `ARRAY_AGG`.
+    items: Vec<Value>,
     /// The sort keys of each part, when the call has an `ORDER BY`.
     keys: Vec<Vec<Value>>,
     desc: Vec<bool>,
@@ -116,6 +122,7 @@ impl AggState {
             count: 0,
             acc: None,
             parts: Vec::new(),
+            items: Vec::new(),
             keys: Vec::new(),
             desc: spec.order.iter().map(|o| o.1).collect(),
             sep: spec.sep.clone().unwrap_or_else(|| ",".into()),
@@ -127,9 +134,9 @@ impl AggState {
 
     /// Feeds one input value with the sort keys of its row (an aggregate with an `ORDER BY`).
     pub fn update_ordered(&mut self, v: Option<&Value>, keys: Vec<Value>) -> Result<()> {
-        let before = self.parts.len();
+        let before = self.parts.len() + self.items.len();
         self.update(v)?;
-        if self.parts.len() > before {
+        if self.parts.len() + self.items.len() > before {
             self.keys.push(keys);
         }
         Ok(())
@@ -141,6 +148,15 @@ impl AggState {
             self.count += 1;
             return Ok(());
         };
+        if self.func == AggFn::ArrayAgg {
+            if let Some(seen) = &mut self.seen {
+                if !seen.insert(v.clone()) {
+                    return Ok(());
+                }
+            }
+            self.items.push(v.clone());
+            return Ok(());
+        }
         if v.is_null() {
             return Ok(());
         }
@@ -197,6 +213,7 @@ impl AggState {
             AggFn::Last => self.acc = Some(v.clone()),
             AggFn::StringAgg => self.parts.push(v.to_string()),
             AggFn::JsonArrayAgg => self.parts.push(crate::json::to_text(&crate::json::from_value(v))),
+            AggFn::ArrayAgg => unreachable!("ARRAY_AGG is fed before the NULL check"),
             AggFn::StddevPop | AggFn::StddevSamp | AggFn::VarPop | AggFn::VarSamp => {
                 let x = v
                     .num_lenient()
@@ -241,6 +258,26 @@ impl AggState {
                     Some(sum) if self.count > 0 => arith(BinOp::ExactDiv, &sum, &Value::Int(self.count)).unwrap_or(Value::Null),
                     _ => Value::Null,
                 }
+            }
+            AggFn::ArrayAgg => {
+                if self.items.is_empty() {
+                    return Value::Null;
+                }
+                let mut at: Vec<usize> = (0..self.items.len()).collect();
+                let (keys, desc) = (&self.keys, &self.desc);
+                if !keys.is_empty() {
+                    at.sort_by(|&a, &b| {
+                        for (i, d) in desc.iter().enumerate() {
+                            let o = keys[a][i].cmp(&keys[b][i]);
+                            let o = if *d { o.reverse() } else { o };
+                            if o != std::cmp::Ordering::Equal {
+                                return o;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+                Value::Array(std::sync::Arc::new(at.into_iter().map(|i| self.items[i].clone()).collect()))
             }
             AggFn::StringAgg | AggFn::JsonArrayAgg if !self.keys.is_empty() => {
                 let mut at: Vec<usize> = (0..self.parts.len()).collect();

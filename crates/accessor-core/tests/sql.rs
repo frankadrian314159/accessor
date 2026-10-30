@@ -6140,3 +6140,61 @@ fn select_into_strict_wants_exactly_one_row() {
     db.execute("CREATE FUNCTION two() RETURNS int AS $$ DECLARE x int; BEGIN SELECT a INTO STRICT x FROM t; RETURN x; END $$ LANGUAGE plpgsql").unwrap();
     db.execute("SELECT two()").unwrap_err();
 }
+
+#[test]
+fn arrays_have_literals_subscripts_functions_and_operators() {
+    use accessor_core::dialect::Dialect;
+    for d in [Dialect::Asql, Dialect::Postgresql] {
+        let mut db = Database::in_memory();
+        db.set_dialect(d);
+        let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).rows[0][0].to_string();
+        assert_eq!(one(&mut db, "SELECT ARRAY[1, 2, 3]"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT ARRAY['a b', NULL, 'c']"), "{\"a b\",NULL,c}");
+        assert_eq!(one(&mut db, "SELECT (ARRAY[10, 20, 30])[2]"), "20");
+        assert_eq!(one(&mut db, "SELECT (ARRAY[10, 20, 30])[2:3]"), "{20,30}");
+        assert_eq!(one(&mut db, "SELECT ARRAY[[1,2],[3,4]]"), "{{1,2},{3,4}}");
+        assert_eq!(one(&mut db, "SELECT '{1,2,3}'::int[]"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT array_length(ARRAY[1,2,3], 1)"), "3");
+        assert_eq!(one(&mut db, "SELECT cardinality(ARRAY[[1,2],[3,4]])"), "4");
+        assert_eq!(one(&mut db, "SELECT array_append(ARRAY[1,2], 3)"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT array_cat(ARRAY[1], ARRAY[2,3])"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT ARRAY[1,2] || ARRAY[3]"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT ARRAY[1,2] || 3"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT 0 || ARRAY[1,2]"), "{0,1,2}");
+        assert_eq!(one(&mut db, "SELECT array_remove(ARRAY[1,2,1], 1)"), "{2}");
+        assert_eq!(one(&mut db, "SELECT array_position(ARRAY['a','b','c'], 'c')"), "3");
+        assert_eq!(one(&mut db, "SELECT array_to_string(ARRAY[1,NULL,3], ',', '*')"), "1,*,3");
+        assert_eq!(one(&mut db, "SELECT string_to_array('a,b,c', ',')"), "{a,b,c}");
+        assert_eq!(one(&mut db, "SELECT array_fill(7, ARRAY[3])"), "{7,7,7}");
+        assert_eq!(one(&mut db, "SELECT ARRAY[1,2,3] @> ARRAY[2,3]"), if d == Dialect::Asql { "Yes" } else { "true" });
+        assert_eq!(one(&mut db, "SELECT ARRAY[1,2] && ARRAY[5,6]"), if d == Dialect::Asql { "No" } else { "false" });
+        assert_eq!(one(&mut db, "SELECT 2 = ANY (ARRAY[1,2,3])"), if d == Dialect::Asql { "Yes" } else { "true" });
+        assert_eq!(one(&mut db, "SELECT 5 > ALL (ARRAY[1,2,3])"), if d == Dialect::Asql { "Yes" } else { "true" });
+        db.execute("CREATE TABLE t (id int, tags text[])").unwrap();
+        db.execute("INSERT INTO t VALUES (1, ARRAY['x','y']), (2, '{y,z}'), (3, NULL)").unwrap();
+        assert_eq!(one(&mut db, "SELECT tags[1] FROM t WHERE id = 2"), "y");
+        assert_eq!(one(&mut db, "SELECT count(*) FROM t WHERE 'y' = ANY (tags)"), "2");
+        assert_eq!(one(&mut db, "SELECT count(*) FROM t WHERE tags @> ARRAY['z']"), "1");
+        assert_eq!(one(&mut db, "SELECT array_agg(id) FROM t"), "{1,2,3}");
+        assert_eq!(one(&mut db, "SELECT array_agg(id ORDER BY id DESC) FROM t"), "{3,2,1}");
+        assert_eq!(one(&mut db, "SELECT ARRAY(SELECT id FROM t WHERE id < 3 ORDER BY id)"), "{1,2}");
+        assert_eq!(db.execute("SELECT * FROM unnest(ARRAY[4,5,6]) AS u(v)").unwrap().rows.len(), 3);
+        assert_eq!(one(&mut db, "SELECT sum(v) FROM unnest(ARRAY[4,5,6]) AS u(v)"), "15");
+    }
+}
+
+#[test]
+fn mysql_json_arrays_have_append_insert_overlaps_and_member_of() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT JSON_ARRAY_APPEND('[1, 2]', '$', 3)"), "[1,2,3]");
+    assert_eq!(one(&mut db, "SELECT JSON_ARRAY_APPEND('[1, [2]]', '$[1]', 'x')"), "[1,[2,\"x\"]]");
+    assert_eq!(one(&mut db, "SELECT JSON_ARRAY_INSERT('[1, 3]', '$[1]', 2)"), "[1,2,3]");
+    assert_eq!(one(&mut db, "SELECT JSON_INSERT('{\"a\": 1}', '$.a', 9, '$.b', 2)"), "{\"a\":1,\"b\":2}");
+    assert_eq!(one(&mut db, "SELECT JSON_REPLACE('{\"a\": 1}', '$.a', 9, '$.b', 2)"), "{\"a\":9}");
+    assert_eq!(one(&mut db, "SELECT JSON_OVERLAPS('[1,3,5]', '[2,5]')"), "1");
+    assert_eq!(one(&mut db, "SELECT 5 MEMBER OF('[1, 5, 7]')"), "1");
+    assert_eq!(one(&mut db, "SELECT 6 MEMBER OF('[1, 5, 7]')"), "0");
+}
