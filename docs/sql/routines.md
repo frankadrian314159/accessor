@@ -10,6 +10,8 @@ A call may name its arguments, `f(10, c => 1)` or `f(b := 3, a := 10)`, for func
 
 In a trigger function `TG_NARGS` and `TG_ARGV[n]` (n from 0 to 5) hold the arguments given in `CREATE TRIGGER ... EXECUTE FUNCTION f('a', 'b')`. The condition of an `IF` may carry the rest of a query, `IF count(*) = 0 FROM room WHERE n = new.n THEN`, and then it is the value of that query.
 
+A record variable (`DECLARE r record` or `r t%ROWTYPE`) is filled by `SELECT ... INTO r` (its first row; every field NULL when there is none) or by `FOR r IN SELECT ... LOOP ... END LOOP` (one row per pass), and its fields are read as `r.col`.
+
 ## Functions that return a set of rows
 
 `CREATE FUNCTION above(n int) RETURNS TABLE (a int, b text) LANGUAGE sql AS $$ SELECT a, b FROM t WHERE a > n $$` (or `RETURNS SETOF int`, whose one column is named like the function) is called in `FROM`: `SELECT * FROM above(1)`, in a join, or inside a view. The body is one or more statements of which the last is the `SELECT` that gives the rows; the arguments replace the parameters. Only a `LANGUAGE sql` body can do this, and the arguments must be values the statement knows before it runs (not columns of other tables in the same `FROM`).
@@ -144,7 +146,7 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 
 | Statement | Notes |
 | --- | --- |
-| `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `%TYPE`, `record` and cursor variables are not |
+| `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `t.col%TYPE` is a variable of no fixed type; `record` and `t%ROWTYPE` are record variables (see above); cursor variables are not |
 | `name := expr;` or `name = expr;` | assignment |
 | `IF c THEN ... ELSIF c THEN ... ELSE ... END IF;` | |
 | `CASE [expr] WHEN v [, v] THEN ... ELSE ... END CASE;` | the statement form |
@@ -156,7 +158,7 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays and records, set-returning functions written in `plpgsql` (`RETURN NEXT`/`RETURN QUERY`; in `sql` they work, see below), event triggers, and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays, assigning a whole record (`r := new`), set-returning functions written in `plpgsql` (`RETURN NEXT`/`RETURN QUERY`; in `sql` they work, see below), event triggers, and every language except `sql` and `plpgsql`.
 
 ### Trigger functions
 

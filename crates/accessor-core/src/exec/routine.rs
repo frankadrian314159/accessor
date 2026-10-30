@@ -385,6 +385,25 @@ impl Database {
                 }
                 return Ok(Flow::Return);
             }
+            ProcStmt::SelectRecord { name, select } => {
+                let (columns, rows) = self.record_query(select, frame)?;
+                self.set_record(frame, name, &columns, rows.into_iter().next());
+            }
+            ProcStmt::ForRecord { name, select, body } => {
+                let (columns, rows) = self.record_query(select, frame)?;
+                for row in rows {
+                    frame.iterations += 1;
+                    if frame.iterations > MAX_ITERATIONS {
+                        return Err(Error::runtime("a procedure made more than a million loop iterations (is a loop endless?)"));
+                    }
+                    self.set_record(frame, name, &columns, Some(row));
+                    match self.run_block(body, frame)? {
+                        Flow::Normal => {}
+                        Flow::Leave => break,
+                        Flow::Return => return Ok(Flow::Return),
+                    }
+                }
+            }
             ProcStmt::Sql(Statement::Raise(message)) => {
                 let text = self.eval_in(message, frame)?;
                 return Err(Error::constraint(text.to_string()));
@@ -396,6 +415,22 @@ impl Database {
             }
         }
         Ok(Flow::Normal)
+    }
+
+    /// Runs the query of a record variable's `SELECT ... INTO` / `FOR ... IN`, with the variables filled in.
+    fn record_query(&mut self, select: &crate::sql::ast::Select, frame: &Frame) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        let mut stmt = Statement::Select(select.clone());
+        bind_params(&mut stmt, &frame.vars)?;
+        let r = self.execute_statement(&stmt)?;
+        Ok((r.columns, r.rows))
+    }
+
+    /// Sets the variables `name.column` from `row` (NULL for all of them when there is none).
+    fn set_record(&self, frame: &mut Frame, name: &str, columns: &[String], row: Option<Vec<Value>>) {
+        for (i, c) in columns.iter().enumerate() {
+            let v = row.as_ref().and_then(|r| r.get(i).cloned()).unwrap_or(Value::Null);
+            frame.vars.insert(format!("{}.{}", name.to_ascii_lowercase(), c.to_ascii_lowercase()), v);
+        }
     }
 
     /// The routine called `name`, if it is a function.

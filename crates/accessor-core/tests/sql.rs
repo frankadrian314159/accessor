@@ -6107,3 +6107,17 @@ fn postgresql_tableoid_names_the_table_a_row_is_in() {
     // * does not show it
     assert_eq!(rows(&db, "SELECT * FROM p1 WHERE tableoid = 'p1'"), [["1"]]);
 }
+
+#[test]
+fn plpgsql_record_variables_hold_a_row() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a int, b text); INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')").unwrap();
+    db.execute(
+        "CREATE FUNCTION f() RETURNS text AS $$ DECLARE r record; one t%ROWTYPE; n t.a%TYPE; s text := ''; BEGIN \
+         SELECT * INTO r FROM t WHERE a = 2; s := r.b; \
+         FOR r IN SELECT * FROM t ORDER BY a LOOP s := s || r.b || r.a; END LOOP; \
+         RETURN s; END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    assert_eq!(db.execute("SELECT f()").unwrap().rows[0][0].to_string(), "yx1y2z3");
+}

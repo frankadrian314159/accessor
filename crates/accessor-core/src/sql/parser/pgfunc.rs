@@ -34,6 +34,8 @@ struct Names {
     params: Vec<String>,
     /// In a trigger function, `NEW.x` and `OLD.x` are variables named `new.x` and `old.x`.
     trigger: bool,
+    /// Record variables: `r.col` is the variable named `r.col`.
+    records: Vec<String>,
 }
 
 impl Names {
@@ -59,6 +61,9 @@ impl Names {
     fn node(&self, x: &mut Expr) {
         match x {
             Expr::Column { table: Some(t), name } if self.trigger && (t.eq_ignore_ascii_case("new") || t.eq_ignore_ascii_case("old")) => {
+                *x = Expr::Param(format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase()));
+            }
+            Expr::Column { table: Some(t), name } if self.records.iter().any(|r| r.eq_ignore_ascii_case(t)) => {
                 *x = Expr::Param(format!("{}.{}", t.to_ascii_lowercase(), name.to_ascii_lowercase()));
             }
             Expr::Column { table: None, name } if self.trigger && (name.eq_ignore_ascii_case("new") || name.eq_ignore_ascii_case("old")) => {
@@ -256,6 +261,7 @@ impl<'a> Parser<'a> {
             all: params.iter().map(|p| p.name.clone()).collect(),
             params: params.iter().map(|p| p.name.clone()).collect(),
             trigger: is_trigger,
+            records: Vec::new(),
         };
         if is_trigger {
             if language != "plpgsql" {
@@ -343,9 +349,39 @@ impl<'a> Parser<'a> {
                 }
                 let name = self.ident()?;
                 self.eat_kw("CONSTANT");
-                if self.peek_sym("%") || self.peek_kw("RECORD") || self.peek_kw("CURSOR") {
-                    return Err(Error::syntax("%TYPE, record and cursor variables are not supported"));
+                if self.peek_kw("CURSOR") || self.peek_kw("REFCURSOR") || self.peek_kw("SCROLL") || self.peek_kw("NO") && self.peek_kw_at(1, "SCROLL") {
+                    return Err(Error::syntax("cursor variables are not supported"));
                 }
+                if self.eat_kw("RECORD") {
+                    self.expect_sym(";")?;
+                    names.records.push(name);
+                    continue;
+                }
+                // `t%ROWTYPE` is a record, `t.col%TYPE` a variable of no fixed type
+                let at = self.pos;
+                let mut dotted = matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_));
+                if dotted {
+                    self.advance();
+                    while self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+                        self.advance();
+                        self.advance();
+                    }
+                    dotted = self.eat_sym("%");
+                }
+                if dotted {
+                    if self.eat_kw("ROWTYPE") {
+                        self.expect_sym(";")?;
+                        names.records.push(name);
+                        continue;
+                    }
+                    self.expect_kw("TYPE")?;
+                    let init = if self.eat_sym(":=") || self.eat_sym("=") || self.eat_kw("DEFAULT") { Some(self.pl_expr(names)?) } else { None };
+                    self.expect_sym(";")?;
+                    names.all.push(name.clone());
+                    out.push(ProcStmt::Declare { name, data_type: None, init });
+                    continue;
+                }
+                self.pos = at;
                 let ty = self.pg_type()?;
                 if self.eat_kw("COLLATE") {
                     self.ident()?;
@@ -480,6 +516,29 @@ impl<'a> Parser<'a> {
         if self.eat_kw("FOR") {
             let var = self.ident()?;
             self.expect_kw("IN")?;
+            if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
+                let start = self.toks[self.pos].pos;
+                let mut depth = 0usize;
+                while !self.at_eof() && !(depth == 0 && self.peek_kw("LOOP")) {
+                    match self.advance() {
+                        Tok::Sym("(") => depth += 1,
+                        Tok::Sym(")") => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                let end = self.toks[self.pos].pos;
+                self.expect_kw("LOOP")?;
+                names.records.push(var.clone());
+                let mut statements = crate::sql::parse_script(&self.src[start..end])?;
+                let Some(mut st @ Statement::Select(_)) = statements.pop() else { return Err(Error::syntax("FOR ... IN needs a SELECT")) };
+                names.statement(&mut st)?;
+                let Statement::Select(sel) = st else { unreachable!("a SELECT stays one") };
+                let body = self.pl_stmts(names, &["END"])?;
+                self.expect_kw("END")?;
+                self.expect_kw("LOOP")?;
+                out.push(ProcStmt::ForRecord { name: var, select: Box::new(sel), body });
+                return self.end_stmt();
+            }
             let reverse = self.eat_kw("REVERSE");
             let first = self.pl_expr(names)?;
             if !self.eat_sym("..") {
@@ -566,6 +625,15 @@ impl<'a> Parser<'a> {
         if self.peek_kw("SELECT") {
             if let Some((into_at, targets, after)) = self.find_into() {
                 self.toks.drain(into_at..after);
+                if let [target] = targets.as_slice() {
+                    if names.records.iter().any(|r| r.eq_ignore_ascii_case(target)) {
+                        let mut st = self.statement()?;
+                        names.statement(&mut st)?;
+                        let Statement::Select(sel) = st else { return Err(Error::syntax("SELECT INTO a record needs a SELECT")) };
+                        out.push(ProcStmt::SelectRecord { name: target.clone(), select: Box::new(sel) });
+                        return self.end_stmt();
+                    }
+                }
                 let mut sel = self.select()?;
                 let mut e = Expr::Literal(Value::Null);
                 for (k, target) in targets.iter().enumerate() {
@@ -860,7 +928,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false };
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new() };
         let stmts = self.my_body(&mut names)?;
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
@@ -874,7 +942,7 @@ impl<'a> Parser<'a> {
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
     /// are variables.
     pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
-        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true };
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new() };
         let body = self.my_body(&mut names)?;
         fn check(list: &[ProcStmt]) -> Result<()> {
             for s in list {

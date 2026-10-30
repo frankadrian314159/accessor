@@ -384,6 +384,10 @@ pub enum ProcStmt {
     Leave,
     Return(Option<Expr>),
     Sql(Statement),
+    /// `SELECT ... INTO rec`: the first row's columns become the variables `rec.column` (all NULL when there is no row).
+    SelectRecord { name: String, select: Box<Select> },
+    /// `FOR rec IN SELECT ... LOOP body END LOOP`: the body runs once per row, with `rec.column` set.
+    ForRecord { name: String, select: Box<Select>, body: Vec<ProcStmt> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
