@@ -331,6 +331,15 @@ fn row_compare(op: BinOp, a: &[Expr], b: &[Expr]) -> Result<Expr> {
 }
 
 /// `(a, b) [NOT] IN (query)` as an EXISTS over the query with its columns compared in turn.
+/// The names a table factor can be referred to by.
+fn factor_names(f: &TableFactor) -> Vec<String> {
+    match f {
+        TableFactor::Named { name, alias, .. } => vec![alias.clone().unwrap_or_else(|| name.clone())],
+        TableFactor::Derived { alias, .. } => vec![alias.clone()],
+        _ => Vec::new(),
+    }
+}
+
 fn row_in_query(items: &[Expr], mut q: Select, negated: bool) -> Expr {
     // A plain query is searched directly, so that it can still refer to the outer query; one that groups, limits or
     // combines is made a table of its own first.
@@ -5091,14 +5100,37 @@ impl<'a> Parser<'a> {
                 break;
             };
             // `a JOIN (b JOIN c ON ..) ON ..`: for an inner join the nested list reads the same as a flat one
-            let nested = if self.peek_sym("(") && matches!(kind, JoinKind::Inner | JoinKind::Cross) && !natural && self.parenthesised_join_ahead() {
+            let nested = if self.peek_sym("(") && matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) && !natural && self.parenthesised_join_ahead() {
                 Some(self.from_source()?).filter(|f| !f.joins.is_empty())
             } else {
                 None
             };
             if let Some(inner) = nested {
-                if inner.joins.iter().any(|j| !matches!(j.kind, JoinKind::Inner | JoinKind::Cross)) {
-                    return Err(Error::syntax("an outer join inside a nested join list is not supported"));
+                // `a [LEFT] JOIN (b LEFT JOIN c ON ..) ON y` is `a [LEFT] JOIN b ON y LEFT JOIN c ON ..` while `y` leaves
+                // `c` alone: the rows of `b` are found first and `c` is then looked up for each
+                if matches!(kind, JoinKind::Inner | JoinKind::Left) && inner.joins.iter().all(|j| j.kind == JoinKind::Left) {
+                    self.expect_kw("ON")?;
+                    let mut on = self.expr()?;
+                    let mut later: Vec<String> = Vec::new();
+                    for j in &inner.joins {
+                        later.extend(factor_names(&j.factor));
+                    }
+                    let mut reads_later = false;
+                    let _ = crate::sql::walk::walk_expr(&mut on, &mut |e| {
+                        if let Expr::Column { table: Some(t), .. } = e {
+                            reads_later |= later.iter().any(|n| n.eq_ignore_ascii_case(t));
+                        }
+                        Ok(())
+                    });
+                    if reads_later {
+                        return Err(Error::syntax("the condition of a join with a nested outer join list may not read the inner side of that list"));
+                    }
+                    from.joins.push(Join { kind, factor: inner.first, on: Some(on), using: Vec::new(), natural: false });
+                    from.joins.extend(inner.joins);
+                    continue;
+                }
+                if inner.joins.iter().any(|j| !matches!(j.kind, JoinKind::Inner | JoinKind::Cross)) || kind == JoinKind::Left {
+                    return Err(Error::syntax("this outer join inside a nested join list is not supported"));
                 }
                 let outer_on = if self.eat_kw("ON") { Some(self.expr()?) } else { None };
                 from.joins.push(Join { kind: JoinKind::Cross, factor: inner.first, on: None, using: Vec::new(), natural: false });

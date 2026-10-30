@@ -6211,6 +6211,10 @@ fn mysql_forms_nested_joins_row_in_having_alias_user_assignment_and_limit_parame
     let count = |db: &mut Database, sql: &str| db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}")).rows.len();
     // a join list nested on the right of an inner join
     assert_eq!(count(&mut db, "SELECT * FROM (t1 AS x JOIN (t2 AS y JOIN t3 ON t3.a = y.a) ON x.a = y.a)"), 1);
+    // an outer join list nested on the right of a left or inner join
+    let lj = db.execute("SELECT t1.a, t1.b, y.b, t3.a FROM t1 LEFT JOIN (t2 AS y LEFT JOIN t3 ON t3.a = y.a) ON t1.a = y.a ORDER BY t1.a, t1.b").unwrap();
+    assert_eq!(lj.rows.iter().map(|r| r.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")).collect::<Vec<_>>(), ["1,1,1,1", "2,2,,", "2,3,,"]);
+    assert_eq!(count(&mut db, "SELECT * FROM t1 JOIN (t2 AS y LEFT JOIN t3 ON t3.a = y.a) ON t1.a = y.a"), 1);
     // a row value against a query that reads the outer query
     assert_eq!(count(&mut db, "SELECT a FROM t1 WHERE (a, b) NOT IN (SELECT x.a, x.b FROM (t1 AS x JOIN t2 ON t2.a = x.a))"), 2);
     let z = db.execute("SELECT a, (a, b) IN (SELECT a, b FROM t2 WHERE t2.a = t1.a) z FROM t1 ORDER BY a, b").unwrap();
