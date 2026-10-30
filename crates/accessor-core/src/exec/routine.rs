@@ -385,9 +385,24 @@ impl Database {
                 }
                 return Ok(Flow::Return);
             }
-            ProcStmt::SelectRecord { name, select } => {
+            ProcStmt::SelectRecord { name, select, strict, targets } => {
                 let (columns, rows) = self.record_query(select, frame)?;
-                self.set_record(frame, name, &columns, rows.into_iter().next());
+                if *strict && rows.len() != 1 {
+                    return Err(Error::runtime(if rows.is_empty() { "query returned no rows" } else { "query returned more than one row" }));
+                }
+                let row = rows.into_iter().next();
+                if targets.is_empty() {
+                    self.set_record(frame, name, &columns, row);
+                } else {
+                    for (i, t) in targets.iter().enumerate() {
+                        let mut v = row.as_ref().and_then(|r| r.get(i).cloned()).unwrap_or(Value::Null);
+                        let k = t.to_ascii_lowercase();
+                        if let Some(ty) = frame.types.get(&k) {
+                            v = v.coerce_to(*ty)?;
+                        }
+                        frame.vars.insert(k, v);
+                    }
+                }
             }
             ProcStmt::ForRecord { name, select, body } => {
                 let (columns, rows) = self.record_query(select, frame)?;

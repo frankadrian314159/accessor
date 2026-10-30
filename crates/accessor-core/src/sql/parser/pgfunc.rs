@@ -623,16 +623,21 @@ impl<'a> Parser<'a> {
         }
         // SELECT ... INTO v
         if self.peek_kw("SELECT") {
-            if let Some((into_at, targets, after)) = self.find_into() {
+            if let Some((into_at, targets, after, strict)) = self.find_into() {
                 self.toks.drain(into_at..after);
-                if let [target] = targets.as_slice() {
-                    if names.records.iter().any(|r| r.eq_ignore_ascii_case(target)) {
-                        let mut st = self.statement()?;
-                        names.statement(&mut st)?;
-                        let Statement::Select(sel) = st else { return Err(Error::syntax("SELECT INTO a record needs a SELECT")) };
-                        out.push(ProcStmt::SelectRecord { name: target.clone(), select: Box::new(sel) });
-                        return self.end_stmt();
+                let is_record = matches!(targets.as_slice(), [t] if names.records.iter().any(|r| r.eq_ignore_ascii_case(t)));
+                if is_record || strict {
+                    for t in &targets {
+                        if !is_record && !names.has(t) {
+                            return Err(Error::syntax(format!("'{t}' is not a declared variable or parameter")));
+                        }
                     }
+                    let mut st = self.statement()?;
+                    names.statement(&mut st)?;
+                    let Statement::Select(sel) = st else { return Err(Error::syntax("SELECT INTO needs a SELECT")) };
+                    let (name, targets) = if is_record { (targets[0].clone(), Vec::new()) } else { (String::new(), targets) };
+                    out.push(ProcStmt::SelectRecord { name, select: Box::new(sel), strict, targets });
+                    return self.end_stmt();
                 }
                 let mut sel = self.select()?;
                 let mut e = Expr::Literal(Value::Null);
@@ -661,7 +666,7 @@ impl<'a> Parser<'a> {
 
     /// For a `SELECT` starting at the cursor: the position of `INTO`, the variables after it, and the position after
     /// them, if the statement has an `INTO` before its end.
-    fn find_into(&self) -> Option<(usize, Vec<String>, usize)> {
+    fn find_into(&self) -> Option<(usize, Vec<String>, usize, bool)> {
         let mut depth = 0i32;
         let mut i = self.pos;
         while let Some(t) = self.toks.get(i) {
@@ -672,7 +677,9 @@ impl<'a> Parser<'a> {
                 Tok::Ident(s) if depth == 0 && s.eq_ignore_ascii_case("INTO") => {
                     let mut targets = Vec::new();
                     let mut j = i + 1;
+                    let mut strict = false;
                     if matches!(&self.toks.get(j)?.tok, Tok::Ident(s) if s.eq_ignore_ascii_case("STRICT")) {
+                        strict = true;
                         j += 1;
                     }
                     loop {
@@ -687,7 +694,7 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    return Some((i, targets, j));
+                    return Some((i, targets, j, strict));
                 }
                 _ => {}
             }
@@ -1162,7 +1169,7 @@ impl<'a> Parser<'a> {
             return self.my_end();
         }
         if self.peek_kw("SELECT") {
-            if let Some((into_at, targets, after)) = self.find_into() {
+            if let Some((into_at, targets, after, _)) = self.find_into() {
                 self.toks.drain(into_at..after);
                 let sel = self.select()?;
                 for (k, target) in targets.iter().enumerate() {

@@ -10,7 +10,7 @@ A call may name its arguments, `f(10, c => 1)` or `f(b := 3, a := 10)`, for func
 
 In a trigger function `TG_NARGS` and `TG_ARGV[n]` (n from 0 to 5) hold the arguments given in `CREATE TRIGGER ... EXECUTE FUNCTION f('a', 'b')`. The condition of an `IF` may carry the rest of a query, `IF count(*) = 0 FROM room WHERE n = new.n THEN`, and then it is the value of that query.
 
-A record variable (`DECLARE r record` or `r t%ROWTYPE`) is filled by `SELECT ... INTO r` (its first row; every field NULL when there is none) or by `FOR r IN SELECT ... LOOP ... END LOOP` (one row per pass), and its fields are read as `r.col`.
+A record variable (`DECLARE r record` or `r t%ROWTYPE`) is filled by `SELECT ... INTO r` (its first row; every field NULL when there is none) or by `FOR r IN SELECT ... LOOP ... END LOOP` (one row per pass), and its fields are read as `r.col`. `SELECT ... INTO STRICT` fails unless the query gives exactly one row.
 
 ## Functions that return a set of rows
 

@@ -6121,3 +6121,22 @@ fn plpgsql_record_variables_hold_a_row() {
     .unwrap();
     assert_eq!(db.execute("SELECT f()").unwrap().rows[0][0].to_string(), "yx1y2z3");
 }
+
+#[test]
+fn with_ordinality_numbers_the_rows_of_a_table_function() {
+    let mut db = Database::in_memory();
+    assert_eq!(rows(&db, "SELECT * FROM generate_series(5, 7) WITH ORDINALITY AS t(v, n) ORDER BY n"), [["5", "1"], ["6", "2"], ["7", "3"]]);
+    assert_eq!(rows(&db, "SELECT ordinality FROM generate_series(5, 6) WITH ORDINALITY ORDER BY 1"), [["1"], ["2"]]);
+    db.execute("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2)").unwrap();
+}
+
+#[test]
+fn select_into_strict_wants_exactly_one_row() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (a int); INSERT INTO t VALUES (1), (2)").unwrap();
+    db.execute("CREATE FUNCTION one(n int) RETURNS int AS $$ DECLARE x int; BEGIN SELECT a INTO STRICT x FROM t WHERE a = n; RETURN x; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(db.execute("SELECT one(2)").unwrap().rows[0][0].to_string(), "2");
+    db.execute("SELECT one(9)").unwrap_err();
+    db.execute("CREATE FUNCTION two() RETURNS int AS $$ DECLARE x int; BEGIN SELECT a INTO STRICT x FROM t; RETURN x; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("SELECT two()").unwrap_err();
+}

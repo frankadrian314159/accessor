@@ -5190,6 +5190,11 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_sym(")")?;
+            let ordinality = self.peek_kw("WITH") && self.peek_kw_at(1, "ORDINALITY");
+            if ordinality {
+                self.advance();
+                self.advance();
+            }
             let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { name.to_ascii_lowercase() };
             let columns = if self.eat_sym("(") {
                 let c = self.ident_list()?;
@@ -5198,6 +5203,19 @@ impl<'a> Parser<'a> {
             } else {
                 Vec::new()
             };
+            if ordinality {
+                // `f(..) WITH ORDINALITY` is the function's rows with their numbers added as a last column
+                let number = Expr::Window {
+                    func: Box::new(Expr::Function { name: "row_number".into(), args: Vec::new(), distinct: false, star: false }),
+                    spec: WindowSpec::default(),
+                };
+                let query = Select {
+                    items: vec![SelectItem::Wildcard, SelectItem::Expr { expr: number, alias: Some("ordinality".into()) }],
+                    from: Some(From { first: TableFactor::Function { name, args, alias: "__f".into(), columns: Vec::new() }, joins: Vec::new() }),
+                    ..Select::default()
+                };
+                return Ok(TableFactor::Derived { query: Box::new(query), alias, columns, lateral: true });
+            }
             return Ok(TableFactor::Function { name, args, alias, columns });
         }
         if lateral {
