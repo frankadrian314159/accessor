@@ -162,6 +162,9 @@ impl Database {
                 }
                 ops
             }
+            AlterAction::MoveColumn { name, after } => {
+                vec![Op::MoveColumn { table, name: name.clone(), after: after.clone() }]
+            }
             AlterAction::SetExpression { name, expr } => {
                 // Changes a calculated field's formula, or turns an ordinary field into a calculated one.
                 if self.table_checked(&table)?.schema().column_index(name).is_none() {

@@ -215,18 +215,62 @@ impl Database {
         self.execute_statement(&statement)
     }
 
-    pub(crate) fn exec_delete_multi(&mut self, target: &str, from: &FromClause, filter: Option<&Expr>) -> Result<QueryResult> {
-        let mut from2 = from.clone();
-        let mut filter2 = filter.cloned();
-        let base = {
-            let mut refs: Vec<&mut Expr> = filter2.iter_mut().collect();
-            rename_target(&mut from2, target, &mut refs)?
-        };
-        let base = self.table_checked(&base)?.name().to_string();
-        let cond = and(filter2, same_row(self, &base)?);
-        let sub = Select { items: vec![one()], from: Some(from2), filter: Some(cond), ..Select::default() };
-        let delete = Statement::Delete { table: base, filter: Some(Expr::Exists { query: Box::new(sub), negated: false }) };
-        self.execute_statement(&delete)
+    pub(crate) fn exec_delete_multi(&mut self, targets: &[String], from: &FromClause, filter: Option<&Expr>) -> Result<QueryResult> {
+        if let [target] = targets {
+            let mut from2 = from.clone();
+            let mut filter2 = filter.cloned();
+            let base = {
+                let mut refs: Vec<&mut Expr> = filter2.iter_mut().collect();
+                rename_target(&mut from2, target, &mut refs)?
+            };
+            let base = self.table_checked(&base)?.name().to_string();
+            let cond = and(filter2, same_row(self, &base)?);
+            let sub = Select { items: vec![one()], from: Some(from2), filter: Some(cond), ..Select::default() };
+            let delete = Statement::Delete { table: base, filter: Some(Expr::Exists { query: Box::new(sub), negated: false }) };
+            return self.execute_statement(&delete);
+        }
+        // several tables: the rows of each that the join reaches are found first, then removed, so that the removal from
+        // one table does not change what the join reaches in the next
+        let mut found: Vec<(String, Vec<String>, Vec<Vec<Value>>)> = Vec::new();
+        for target in targets {
+            let mut from2 = from.clone();
+            let mut filter2 = filter.cloned();
+            let base = {
+                let mut refs: Vec<&mut Expr> = filter2.iter_mut().collect();
+                rename_target(&mut from2, target, &mut refs)?
+            };
+            let base = self.table_checked(&base)?.name().to_string();
+            let sel = Select { items: vec![SelectItem::QualifiedWildcard(COPY.to_string())], distinct: true, from: Some(from2), filter: filter2, ..Select::default() };
+            let res = self.execute_statement(&Statement::Select(sel))?;
+            found.push((base, res.columns, res.rows));
+        }
+        let mut affected = 0;
+        for (base, columns, rows) in found {
+            if rows.len() > 200 {
+                // many rows: find them in one pass over the table
+                let wanted: std::collections::HashSet<Vec<Value>> = rows.into_iter().collect();
+                let ids: Vec<_> = self.table_checked(&base)?.iter().filter(|(_, r)| wanted.contains(*r)).map(|(id, _)| id).collect();
+                affected += ids.len();
+                self.apply_all(ids.into_iter().map(|id| crate::storage::Op::Delete { table: base.clone(), id }).collect())?;
+                continue;
+            }
+            for row in rows {
+                let mut cond: Option<Expr> = None;
+                for (c, v) in columns.iter().zip(row) {
+                    let col = Expr::Column { table: Some(base.clone()), name: c.clone() };
+                    let lit = Expr::Literal(v);
+                    let eq = Expr::Binary { op: BinOp::Eq, left: Box::new(col.clone()), right: Box::new(lit.clone()) };
+                    let nulls = Expr::Binary {
+                        op: BinOp::And,
+                        left: Box::new(Expr::IsNull { expr: Box::new(col), negated: false }),
+                        right: Box::new(Expr::IsNull { expr: Box::new(lit), negated: false }),
+                    };
+                    cond = Some(and(cond, Expr::Binary { op: BinOp::Or, left: Box::new(eq), right: Box::new(nulls) }));
+                }
+                affected += self.execute_statement(&Statement::Delete { table: base.clone(), filter: cond })?.affected;
+            }
+        }
+        Ok(QueryResult { affected, ..QueryResult::default() })
     }
 
     pub(crate) fn exec_update_multi(&mut self, from: &FromClause, assignments: &[(Option<String>, String, Expr)], filter: Option<&Expr>) -> Result<QueryResult> {

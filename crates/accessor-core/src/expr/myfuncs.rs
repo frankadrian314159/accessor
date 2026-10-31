@@ -82,10 +82,50 @@ pub enum MyFn {
     /// JSON_TABLE `ERROR ON EMPTY`: the value, or an error when the path matched nothing.
     JsonTableRequire,
     LastInsertId,
+    /// A spatial function (see `geom`), by its registered name.
+    Geo(&'static str),
+    DayOfYear,
+    DayOfWeek,
+    Quarter,
+    TimeToSec,
+    Microsecond,
+    MakeDate,
+    FromDays,
+    YearWeek,
+    Crc32,
+    Log2,
+    Quote,
+    PeriodAdd,
+    PeriodDiff,
+    MakeSet,
+    IsIpv4Mapped,
+    IsIpv4Compat,
+    Inet6Aton,
+    Inet6Ntoa,
+    IsUuid,
+    UuidToBin,
+    BinToUuid,
+    Compress,
+    Uncompress,
+    UncompressedLength,
+    AesEncrypt,
+    AesDecrypt,
+    CurrentRole,
+    CurTime,
+    Timestamp,
+    /// `BINARY expr`: a text becomes bytes, which compare byte for byte.
+    Binary,
+    /// `INTERVAL(n, n1, n2, ..)`: how many of the list are not above `n`.
+    IntervalIdx,
+    /// `GET_FORMAT(DATE | TIME | DATETIME, 'USA' | 'EUR' | 'JIS' | 'ISO' | 'INTERNAL')`.
+    GetFormat,
 }
 
 pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
     use MyFn::*;
+    if let Some((n, lo, hi)) = super::geom::lookup(name) {
+        return Some((Geo(n), lo, hi));
+    }
     Some(match name {
         "HEX" => (Hex, 1, 1),
         "UNHEX" => (Unhex, 1, 1),
@@ -150,6 +190,39 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "__ASSIGN_VAR" => (AssignVar, 2, 2),
         "__JT_REQUIRE" => (JsonTableRequire, 2, 2),
         "LAST_INSERT_ID" => (LastInsertId, 0, 1),
+        "DAYOFYEAR" => (DayOfYear, 1, 1),
+        "DAYOFWEEK" => (DayOfWeek, 1, 1),
+        "QUARTER" => (Quarter, 1, 1),
+        "TIME_TO_SEC" => (TimeToSec, 1, 1),
+        "MICROSECOND" => (Microsecond, 1, 1),
+        "MAKEDATE" => (MakeDate, 2, 2),
+        "FROM_DAYS" => (FromDays, 1, 1),
+        "YEARWEEK" => (YearWeek, 1, 2),
+        "CRC32" => (Crc32, 1, 1),
+        "LOG2" => (Log2, 1, 1),
+        "QUOTE" => (Quote, 1, 1),
+        "PERIOD_ADD" => (PeriodAdd, 2, 2),
+        "PERIOD_DIFF" => (PeriodDiff, 2, 2),
+        "MAKE_SET" => (MakeSet, 2, usize::MAX),
+        "IS_IPV4_MAPPED" => (IsIpv4Mapped, 1, 1),
+        "IS_IPV4_COMPAT" => (IsIpv4Compat, 1, 1),
+        "INET6_ATON" => (Inet6Aton, 1, 1),
+        "INET6_NTOA" => (Inet6Ntoa, 1, 1),
+        "IS_UUID" => (IsUuid, 1, 1),
+        "UUID_TO_BIN" => (UuidToBin, 1, 2),
+        "BIN_TO_UUID" => (BinToUuid, 1, 2),
+        "COMPRESS" => (Compress, 1, 1),
+        "UNCOMPRESS" => (Uncompress, 1, 1),
+        "UNCOMPRESSED_LENGTH" => (UncompressedLength, 1, 1),
+        "AES_ENCRYPT" => (AesEncrypt, 2, 3),
+        "AES_DECRYPT" => (AesDecrypt, 2, 3),
+        "CURRENT_ROLE" => (CurrentRole, 0, 0),
+        "CURTIME" => (CurTime, 0, 1),
+        "TIMESTAMP" => (Timestamp, 1, 2),
+        "__BINARY" => (Binary, 1, 1),
+        "INTERVAL" => (IntervalIdx, 2, usize::MAX),
+        "GET_FORMAT" => (GetFormat, 2, 2),
+        "CURRENT_TIME" => (CurTime, 0, 1),
         "TO_BASE64" => (ToBase64, 1, 1),
         "FROM_BASE64" => (FromBase64, 1, 1),
         _ => return None,
@@ -159,12 +232,12 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
 impl MyFn {
     /// Functions that get their NULL arguments instead of answering NULL themselves.
     pub fn handles_null(self) -> bool {
-        matches!(self, MyFn::Field | MyFn::Char | MyFn::MatchAgainst)
+        matches!(self, MyFn::Field | MyFn::Char | MyFn::MatchAgainst | MyFn::Quote | MyFn::MakeSet | MyFn::IntervalIdx)
     }
 
     /// Functions that give a different answer each time.
     pub fn is_volatile(self) -> bool {
-        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::JsonTableRequire | MyFn::LastInsertId)
+        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::JsonTableRequire | MyFn::LastInsertId | MyFn::CurTime)
     }
 }
 
@@ -592,6 +665,187 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
     use MyFn::*;
     let v = |i: usize| -> &Value { &vals[i] };
     Ok(match f {
+        Geo(name) => return super::geom::call(name, vals),
+        DayOfYear => datetime_of(v(0)).map_or(Value::Null, |d| Value::Int(i64::from(d.ordinal()))),
+        DayOfWeek => datetime_of(v(0)).map_or(Value::Null, |d| Value::Int(i64::from(d.weekday().num_days_from_sunday()) + 1)),
+        Quarter => datetime_of(v(0)).map_or(Value::Null, |d| Value::Int(i64::from((d.month() - 1) / 3 + 1))),
+        TimeToSec => match temporal(v(0)) {
+            Some((s, true)) => Value::Int(s),
+            Some((s, false)) => Value::Int(s.rem_euclid(86_400)),
+            None => Value::Null,
+        },
+        Microsecond => match text(v(0)).rsplit_once('.') {
+            Some((_, f)) => {
+                let d: String = f.chars().take_while(char::is_ascii_digit).take(6).collect();
+                Value::Int(format!("{d:0<6}").parse().unwrap_or(0))
+            }
+            None => Value::Int(0),
+        },
+        MakeDate => match (int(v(0)), int(v(1))) {
+            (Some(y), Some(n)) if n > 0 && (0..=9999).contains(&y) => {
+                let y = if y < 70 { y + 2000 } else if y < 100 { y + 1900 } else { y };
+                chrono::NaiveDate::from_ymd_opt(y as i32, 1, 1)
+                    .and_then(|d| chrono::TimeDelta::try_days(n - 1).and_then(|dd| d.checked_add_signed(dd)))
+                    .filter(|d| d.year() <= 9999)
+                    .map_or(Value::Null, |d| Value::DateTime(to_secs(d.and_hms_opt(0, 0, 0).expect("midnight"))))
+            }
+            _ => Value::Null,
+        },
+        FromDays => match int(v(0)) {
+            Some(n) if n > 365 && n < 3_652_500 => chrono::NaiveDate::from_num_days_from_ce_opt((n - 365) as i32)
+                .map_or(Value::Null, |d| Value::DateTime(to_secs(d.and_hms_opt(0, 0, 0).expect("midnight")))),
+            _ => Value::Null,
+        },
+        YearWeek => match datetime_of(v(0)) {
+            Some(d) => {
+                let week = mysql_week(d.date(), vals.get(1).and_then(|m| int(m)).unwrap_or(0) | 2);
+                let year = if week >= 52 && d.month() == 1 {
+                    d.year() - 1
+                } else if week == 1 && d.month() == 12 {
+                    d.year() + 1
+                } else {
+                    d.year()
+                };
+                Value::Int(i64::from(year) * 100 + week)
+            }
+            None => Value::Null,
+        },
+        Crc32 => Value::Int(i64::from(super::bytefuncs::crc32(&raw(v(0))))),
+        Log2 => match text(v(0)).trim().parse::<f64>() {
+            Ok(x) if x > 0.0 => Value::Double(x.log2()),
+            _ => Value::Null,
+        },
+        Quote => {
+            if v(0).is_null() {
+                Value::text("NULL")
+            } else {
+                let mut o = String::from("'");
+                for c in text(v(0)).chars() {
+                    match c {
+                        '\\' => o.push_str("\\\\"),
+                        '\'' => o.push_str("\\'"),
+                        '\0' => o.push_str("\\0"),
+                        '\x1a' => o.push_str("\\Z"),
+                        c => o.push(c),
+                    }
+                }
+                o.push('\'');
+                Value::text(&o)
+            }
+        }
+        PeriodAdd | PeriodDiff => {
+            let months = |p: i64| {
+                let y = p / 100;
+                let y = if y < 70 { y + 2000 } else if y < 100 { y + 1900 } else { y };
+                y * 12 + p % 100 - 1
+            };
+            match (int(v(0)), int(v(1))) {
+                (Some(p), Some(n)) if f == PeriodAdd => {
+                    if p == 0 {
+                        Value::Int(0)
+                    } else {
+                        let m = months(p) + n;
+                        Value::Int(m.div_euclid(12) * 100 + m.rem_euclid(12) + 1)
+                    }
+                }
+                (Some(a), Some(b)) => Value::Int(months(a) - months(b)),
+                _ => Value::Null,
+            }
+        }
+        MakeSet => match int(v(0)) {
+            Some(bits) => {
+                let items: Vec<String> = vals[1..].iter().enumerate().filter(|(i, x)| *i < 64 && (bits as u64) >> i & 1 == 1 && !x.is_null()).map(|(_, x)| text(x)).collect();
+                Value::text(&items.join(","))
+            }
+            None => Value::Null,
+        },
+        IsIpv4Mapped => {
+            let b = raw(v(0));
+            Value::Int(i64::from(b.len() == 16 && b[..10].iter().all(|x| *x == 0) && b[10] == 0xff && b[11] == 0xff))
+        }
+        IsIpv4Compat => {
+            let b = raw(v(0));
+            Value::Int(i64::from(b.len() == 16 && b[..12].iter().all(|x| *x == 0) && b[12..] != [0, 0, 0, 0] && b[12..] != [0, 0, 0, 1]))
+        }
+        Inet6Aton => {
+            let s = text(v(0));
+            match (ipv4(&s), s.trim().parse::<std::net::Ipv6Addr>()) {
+                (Some(o), _) => Value::bytes(o.to_vec()),
+                (None, Ok(a)) => Value::bytes(a.octets().to_vec()),
+                _ => Value::Null,
+            }
+        }
+        Inet6Ntoa => {
+            let b = raw(v(0));
+            match b.len() {
+                4 => Value::text(&std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()),
+                16 => Value::text(&std::net::Ipv6Addr::from(<[u8; 16]>::try_from(b.as_slice()).expect("sixteen bytes")).to_string()),
+                _ => Value::Null,
+            }
+        }
+        IsUuid => Value::Int(i64::from(super::bytefuncs::uuid_bytes(&text(v(0))).is_some())),
+        UuidToBin => match super::bytefuncs::uuid_bytes(&text(v(0))) {
+            Some(b) => Value::bytes(super::bytefuncs::uuid_to_bin(b, vals.get(1).and_then(|x| int(x)).unwrap_or(0) != 0).to_vec()),
+            None => return Err(Error::runtime(format!("Incorrect string value: '{}' for function uuid_to_bin", text(v(0))))),
+        },
+        BinToUuid => match super::bytefuncs::bin_to_uuid(&raw(v(0)), vals.get(1).and_then(|x| int(x)).unwrap_or(0) != 0) {
+            Some(s) => Value::text(&s),
+            None => return Err(Error::runtime("Incorrect string value for function bin_to_uuid")),
+        },
+        Compress => Value::bytes(super::bytefuncs::compress(&raw(v(0)))),
+        Uncompress => super::bytefuncs::uncompress(&raw(v(0))).map_or(Value::Null, Value::bytes),
+        UncompressedLength => {
+            let b = raw(v(0));
+            if b.len() >= 4 {
+                Value::Int(i64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            } else {
+                Value::Int(0)
+            }
+        }
+        AesEncrypt => {
+            let iv = vals.get(2).map(|x| raw(x));
+            Value::bytes(super::bytefuncs::aes_encrypt(&raw(v(0)), &raw(v(1)), iv.as_deref(), 128))
+        }
+        AesDecrypt => {
+            let iv = vals.get(2).map(|x| raw(x));
+            super::bytefuncs::aes_decrypt(&raw(v(0)), &raw(v(1)), iv.as_deref(), 128).map_or(Value::Null, Value::bytes)
+        }
+        IntervalIdx => match v(0) {
+            Value::Null => Value::Int(-1),
+            n => {
+                let below = vals[1..].iter().take_while(|x| !x.is_null() && n.sql_cmp(x) != Some(std::cmp::Ordering::Less)).count();
+                Value::Int(below as i64)
+            }
+        },
+        GetFormat => {
+            let kind = text(v(0)).to_ascii_uppercase();
+            let region = text(v(1)).to_ascii_uppercase();
+            let fmt = match (kind.as_str(), region.as_str()) {
+                ("DATE", "USA") => "%m.%d.%Y",
+                ("DATE", "JIS" | "ISO") => "%Y-%m-%d",
+                ("DATE", "EUR") => "%d.%m.%Y",
+                ("DATE", "INTERNAL") => "%Y%m%d",
+                ("DATETIME" | "TIMESTAMP", "USA" | "EUR") => "%Y-%m-%d %H.%i.%s",
+                ("DATETIME" | "TIMESTAMP", "JIS" | "ISO") => "%Y-%m-%d %H:%i:%s",
+                ("DATETIME" | "TIMESTAMP", "INTERNAL") => "%Y%m%d%H%i%s",
+                ("TIME", "USA") => "%h:%i:%s %p",
+                ("TIME", "JIS" | "ISO") => "%H:%i:%s",
+                ("TIME", "EUR") => "%H.%i.%s",
+                ("TIME", "INTERNAL") => "%H%i%s",
+                _ => return Ok(Value::Null),
+            };
+            Value::text(fmt)
+        }
+        Binary => match v(0) {
+            Value::Text(_) | Value::Bytes(_) => Value::Bytes(std::sync::Arc::new(raw(v(0)))),
+            other => other.clone(),
+        },
+        CurrentRole => Value::text("NONE"),
+        CurTime => Value::text(&time_text(crate::tz::session().to_local(crate::datetime::now()).rem_euclid(86_400))),
+        Timestamp => match temporal(v(0)) {
+            Some((s, false)) => Value::DateTime(s + vals.get(1).and_then(|t| temporal(t)).map_or(0, |(t, _)| t)),
+            _ => Value::Null,
+        },
         Hex => match v(0) {
             Value::Int(i) => Value::text(&format!("{:X}", *i as u64)),
             Value::Bytes(b) => Value::text(&b.iter().map(|b| format!("{b:02X}")).collect::<String>()),

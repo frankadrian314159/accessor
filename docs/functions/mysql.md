@@ -54,4 +54,14 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `STD(x)` | population standard deviation (the aggregate `STDDEV_POP`) |
 | `DATE_ADD`, `DATE_SUB`, `ADDDATE`, `SUBDATE` | date arithmetic with `INTERVAL n unit` ([mysql.md](../sql/mysql.md#dates-and-intervals)) |
 | `CONVERT(x, type)`, `CONVERT(x USING cs)` | a cast; the text itself |
+| `DAYOFYEAR(d)`, `DAYOFWEEK(d)` (Sunday is 1), `DAYOFMONTH(d)`, `QUARTER(d)`, `YEARWEEK(d [, mode])`, `MICROSECOND(t)` | parts of a date |
+| `TIME_TO_SEC(t)`, `MAKEDATE(year, day)`, `FROM_DAYS(n)`, `PERIOD_ADD(p, n)`, `PERIOD_DIFF(a, b)`, `TIMESTAMP(d [, t])` | time and date arithmetic |
+| `CURDATE()`, `CURTIME()`, `SYSDATE()`, `UTC_TIMESTAMP()`, `CURRENT_ROLE()` | now, in the session's zone (`UTC_TIMESTAMP` in UTC); the role is `NONE` |
+| `CRC32(s)`, `LOG2(x)`, `QUOTE(s)`, `MAKE_SET(bits, s, ...)` | a checksum, a base-2 logarithm, the text quoted for SQL (`NULL` for NULL), the strings whose bits are set |
+| `AES_ENCRYPT(s, key [, iv])`, `AES_DECRYPT(s, key [, iv])` | AES with a 128-bit key (the key folded by xor as MySQL does) and PKCS7 padding: ECB, or CBC when a vector is given; NULL for data that does not decrypt |
+| `COMPRESS(s)`, `UNCOMPRESS(s)`, `UNCOMPRESSED_LENGTH(s)` | a length and a zlib stream made of stored (uncompressed) blocks, so the bytes differ from MySQL's but `UNCOMPRESS(COMPRESS(s))` is `s` |
+| `INET6_ATON(s)`, `INET6_NTOA(b)`, `IS_IPV4_MAPPED(b)`, `IS_IPV4_COMPAT(b)` | IPv4 and IPv6 addresses as 4 or 16 bytes |
+| `IS_UUID(s)`, `UUID_TO_BIN(s [, swap])`, `BIN_TO_UUID(b [, swap])` | a UUID as 16 bytes (the time parts swapped round with the flag) |
+| `BINARY expr` | the text as bytes: compared and sorted byte for byte, so `BINARY 'a' = 'A'` is 0 |
+| `ST_*`, `MBR*`, `POINT(x, y)`, ... | spatial values and relations, see [spatial values](../sql/mysql.md#spatial-values) |
 | `a \| b`, `~a`, `a << b`, `a >> b` | bitwise OR, NOT, and shifts (`&` joins text and `^` is a power, so there is no AND or XOR operator) |

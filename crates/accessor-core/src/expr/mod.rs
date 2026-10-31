@@ -6,6 +6,8 @@ pub(crate) mod extra;
 pub mod func;
 pub mod like;
 pub mod arrays;
+pub mod bytefuncs;
+pub mod geom;
 pub mod myfuncs;
 pub mod pgfuncs;
 
@@ -77,7 +79,10 @@ impl BExpr {
     pub fn eval<'a>(&'a self, row: &'a [Value]) -> Result<Cow<'a, Value>> {
         Ok(match self {
             BExpr::Lit(v) => Cow::Borrowed(v),
-            BExpr::Col(i) => Cow::Borrowed(&row[*i]),
+            BExpr::Col(i) => match row.get(*i) {
+                Some(v) => Cow::Borrowed(v),
+                None => return Err(Error::runtime("this expression cannot be used here (a window function inside a sub-query's comparison)")),
+            },
             BExpr::Neg(e) => Cow::Owned(negate(&*e.eval(row)?)?),
             BExpr::Not(e) => Cow::Owned(from_tri(e.eval_tri(row)?.map(|b| !b))),
             BExpr::Bin(op, a, b) => match op {

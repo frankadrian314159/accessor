@@ -251,7 +251,7 @@ impl Database {
             Statement::Grant(g) => self.exec_grant(g),
             Statement::Ignored(_) => Ok(QueryResult::default()),
             Statement::Handler(h) => self.exec_handler(h),
-            Statement::DeleteMulti { target, from, filter } => self.exec_delete_multi(target, from, filter.as_ref()),
+            Statement::DeleteMulti { targets, from, filter } => self.exec_delete_multi(targets, from, filter.as_ref()),
             Statement::UpdateMulti { from, assignments, filter } => self.exec_update_multi(from, assignments, filter.as_ref()),
             Statement::DeleteLimited { table, alias, filter, order_by, limit } => {
                 self.exec_limited(table, alias.as_deref(), None, filter.as_ref(), order_by, *limit)

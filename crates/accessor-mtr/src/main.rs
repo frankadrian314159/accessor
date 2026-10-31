@@ -101,8 +101,7 @@ fn split_test(src: &str) -> Vec<Unit> {
             };
             let lname = name.to_ascii_lowercase();
             if lname == "delimiter" {
-                let d = rest.trim_end_matches(';').trim();
-                delim = if d.is_empty() { vec![';'] } else { d.chars().collect() };
+                delim = new_delimiter(rest.trim(), &delim);
                 i = j;
                 continue;
             }
@@ -159,8 +158,8 @@ fn split_test(src: &str) -> Vec<Unit> {
         }
         if word == "delimiter" {
             let e = eol(j, &b);
-            let d: String = b[j..e].iter().collect::<String>().trim().trim_end_matches(';').trim().to_string();
-            delim = if d.is_empty() { vec![';'] } else { d.chars().collect() };
+            let d: String = b[j..e].iter().collect::<String>().trim().to_string();
+            delim = new_delimiter(&d, &delim);
             i = e;
             continue;
         }
@@ -482,6 +481,19 @@ fn has_unresolved(s: &str) -> bool {
     false
 }
 
+/// The delimiter that `delimiter <text>` sets: the text up to the delimiter in force (`delimiter ;|` ends at `|`).
+fn new_delimiter(text: &str, current: &[char]) -> Vec<char> {
+    let cur: String = current.iter().collect();
+    let t = text.strip_suffix(cur.as_str()).unwrap_or(text);
+    let t = if t.len() == text.len() { text.trim_end_matches(';') } else { t };
+    let t = t.trim();
+    if t.is_empty() {
+        vec![';']
+    } else {
+        t.chars().collect()
+    }
+}
+
 fn skipped_include(path: &str) -> bool {
     let file = path.rsplit('/').next().unwrap_or(path);
     file.starts_with("have_")
@@ -739,7 +751,7 @@ impl Runner<'_> {
                     "remove_file" => {
                         let path = subst(rest.trim().trim_end_matches(';'), &self.vars);
                         if !has_unresolved(&path) {
-                            let _ = std::fs::remove_file(path.trim());
+                            let _ = std::fs::remove_file(path.trim().trim_matches(|c| c == '\'' || c == '"'));
                         }
                     }
                     "error" => self.expect_error = !rest.trim().starts_with('0') || rest.contains(','),

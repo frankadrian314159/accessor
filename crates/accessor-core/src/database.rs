@@ -419,6 +419,13 @@ impl Database {
                 self.shift_references(table, pos);
                 Ok(None)
             }
+            Op::MoveColumn { table, name, after } => {
+                let map = self.table_mut(table)?.move_column(name, after.as_deref())?;
+                for t in self.tables.values_mut() {
+                    t.remap_references(table, &map);
+                }
+                Ok(None)
+            }
             Op::RenameColumn { table, from, to } => {
                 self.guard_calculated_dependency(table, from, "renamed")?;
                 self.table_mut(table)?.rename_column(from, to)?;
@@ -683,7 +690,7 @@ impl Database {
             Op::CreateRoutine { .. } | Op::DropRoutine(_) => undo.routines = Some(self.routines.clone()),
             Op::CreateReport { .. } | Op::DropReport(_) => undo.reports = Some(self.reports.clone()),
             Op::CreateTrigger { .. } | Op::DropTrigger(_) => undo.triggers = Some(self.triggers.clone()),
-            Op::DropColumn { table, .. } => {
+            Op::DropColumn { table, .. } | Op::MoveColumn { table, .. } => {
                 names.push(key(table));
                 // Relationships in other tables that point at the later fields are renumbered.
                 for t in self.tables.values() {

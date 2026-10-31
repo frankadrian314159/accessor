@@ -58,6 +58,8 @@ pub enum Op {
     /// A named object of the catalog that has no table of its own (a schema, domain, type, role, grant, extension,
     /// rule, or a fact about a table such as its parents): `value` is its description as text, `None` removes it.
     Catalog { kind: String, name: String, value: Option<String> },
+    /// `ADD COLUMN .. FIRST | AFTER c`: moves a field to the front (`after` is `None`) or behind another field.
+    MoveColumn { table: String, name: String, after: Option<String> },
 }
 
 impl Op {

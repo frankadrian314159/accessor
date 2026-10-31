@@ -67,12 +67,51 @@ impl Database {
         let cols = match view.to_ascii_lowercase().as_str() {
             "tables" => {
                 for tb in self.tables.values() {
-                    rows.push(vec![t(tb.name()), t("BASE TABLE"), Value::Int(tb.len() as i64), t("def"), t(schema_of(tb.name())), t("InnoDB")]);
+                    let auto = if tb.schema().autonumber_column().is_some() { Value::Int(tb.next_auto()) } else { Value::Null };
+                    rows.push(vec![
+                        t(tb.name()),
+                        t("BASE TABLE"),
+                        Value::Int(tb.len() as i64),
+                        t("def"),
+                        t(schema_of(tb.name())),
+                        t("InnoDB"),
+                        Value::Int(tb.len() as i64),
+                        t("Dynamic"),
+                        t(""),
+                        t("utf8mb4_0900_ai_ci"),
+                        auto,
+                        Value::Null,
+                        Value::Null,
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(10),
+                        t(""),
+                    ]);
                 }
                 for (name, _) in self.views.values() {
-                    rows.push(vec![t(name), t("VIEW"), Value::Null, t("def"), t(schema_of(name)), Value::Null]);
+                    rows.push(vec![
+                        t(name),
+                        t("VIEW"),
+                        Value::Null,
+                        t("def"),
+                        t(schema_of(name)),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        t("VIEW"),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]);
                 }
-                names(&["table_name", "table_type", "row_count", "table_catalog", "table_schema", "engine"])
+                names(&["table_name", "table_type", "row_count", "table_catalog", "table_schema", "engine", "table_rows", "row_format", "table_comment", "table_collation", "auto_increment", "create_time", "update_time", "data_length", "index_length", "avg_row_length", "version", "create_options"])
             }
             "columns" => {
                 for tb in self.tables.values() {
@@ -101,6 +140,13 @@ impl Database {
                             t(if c.autonumber { "auto_increment" } else { "" }),
                             if c.data_type == crate::value::DataType::Text { t("utf8mb4") } else { Value::Null },
                             if c.data_type == crate::value::DataType::Text { t("utf8mb4_0900_ai_ci") } else { Value::Null },
+                            t(""),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            t(""),
+                            t("select,insert,update,references"),
                         ]);
                     }
                 }
@@ -134,11 +180,18 @@ impl Database {
                                 t(""),
                                 Value::Null,
                                 Value::Null,
+                                t(""),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                t(""),
+                                t("select,insert,update,references"),
                             ]);
                         }
                     }
                 }
-                names(&["table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default", "is_primary_key", "is_autonumber", "calculated_expression", "table_catalog", "table_schema", "column_type", "column_key", "extra", "character_set_name", "collation_name"])
+                names(&["table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default", "is_primary_key", "is_autonumber", "calculated_expression", "table_catalog", "table_schema", "column_type", "column_key", "extra", "character_set_name", "collation_name", "column_comment", "character_maximum_length", "numeric_precision", "numeric_scale", "datetime_precision", "generation_expression", "privileges"])
             }
             "views" => {
                 for (name, sql) in self.views.values() {
@@ -222,9 +275,21 @@ impl Database {
                         t(if r.function { "FUNCTION" } else { "PROCEDURE" }),
                         r.returns.map_or(Value::Null, |d| t(d.sql_name())),
                         t(&r.sql),
+                        t("test"),
+                        t("def"),
+                        t(&r.name),
+                        t("SQL"),
+                        Value::Null,
+                        Value::Null,
+                        t("SQL"),
+                        t("NO"),
+                        t("CONTAINS SQL"),
+                        t("DEFINER"),
+                        t("root@localhost"),
+                        t(""),
                     ]);
                 }
-                names(&["routine_name", "routine_type", "data_type", "routine_definition"])
+                names(&["routine_name", "routine_type", "data_type", "routine_definition", "routine_schema", "routine_catalog", "specific_name", "routine_body", "external_name", "external_language", "parameter_style", "is_deterministic", "sql_data_access", "security_type", "definer", "routine_comment"])
             }
             "parameters" => {
                 for r in self.routines.values() {
@@ -276,9 +341,14 @@ impl Database {
                         t(&events.join(", ")),
                         t(if tr.each_statement { "STATEMENT" } else { "ROW" }),
                         t(&tr.sql),
+                        t("test"),
+                        t("def"),
+                        t("test"),
+                        Value::Int(1),
+                        t("root@localhost"),
                     ]);
                 }
-                names(&["trigger_name", "event_object_table", "action_timing", "event_manipulation", "action_orientation", "action_statement"])
+                names(&["trigger_name", "event_object_table", "action_timing", "event_manipulation", "action_orientation", "action_statement", "trigger_schema", "trigger_catalog", "event_object_schema", "action_order", "definer"])
             }
             "reports" => {
                 for r in self.reports.values() {
@@ -315,11 +385,15 @@ impl Database {
                                 Value::Null,
                                 t(if schema.columns[c].not_null { "" } else { "YES" }),
                                 t("BTREE"),
+                                t("YES"),
+                                t(""),
+                                t(""),
+                                Value::Null,
                             ]);
                         }
                     }
                 }
-                names(&["table_catalog", "table_schema", "table_name", "non_unique", "index_schema", "index_name", "seq_in_index", "column_name", "collation", "cardinality", "sub_part", "packed", "nullable", "index_type"])
+                names(&["table_catalog", "table_schema", "table_name", "non_unique", "index_schema", "index_name", "seq_in_index", "column_name", "collation", "cardinality", "sub_part", "packed", "nullable", "index_type", "is_visible", "comment", "index_comment", "expression"])
             }
             "character_sets" => {
                 for (cs, desc, coll, len) in [("binary", "Binary pseudo charset", "binary", 1), ("latin1", "cp1252 West European", "latin1_swedish_ci", 1), ("utf8mb3", "UTF-8 Unicode", "utf8mb3_general_ci", 3), ("utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", 4)] {
@@ -337,9 +411,9 @@ impl Database {
             }
             "partitions" => {
                 for tb in self.tables.values() {
-                    rows.push(vec![t("def"), t(schema_of(tb.name())), t(tb.name()), Value::Null, Value::Null, Value::Null, Value::Int(tb.len() as i64)]);
+                    rows.push(vec![t("def"), t(schema_of(tb.name())), t(tb.name()), Value::Null, Value::Null, Value::Null, Value::Int(tb.len() as i64), Value::Null]);
                 }
-                names(&["table_catalog", "table_schema", "table_name", "partition_name", "partition_method", "partition_expression", "table_rows"])
+                names(&["table_catalog", "table_schema", "table_name", "partition_name", "partition_method", "partition_expression", "table_rows", "partition_description"])
             }
             "check_constraints" => names(&["constraint_catalog", "constraint_schema", "constraint_name", "check_clause"]),
             other if EMPTY_VIEWS.iter().any(|(n, _)| *n == other) => {

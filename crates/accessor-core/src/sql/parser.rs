@@ -293,6 +293,18 @@ fn row_items(e: &Expr) -> Option<&[Expr]> {
     }
 }
 
+/// A sub-query with several columns, `(SELECT 1, 2)`, as the row of its columns, each read by a sub-query of its own;
+/// anything else as it is.
+fn as_row(e: Expr) -> Expr {
+    if let Expr::Subquery(q) = &e {
+        if q.items.len() > 1 && q.items.iter().all(|i| matches!(i, SelectItem::Expr { .. })) {
+            let parts = q.items.iter().map(|item| Expr::Subquery(Box::new(Select { items: vec![item.clone()], ..(**q).clone() }))).collect();
+            return row_value(parts);
+        }
+    }
+    e
+}
+
 /// `(a1, a2, ..) op (b1, b2, ..)`, written out as comparisons of the parts.
 fn row_compare(op: BinOp, a: &[Expr], b: &[Expr]) -> Result<Expr> {
     if a.len() != b.len() {
@@ -1519,6 +1531,13 @@ impl<'a> Parser<'a> {
                 let kind = self.role_name()?.to_ascii_lowercase();
                 show.what = format!("create {kind}");
                 show.target = Some(self.table_ident()?);
+                // SHOW CREATE USER name@host
+                if matches!(self.peek(), Tok::Param(_)) {
+                    self.advance();
+                } else if self.peek_sym("@") && matches!(self.peek_at(1), Tok::Str(_) | Tok::Ident(_)) {
+                    self.advance();
+                    self.advance();
+                }
             }
             "character set" => {
                 self.advance();
@@ -1805,11 +1824,14 @@ impl<'a> Parser<'a> {
             }
             return Ok(Some(Statement::Ignored("ALTER TABLE".into())));
         }
-        let position = |p: &mut Self| {
+        let position = |p: &mut Self| -> Option<Option<String>> {
             // FIRST | AFTER column
             if p.eat_kw("FIRST") {
+                Some(None)
             } else if p.eat_kw("AFTER") {
-                let _ = p.ident();
+                p.ident().ok().map(Some)
+            } else {
+                None
             }
         };
         if self.peek_kw("ADD") {
@@ -1885,15 +1907,26 @@ impl<'a> Parser<'a> {
             self.eat_kw("COLUMN");
             let old = self.ident()?;
             let mut def = self.column_def_after_name(change, &old)?;
-            position(self);
+            let place = position(self);
             let mut all = Vec::new();
             if change && !def.name.eq_ignore_ascii_case(&old) {
                 all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::RenameColumn { from: old.clone(), to: def.name.clone() } });
             }
             def.name = if change { def.name } else { old };
             all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::AlterColumn { name: def.name.clone(), data_type: def.data_type } });
-            all.push(Statement::AlterTable { table, action: AlterAction::SetNotNull { name: def.name.clone(), not_null: def.not_null } });
+            all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::SetNotNull { name: def.name.clone(), not_null: def.not_null } });
+            if let Some(after) = place {
+                all.push(Statement::AlterTable { table, action: AlterAction::MoveColumn { name: def.name.clone(), after } });
+            }
             return Ok(Some(Statement::Batch(all)));
+        }
+        if self.peek_kw("ALTER") && self.peek_kw_at(1, "INDEX") && (self.peek_kw_at(3, "VISIBLE") || self.peek_kw_at(3, "INVISIBLE")) {
+            // MySQL: ALTER INDEX name VISIBLE | INVISIBLE; every index is visible here, so there is nothing to change
+            self.advance();
+            self.advance();
+            self.ident()?;
+            self.advance();
+            return Ok(Some(Statement::Batch(Vec::new())));
         }
         if self.peek_kw("RENAME") && !self.peek_kw_at(1, "COLUMN") && !self.peek_kw_at(1, "KEY") && !self.peek_kw_at(1, "INDEX") && !self.peek_kw_at(1, "TO") && !self.peek_kw_at(2, "TO") {
             self.advance();
@@ -2204,7 +2237,12 @@ impl<'a> Parser<'a> {
                     return Ok(self.ignore_rest("EXPLAIN"));
                 }
             }
-            if self.peek_sym("(") {
+            if self.eat_kw("INTO") {
+                // MySQL: EXPLAIN [options] INTO @var statement; the plan goes to the variable
+                self.advance();
+            }
+            let query_in_parens = self.peek_sym("(") && (self.peek_kw_at(1, "SELECT") || self.peek_kw_at(1, "WITH") || self.peek_kw_at(1, "VALUES") || self.peek_kw_at(1, "TABLE") || matches!(self.peek_at(1), Tok::Sym("(")));
+            if self.peek_sym("(") && !query_in_parens {
                 self.advance();
                 loop {
                     let option = self.ident()?.to_ascii_uppercase();
@@ -2748,22 +2786,22 @@ impl<'a> Parser<'a> {
             self.expect_kw("FROM")?;
             let from = self.from_clause()?;
             let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
-            if targets.len() != 1 {
-                return Err(Error::syntax("DELETE from several tables at once is not supported"));
-            }
-            return Ok(Statement::DeleteMulti { target: targets.remove(0), from, filter });
+            return Ok(Statement::DeleteMulti { targets, from, filter });
         }
         self.eat_sym("*");
         self.expect_kw("FROM")?;
         // DELETE FROM t1 USING t1, t2 WHERE ...
         if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) {
             let save = self.pos;
-            let target = self.ident()?;
+            let mut targets = vec![self.ident()?];
+            while self.eat_sym(",") {
+                targets.push(self.ident()?);
+            }
             if self.peek_kw("USING") {
                 self.advance();
                 let from = self.from_clause()?;
                 let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
-                return Ok(Statement::DeleteMulti { target, from, filter });
+                return Ok(Statement::DeleteMulti { targets, from, filter });
             }
             self.pos = save;
         }
@@ -2843,7 +2881,11 @@ impl<'a> Parser<'a> {
 
     /// `EXEC name [(] [@p =] value, ... [)]`
     fn exec(&mut self) -> Result<Statement> {
-        let name = self.ident()?;
+        let mut name = self.ident()?;
+        // `CALL db.proc(..)`: the schema is dropped
+        while self.eat_sym(".") {
+            name = self.ident()?;
+        }
         let paren = self.eat_sym("(");
         let mut args = Vec::new();
         if !(self.at_eof() || self.peek_sym(";") || (paren && self.peek_sym(")"))) {
@@ -3440,6 +3482,13 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw("TABLESPACE") {
                 self.ident()?;
+            }
+            // MySQL: USING BTREE, COMMENT 'x', KEY_BLOCK_SIZE = n, VISIBLE | INVISIBLE, ALGORITHM = x, LOCK = x
+            while self.eat_kw("USING") || self.eat_kw("COMMENT") || self.eat_kw("KEY_BLOCK_SIZE") || self.eat_kw("VISIBLE") || self.eat_kw("INVISIBLE") || self.eat_kw("ALGORITHM") || self.eat_kw("LOCK") {
+                self.eat_sym("=");
+                if !matches!(self.peek(), Tok::Sym(",") | Tok::Sym(";") | Tok::Eof) && !self.peek_kw("USING") && !self.peek_kw("COMMENT") && !self.peek_kw("VISIBLE") && !self.peek_kw("INVISIBLE") && !self.peek_kw("ALGORITHM") && !self.peek_kw("LOCK") {
+                    self.advance();
+                }
             }
             if self.peek_kw("WHERE") {
                 return Err(Error::syntax("a partial index (CREATE INDEX ... WHERE) is not supported"));
@@ -4061,7 +4110,11 @@ impl<'a> Parser<'a> {
 
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.ident()?;
-        let type_name = self.type_name()?;
+        let mut type_name = self.type_name()?;
+        // MySQL's TIME holds a length of time (`-838:59:59`, `10:11:12.5`), which a date-time cannot: it is kept as text
+        if type_name.eq_ignore_ascii_case("TIME") && crate::dialect::current() == crate::dialect::Dialect::Mysql {
+            type_name = "TEXT".into();
+        }
         let user = crate::sql::usertypes::lookup(&type_name);
         // ENUM('a', 'b') and SET('a', 'b'): text that must be one of the labels
         let mut labels: Option<Vec<String>> = None;
@@ -4431,15 +4484,25 @@ impl<'a> Parser<'a> {
                 self.eat_kw("COLUMN");
                 let mut def = self.column_def()?;
                 // MySQL: FIRST | AFTER column
-                if self.eat_kw("FIRST") {
+                let place = if self.eat_kw("FIRST") {
+                    Some(None)
                 } else if self.eat_kw("AFTER") {
-                    self.ident()?;
-                }
+                    Some(Some(self.ident()?))
+                } else {
+                    None
+                };
                 // the column's CHECK is a constraint of the table, added with it
-                if let Some(expr) = def.check.take() {
-                    let add = Statement::AlterTable { table: table.clone(), action: AlterAction::AddColumn(def) };
-                    let check = Statement::AlterTable { table, action: AlterAction::AddCheck { name: None, expr } };
-                    return Ok(Statement::Batch(vec![add, check]));
+                let check = def.check.take();
+                let name = def.name.clone();
+                if check.is_some() || place.is_some() {
+                    let mut all = vec![Statement::AlterTable { table: table.clone(), action: AlterAction::AddColumn(def) }];
+                    if let Some(after) = place {
+                        all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::MoveColumn { name, after } });
+                    }
+                    if let Some(expr) = check {
+                        all.push(Statement::AlterTable { table, action: AlterAction::AddCheck { name: None, expr } });
+                    }
+                    return Ok(Statement::Batch(all));
                 }
                 AlterAction::AddColumn(def)
             }
@@ -5648,7 +5711,8 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 let right = self.concat()?;
-                left = match (row_items(&left), row_items(&right)) {
+                let (left_row, right_row) = (as_row(left.clone()), as_row(right.clone()));
+                left = match (row_items(&left_row), row_items(&right_row)) {
                     (Some(a), Some(b)) => row_compare(op, a, b)?,
                     (None, None) => Expr::Binary { op, left: Box::new(left), right: Box::new(right) },
                     _ => return Err(Error::syntax("a row value (a, b) can only be compared with another row value of the same size")),
@@ -5734,7 +5798,8 @@ impl<'a> Parser<'a> {
                 if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
                     let q = self.select()?;
                     self.expect_sym(")")?;
-                    left = match row_items(&left) {
+                    let as_rows = as_row(left.clone());
+                    left = match row_items(&as_rows) {
                         Some(items) => row_in_query(items, q, negated),
                         None => Expr::InSelect { expr: Box::new(left), query: Box::new(q), negated },
                     };
@@ -5860,12 +5925,30 @@ impl<'a> Parser<'a> {
         if self.eat_sym("+") {
             return self.unary();
         }
+        if self.peek_kw("BINARY") && crate::dialect::current() == crate::dialect::Dialect::Mysql && self.binary_prefix_ahead() {
+            // MySQL's `BINARY expr`: the text is compared by its bytes, which is how text is compared here
+            self.advance();
+            let inner = self.unary()?;
+            return Ok(Expr::Function { name: "__BINARY".into(), args: vec![inner], distinct: false, star: false });
+        }
         if self.eat_sym("~") {
             // MySQL's bitwise NOT
             let inner = self.unary()?;
             return Ok(Expr::Function { name: "__BITNOT".into(), args: vec![inner], distinct: false, star: false });
         }
         self.power()
+    }
+
+    /// After `BINARY`: whether an operand follows (and `BINARY` is not a column name).
+    fn binary_prefix_ahead(&self) -> bool {
+        match self.peek_at(1) {
+            Tok::Str(_) | Tok::Int(_) | Tok::Dec(_) | Tok::Float(_) | Tok::Quoted(_) | Tok::Param(_) | Tok::Sym("(") => true,
+            Tok::Ident(w) => {
+                const STOP: [&str; 20] = ["FROM", "AS", "AND", "OR", "ORDER", "GROUP", "LIMIT", "ASC", "DESC", "WHERE", "HAVING", "IS", "IN", "LIKE", "BETWEEN", "NOT", "UNION", "INTO", "XOR", "REGEXP"];
+                !STOP.iter().any(|k| w.eq_ignore_ascii_case(k))
+            }
+            _ => false,
+        }
     }
 
     fn power(&mut self) -> Result<Expr> {
@@ -6020,6 +6103,20 @@ impl<'a> Parser<'a> {
                         return Ok(Expr::Function { name: "__INTERVAL".into(), args: vec![n, Expr::Literal(Value::text(&unit))], distinct: false, star: false });
                     }
                 }
+                // GET_FORMAT(DATE, 'USA'): the kind is a word, not a column
+                if name.eq_ignore_ascii_case("GET_FORMAT")
+                    && matches!(self.peek_at(1), Tok::Sym("("))
+                    && matches!(self.peek_at(2), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(), "DATE" | "TIME" | "DATETIME" | "TIMESTAMP"))
+                    && matches!(self.peek_at(3), Tok::Sym(","))
+                {
+                    self.advance();
+                    self.advance();
+                    let Tok::Ident(kind) = self.advance() else { unreachable!("checked") };
+                    self.advance();
+                    let region = self.expr()?;
+                    self.expect_sym(")")?;
+                    return Ok(Expr::Function { name: "GET_FORMAT".into(), args: vec![Expr::Literal(Value::text(&kind.to_ascii_uppercase())), region], distinct: false, star: false });
+                }
                 // VALUES(col) in ON DUPLICATE KEY UPDATE
                 if name.eq_ignore_ascii_case("VALUES") && matches!(self.peek_at(1), Tok::Sym("(")) {
                     self.advance();
@@ -6161,6 +6258,7 @@ impl<'a> Parser<'a> {
                         self.advance();
                         let f = match up.as_str() {
                             "CURRENT_DATE" => "LOCALDATE",
+                            "CURRENT_TIME" if crate::dialect::current() == crate::dialect::Dialect::Mysql => "CURTIME",
                             "CURRENT_TIMESTAMP" => "NOWTZ",
                             _ => "LOCALNOW",
                         };
@@ -6222,10 +6320,10 @@ impl<'a> Parser<'a> {
                         self.expect_sym(")")?;
                         return Ok(Expr::Function { name: "INSTR".into(), args: vec![hay, needle], distinct: false, star: false });
                     }
-                    "MATCH" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                    "MATCH" if matches!(self.peek_at(1), Tok::Sym("(")) || (crate::dialect::current() == crate::dialect::Dialect::Mysql && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && !self.peek_kw_at(1, "AGAINST")) => {
                         // MATCH (col, ..) AGAINST (expr [IN NATURAL LANGUAGE MODE | IN BOOLEAN MODE | WITH QUERY EXPANSION])
                         self.advance();
-                        self.advance();
+                        let parens = self.eat_sym("(");
                         let mut args = vec![Expr::Literal(Value::text("natural")), Expr::Literal(Value::Null)];
                         loop {
                             args.push(self.primary_column()?);
@@ -6233,7 +6331,9 @@ impl<'a> Parser<'a> {
                                 break;
                             }
                         }
-                        self.expect_sym(")")?;
+                        if parens {
+                            self.expect_sym(")")?;
+                        }
                         self.expect_kw("AGAINST")?;
                         self.expect_sym("(")?;
                         args[1] = self.additive()?;
@@ -6820,6 +6920,12 @@ impl<'a> Parser<'a> {
         }
         let mut q = self.select()?;
         self.expect_sym(")")?;
+        let x = as_row(x);
+        if let Some(items) = row_items(&x) {
+            if (!all && op == BinOp::Eq) || (all && op == BinOp::Ne) {
+                return Ok(row_in_query(items, q, all));
+            }
+        }
         if !all && op == BinOp::Eq {
             return Ok(Expr::InSelect { expr: Box::new(x), query: Box::new(q), negated: false });
         }

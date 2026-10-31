@@ -733,8 +733,42 @@ impl Table {
         if self.schema.column_index(&column.name).is_some() {
             return Err(Error::catalog(format!("duplicate column '{}' in table '{}'", column.name, self.schema.name)));
         }
+        if column.primary_key && self.schema.columns.iter().any(|c| c.primary_key) {
+            return Err(Error::catalog("multiple primary key defined"));
+        }
         if column.autonumber || column.primary_key {
-            return Err(Error::catalog("AutoNumber and primary key columns cannot be added to an existing table"));
+            // the records are numbered in the order they are kept; only an AutoNumber can fill a key that is new
+            if !column.autonumber && self.live > 1 {
+                return Err(Error::catalog("a primary key column cannot be added to a table that has records"));
+            }
+            let mut n = 0i64;
+            for head in self.rows.iter_mut().flatten() {
+                n += 1;
+                let fill = if column.autonumber { Value::Int(n) } else { column.default.clone().unwrap_or(Value::Null) };
+                head.each_mut(&mut |v| v.row.push(fill.clone()));
+            }
+            if column.autonumber {
+                self.next_auto = n + 1;
+            }
+            let pos = self.schema.columns.len();
+            let name = column.name.clone();
+            let primary = column.primary_key;
+            self.schema.columns.push(column);
+            if primary {
+                let def = IndexDef::new(format!("{}_pkey", self.schema.name.replace('.', "_")), vec![pos], true);
+                if let Err(e) = self.add_index(def) {
+                    // put the table back as it was
+                    for head in self.rows.iter_mut().flatten() {
+                        head.each_mut(&mut |v| {
+                            v.row.pop();
+                        });
+                    }
+                    self.schema.columns.pop();
+                    return Err(e);
+                }
+            }
+            let _ = name;
+            return Ok(());
         }
         if let Some(d) = column.default.take() {
             column.default = Some(if d.is_null() { d } else { d.coerce_to(column.data_type)? });
@@ -755,6 +789,60 @@ impl Table {
         }
         self.schema.columns.push(column);
         Ok(())
+    }
+
+    /// Moves a column to the front (`after` is `None`) or behind `after`; gives where each old position went.
+    pub(crate) fn move_column(&mut self, name: &str, after: Option<&str>) -> Result<Vec<usize>> {
+        self.generation += 1;
+        let from = self.column_checked(name)?;
+        let n = self.schema.columns.len();
+        let mut order: Vec<usize> = (0..n).filter(|&i| i != from).collect();
+        let at = match after {
+            None => 0,
+            Some(a) => {
+                let p = self.column_checked(a)?;
+                if p == from {
+                    return Err(Error::catalog(format!("the field '{name}' cannot be placed after itself")));
+                }
+                order.iter().position(|&i| i == p).expect("the other fields are all there") + 1
+            }
+        };
+        order.insert(at, from);
+        let mut map = vec![0; n];
+        for (new, &old) in order.iter().enumerate() {
+            map[old] = new;
+        }
+        if order.iter().enumerate().all(|(i, &o)| i == o) {
+            return Ok(map);
+        }
+        for head in self.rows.iter_mut().flatten() {
+            head.each_mut(&mut |v| {
+                let old = std::mem::take(&mut v.row);
+                v.row = order.iter().map(|&o| old[o].clone()).collect();
+            });
+        }
+        let cols = std::mem::take(&mut self.schema.columns);
+        self.schema.columns = order.iter().map(|&o| cols[o].clone()).collect();
+        for (ix, def) in self.indexes.iter_mut().zip(&mut self.schema.indexes) {
+            for c in ix.def.columns.iter_mut().chain(def.columns.iter_mut()) {
+                *c = map[*c];
+            }
+        }
+        for fk in &mut self.schema.foreign_keys {
+            for c in &mut fk.columns {
+                *c = map[*c];
+            }
+        }
+        Ok(map)
+    }
+
+    /// After the fields of `parent` were moved (`map`: old position to new), re-points relationships that referenced them.
+    pub(crate) fn remap_references(&mut self, parent: &str, map: &[usize]) {
+        for fk in self.schema.foreign_keys.iter_mut().filter(|f| f.ref_table.eq_ignore_ascii_case(parent)) {
+            for c in &mut fk.ref_columns {
+                *c = map[*c];
+            }
+        }
     }
 
     /// Removes a column. Columns used by an index must be freed first.

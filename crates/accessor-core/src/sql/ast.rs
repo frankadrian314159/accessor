@@ -278,6 +278,8 @@ pub struct ForeignKeyDef {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterAction {
     AddColumn(ColumnDef),
+    /// `FIRST` (`after` is `None`) or `AFTER c` for a field just added.
+    MoveColumn { name: String, after: Option<String> },
     DropColumn(String),
     RenameColumn { from: String, to: String },
     AddForeignKey(ForeignKeyDef),
@@ -570,7 +572,7 @@ pub enum Statement {
     /// `ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...` (a bound), or `DETACH PARTITION child` (`None`).
     AttachPartition { parent: String, child: String, bound: Option<String> },
     /// `DELETE t1 FROM t1, t2 WHERE ...` and `DELETE FROM t1 USING t1, t2 WHERE ...`: the target is the name or alias of one of the tables.
-    DeleteMulti { target: String, from: From, filter: Option<Expr> },
+    DeleteMulti { targets: Vec<String>, from: From, filter: Option<Expr> },
     /// `UPDATE t1, t2 SET t1.a = t2.b WHERE ...`.
     UpdateMulti { from: From, assignments: Vec<(Option<String>, String, Expr)>, filter: Option<Expr> },
     /// `DELETE FROM t [WHERE ..] ORDER BY .. LIMIT n`: only the first rows of the order are deleted.

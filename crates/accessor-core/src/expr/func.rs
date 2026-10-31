@@ -200,13 +200,16 @@ impl ScalarFn {
             "LOG" | "LN" => (Log, 1, 1),
             "YEAR" => (Year, 1, 1),
             "MONTH" => (Month, 1, 1),
-            "DAY" => (Day, 1, 1),
+            "DAY" | "DAYOFMONTH" => (Day, 1, 1),
+            "CURDATE" | "CURRENT_DATE" => (LocalDate, 0, 0),
+            "SYSDATE" => (LocalNow, 0, 1),
+            "UTC_TIMESTAMP" => (Now, 0, 1),
             "HOUR" => (Hour, 1, 1),
             "MINUTE" => (Minute, 1, 1),
             "SECOND" => (Second, 1, 1),
             "WEEKDAY" => (Weekday, 1, 1),
-            "NOW" => (Now, 0, 0),
-            "DATE" | "TODAY" => (Date, 0, 0),
+            "NOW" => (Now, 0, 1),
+            "DATE" | "TODAY" => (Date, 0, 1),
             "DATEADD" => (DateAdd, 3, 3),
             "DATEDIFF" => (DateDiff, 3, 3),
             "DATESERIAL" => (DateSerial, 3, 3),
@@ -249,8 +252,8 @@ impl ScalarFn {
             "TANH" => (Tanh, 1, 1),
             "OCTET_LENGTH" => (OctetLength, 1, 1),
             "GROUPINGBIT" => (GroupingBit, 2, usize::MAX),
-            "NOWTZ" => (NowTz, 0, 0),
-            "LOCALNOW" => (LocalNow, 0, 0),
+            "NOWTZ" | "CURRENT_TIMESTAMP" => (NowTz, 0, 1),
+            "LOCALNOW" | "LOCALTIME" | "LOCALTIMESTAMP" => (LocalNow, 0, 1),
             "LOCALDATE" => (LocalDate, 0, 0),
             "SESSIONTIMEZONE" | "CURRENT_TIMEZONE" => (SessionTimeZone, 0, 0),
             "ATTIMEZONE" => (AtTimeZone, 2, 2),
@@ -493,7 +496,17 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         }
         IsNull => return Ok(Value::Bool(args[0].eval(row)?.is_null())),
         Now => return Ok(Value::DateTime(datetime::now())),
-        Date => return Ok(Value::DateTime(datetime::now().div_euclid(86_400) * 86_400)),
+        Date => {
+            // `DATE()` is today; `DATE(x)` is the date part of x
+            if let Some(a) = args.first() {
+                let v = a.eval(row)?;
+                return Ok(match v.coerce_to(DataType::DateTime) {
+                    Ok(Value::DateTime(t)) => Value::DateTime(t.div_euclid(86_400) * 86_400),
+                    _ => Value::Null,
+                });
+            }
+            return Ok(Value::DateTime(datetime::now().div_euclid(86_400) * 86_400));
+        }
         NowTz => return Ok(Value::TimestampTz(datetime::now())),
         LocalNow => return Ok(Value::DateTime(tz::session().to_local(datetime::now()))),
         LocalDate => return Ok(Value::DateTime(tz::session().to_local(datetime::now()).div_euclid(86_400) * 86_400)),

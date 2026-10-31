@@ -202,7 +202,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             let end = chars.get(i).map_or(src.len(), |&(p, _)| p);
             let _ = start;
             out.push(Token { tok: Tok::Ident(src[pos..end].to_string()), pos });
-        } else if c == '@' && at(i + 1).is_some_and(is_ident_start) {
+        } else if c == '@' && at(i + 1).is_some_and(|d| is_ident_start(d) || (d.is_ascii_digit() && crate::dialect::current() == crate::dialect::Dialect::Mysql)) {
             i += 1;
             let start = i;
             while at(i).is_some_and(is_ident_part) {

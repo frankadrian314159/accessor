@@ -6375,3 +6375,102 @@ fn mysql_digests_match_the_known_values() {
     assert_eq!(one(&mut db, "SELECT SHA1('abc')"), "a9993e364706816aba3e25717850c26c9cd0d89d");
     assert_eq!(one(&mut db, "SELECT MD5(X'FF')"), "00594fd4f42ba43fc1ca0427a0576295");
 }
+
+#[test]
+fn mysql_spatial_values_are_kept_as_well_known_text() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT ST_AsText(ST_GeomFromText('LineString(1 1, 2 2)'))"), "LINESTRING(1 1,2 2)");
+    assert_eq!(one(&mut db, "SELECT ST_AsText(POINT(1.5, 2))"), "POINT(1.5 2)");
+    assert_eq!(one(&mut db, "SELECT ST_AsText(POLYGON(LINESTRING(POINT(0,0), POINT(4,0), POINT(4,4), POINT(0,0))))"), "POLYGON((0 0,4 0,4 4,0 0))");
+    assert_eq!(one(&mut db, "SELECT ST_X(POINT(3, 4)) + ST_Y(POINT(3, 4))"), "7");
+    assert_eq!(one(&mut db, "SELECT ST_Distance(POINT(0,0), POINT(3,4))"), "5");
+    assert_eq!(one(&mut db, "SELECT ST_Area(ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))'))"), "100");
+    assert_eq!(one(&mut db, "SELECT ST_Length(ST_GeomFromText('LINESTRING(0 0,3 4)'))"), "5");
+    assert_eq!(one(&mut db, "SELECT ST_GeometryType(ST_GeomFromText('MULTIPOINT((1 1),(2 2))'))"), "MULTIPOINT");
+    assert_eq!(one(&mut db, "SELECT ST_NumPoints(ST_GeomFromText('LINESTRING(0 0,1 1,2 2)'))"), "3");
+    let square = "ST_GeomFromText('POLYGON((0 0,10 0,10 10,0 10,0 0))')";
+    assert_eq!(one(&mut db, &format!("SELECT ST_Contains({square}, POINT(5, 5))")), "1");
+    assert_eq!(one(&mut db, &format!("SELECT ST_Contains({square}, POINT(10, 5))")), "0");
+    assert_eq!(one(&mut db, &format!("SELECT ST_Intersects({square}, POINT(10, 5))")), "1");
+    assert_eq!(one(&mut db, &format!("SELECT ST_Touches({square}, POINT(10, 5))")), "1");
+    assert_eq!(one(&mut db, &format!("SELECT ST_Disjoint({square}, POINT(11, 5))")), "1");
+    assert_eq!(one(&mut db, &format!("SELECT ST_Within(POINT(5, 5), {square})")), "1");
+    assert_eq!(one(&mut db, "SELECT ST_Crosses(ST_GeomFromText('LINESTRING(0 0,10 10)'), ST_GeomFromText('LINESTRING(0 10,10 0)'))"), "1");
+    assert_eq!(one(&mut db, &format!("SELECT MBRContains({square}, POINT(5, 5))")), "1");
+    assert!(db.execute("SELECT ST_GeomFromText('POLYGON((0 0,1 1))')").is_err());
+    // a spatial column holds the text
+    db.execute("CREATE TABLE g (id INT, p POINT, l LINESTRING)").unwrap();
+    db.execute("INSERT INTO g VALUES (1, ST_PointFromText('POINT(10 10)'), ST_LineFromText('LINESTRING(0 0,1 1)'))").unwrap();
+    assert_eq!(one(&mut db, "SELECT ST_AsText(p) FROM g"), "POINT(10 10)");
+}
+
+#[test]
+fn mysql_more_functions_and_row_subqueries() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT DAYOFYEAR('2020-03-04')"), "64");
+    assert_eq!(one(&mut db, "SELECT DAYOFWEEK('2020-03-04')"), "4");
+    assert_eq!(one(&mut db, "SELECT QUARTER('2020-05-04')"), "2");
+    assert_eq!(one(&mut db, "SELECT TIME_TO_SEC('10:00:01')"), "36001");
+    assert_eq!(one(&mut db, "SELECT MAKEDATE(2020, 60)"), "2020-02-29");
+    assert_eq!(one(&mut db, "SELECT FROM_DAYS(730669)"), "2000-07-03");
+    assert_eq!(one(&mut db, "SELECT YEARWEEK('2020-03-04')"), "202009");
+    assert_eq!(one(&mut db, "SELECT CRC32('123456789')"), "3421780262");
+    assert_eq!(one(&mut db, "SELECT LOG2(8)"), "3");
+    assert_eq!(one(&mut db, "SELECT QUOTE('a''b')"), r"'a\'b'");
+    assert_eq!(one(&mut db, "SELECT PERIOD_ADD(200801, 2)"), "200803");
+    assert_eq!(one(&mut db, "SELECT MAKE_SET(5, 'a', 'b', 'c')"), "a,c");
+    assert_eq!(one(&mut db, "SELECT DATE('2020-03-04 10:11:12')"), "2020-03-04");
+    assert_eq!(one(&mut db, "SELECT INET6_NTOA(INET6_ATON('::ffff:1.2.3.4'))"), "::ffff:1.2.3.4");
+    assert_eq!(one(&mut db, "SELECT BIN_TO_UUID(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'))"), "6ccd780c-baba-1026-9564-5b8c656024db");
+    assert_eq!(one(&mut db, "SELECT AES_DECRYPT(AES_ENCRYPT('text', 'key'), 'key')"), "text");
+    assert_eq!(one(&mut db, "SELECT HEX(AES_ENCRYPT('', 'key'))").len(), 32);
+    assert_eq!(one(&mut db, "SELECT UNCOMPRESS(COMPRESS('hello hello'))"), "hello hello");
+    // BINARY compares byte for byte
+    assert_eq!(one(&mut db, "SELECT BINARY 'a' = 'A'"), "0");
+    assert_eq!(one(&mut db, "SELECT 'a' = 'A'"), "1");
+    // row values against sub-queries
+    db.execute("CREATE TABLE r (a INT, b INT); INSERT INTO r VALUES (1,2),(3,4)").unwrap();
+    assert_eq!(one(&mut db, "SELECT ROW(1,2) = (SELECT 1,2)"), "1");
+    assert_eq!(one(&mut db, "SELECT (SELECT 1,2) IN (SELECT a, b FROM r)"), "1");
+    assert_eq!(db.execute("SELECT a FROM r WHERE (a,b) <> ALL (SELECT a,b FROM r WHERE a = 1)").unwrap().rows.len(), 1);
+    assert_eq!(db.execute("SELECT a FROM r WHERE (a,b) = ANY (SELECT a,b FROM r WHERE a = 1)").unwrap().rows.len(), 1);
+}
+
+#[test]
+fn mysql_columns_get_places_and_keys_can_be_added_late() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute("CREATE TABLE t (a INT, b INT, c INT); CREATE INDEX ib ON t (b); INSERT INTO t VALUES (5,1,9),(6,2,8)").unwrap();
+    db.execute("ALTER TABLE t ADD id INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST").unwrap();
+    let r = db.execute("SELECT * FROM t ORDER BY id").unwrap();
+    assert_eq!(r.columns, vec!["id", "a", "b", "c"]);
+    assert_eq!(r.rows[1].iter().map(|v| v.to_string()).collect::<Vec<_>>(), vec!["2", "6", "2", "8"]);
+    db.execute("INSERT INTO t (a, b, c) VALUES (7, 3, 7)").unwrap();
+    assert_eq!(db.execute("SELECT id FROM t WHERE b = 3").unwrap().rows[0][0].to_string(), "3");
+    db.execute("ALTER TABLE t ADD d INT AFTER a").unwrap();
+    assert_eq!(db.execute("SELECT * FROM t").unwrap().columns, vec!["id", "a", "d", "b", "c"]);
+    db.execute("ALTER TABLE t MODIFY c INT FIRST").unwrap();
+    assert_eq!(db.execute("SELECT * FROM t").unwrap().columns, vec!["c", "id", "a", "d", "b"]);
+    // the index still finds its column
+    assert_eq!(db.execute("SELECT id FROM t WHERE b = 2").unwrap().rows[0][0].to_string(), "2");
+    // invisible indexes are accepted
+    db.execute("CREATE INDEX ia ON t (a) INVISIBLE; ALTER TABLE t ALTER INDEX ia VISIBLE").unwrap();
+}
+
+#[test]
+fn mysql_delete_from_several_tables_at_once() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute("CREATE TABLE t1 (a INT, b INT); CREATE TABLE t2 (a INT, b INT); INSERT INTO t1 VALUES (1,1),(2,2),(3,3); INSERT INTO t2 VALUES (1,5),(2,6),(4,7)").unwrap();
+    db.execute("DELETE t1, t2 FROM t1, t2 WHERE t1.a = t2.a").unwrap();
+    assert_eq!(db.execute("SELECT a FROM t1").unwrap().rows.len(), 1);
+    assert_eq!(db.execute("SELECT a FROM t2").unwrap().rows[0][0].to_string(), "4");
+}
