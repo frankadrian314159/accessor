@@ -28,6 +28,7 @@ pub enum MyFn {
     Uuid,
     Sha2,
     Md5,
+    Sha1,
     Charset,
     Collation,
     Coercibility,
@@ -102,6 +103,7 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "UUID" => (Uuid, 0, 0),
         "SHA2" => (Sha2, 2, 2),
         "MD5" => (Md5, 1, 1),
+        "SHA1" | "SHA" => (Sha1, 1, 1),
         "CHARSET" => (Charset, 1, 1),
         "COLLATION" => (Collation, 1, 1),
         "COERCIBILITY" => (Coercibility, 1, 1),
@@ -377,11 +379,137 @@ fn md5(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// The bytes of a text or binary value.
+fn raw(v: &Value) -> Vec<u8> {
+    v.as_bytes().map_or_else(|| text(v).as_bytes().to_vec(), |b| b.to_vec())
+}
+
+/// The integer `k`-th root of `n`, by bisection.
+fn iroot(n: &num_bigint::BigUint, k: u32) -> num_bigint::BigUint {
+    use num_bigint::BigUint;
+    let (mut lo, mut hi) = (BigUint::from(0u8), BigUint::from(1u8) << (n.bits() as usize / k as usize + 1));
+    while &lo + 1u8 < hi {
+        let mid: BigUint = (&lo + &hi) >> 1usize;
+        if mid.pow(k) <= *n {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// The first `count` primes.
+fn first_primes(count: usize) -> Vec<u64> {
+    (2u64..).filter(|n| (2..*n).take_while(|d| d * d <= *n).all(|d| n % d != 0)).take(count).collect()
+}
+
+/// The first 64 bits of the fractional part of the `k`-th root of the prime `p`: the constants of SHA-2.
+fn frac64(p: u64, k: u32) -> u64 {
+    use num_bigint::BigUint;
+    let r = iroot(&(BigUint::from(p) << (64 * k as usize)), k);
+    (r & BigUint::from(u64::MAX)).to_u64_digits().first().copied().unwrap_or(0)
+}
+
+/// SHA-384 (`short`) and SHA-512 of `data`.
+fn sha512_family(data: &[u8], short: bool) -> Vec<u8> {
+    let primes = first_primes(80);
+    let k: Vec<u64> = primes.iter().map(|&p| frac64(p, 3)).collect();
+    let mut h: Vec<u64> = primes.iter().skip(if short { 8 } else { 0 }).take(8).map(|&p| frac64(p, 2)).collect();
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 128 != 112 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u128) * 8).to_be_bytes());
+    for chunk in msg.chunks(128) {
+        let mut w = [0u64; 80];
+        for (i, c) in chunk.chunks(8).enumerate() {
+            w[i] = u64::from_be_bytes(c.try_into().expect("eight bytes"));
+        }
+        for i in 16..80 {
+            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
+            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let mut v = h.clone();
+        for i in 0..80 {
+            let s1 = v[4].rotate_right(14) ^ v[4].rotate_right(18) ^ v[4].rotate_right(41);
+            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(k[i]).wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(28) ^ v[0].rotate_right(34) ^ v[0].rotate_right(39);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v = vec![t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
+        }
+        for i in 0..8 {
+            h[i] = h[i].wrapping_add(v[i]);
+        }
+    }
+    let mut out: Vec<u8> = h.iter().flat_map(|x| x.to_be_bytes()).collect();
+    out.truncate(if short { 48 } else { 64 });
+    out
+}
+
+/// SHA-224: SHA-256 from another start, cut to 28 bytes.
+fn sha224(data: &[u8]) -> Vec<u8> {
+    let iv: Vec<u32> = first_primes(16).iter().skip(8).map(|&p| frac64(p, 2) as u32).collect();
+    sha256_from(data, iv)[..28].to_vec()
+}
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut msg = data.to_vec();
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&((data.len() as u64) * 8).to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 80];
+        for (i, c) in chunk.chunks(4).enumerate() {
+            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (i, v) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
 fn sha256(data: &[u8]) -> [u8; 32] {
-    let primes: Vec<u64> = (2u64..).filter(|n| (2..*n).take_while(|d| d * d <= *n).all(|d| n % d != 0)).take(64).collect();
+    let primes = first_primes(8);
+    let frac = |x: f64| ((x - x.floor()) * 4294967296.0) as u32;
+    sha256_from(data, primes.iter().map(|&p| frac((p as f64).sqrt())).collect()).try_into().expect("32 bytes")
+}
+
+fn sha256_from(data: &[u8], start: Vec<u32>) -> Vec<u8> {
+    let primes: Vec<u64> = first_primes(64);
     let frac = |x: f64| ((x - x.floor()) * 4294967296.0) as u32;
     let k: Vec<u32> = primes.iter().map(|&p| frac((p as f64).cbrt())).collect();
-    let mut h: Vec<u32> = primes.iter().take(8).map(|&p| frac((p as f64).sqrt())).collect();
+    let mut h: Vec<u32> = start;
     let mut msg = data.to_vec();
     msg.push(0x80);
     while msg.len() % 64 != 56 {
@@ -412,11 +540,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
             h[i] = h[i].wrapping_add(v[i]);
         }
     }
-    let mut out = [0u8; 32];
-    for (i, v) in h.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
-    }
-    out
+    h.iter().flat_map(|v| v.to_be_bytes()).collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -543,9 +667,13 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let h = hex(&md5(seed.as_bytes()));
             Value::text(&format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32]))
         }
-        Md5 => Value::text(&hex(&md5(text(v(0)).as_bytes()))),
+        Md5 => Value::text(&hex(&md5(&raw(v(0))))),
+        Sha1 => Value::text(&hex(&sha1(&raw(v(0))))),
         Sha2 => match int(v(1)) {
-            Some(0) | Some(256) => Value::text(&hex(&sha256(text(v(0)).as_bytes()))),
+            Some(0) | Some(256) => Value::text(&hex(&sha256(&raw(v(0))))),
+            Some(224) => Value::text(&hex(&sha224(&raw(v(0))))),
+            Some(384) => Value::text(&hex(&sha512_family(&raw(v(0)), true))),
+            Some(512) => Value::text(&hex(&sha512_family(&raw(v(0)), false))),
             _ => Value::Null,
         },
         Charset => Value::text("utf8mb4"),
@@ -749,7 +877,8 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 }
                 Value::bytes(out)
             } else {
-                // a character per two bytes, upper-cased so that strings differing in case have the same weight
+                // upper-cased so that strings differing in case have the same weight: a byte for an ASCII character,
+                // two for any other
                 let mut chars: Vec<char> = text(v(0)).chars().collect();
                 if let Some(n) = n {
                     chars.resize(n, ' ');
@@ -758,7 +887,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                     .into_iter()
                     .flat_map(|c| {
                         let w = c.to_uppercase().next().unwrap_or(c) as u32;
-                        [((w >> 8) & 0xFF) as u8, (w & 0xFF) as u8]
+                        if c.is_ascii() { vec![w as u8] } else { vec![((w >> 8) & 0xFF) as u8, (w & 0xFF) as u8] }
                     })
                     .collect();
                 Value::bytes(out)

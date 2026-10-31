@@ -6360,5 +6360,18 @@ fn mysql_nested_join_lists_performance_schema_match_against_bytes_and_weight_str
     db.execute("CREATE TABLE bl (b BLOB); INSERT INTO bl VALUES (X'DEADBEEF')").unwrap();
     assert_eq!(rows(&mut db, "SELECT HEX(b) FROM bl"), ["DEADBEEF"]);
     // WEIGHT_STRING: equal for strings that compare equal, padded by the AS clause
-    assert_eq!(rows(&mut db, "SELECT HEX(WEIGHT_STRING('a')) = HEX(WEIGHT_STRING('A')), HEX(WEIGHT_STRING('a' AS CHAR(3))), HEX(WEIGHT_STRING('ab' AS BINARY(4)))"), ["1,004100200020,61620000"]);
+    assert_eq!(rows(&mut db, "SELECT HEX(WEIGHT_STRING('a')) = HEX(WEIGHT_STRING('A')), HEX(WEIGHT_STRING('a' AS CHAR(3))), HEX(WEIGHT_STRING('ab' AS BINARY(4)))"), ["1,412020,61620000"]);
+}
+
+#[test]
+fn mysql_digests_match_the_known_values() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT SHA2('abc', 224)"), "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7");
+    assert_eq!(one(&mut db, "SELECT SHA2('abc', 384)"), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7");
+    assert_eq!(one(&mut db, "SELECT SHA2('abc', 512)"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+    assert_eq!(one(&mut db, "SELECT SHA1('abc')"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    assert_eq!(one(&mut db, "SELECT MD5(X'FF')"), "00594fd4f42ba43fc1ca0427a0576295");
 }

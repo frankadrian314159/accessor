@@ -18,7 +18,7 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `FIND_IN_SET(s, 'a,b,c')` | position of `s` in the comma-separated list, 0 if absent |
 | `SUBSTRING_INDEX(s, delim, n)` | the text before the `n`-th `delim` (after the `n`-th from the end if `n` is negative) |
 | `SOUNDEX(s)` | the four-character sound code |
-| `MD5(s)`, `SHA2(s, 256)` | hash as hexadecimal text (`SHA2` with other sizes gives NULL) |
+| `MD5(s)`, `SHA1(s)`, `SHA2(s, 224 / 256 / 384 / 512)` | hash of the bytes of `s` as hexadecimal text (`SHA2(s, 0)` is 256; other sizes give NULL) |
 | `UUID()` | a random version-4 UUID; a new one each call |
 | `STR_TO_DATE(s, fmt)` | the date-time `s` is written as in `fmt` (`%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %p %b %M %a %W %T %j %f %%`); NULL if it does not fit |
 | `INSERT(s, pos, len, new)` | `s` with `len` characters from the 1-based `pos` replaced by `new` (`s` itself when `pos` is outside) |
