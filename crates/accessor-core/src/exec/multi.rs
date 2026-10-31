@@ -276,11 +276,21 @@ impl Database {
     pub(crate) fn exec_update_multi(&mut self, from: &FromClause, assignments: &[(Option<String>, String, Expr)], filter: Option<&Expr>) -> Result<QueryResult> {
         // the table that is changed: the one the assignments name
         let mut qualifiers: Vec<String> = assignments.iter().filter_map(|(q, _, _)| q.clone()).collect();
-        qualifiers.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        let mut seen: Vec<String> = Vec::new();
+        qualifiers.retain(|q| if seen.iter().any(|s| s.eq_ignore_ascii_case(q)) { false } else { seen.push(q.clone()); true });
         let target = match qualifiers.as_slice() {
             [one] => one.clone(),
             [] => factor_names(&from.first).map(|(_, alias)| alias).ok_or_else(|| Error::runtime("UPDATE needs a table to change"))?,
-            _ => return Err(Error::runtime("UPDATE of several tables at once is not supported")),
+            several => {
+                // SET t1.a = .., t2.b = ..: one table after the other, each seeing what the one before changed
+                let mut total = QueryResult::default();
+                for q in several.to_vec() {
+                    let mine: Vec<_> = assignments.iter().filter(|(a, _, _)| a.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(&q))).cloned().collect();
+                    let r = self.exec_update_multi(from, &mine, filter)?;
+                    total.affected += r.affected;
+                }
+                return Ok(total);
+            }
         };
         let mut from2 = from.clone();
         let mut filter2 = filter.cloned();

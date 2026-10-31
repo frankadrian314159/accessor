@@ -198,6 +198,7 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
         Statement::Delete { filter, .. } => filter.iter_mut().try_for_each(|e| walk_expr(e, f)),
         Statement::Exec { args, .. } => args.iter_mut().try_for_each(|(_, e)| walk_expr(e, f)),
         Statement::Raise(e) => walk_expr(e, f),
+        Statement::SetVar { expr, .. } => walk_expr(expr, f),
         Statement::Guarded { stmt, .. } => walk_statement(stmt, f),
         Statement::Upsert { insert, conflict } => {
             walk_statement(insert, f)?;
@@ -251,6 +252,10 @@ pub fn bind_params_select(s: &mut Select, values: &HashMap<String, Value>) -> Re
 
 fn bind_param(e: &mut Expr, values: &HashMap<String, Value>) -> Result<()> {
     if let Expr::Param(name) = e {
+        if crate::dialect::current() == crate::dialect::Dialect::Mysql && !values.contains_key(&name.to_ascii_lowercase()) {
+            *e = Expr::Literal(Value::Null);
+            return Ok(());
+        }
         let v = values.get(&name.to_ascii_lowercase()).ok_or_else(|| {
             Error::runtime(format!("the parameter @{name} has no value; run the query with EXEC and supply one"))
         })?;

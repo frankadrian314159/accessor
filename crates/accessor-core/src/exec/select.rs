@@ -301,16 +301,27 @@ impl Database {
                 for f in std::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.factor)) {
                     let src = self.resolve_source(f, &scope, depth, false)?;
                     for n in &src.names {
-                        quals.push(src.alias.clone());
-                        scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: false });
+                        let col = scope_col(&src.alias, n);
+                        quals.push(col.table.clone());
+                        scope.cols.push(col);
                     }
                 }
                 let inner = Select { items: vec![SelectItem::Wildcard], from: Some((**from).clone()), ..Select::default() };
                 let res = self.run_select_depth(&inner, depth + 1)?;
-                if res.columns.len() != quals.len() {
-                    return Err(Error::runtime("a nested join list gives columns that cannot be told apart"));
+                // a column merged by USING or NATURAL belongs to the first table that has it
+                let mut used = vec![false; scope.cols.len()];
+                let mut names: Vec<String> = Vec::with_capacity(res.columns.len());
+                for c in &res.columns {
+                    let at = (0..scope.cols.len()).find(|&i| !used[i] && scope.cols[i].name.eq_ignore_ascii_case(c));
+                    let q = match at {
+                        Some(i) => {
+                            used[i] = true;
+                            quals[i].clone()
+                        }
+                        None => return Err(Error::runtime("a nested join list gives columns that cannot be told apart")),
+                    };
+                    names.push(format!("{q}\u{1}{c}"));
                 }
-                let names = quals.iter().zip(&res.columns).map(|(q, c)| format!("{q}\u{1}{c}")).collect();
                 Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
         }
@@ -2767,6 +2778,11 @@ fn rename_columns(actual: Vec<String>, wanted: &[String], what: &str) -> Result<
     Ok(wanted.to_vec())
 }
 
+/// The name of a column of a source without the table a nested join list puts in front of it.
+fn plain_name(n: &str) -> &str {
+    n.split_once('\u{1}').map_or(n, |(_, c)| c)
+}
+
 /// The ON condition of each join. `USING` and `NATURAL` become equalities of
 /// the like-named columns, and hide the duplicate so the column shows once.
 fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Result<Vec<Option<Expr>>> {
@@ -2784,7 +2800,8 @@ fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Re
         }
         let names: Vec<String> = if join.natural {
             let mut common: Vec<String> = Vec::new();
-            for n in &right.names {
+            for n in right.names.iter().map(|n| plain_name(n)) {
+                let n = &n.to_string();
                 let in_left = scope.cols[..left_width].iter().any(|c| !c.hidden && c.name.eq_ignore_ascii_case(n));
                 if in_left && !common.iter().any(|c| c.eq_ignore_ascii_case(n)) {
                     common.push(n.clone());
@@ -2800,7 +2817,7 @@ fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Re
                 .filter(|&i| !scope.cols[i].hidden && scope.cols[i].name.eq_ignore_ascii_case(name))
                 .collect();
             let rights: Vec<usize> =
-                (0..right.ncols()).filter(|&i| right.names[i].eq_ignore_ascii_case(name)).collect();
+                (0..right.ncols()).filter(|&i| plain_name(&right.names[i]).eq_ignore_ascii_case(name)).collect();
             let (li, ri) = match (lefts.as_slice(), rights.as_slice()) {
                 ([l], [r]) => (*l, *r),
                 ([], _) => return Err(Error::catalog(format!("the column '{name}' of USING is not on the left side of the join"))),
@@ -2810,7 +2827,10 @@ fn join_conditions(from: &From, sources: &[Source<'_>], scope: &mut Scope) -> Re
             let eq = Expr::Binary {
                 op: BinOp::Eq,
                 left: Box::new(Expr::Column { table: Some(scope.cols[li].table.clone()), name: scope.cols[li].name.clone() }),
-                right: Box::new(Expr::Column { table: Some(right.alias.clone()), name: right.names[ri].clone() }),
+                right: Box::new(match right.names[ri].split_once('\u{1}') {
+                    Some((t, c)) => Expr::Column { table: Some(t.to_string()), name: c.to_string() },
+                    None => Expr::Column { table: Some(right.alias.clone()), name: right.names[ri].clone() },
+                }),
             };
             cond = Some(match cond {
                 None => eq,

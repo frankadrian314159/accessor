@@ -290,6 +290,9 @@ impl Database {
     }
 
     pub(crate) fn guard_drop_table(&self, name: &str) -> Result<()> {
+        if !self.foreign_key_checks() {
+            return Ok(());
+        }
         for t in self.tables.values() {
             if t.name().eq_ignore_ascii_case(name) {
                 continue;

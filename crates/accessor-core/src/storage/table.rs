@@ -780,7 +780,16 @@ impl Table {
             return Err(Error::catalog("a column filled from a sequence cannot be added to a table that has records"));
         }
         // A calculated field's "default" is its expression; its values are computed afterwards.
-        let fill = if column.is_calculated() { Value::Null } else { column.default.clone().unwrap_or(Value::Null) };
+        let mut fill = if column.is_calculated() { Value::Null } else { column.default.clone().unwrap_or(Value::Null) };
+        if fill.is_null() && column.not_null && self.live > 0 && crate::dialect::current() == crate::dialect::Dialect::Mysql {
+            // MySQL gives the rows the implicit default of the type: 0, '' or the zero date
+            fill = match column.data_type {
+                DataType::Text => Value::text(""),
+                DataType::DateTime => Value::DateTime(0),
+
+                _ => Value::Int(0).coerce_to(column.data_type).unwrap_or(Value::Null),
+            };
+        }
         if fill.is_null() && column.not_null && self.live > 0 {
             return Err(Error::constraint(format!(
                 "cannot add required field '{}' without a default to a table that has records",

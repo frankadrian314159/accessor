@@ -481,6 +481,10 @@ impl<'a> Binder<'a> {
                 if let Some(v) = self.db.session_value(name) {
                     return Ok(BExpr::Lit(v));
                 }
+                if crate::dialect::current() == crate::dialect::Dialect::Mysql {
+                    // an unset user variable is NULL
+                    return Ok(BExpr::Lit(Value::Null));
+                }
                 return Err(Error::runtime(format!(
                     "the parameter @{name} has no value; run the query with EXEC and supply one"
                 )))
@@ -591,6 +595,24 @@ impl<'a> Binder<'a> {
                     return Err(Error::runtime("scalar subquery returned more than one row"));
                 }
                 BExpr::Lit(res.rows.pop().map_or(Value::Null, |mut r| r.swap_remove(0)))
+            }
+            Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("DEFAULT") && args.len() == 1 && matches!(&args[0], Expr::Column { .. }) => {
+                // MySQL: DEFAULT(col) is the column's default value
+                let Expr::Column { table, name: col } = &args[0] else { unreachable!("checked") };
+                let mut candidates: Vec<String> = match table {
+                    Some(t) => vec![t.clone()],
+                    None => self.scope.cols.iter().map(|c| c.table.clone()).collect(),
+                };
+                candidates.extend(self.db.table_names().into_iter().map(String::from));
+                let found = candidates.iter().find_map(|t| {
+                    let tb = self.db.table(t)?;
+                    let i = tb.schema().column_index(col)?;
+                    Some(tb.schema().columns[i].default.clone().unwrap_or(Value::Null))
+                });
+                return match found {
+                    Some(v) => Ok(BExpr::Lit(v)),
+                    None => Err(Error::catalog(format!("column '{col}' was not found"))),
+                };
             }
             Expr::Window { func, spec } => return self.bind_window(func, spec),
             Expr::Function { name, .. } if name == "__ROW" => {
@@ -783,7 +805,17 @@ impl<'a> Binder<'a> {
         // `ORDER BY` inside the call arrives as trailing `__AGG_ORDER(key, descending)` arguments
         let (args, order_args): (Vec<&Expr>, Vec<&Expr>) =
             all_args.iter().partition(|a| !matches!(a, Expr::Function { name, .. } if name == "__AGG_ORDER"));
-        let args: Vec<Expr> = args.into_iter().cloned().collect();
+        let mut args: Vec<Expr> = args.into_iter().cloned().collect();
+        if func == AggFn::Count && distinct && args.len() > 1 {
+            // COUNT(DISTINCT a, b): the distinct combinations, skipping those with a NULL
+            let any_null = args
+                .iter()
+                .map(|a| Expr::IsNull { expr: Box::new(a.clone()), negated: false })
+                .reduce(|l, r| Expr::Binary { op: crate::sql::ast::BinOp::Or, left: Box::new(l), right: Box::new(r) })
+                .expect("several arguments");
+            let key = Expr::Function { name: "__ARRAY".into(), args: args.clone(), distinct: false, star: false };
+            args = vec![Expr::Case { whens: vec![(any_null, Expr::Literal(Value::Null))], else_expr: Some(Box::new(key)) }];
+        }
         let args = &args[..];
         let mut order: Vec<(BExpr, bool)> = Vec::new();
         let arg = if star {

@@ -934,7 +934,17 @@ impl<'a> Parser<'a> {
             self.if_exists_clause(true, guarded)?;
             let name = self.role_name()?;
             let options = self.role_options()?;
-            return Ok(Some(change("role", name, Self::options_text(&options))));
+            let mut all = vec![change("role", name, Self::options_text(&options))];
+            // MySQL: CREATE ROLE r1, r2
+            while self.eat_sym(",") {
+                let name = self.role_name()?;
+                let options = self.role_options()?;
+                all.push(change("role", name, Self::options_text(&options)));
+            }
+            if all.len() > 1 {
+                return Ok(Some(Statement::Batch(all)));
+            }
+            return Ok(Some(all.remove(0)));
         }
         if self.eat_kw("DOMAIN") {
             self.if_exists_clause(true, guarded)?;
@@ -1530,13 +1540,21 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let kind = self.role_name()?.to_ascii_lowercase();
                 show.what = format!("create {kind}");
-                show.target = Some(self.table_ident()?);
-                // SHOW CREATE USER name@host
-                if matches!(self.peek(), Tok::Param(_)) {
+                show.target = Some(if let Tok::Str(u) = self.peek().clone() {
                     self.advance();
+                    u
+                } else {
+                    self.table_ident()?
+                });
+                // SHOW CREATE USER name@host
+                if let Tok::Param(host) = self.peek().clone() {
+                    self.advance();
+                    show.target = show.target.take().map(|t| format!("{t}@{host}"));
                 } else if self.peek_sym("@") && matches!(self.peek_at(1), Tok::Str(_) | Tok::Ident(_)) {
                     self.advance();
-                    self.advance();
+                    if let Tok::Str(host) | Tok::Ident(host) = self.advance() {
+                        show.target = show.target.take().map(|t| format!("{t}@{host}"));
+                    }
                 }
             }
             "character set" => {
@@ -1698,7 +1716,7 @@ impl<'a> Parser<'a> {
         (self.peek_kw_at(k, "PRIMARY") && self.peek_kw_at(k + 1, "KEY"))
             || self.peek_kw_at(k, "UNIQUE")
             || ((self.peek_kw_at(k, "KEY") || self.peek_kw_at(k, "INDEX")) && k == 0 && self.mysql_key_ahead(k))
-            || ((self.peek_kw_at(k, "FULLTEXT") || self.peek_kw_at(k, "SPATIAL")) && (self.peek_kw_at(k + 1, "KEY") || self.peek_kw_at(k + 1, "INDEX") || matches!(self.peek_at(k + 1), Tok::Sym("("))))
+            || ((self.peek_kw_at(k, "FULLTEXT") || self.peek_kw_at(k, "SPATIAL")) && (self.peek_kw_at(k + 1, "KEY") || self.peek_kw_at(k + 1, "INDEX") || matches!(self.peek_at(k + 1), Tok::Sym("(")) || (matches!(self.peek_at(k + 1), Tok::Ident(_) | Tok::Quoted(_)) && matches!(self.peek_at(k + 2), Tok::Sym("(")))))
     }
 
     /// At `KEY` / `INDEX` inside a table definition or `ALTER TABLE`: MySQL's `KEY [name] [USING ..] (columns)`, rather than a
@@ -2130,6 +2148,10 @@ impl<'a> Parser<'a> {
     }
 
     fn statement_inner(&mut self) -> Result<Statement> {
+        // PostgreSQL's text search objects (configurations, dictionaries, parsers, templates): the search uses its built-in ones
+        if (self.peek_kw("CREATE") || self.peek_kw("ALTER") || self.peek_kw("DROP")) && self.peek_kw_at(1, "TEXT") && self.peek_kw_at(2, "SEARCH") {
+            return Ok(self.ignore_rest("TEXT SEARCH"));
+        }
         for word in ["VACUUM", "ANALYZE", "ANALYSE", "LOCK", "UNLOCK", "COMMENT", "CHECKPOINT", "DISCARD", "CLUSTER", "LISTEN", "UNLISTEN", "NOTIFY", "SECURITY"] {
             if self.peek_kw(word) {
                 // maintenance commands for a server: there is nothing to do, so they are read and ignored
@@ -2295,7 +2317,7 @@ impl<'a> Parser<'a> {
         if let Some(st) = self.mysql_statement()? {
             return Ok(st);
         }
-        if self.peek_kw("RESET") && (self.peek_kw_at(1, "PERSIST") || self.peek_kw_at(1, "MASTER") || self.peek_kw_at(1, "SLAVE") || self.peek_kw_at(1, "REPLICA") || self.peek_kw_at(1, "QUERY")) {
+        if self.peek_kw("RESET") && (self.peek_kw_at(1, "PERSIST") || self.peek_kw_at(1, "BINARY") || self.peek_kw_at(1, "MASTER") || self.peek_kw_at(1, "SLAVE") || self.peek_kw_at(1, "REPLICA") || self.peek_kw_at(1, "QUERY")) {
             return Ok(self.ignore_rest("RESET"));
         }
         if self.eat_kw("RESET") {
@@ -3023,7 +3045,7 @@ impl<'a> Parser<'a> {
                 }
                 let data_type = if matches!(self.peek(), Tok::Ident(_)) && !self.peek_kw("DEFAULT") { Some(self.data_type_name()?) } else { None };
                 let default = if self.eat_sym("=") || self.eat_kw("DEFAULT") { Some(self.expr()?) } else { None };
-                params.push(RoutineParam { name: pname, data_type, default });
+                params.push(RoutineParam { name: pname, data_type, default, out: false });
                 if !self.eat_sym(",") {
                     break;
                 }
@@ -3455,7 +3477,8 @@ impl<'a> Parser<'a> {
             let mut descending = Vec::new();
             loop {
                 if self.peek_sym("(") || matches!(self.peek_at(1), Tok::Sym("(")) {
-                    return Err(Error::syntax("an index on an expression is not supported; index the column"));
+                    // an index on an expression is accepted and not built: queries read the table
+                    return Ok(self.ignore_rest("CREATE INDEX"));
                 }
                 columns.push(self.ident()?);
                 // an operator class or collation, then ASC/DESC and NULLS FIRST/LAST
@@ -3649,6 +3672,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("WITH") {
                 self.skip_parens()?;
             } else if self.eat_kw("TABLESPACE") || self.eat_kw("USING") {
+                self.eat_sym("=");
                 self.ident()?;
             } else if self.table_option()? {
             } else if self.peek_kw("SELECT") || (self.peek_kw("AS") && self.peek_kw_at(1, "SELECT")) {
@@ -5138,6 +5162,17 @@ impl<'a> Parser<'a> {
 
     fn from_clause(&mut self) -> Result<From> {
         let mut from = self.from_source()?;
+        self.join_chain(&mut from, false)?;
+        Ok(from)
+    }
+
+    /// Whether a join keyword is next (`JOIN`, `INNER JOIN`, `LEFT [OUTER] JOIN`, ...).
+    fn join_ahead(&self) -> bool {
+        ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "STRAIGHT_JOIN"].iter().any(|k| self.peek_kw(k))
+    }
+
+    /// The joins that follow the first source of `from`. With `nested`, a comma ends the chain: it belongs to the outer list.
+    fn join_chain(&mut self, from: &mut From, nested: bool) -> Result<()> {
         loop {
             let natural = self.eat_kw("NATURAL");
             let mut kind = if self.eat_kw("INNER") {
@@ -5162,27 +5197,39 @@ impl<'a> Parser<'a> {
                 JoinKind::Inner
             } else if natural {
                 return Err(self.unexpected("JOIN"));
-            } else if self.eat_sym(",") {
+            } else if !nested && self.eat_sym(",") {
                 JoinKind::Cross
             } else {
                 break;
             };
             // a parenthesised join list on the right: written as a flat list when that reads the same, else a source of its own
             let mut nested_factor = None;
-            if self.peek_sym("(") && !natural && self.parenthesised_join_ahead() {
+            if self.peek_sym("(") && self.parenthesised_join_ahead() {
                 let inner = self.from_source()?;
                 if inner.joins.is_empty() {
                     nested_factor = Some(inner.first);
-                } else if self.flatten_nested(&mut from, kind, &inner)? {
+                } else if !natural && !self.peek_kw("USING") && self.flatten_nested(from, kind, &inner)? {
                     continue;
                 } else {
                     nested_factor = Some(TableFactor::Nested { from: Box::new(inner), alias: format!("__nest{}", self.pos) });
                 }
             }
-            let factor = match nested_factor {
+            let mut factor = match nested_factor {
                 Some(f) => f,
                 None => self.table_factor()?,
             };
+            // `a LEFT JOIN b RIGHT JOIN c ON x ON y`: the second join belongs to `b`, and its condition comes first
+            if kind != JoinKind::Cross && !natural && self.join_ahead() && !self.peek_kw("USING") {
+                let mut inner = From { first: factor, joins: Vec::new() };
+                self.join_chain(&mut inner, true)?;
+                if inner.joins.is_empty() {
+                    factor = inner.first;
+                } else if self.flatten_nested(from, kind, &inner)? {
+                    continue;
+                } else {
+                    factor = TableFactor::Nested { from: Box::new(inner), alias: format!("__nest{}", self.pos) };
+                }
+            }
             let mut on = None;
             let mut using = Vec::new();
             if kind != JoinKind::Cross && !natural {
@@ -5200,7 +5247,7 @@ impl<'a> Parser<'a> {
             }
             from.joins.push(Join { kind, factor, on, using, natural });
         }
-        Ok(from)
+        Ok(())
     }
 
     /// A join with a parenthesised list `inner` on its right, read as the flat list where that means the same: a list of
@@ -6844,6 +6891,11 @@ impl<'a> Parser<'a> {
     /// The type after `::`, with an optional size, applied to `e`.
     fn type_cast(&mut self, e: Expr) -> Result<Expr> {
         let tn = self.type_name()?;
+        // full-text values are text read and written in their own form
+        if tn.eq_ignore_ascii_case("tsvector") || tn.eq_ignore_ascii_case("tsquery") {
+            let name = if tn.eq_ignore_ascii_case("tsvector") { "TSVECTOR_IN" } else { "TSQUERY_IN" };
+            return Ok(Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false });
+        }
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
         let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         if ty == DataType::Calculated {

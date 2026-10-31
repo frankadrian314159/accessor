@@ -193,6 +193,15 @@ impl Database {
                 let ddl = format!("CREATE TABLE {} (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci", quoted(&schema.name), lines.join(",\n"));
                 (cols(&["Table", "Create Table"]), vec![vec![text(&schema.name), text(&ddl)]])
             }
+            "create user" => {
+                // accounts are not kept: every account reads as one made with the defaults
+                let (user, host) = target.split_once('@').unwrap_or((target.as_str(), "%"));
+                let account = format!("`{}`@`{}`", user.trim_matches('\''), host.trim_matches('\''));
+                let ddl = format!(
+                    "CREATE USER {account} IDENTIFIED WITH 'caching_sha2_password' REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK PASSWORD HISTORY DEFAULT PASSWORD REUSE INTERVAL DEFAULT PASSWORD REQUIRE CURRENT DEFAULT"
+                );
+                (cols(&[&format!("CREATE USER for {user}@{host}")]), vec![vec![text(&ddl)]])
+            }
             "create view" => {
                 let sql = self.view_sql(&target).ok_or_else(|| Error::catalog(format!("Unknown table '{target}'")))?;
                 (cols(&["View", "Create View", "character_set_client", "collation_connection"]), vec![vec![text(&target), text(&format!("CREATE VIEW {} AS {}", quoted(&target), sql)), text("utf8mb4"), text("utf8mb4_0900_ai_ci")]])

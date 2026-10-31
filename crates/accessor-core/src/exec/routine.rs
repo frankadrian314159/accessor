@@ -124,7 +124,58 @@ pub(crate) fn inline_call(def: &RoutineDef, args: &[Expr]) -> Result<Expr> {
 enum Flow {
     Normal,
     Leave,
+    /// `LEAVE label` (MySQL): out to the block or loop with that label.
+    LeaveTo(String),
+    /// `ITERATE label`: on with the next round of the loop with that label.
+    IterateTo(String),
     Return,
+}
+
+/// The SQLSTATE of an error, as far as it can be told from what went wrong.
+fn sqlstate_of(e: &Error) -> &'static str {
+    let m = e.to_string().to_ascii_lowercase();
+    if m.starts_with("no data to fetch") {
+        "02000"
+    } else if m.contains("duplicate") {
+        "23000"
+    } else if m.contains("cannot contain a null") || m.contains("cannot be null") || m.contains("null value") {
+        "23000"
+    } else if m.contains("already exists") {
+        "42S01"
+    } else if m.contains("does not exist") || m.contains("was not found") {
+        "42S02"
+    } else if m.contains("division by zero") {
+        "22012"
+    } else if m.starts_with("syntax error") {
+        "42000"
+    } else {
+        "HY000"
+    }
+}
+
+/// The MySQL error number of an error, as far as it can be told.
+fn errcode_of(e: &Error) -> i64 {
+    match sqlstate_of(e) {
+        "02000" => 1329,
+        "42S01" => 1050,
+        "42S02" => 1146,
+        "22012" => 1365,
+        "23000" if e.to_string().to_ascii_lowercase().contains("duplicate") => 1062,
+        "23000" => 1048,
+        "42000" => 1064,
+        _ => 1105,
+    }
+}
+
+fn handler_matches(h: &Handler, e: &Error) -> bool {
+    let not_found = sqlstate_of(e) == "02000";
+    h.conditions.iter().any(|c| match c {
+        HandlerCond::SqlException => !not_found,
+        HandlerCond::SqlWarning => false,
+        HandlerCond::NotFound => not_found,
+        HandlerCond::SqlState(s) => s == sqlstate_of(e),
+        HandlerCond::Code(n) => *n == errcode_of(e),
+    })
 }
 
 /// A function that returns a set of rows with `RETURN NEXT` / `RETURN QUERY` statements, rather than as a query of its own
@@ -144,11 +195,15 @@ struct Frame {
     rows: Vec<Vec<Value>>,
     /// The columns of each record variable, in order.
     rec_cols: HashMap<String, Vec<String>>,
+    /// The cursors declared, with the rows of each that is open and how many were fetched.
+    cursors: HashMap<String, (crate::sql::ast::Select, Option<(Vec<Vec<Value>>, usize)>)>,
+    /// The label of the loop about to run.
+    loop_label: Option<String>,
 }
 
 impl Frame {
     fn new(vars: HashMap<String, Value>) -> Frame {
-        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new() }
+        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), loop_label: None }
     }
 }
 
@@ -358,6 +413,7 @@ impl Database {
         }
         // Arguments, positionally or by name, then defaults.
         let mut given: Vec<Option<Value>> = vec![None; def.params.len()];
+        let mut arg_exprs: Vec<Option<Expr>> = vec![None; def.params.len()];
         let mut next = 0;
         for (pname, e) in args {
             let v = self.eval_const(e)?;
@@ -381,6 +437,7 @@ impl Database {
             if given[at].replace(v).is_some() {
                 return Err(Error::runtime(format!("the parameter @{} was supplied twice", def.params[at].name)));
             }
+            arg_exprs[at] = Some(e.clone());
         }
         let mut frame = Frame::new(HashMap::new());
         for (p, v) in def.params.iter().zip(given) {
@@ -407,6 +464,13 @@ impl Database {
         let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| ()));
         self.call_depth.fetch_sub(1, Ordering::Relaxed);
         outcome?;
+        // the OUT and INOUT parameters go back to the variables the caller named
+        for (p, arg) in def.params.iter().zip(&arg_exprs) {
+            if let (true, Some(Expr::Param(var))) = (p.out, arg) {
+                let v = frame.vars.get(&p.name.to_ascii_lowercase()).cloned().unwrap_or(Value::Null);
+                self.user_vars.insert(var.to_ascii_lowercase(), v);
+            }
+        }
         Ok(Some(match (frame.returned, frame.last) {
             (Some(v), _) => QueryResult { columns: vec!["return".into()], rows: vec![vec![v]], affected: 0 },
             (None, Some(r)) => r,
@@ -425,6 +489,28 @@ impl Database {
             match self.run_proc_stmt(st, frame)? {
                 Flow::Normal => {}
                 other => return Ok(other),
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
+    /// A block with handlers: an error in one of its statements goes to the first handler that answers to it; a `CONTINUE`
+    /// handler lets the block go on with the next statement, an `EXIT` handler ends the block.
+    fn run_block_handled(&mut self, body: &[ProcStmt], handlers: &[Handler], frame: &mut Frame) -> Result<Flow> {
+        for st in body {
+            match self.run_proc_stmt(st, frame) {
+                Ok(Flow::Normal) => {}
+                Ok(other) => return Ok(other),
+                Err(e) => {
+                    let Some(h) = handlers.iter().find(|h| handler_matches(h, &e)) else { return Err(e) };
+                    match self.run_block(&h.body, frame)? {
+                        Flow::Normal => {}
+                        other => return Ok(other),
+                    }
+                    if h.exit {
+                        return Ok(Flow::Normal);
+                    }
+                }
             }
         }
         Ok(Flow::Normal)
@@ -467,6 +553,7 @@ impl Database {
                 return self.run_block(otherwise, frame);
             }
             ProcStmt::While { cond, body } => {
+                let mine = frame.loop_label.take();
                 while matches!(self.eval_in(cond, frame)?, Value::Bool(true)) {
                     frame.iterations += 1;
                     if frame.iterations > MAX_ITERATIONS {
@@ -475,11 +562,70 @@ impl Database {
                     match self.run_block(body, frame)? {
                         Flow::Normal => {}
                         Flow::Leave => break,
-                        Flow::Return => return Ok(Flow::Return),
+                        Flow::IterateTo(l) if mine.as_deref() == Some(l.as_str()) => {}
+                        other => return Ok(other),
                     }
                 }
             }
+            ProcStmt::Labeled { label, stmt } => {
+                frame.loop_label = Some(label.clone());
+                let flow = self.run_proc_stmt(stmt, frame)?;
+                frame.loop_label = None;
+                return Ok(match flow {
+                    Flow::LeaveTo(l) if l.eq_ignore_ascii_case(label) => Flow::Normal,
+                    other => other,
+                });
+            }
+            ProcStmt::Block { label, body, handlers } => {
+                let flow = self.run_block_handled(body, handlers, frame)?;
+                return Ok(match flow {
+                    Flow::LeaveTo(l) if label.as_deref().is_some_and(|b| b.eq_ignore_ascii_case(&l)) => Flow::Normal,
+                    other => other,
+                });
+            }
             ProcStmt::Leave => return Ok(Flow::Leave),
+            ProcStmt::LeaveTo(label) => return Ok(Flow::LeaveTo(label.clone())),
+            ProcStmt::Iterate(label) => return Ok(Flow::IterateTo(label.clone())),
+            ProcStmt::DeclareCursor { name, select } => {
+                frame.cursors.insert(name.to_ascii_lowercase(), ((**select).clone(), None));
+            }
+            ProcStmt::OpenCursor(name) => {
+                let k = name.to_ascii_lowercase();
+                let select = frame.cursors.get(&k).map(|c| c.0.clone()).ok_or_else(|| Error::runtime(format!("the cursor '{name}' is not declared")))?;
+                let (_, rows) = self.record_query(&select, frame)?;
+                if let Some(c) = frame.cursors.get_mut(&k) {
+                    c.1 = Some((rows, 0));
+                }
+            }
+            ProcStmt::CloseCursor(name) => {
+                let k = name.to_ascii_lowercase();
+                match frame.cursors.get_mut(&k) {
+                    Some(c) if c.1.is_some() => c.1 = None,
+                    _ => return Err(Error::runtime(format!("the cursor '{name}' is not open"))),
+                }
+            }
+            ProcStmt::Fetch { cursor, targets } => {
+                let k = cursor.to_ascii_lowercase();
+                let row = match frame.cursors.get_mut(&k) {
+                    Some((_, Some((rows, pos)))) => {
+                        let row = rows.get(*pos).cloned();
+                        if row.is_some() {
+                            *pos += 1;
+                        }
+                        row
+                    }
+                    _ => return Err(Error::runtime(format!("the cursor '{cursor}' is not open"))),
+                };
+                let Some(row) = row else { return Err(Error::runtime("No data to FETCH")) };
+                for (i, t) in targets.iter().enumerate() {
+                    let mut v = row.get(i).cloned().unwrap_or(Value::Null);
+                    let tk = t.to_ascii_lowercase();
+                    if let Some(ty) = frame.types.get(&tk) {
+                        v = v.coerce_to(*ty)?;
+                    }
+                    frame.vars.insert(tk, v);
+                }
+            }
             ProcStmt::Return(value) => {
                 if let Some(e) = value {
                     frame.returned = Some(self.eval_in(e, frame)?);
@@ -516,7 +662,7 @@ impl Database {
                     match self.run_block(body, frame)? {
                         Flow::Normal => {}
                         Flow::Leave => break,
-                        Flow::Return => return Ok(Flow::Return),
+                        other => return Ok(other),
                     }
                 }
             }

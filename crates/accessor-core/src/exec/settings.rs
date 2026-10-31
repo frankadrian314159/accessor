@@ -242,6 +242,11 @@ impl Database {
         crate::dialect::set_session(dialect);
     }
 
+    /// Are foreign keys checked? (`SET foreign_key_checks = 0` turns it off for the session.)
+    pub(crate) fn foreign_key_checks(&self) -> bool {
+        !matches!(self.settings.get("foreign_key_checks").map(|v| v.to_ascii_lowercase()).as_deref(), Some("0" | "off" | "false"))
+    }
+
     /// Is MySQL's `ONLY_FULL_GROUP_BY` in the `sql_mode` (it is in the default one)?
     pub(crate) fn only_full_group_by(&self) -> bool {
         self.settings.get("sql_mode").is_none_or(|m| m.to_ascii_uppercase().contains("ONLY_FULL_GROUP_BY"))

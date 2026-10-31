@@ -38,6 +38,10 @@ struct Names {
     records: Vec<String>,
     /// A function that returns a set of rows: `RETURN` takes no value.
     set: bool,
+    /// The handlers declared in the block being read.
+    handlers: Vec<Handler>,
+    /// `DECLARE name CONDITION FOR ...`
+    conditions: Vec<(String, HandlerCond)>,
 }
 
 impl Names {
@@ -148,7 +152,7 @@ impl<'a> Parser<'a> {
                     if params.iter().any(|p| p.name.eq_ignore_ascii_case(&pname)) {
                         return Err(Error::syntax(format!("the parameter {pname} is declared twice")));
                     }
-                    params.push(RoutineParam { name: pname, data_type: Some(ty), default });
+                    params.push(RoutineParam { name: pname, data_type: Some(ty), default, out: false });
                 }
                 if !self.eat_sym(",") {
                     break;
@@ -263,6 +267,8 @@ impl<'a> Parser<'a> {
             trigger: is_trigger,
             records: Vec::new(),
             set: !set_columns.is_empty(),
+            handlers: Vec::new(),
+            conditions: Vec::new(),
         };
         if is_trigger {
             if language != "plpgsql" {
@@ -924,14 +930,17 @@ impl<'a> Parser<'a> {
         let mut params: Vec<RoutineParam> = Vec::new();
         if !self.peek_sym(")") {
             loop {
-                self.eat_kw("IN");
-                if self.peek_kw("OUT") || self.peek_kw("INOUT") {
-                    return Err(Error::syntax("OUT and INOUT parameters are not supported"));
+                let mut out_param = false;
+                if self.eat_kw("OUT") || self.eat_kw("INOUT") {
+                    out_param = true;
+                } else {
+                    self.eat_kw("IN");
                 }
                 let pname = self.ident()?;
                 let ty = self.pg_type()?;
+                while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") {}
                 self.skip_charset();
-                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None });
+                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None, out: out_param });
                 if !self.eat_sym(",") {
                     break;
                 }
@@ -967,7 +976,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false };
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, handlers: Vec::new(), conditions: Vec::new() };
         let stmts = self.my_body(&mut names)?;
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
@@ -981,7 +990,7 @@ impl<'a> Parser<'a> {
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
     /// are variables.
     pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
-        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false };
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, handlers: Vec::new(), conditions: Vec::new() };
         let body = self.my_body(&mut names)?;
         fn check(list: &[ProcStmt]) -> Result<()> {
             for s in list {
@@ -1010,22 +1019,29 @@ impl<'a> Parser<'a> {
     fn my_body(&mut self, names: &mut Names) -> Result<Vec<ProcStmt>> {
         let mut out = Vec::new();
         if self.peek_kw("BEGIN") || (matches!(self.peek(), Tok::Ident(_)) && self.peek_sym_at(1, ":") && self.peek_kw_at(2, "BEGIN")) {
-            self.my_block(names, &mut out)?;
+            self.my_block(names, &mut out, None)?;
         } else {
             self.my_stmt(names, &mut out)?;
         }
         Ok(out)
     }
 
-    fn my_block(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>) -> Result<()> {
+    fn my_block(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>, label: Option<String>) -> Result<()> {
+        let mut label = label;
         if matches!(self.peek(), Tok::Ident(_)) && self.peek_sym_at(1, ":") {
-            self.advance();
+            label = Some(self.ident()?);
             self.advance();
         }
         self.expect_kw("BEGIN")?;
         self.eat_kw("ATOMIC");
+        let saved = std::mem::take(&mut names.handlers);
         let inner = self.my_stmts(names, &["END"])?;
-        out.extend(inner);
+        let handlers = std::mem::replace(&mut names.handlers, saved);
+        if handlers.is_empty() && label.is_none() {
+            out.extend(inner);
+        } else {
+            out.push(ProcStmt::Block { label, body: inner, handlers });
+        }
         self.expect_kw("END")?;
         // an end label
         if matches!(self.peek(), Tok::Ident(w) if !matches!(w.to_ascii_uppercase().as_str(), "ELSE" | "ELSEIF" | "UNTIL" | "WHEN")) && !self.peek_sym(";") {
@@ -1048,6 +1064,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// One condition of `DECLARE HANDLER FOR` / `DECLARE name CONDITION FOR`.
+    fn handler_condition(&mut self, names: &Names) -> Result<HandlerCond> {
+        if self.eat_kw("SQLEXCEPTION") {
+            return Ok(HandlerCond::SqlException);
+        }
+        if self.eat_kw("SQLWARNING") {
+            return Ok(HandlerCond::SqlWarning);
+        }
+        if self.eat_kw("NOT") {
+            self.expect_kw("FOUND")?;
+            return Ok(HandlerCond::NotFound);
+        }
+        if self.eat_kw("SQLSTATE") {
+            self.eat_kw("VALUE");
+            return match self.advance() {
+                Tok::Str(s) => Ok(HandlerCond::SqlState(s)),
+                _ => {
+                    self.pos = self.pos.saturating_sub(1);
+                    Err(self.unexpected("a SQLSTATE value"))
+                }
+            };
+        }
+        if let Tok::Int(n) = self.peek().clone() {
+            self.advance();
+            return Ok(HandlerCond::Code(n));
+        }
+        let name = self.ident()?;
+        names
+            .conditions
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+            .map(|(_, c)| c.clone())
+            .ok_or_else(|| Error::syntax(format!("the condition '{name}' is not declared")))
+    }
+
     fn my_end(&mut self) -> Result<()> {
         if self.eat_sym(";") || self.at_eof() || ["END", "ELSE", "ELSEIF", "UNTIL", "WHEN"].iter().any(|w| self.peek_kw(w)) {
             Ok(())
@@ -1058,23 +1109,57 @@ impl<'a> Parser<'a> {
 
     fn my_stmt(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>) -> Result<()> {
         // a label: `lbl: LOOP`
+        let mut label = None;
         if matches!(self.peek(), Tok::Ident(_)) && self.peek_sym_at(1, ":") && !self.peek_kw("BEGIN") {
-            self.advance();
+            label = Some(self.ident()?);
             self.advance();
         }
         if self.peek_kw("BEGIN") {
-            return self.my_block(names, out).and_then(|()| self.my_end());
+            return self.my_block(names, out, label).and_then(|()| self.my_end());
         }
+        let wrap = |label: Option<String>, out: &mut Vec<ProcStmt>| {
+            if let Some(label) = label {
+                if let Some(last) = out.pop() {
+                    out.push(ProcStmt::Labeled { label, stmt: Box::new(last) });
+                }
+            }
+        };
         if self.eat_kw("DECLARE") {
             if self.peek_kw("CONTINUE") || self.peek_kw("EXIT") || self.peek_kw("UNDO") {
-                return Err(Error::syntax("condition handlers (DECLARE ... HANDLER) are not supported"));
+                // DECLARE CONTINUE | EXIT HANDLER FOR condition [, ...] statement
+                let exit = !self.peek_kw("CONTINUE");
+                self.advance();
+                self.expect_kw("HANDLER")?;
+                self.expect_kw("FOR")?;
+                let mut conditions = Vec::new();
+                loop {
+                    conditions.push(self.handler_condition(names)?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                let mut body = Vec::new();
+                self.my_stmt(names, &mut body)?;
+                names.handlers.push(Handler { exit, conditions, body });
+                return Ok(());
             }
             let mut vars = vec![self.ident()?];
             while self.eat_sym(",") {
                 vars.push(self.ident()?);
             }
-            if self.peek_kw("CURSOR") || self.peek_kw("CONDITION") {
-                return Err(Error::syntax("cursors and named conditions are not supported"));
+            if self.eat_kw("CONDITION") {
+                self.expect_kw("FOR")?;
+                let cond = self.handler_condition(names)?;
+                names.conditions.push((vars.remove(0), cond));
+                return self.my_end();
+            }
+            if self.eat_kw("CURSOR") {
+                self.expect_kw("FOR")?;
+                let mut st = Statement::Select(self.select()?);
+                names.statement(&mut st)?;
+                let Statement::Select(select) = st else { unreachable!("a select") };
+                out.push(ProcStmt::DeclareCursor { name: vars.remove(0), select: Box::new(select) });
+                return self.my_end();
             }
             let ty = self.pg_type()?;
             self.skip_charset();
@@ -1148,6 +1233,7 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             out.push(ProcStmt::While { cond, body });
+            wrap(label, out);
             return self.my_end();
         }
         if self.eat_kw("REPEAT") {
@@ -1158,6 +1244,7 @@ impl<'a> Parser<'a> {
             self.expect_kw("REPEAT")?;
             body.push(ProcStmt::If { branches: vec![(cond, vec![ProcStmt::Leave])], otherwise: Vec::new() });
             out.push(ProcStmt::While { cond: lit_true(), body });
+            wrap(label, out);
             return self.my_end();
         }
         if self.eat_kw("LOOP") {
@@ -1165,17 +1252,45 @@ impl<'a> Parser<'a> {
             self.expect_kw("END")?;
             self.expect_kw("LOOP")?;
             out.push(ProcStmt::While { cond: lit_true(), body });
+            wrap(label, out);
             return self.my_end();
         }
         if self.eat_kw("LEAVE") {
             if matches!(self.peek(), Tok::Ident(_)) {
-                self.advance();
+                out.push(ProcStmt::LeaveTo(self.ident()?));
+            } else {
+                out.push(ProcStmt::Leave);
             }
-            out.push(ProcStmt::Leave);
             return self.my_end();
         }
-        if self.peek_kw("ITERATE") || self.peek_kw("OPEN") || self.peek_kw("FETCH") || self.peek_kw("CLOSE") {
-            return Err(Error::syntax("ITERATE and cursors are not supported"));
+        if self.eat_kw("ITERATE") {
+            out.push(ProcStmt::Iterate(self.ident()?));
+            return self.my_end();
+        }
+        if self.eat_kw("OPEN") {
+            out.push(ProcStmt::OpenCursor(self.ident()?));
+            return self.my_end();
+        }
+        if self.eat_kw("CLOSE") {
+            out.push(ProcStmt::CloseCursor(self.ident()?));
+            return self.my_end();
+        }
+        if self.eat_kw("FETCH") {
+            self.eat_kw("NEXT");
+            self.eat_kw("FROM");
+            let cursor = self.ident()?;
+            self.expect_kw("INTO")?;
+            let mut targets = vec![self.ident()?];
+            while self.eat_sym(",") {
+                targets.push(self.ident()?);
+            }
+            for t in &targets {
+                if !names.has(t) {
+                    return Err(Error::syntax(format!("'{t}' is not a declared variable or parameter")));
+                }
+            }
+            out.push(ProcStmt::Fetch { cursor, targets });
+            return self.my_end();
         }
         if self.eat_kw("RETURN") {
             let value = if self.peek_sym(";") || self.at_eof() || self.peek_kw("END") { None } else { Some(self.pl_expr(names)?) };

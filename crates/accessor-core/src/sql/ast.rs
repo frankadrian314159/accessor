@@ -379,6 +379,26 @@ pub struct RoutineParam {
     pub name: String,
     pub data_type: Option<DataType>,
     pub default: Option<Expr>,
+    /// `OUT` or `INOUT` (MySQL): the value at the end goes back to the variable the caller gave.
+    pub out: bool,
+}
+
+/// What a `DECLARE ... HANDLER` answers to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HandlerCond {
+    SqlException,
+    SqlWarning,
+    NotFound,
+    SqlState(String),
+    Code(i64),
+}
+
+/// `DECLARE CONTINUE | EXIT HANDLER FOR conditions statement`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handler {
+    pub exit: bool,
+    pub conditions: Vec<HandlerCond>,
+    pub body: Vec<ProcStmt>,
 }
 
 /// One statement of a stored procedure.
@@ -404,6 +424,19 @@ pub enum ProcStmt {
     ReturnNextRecord(String),
     /// `RETURN QUERY select`: the rows of the query are rows of the result.
     ReturnQuery(Box<Select>),
+    /// `BEGIN ... END` with handlers or a label; a plain block is just its statements.
+    Block { label: Option<String>, body: Vec<ProcStmt>, handlers: Vec<Handler> },
+    /// `label: WHILE | LOOP | REPEAT ...`
+    Labeled { label: String, stmt: Box<ProcStmt> },
+    /// `LEAVE label`
+    LeaveTo(String),
+    /// `ITERATE label`
+    Iterate(String),
+    DeclareCursor { name: String, select: Box<Select> },
+    OpenCursor(String),
+    CloseCursor(String),
+    /// `FETCH c INTO a, b`
+    Fetch { cursor: String, targets: Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -4704,7 +4704,8 @@ fn postgres_statement_forms() {
     let mut db = Database::in_memory();
     db.execute("CREATE TABLE t (a int, b text, c regclass, d inet, e int4range, f point)").unwrap();
     db.execute("CREATE INDEX ON t (a); CREATE INDEX CONCURRENTLY IF NOT EXISTS t_b ON t USING btree (b text_pattern_ops DESC NULLS LAST)").unwrap();
-    assert!(db.execute("CREATE INDEX ON t (lower(b))").is_err());
+    // an index on an expression is read and not built
+    db.execute("CREATE INDEX ON t (lower(b))").unwrap();
     db.execute("CREATE TABLE u (LIKE t INCLUDING ALL, z int)").unwrap();
     assert_eq!(db.query("SELECT * FROM u").unwrap().columns.len(), 7);
     db.execute("START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY; INSERT INTO t (a) VALUES (1); COMMIT AND CHAIN").unwrap();
@@ -6473,4 +6474,94 @@ fn mysql_delete_from_several_tables_at_once() {
     db.execute("DELETE t1, t2 FROM t1, t2 WHERE t1.a = t2.a").unwrap();
     assert_eq!(db.execute("SELECT a FROM t1").unwrap().rows.len(), 1);
     assert_eq!(db.execute("SELECT a FROM t2").unwrap().rows[0][0].to_string(), "4");
+}
+
+#[test]
+fn mysql_procedures_have_out_parameters_cursors_handlers_and_labels() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute("CREATE TABLE t (a INT, b INT); INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute(
+        "CREATE PROCEDURE sum_it(OUT total INT, INOUT extra INT)
+         BEGIN
+           DECLARE done INT DEFAULT 0;
+           DECLARE y INT;
+           DECLARE c CURSOR FOR SELECT b FROM t ORDER BY a;
+           DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+           SET total = 0;
+           OPEN c;
+           rd: LOOP
+             FETCH c INTO y;
+             IF done = 1 THEN LEAVE rd; END IF;
+             SET total = total + y;
+           END LOOP;
+           CLOSE c;
+           SET extra = extra + 1;
+         END",
+    )
+    .unwrap();
+    db.execute("SET @e = 5; CALL sum_it(@t, @e)").unwrap();
+    let r = db.execute("SELECT @t, @e").unwrap();
+    assert_eq!((r.rows[0][0].to_string(), r.rows[0][1].to_string()), ("60".into(), "6".into()));
+    db.execute("CREATE PROCEDURE h() BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION SET @caught = 1; INSERT INTO nope VALUES (1); SET @after = 1; END").unwrap();
+    db.execute("CALL h()").unwrap();
+    assert_eq!(db.execute("SELECT @caught, @after").unwrap().rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), vec!["1", ""]);
+    db.execute("CREATE PROCEDURE h2() BEGIN DECLARE CONTINUE HANDLER FOR SQLSTATE '42S02' SET @c = 1; INSERT INTO nope VALUES (1); SET @d = 2; END").unwrap();
+    db.execute("CALL h2()").unwrap();
+    assert_eq!(db.execute("SELECT @c, @d").unwrap().rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), vec!["1", "2"]);
+    db.execute("CREATE PROCEDURE it() BEGIN DECLARE i INT DEFAULT 0; DECLARE s INT DEFAULT 0; l: WHILE i < 5 DO SET i = i + 1; IF i = 3 THEN ITERATE l; END IF; SET s = s + i; END WHILE; SET @s = s; END").unwrap();
+    db.execute("CALL it()").unwrap();
+    assert_eq!(db.execute("SELECT @s").unwrap().rows[0][0].to_string(), "12");
+}
+
+#[test]
+fn mysql_join_chains_nested_lists_update_and_misc_forms() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute("CREATE TABLE t (a INT); INSERT INTO t VALUES (1),(2)").unwrap();
+    // each ON closes the join before it: t1 LEFT JOIN (t2 RIGHT JOIN (t3 JOIN t4 ON 1) ON 1) ON 1
+    assert_eq!(db.execute("SELECT COUNT(*) FROM t t1 LEFT JOIN t t2 RIGHT JOIN t t3 JOIN t t4 ON 1 ON 1 ON 1").unwrap().rows[0][0].to_string(), "16");
+    db.execute("CREATE TABLE u1 (a INT, b INT); CREATE TABLE u2 (a INT, b INT); CREATE TABLE u3 (a INT, b INT); INSERT INTO u1 VALUES (1,1); INSERT INTO u2 VALUES (1,2); INSERT INTO u3 VALUES (1,3)").unwrap();
+    db.execute("UPDATE u2 INNER JOIN (u1 JOIN u3 USING (a)) USING (a) SET u2.b = 9 WHERE u1.b <> u2.b").unwrap();
+    assert_eq!(db.execute("SELECT b FROM u2").unwrap().rows[0][0].to_string(), "9");
+    db.execute("UPDATE u1 JOIN u2 ON u1.a = u2.a SET u1.b = u2.b + 1, u2.b = 0").unwrap();
+    assert_eq!((db.execute("SELECT b FROM u1").unwrap().rows[0][0].to_string(), db.execute("SELECT b FROM u2").unwrap().rows[0][0].to_string()), ("10".into(), "0".into()));
+    // an unset variable is NULL; COUNT(DISTINCT a, b); DEFAULT(col); DROP DATABASE with tables; foreign_key_checks
+    assert_eq!(db.execute("SELECT @nothing + 1").unwrap().rows[0][0].to_string(), "");
+    db.execute("CREATE TABLE d (a INT, b INT DEFAULT 5); INSERT INTO d VALUES (1,2),(1,2),(2,NULL)").unwrap();
+    assert_eq!(db.execute("SELECT COUNT(DISTINCT a, b) FROM d").unwrap().rows[0][0].to_string(), "1");
+    assert_eq!(db.execute("SELECT DEFAULT(b) FROM d LIMIT 1").unwrap().rows[0][0].to_string(), "5");
+    db.execute("CREATE DATABASE dd; CREATE TABLE dd.q (a INT); DROP DATABASE dd").unwrap();
+    db.execute("SET foreign_key_checks = 0; CREATE TABLE par (a INT PRIMARY KEY); CREATE TABLE ch (a INT, FOREIGN KEY (a) REFERENCES par (a)); DROP TABLE par").unwrap();
+    assert!(db.execute("SHOW CREATE USER 'u1'@'localhost'").unwrap().rows[0][0].to_string().starts_with("CREATE USER `u1`@`localhost`"));
+    // a column added NOT NULL to a table with rows takes the type's default; the new forms of other statements
+    db.execute("ALTER TABLE d ADD COLUMN c VARCHAR(5) NOT NULL").unwrap();
+    assert_eq!(db.execute("SELECT c FROM d LIMIT 1").unwrap().rows[0][0].to_string(), "");
+    db.execute("CREATE TABLE f (a INT, b TEXT, FULLTEXT idx (b)) TABLESPACE = innodb_system; CREATE ROLE r1, r2; RESET BINARY LOGS AND GTIDS").unwrap();
+    assert_eq!(db.execute("SELECT NOW(3) IS NOT NULL, INTERVAL(5, 1, 3, 7), GET_FORMAT(DATE, 'USA')").unwrap().rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), vec!["1", "2", "%m.%d.%Y"]);
+}
+
+#[test]
+fn postgresql_full_text_search() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT to_tsvector('english', 'a fat cat sat on a mat and ate a fat rat')"), "'ate':9 'cat':3 'fat':2,11 'mat':7 'rat':12 'sat':4");
+    assert_eq!(one(&mut db, "SELECT to_tsquery('english', 'The & Fat & Rats')"), "'fat' & 'rat'");
+    assert_eq!(one(&mut db, "SELECT plainto_tsquery('english', 'the fat cats')"), "'fat' & 'cat'");
+    assert_eq!(one(&mut db, "SELECT websearch_to_tsquery('english', '\"fat cat\" or rat -dog')"), "'fat' <-> 'cat' | 'rat' & !'dog'");
+    assert_eq!(one(&mut db, "SELECT 'a fat cat'::tsvector"), "'a' 'cat' 'fat'");
+    assert_eq!(one(&mut db, "SELECT to_tsvector('fat cats ate rats') @@ to_tsquery('cat & rat')"), "true");
+    assert_eq!(one(&mut db, "SELECT to_tsvector('fat cats ate rats') @@ to_tsquery('cat <-> rat')"), "false");
+    assert_eq!(one(&mut db, "SELECT to_tsvector('fat cats') @@ to_tsquery('fat <-> cat')"), "true");
+    assert_eq!(one(&mut db, "SELECT setweight(to_tsvector('fat cat'), 'A')"), "'cat':2A 'fat':1A");
+    assert_eq!(one(&mut db, "SELECT ts_headline('english', 'The fat cat ate the rat', to_tsquery('cat'))"), "The fat <b>cat</b> ate the rat");
+    assert_eq!(one(&mut db, "SELECT round(ts_rank(to_tsvector('fat cat'), to_tsquery('cat'))::numeric, 6)"), "0.060793");
+    db.execute("CREATE TABLE docs (id int, body text, tsv tsvector); CREATE INDEX di ON docs USING gin (to_tsvector('english', body)); CREATE TEXT SEARCH CONFIGURATION mine (COPY = english)").unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'The quick brown fox', to_tsvector('english', 'The quick brown fox')), (2, 'lazy dogs', to_tsvector('english', 'lazy dogs'))").unwrap();
+    assert_eq!(db.execute("SELECT id FROM docs WHERE tsv @@ to_tsquery('english', 'fox | dog') ORDER BY id").unwrap().rows.len(), 2);
+    assert_eq!(db.execute("SELECT id FROM docs WHERE tsv @@ to_tsquery('english', 'foxes')").unwrap().rows.len(), 1);
 }

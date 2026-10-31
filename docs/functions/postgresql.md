@@ -63,10 +63,27 @@ SELECT to_date('March 5, 2024', 'Month DD, YYYY');                          -- 2
 
 `array_length`, `array_append`, `array_cat`, `array_position`, `array_to_string`, `string_to_array`, `array_agg`, `unnest`, `cardinality` and the rest work on the `ARRAY` type: see [../types/array.md](../types/array.md).
 
+## Full-text search
+
+A `tsvector` and a `tsquery` are kept as text in the form PostgreSQL prints them (`'cat':3 'fat':2`, `'fat' & 'cat'`), so a column of either type is a text column, and `'a fat cat'::tsvector` and `'fat & cat'::tsquery` read and normalise their text.
+
+| Function | What it gives |
+| --- | --- |
+| `to_tsvector([config,] text)` | the words of the text, lower-cased, with their positions; the `english` configuration (the default) drops stop words and stems with the Snowball English stemmer, any other configuration (`simple`) keeps the words as they are |
+| `to_tsquery([config,] text)` | the query `'fat & rats'` with its words stemmed and its stop words dropped; `&`, `\|`, `!`, `<->`, `<n>`, `( )`, `word:*` and `word:AB` are read |
+| `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery` | a query from plain text (ANDed), a phrase (`<->`, or `<n>` over a stop word), or a search box (`"a phrase"`, `or`, `-word`) |
+| `vector @@ query` | true when the query holds; phrases use the positions. Plain text on either side is read as a document or a query. (`jsonb @@ path` is still the JSON path match.) |
+| `setweight(vector, 'A'..'D' [, words])`, `strip(vector)`, `ts_delete`, `ts_filter`, `tsvector_to_array`, `array_to_tsvector`, `tsvector_concat`, `numnode`, `querytree` | the vector or query changed or measured |
+| `ts_rank(vector, query [, norm])`, `ts_rank_cd(...)` | PostgreSQL's rank formulas (weights 0.1, 0.2, 0.4, 1.0); `ts_rank_cd` gives the same numbers as `ts_rank`; the array of weights is not accepted |
+| `ts_headline([config,] text, query [, options])` | the text with the words of the query between `<b>` and `</b>` (`StartSel`, `StopSel`, `MaxWords`, `MinWords`, `FragmentDelimiter`, `HighlightAll`) |
+| `json_to_tsvector`, `jsonb_to_tsvector` | the strings (and, by the filter, numbers, booleans, keys) of a JSON document |
+
+The parser sees a word as letters and digits (`3.14` is one word); e-mail addresses, URLs and hyphenated words are not told apart. `CREATE INDEX ... USING gin (to_tsvector('english', col))` is accepted and builds nothing: an index on an expression is read and ignored.
+
 ## For a database with one user
 
 `has_table_privilege`, `has_schema_privilege`, `has_column_privilege`, `has_function_privilege`, `has_database_privilege`, `has_sequence_privilege`, `has_type_privilege`, `has_language_privilege`, `has_tablespace_privilege`, `has_server_privilege`, `has_foreign_data_wrapper_privilege`, `has_largeobject_privilege` and `has_parameter_privilege` are **always true** (NULL if an argument is NULL): they do not look at the roles of [roles-and-privileges.md](../sql/roles-and-privileges.md). `pg_sleep(seconds)` waits that long, at most a second. `pg_advisory_lock`, `pg_advisory_unlock` and `pg_stat_force_next_flush` do nothing and return NULL. `pg_get_viewdef('name')` is the text of a saved query (the name must be written in quotes in the statement).
 
 ## Not available
 
-Full-text search (`to_tsvector`, `to_tsquery`, `ts_*`), the SQL/JSON path functions (`jsonb_path_query` and its relatives), XML functions, ranges and multiranges, `regexp_matches` and `regexp_split_to_array`, `encode`/`decode` and large objects (there is no `BLOB` type), and the statistical aggregates `corr`, `covar_pop`, `regr_slope` and their relatives.
+The text search objects (`CREATE TEXT SEARCH CONFIGURATION`, dictionaries, parsers: read and ignored), `ts_lexize`, `ts_debug`, `ts_stat`, `tsvector || tsvector` (the two texts are joined; use `tsvector_concat`), the SQL/JSON path functions (`jsonb_path_query` and its relatives), XML functions, ranges and multiranges, `regexp_matches` and `regexp_split_to_array`, `encode`/`decode` and large objects (there is no `BLOB` type), and the statistical aggregates `corr`, `covar_pop`, `regr_slope` and their relatives.

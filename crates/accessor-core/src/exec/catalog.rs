@@ -81,6 +81,8 @@ impl Database {
                     self.table_names().into_iter().filter(|t| key(t).starts_with(&prefix)).map(String::from).collect();
                 let views: Vec<String> =
                     self.view_names().into_iter().filter(|t| key(t).starts_with(&prefix)).map(String::from).collect();
+                // MySQL's DROP DATABASE drops what is in it
+                let cascade = cascade || crate::dialect::current() == crate::dialect::Dialect::Mysql;
                 if (!tables.is_empty() || !views.is_empty()) && !cascade {
                     return Err(Error::catalog(format!(
                         "cannot drop schema {name} because other objects depend on it (use DROP SCHEMA {name} CASCADE)"

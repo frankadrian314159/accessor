@@ -56,6 +56,8 @@ pub enum PgFn {
     JsonbSet,
     JsonbInsert,
     JsonStripNulls,
+    /// A full-text search function ([`super::tsearch`]).
+    Ts(&'static str),
 }
 
 pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
@@ -100,8 +102,9 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
         "PG_RELATION_SIZE" | "PG_TOTAL_RELATION_SIZE" | "PG_TABLE_SIZE" | "PG_INDEXES_SIZE" | "PG_DATABASE_SIZE" => (Zero, 1, 2),
         "TO_REGCLASS" | "TO_REGTYPE" | "TO_REGPROC" | "TO_REGROLE" | "TO_REGNAMESPACE" | "TO_REGPROCEDURE" | "TO_REGOPER" | "TO_REGDATABASE" => (Same, 1, 1),
         _ => {
-            return super::arrays::lookup(name)
-                .map(|(m, a, b)| (Arr(m), a, b))
+            return super::tsearch::lookup(name)
+                .map(|(n, a, b)| (Ts(n), a, b))
+                .or_else(|| super::arrays::lookup(name).map(|(m, a, b)| (Arr(m), a, b)))
                 .or_else(|| super::myfuncs::lookup(name).map(|(m, a, b)| (My(m), a, b)))
         }
     })
@@ -309,6 +312,11 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 other => return Err(Error::runtime(format!("unrecognized encoding: \"{other}\""))),
             };
             Value::text(&String::from_utf8_lossy(&bytes))
+        }
+        Ts(name) => return super::tsearch::call(name, vals),
+        // `a @@ b` is a full-text match when `a` is text (a tsvector or a document) and a path match when it is a JSON value
+        JsonPathMatch if !matches!(vals[0].as_ref(), Value::Json(_)) && !vals[0].is_null() && vals.len() == 4 => {
+            return super::tsearch::call("__TS_MATCH", &vals[..2]);
         }
         JsonPathArray | JsonPathFirst | JsonPathExists | JsonPathMatch => {
             let (doc, path, vars, silent) = json_path_args(vals)?;
