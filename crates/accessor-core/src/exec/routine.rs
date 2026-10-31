@@ -127,6 +127,12 @@ enum Flow {
     Return,
 }
 
+/// A function that returns a set of rows with `RETURN NEXT` / `RETURN QUERY` statements, rather than as a query of its own
+/// (a `LANGUAGE sql` body ends with the query whose rows it gives).
+fn returns_rows_by_statements(d: &RoutineDef) -> bool {
+    d.function && !d.set_columns.is_empty() && matches!(&d.body, RoutineBody::Block(b) if !matches!(b.last(), Some(ProcStmt::Sql(Statement::Select(_)))))
+}
+
 struct Frame {
     vars: HashMap<String, Value>,
     types: HashMap<String, DataType>,
@@ -220,7 +226,7 @@ impl Database {
         }
         let mut copy = st.clone();
         let mut any = false;
-        if self.routines.values().any(|r| r.function && !r.set_columns.is_empty() && matches!(r.body, RoutineBody::Block(_))) {
+        if self.routines.values().any(|r| returns_rows_by_statements(r)) {
             match &mut copy {
                 Statement::Select(s) => any |= self.materialise_set_calls(s, 0, false)?,
                 Statement::Insert { source: crate::sql::ast::InsertSource::Select(s), .. } => any |= self.materialise_set_calls(s, 0, false)?,
@@ -303,7 +309,7 @@ impl Database {
         for f in factors {
             match f {
                 TableFactor::Function { name, args, alias, .. } => {
-                    let Some(def) = self.routine_def(name).filter(|d| d.function && !d.set_columns.is_empty() && matches!(d.body, RoutineBody::Block(_))) else { continue };
+                    let Some(def) = self.routine_def(name).filter(|d| returns_rows_by_statements(d)) else { continue };
                     let mut vals = Vec::with_capacity(args.len());
                     let mut known = true;
                     for a in args.iter() {
