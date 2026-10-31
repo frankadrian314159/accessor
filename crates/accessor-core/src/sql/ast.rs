@@ -114,6 +114,9 @@ pub enum TableFactor {
     Function { name: String, args: Vec<Expr>, alias: String, columns: Vec<String> },
     /// Rows already computed (the result of a common table expression).
     Materialized { rows: Arc<Vec<Row>>, columns: Vec<String>, alias: String },
+    /// A parenthesised join list that cannot be written as a flat one, `a LEFT JOIN (b JOIN c ON ..) ON ..`: its tables
+    /// are joined first, and the result is one source whose columns still belong to the tables they came from.
+    Nested { from: Box<From>, alias: String },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

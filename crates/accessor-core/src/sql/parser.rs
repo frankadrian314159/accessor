@@ -560,6 +560,7 @@ impl<'a> Parser<'a> {
             Tok::Eof => "end of input".to_string(),
             Tok::Ident(s) | Tok::Quoted(s) => format!("'{s}'"),
             Tok::Str(s) => format!("'{s}'"),
+            Tok::Bytes(_) => "a binary literal".to_string(),
             Tok::Int(i) => i.to_string(),
             Tok::Dec(d) => d.to_string(),
             Tok::Big(b) => b.to_string(),
@@ -3353,6 +3354,10 @@ impl<'a> Parser<'a> {
             self.advance();
         }
         let unique = self.eat_kw("UNIQUE");
+        // MySQL: CREATE FULLTEXT INDEX / SPATIAL INDEX is an ordinary index here (MATCH reads the column itself)
+        if !unique && (self.peek_kw("FULLTEXT") || self.peek_kw("SPATIAL")) && self.peek_kw_at(1, "INDEX") {
+            self.advance();
+        }
         if !unique && self.eat_kw("TRIGGER") {
             return self.trigger(create_pos);
         }
@@ -5099,59 +5104,22 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             };
-            // `a JOIN (b JOIN c ON ..) ON ..`: for an inner join the nested list reads the same as a flat one
-            let nested = if self.peek_sym("(") && matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) && !natural && self.parenthesised_join_ahead() {
-                Some(self.from_source()?).filter(|f| !f.joins.is_empty())
-            } else {
-                None
-            };
-            if let Some(inner) = nested {
-                // `a [LEFT] JOIN (b LEFT JOIN c ON ..) ON y` is `a [LEFT] JOIN b ON y LEFT JOIN c ON ..` while `y` leaves
-                // `c` alone: the rows of `b` are found first and `c` is then looked up for each
-                if matches!(kind, JoinKind::Inner | JoinKind::Left) && inner.joins.iter().all(|j| j.kind == JoinKind::Left) {
-                    self.expect_kw("ON")?;
-                    let mut on = self.expr()?;
-                    let mut later: Vec<String> = Vec::new();
-                    for j in &inner.joins {
-                        later.extend(factor_names(&j.factor));
-                    }
-                    let mut reads_later = false;
-                    let _ = crate::sql::walk::walk_expr(&mut on, &mut |e| {
-                        if let Expr::Column { table: Some(t), .. } = e {
-                            reads_later |= later.iter().any(|n| n.eq_ignore_ascii_case(t));
-                        }
-                        Ok(())
-                    });
-                    if reads_later {
-                        return Err(Error::syntax("the condition of a join with a nested outer join list may not read the inner side of that list"));
-                    }
-                    from.joins.push(Join { kind, factor: inner.first, on: Some(on), using: Vec::new(), natural: false });
-                    from.joins.extend(inner.joins);
+            // a parenthesised join list on the right: written as a flat list when that reads the same, else a source of its own
+            let mut nested_factor = None;
+            if self.peek_sym("(") && !natural && self.parenthesised_join_ahead() {
+                let inner = self.from_source()?;
+                if inner.joins.is_empty() {
+                    nested_factor = Some(inner.first);
+                } else if self.flatten_nested(&mut from, kind, &inner)? {
                     continue;
+                } else {
+                    nested_factor = Some(TableFactor::Nested { from: Box::new(inner), alias: format!("__nest{}", self.pos) });
                 }
-                if inner.joins.iter().any(|j| !matches!(j.kind, JoinKind::Inner | JoinKind::Cross)) || kind == JoinKind::Left {
-                    return Err(Error::syntax("this outer join inside a nested join list is not supported"));
-                }
-                let outer_on = if self.eat_kw("ON") { Some(self.expr()?) } else { None };
-                from.joins.push(Join { kind: JoinKind::Cross, factor: inner.first, on: None, using: Vec::new(), natural: false });
-                let last = inner.joins.len() - 1;
-                for (i, mut j) in inner.joins.into_iter().enumerate() {
-                    if i == last {
-                        if let Some(o) = outer_on.clone() {
-                            j.on = Some(match j.on.take() {
-                                Some(own) => Expr::Binary { op: BinOp::And, left: Box::new(own), right: Box::new(o) },
-                                None => o,
-                            });
-                            if j.kind == JoinKind::Cross {
-                                j.kind = JoinKind::Inner;
-                            }
-                        }
-                    }
-                    from.joins.push(j);
-                }
-                continue;
             }
-            let factor = self.table_factor()?;
+            let factor = match nested_factor {
+                Some(f) => f,
+                None => self.table_factor()?,
+            };
             let mut on = None;
             let mut using = Vec::new();
             if kind != JoinKind::Cross && !natural {
@@ -5170,6 +5138,55 @@ impl<'a> Parser<'a> {
             from.joins.push(Join { kind, factor, on, using, natural });
         }
         Ok(from)
+    }
+
+    /// A join with a parenthesised list `inner` on its right, read as the flat list where that means the same: a list of
+    /// left joins under an inner or left join (while the condition leaves the later tables alone), or a list of inner
+    /// joins under an inner join. Reads the condition; false (and nothing read) when it is not so.
+    fn flatten_nested(&mut self, from: &mut From, kind: JoinKind, inner: &From) -> Result<bool> {
+        if matches!(kind, JoinKind::Inner | JoinKind::Left) && inner.joins.iter().all(|j| j.kind == JoinKind::Left) {
+            self.expect_kw("ON")?;
+            let mut on = self.expr()?;
+            let mut later: Vec<String> = Vec::new();
+            for j in &inner.joins {
+                later.extend(factor_names(&j.factor));
+            }
+            let mut reads_later = false;
+            let _ = crate::sql::walk::walk_expr(&mut on, &mut |e| {
+                if let Expr::Column { table: Some(t), .. } = e {
+                    reads_later |= later.iter().any(|n| n.eq_ignore_ascii_case(t));
+                }
+                Ok(())
+            });
+            if reads_later {
+                return Err(Error::syntax("the condition of a join with a nested outer join list may not read the inner side of that list"));
+            }
+            from.joins.push(Join { kind, factor: inner.first.clone(), on: Some(on), using: Vec::new(), natural: false });
+            from.joins.extend(inner.joins.iter().cloned());
+            return Ok(true);
+        }
+        if matches!(kind, JoinKind::Inner | JoinKind::Cross) && inner.joins.iter().all(|j| matches!(j.kind, JoinKind::Inner | JoinKind::Cross)) {
+            let outer_on = if self.eat_kw("ON") { Some(self.expr()?) } else { None };
+            from.joins.push(Join { kind: JoinKind::Cross, factor: inner.first.clone(), on: None, using: Vec::new(), natural: false });
+            let last = inner.joins.len() - 1;
+            for (i, j) in inner.joins.iter().enumerate() {
+                let mut j = j.clone();
+                if i == last {
+                    if let Some(o) = outer_on.clone() {
+                        j.on = Some(match j.on.take() {
+                            Some(own) => Expr::Binary { op: BinOp::And, left: Box::new(own), right: Box::new(o) },
+                            None => o,
+                        });
+                        if j.kind == JoinKind::Cross {
+                            j.kind = JoinKind::Inner;
+                        }
+                    }
+                }
+                from.joins.push(j);
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// A table factor, or a parenthesised join list (Access nests joins).
@@ -5454,6 +5471,10 @@ impl<'a> Parser<'a> {
             // The catalog, as tables: INFORMATION_SCHEMA.COLUMNS and so on.
             let part = self.ident()?;
             name = format!("information_schema.{}", part.to_ascii_lowercase());
+            default_alias = Some(part);
+        } else if name.eq_ignore_ascii_case("performance_schema") && self.eat_sym(".") {
+            let part = self.ident()?;
+            name = format!("performance_schema.{}", part.to_ascii_lowercase());
             default_alias = Some(part);
         } else if self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
             self.advance();
@@ -5942,6 +5963,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::Literal(Value::text(&s)))
             }
+            Tok::Bytes(b) => {
+                self.advance();
+                Ok(Expr::Literal(Value::bytes(b)))
+            }
             Tok::Date(d) => {
                 self.advance();
                 Ok(Expr::Literal(Value::DateTime(d)))
@@ -6196,6 +6221,60 @@ impl<'a> Parser<'a> {
                         let hay = self.expr()?;
                         self.expect_sym(")")?;
                         return Ok(Expr::Function { name: "INSTR".into(), args: vec![hay, needle], distinct: false, star: false });
+                    }
+                    "MATCH" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        // MATCH (col, ..) AGAINST (expr [IN NATURAL LANGUAGE MODE | IN BOOLEAN MODE | WITH QUERY EXPANSION])
+                        self.advance();
+                        self.advance();
+                        let mut args = vec![Expr::Literal(Value::text("natural")), Expr::Literal(Value::Null)];
+                        loop {
+                            args.push(self.primary_column()?);
+                            if !self.eat_sym(",") {
+                                break;
+                            }
+                        }
+                        self.expect_sym(")")?;
+                        self.expect_kw("AGAINST")?;
+                        self.expect_sym("(")?;
+                        args[1] = self.additive()?;
+                        if self.eat_kw("IN") {
+                            if self.eat_kw("BOOLEAN") {
+                                self.expect_kw("MODE")?;
+                                args[0] = Expr::Literal(Value::text("boolean"));
+                            } else {
+                                for w in ["NATURAL", "LANGUAGE", "MODE"] {
+                                    self.expect_kw(w)?;
+                                }
+                            }
+                        }
+                        if self.eat_kw("WITH") {
+                            for w in ["QUERY", "EXPANSION"] {
+                                self.expect_kw(w)?;
+                            }
+                        }
+                        self.expect_sym(")")?;
+                        return Ok(Expr::Function { name: "__MATCH_AGAINST".into(), args, distinct: false, star: false });
+                    }
+                    "WEIGHT_STRING" if matches!(self.peek_at(1), Tok::Sym("(")) => {
+                        // WEIGHT_STRING(str [AS {CHAR | BINARY}(n)] [LEVEL n | n-m | n, m ..] [flags]): the arguments after
+                        // the string are the kind and the length, and the levels and flags are read and ignored
+                        self.advance();
+                        self.advance();
+                        let s = self.expr()?;
+                        let mut args = vec![s, Expr::Literal(Value::text("")), Expr::Literal(Value::Int(-1))];
+                        if self.eat_kw("AS") {
+                            let kind = self.ident()?.to_ascii_lowercase();
+                            self.expect_sym("(")?;
+                            let n = self.usize_literal()?;
+                            self.expect_sym(")")?;
+                            args[1] = Expr::Literal(Value::text(&kind));
+                            args[2] = Expr::Literal(Value::Int(n as i64));
+                        }
+                        while !self.peek_sym(")") && !self.at_eof() {
+                            self.advance();
+                        }
+                        self.expect_sym(")")?;
+                        return Ok(Expr::Function { name: "WEIGHT_STRING".into(), args, distinct: false, star: false });
                     }
                     "SUBSTRING" if matches!(self.peek_at(1), Tok::Sym("(")) => {
                         self.advance();
@@ -6621,6 +6700,11 @@ impl<'a> Parser<'a> {
         self.expect_sym(")")?;
         let source = TableFactor::Function { name: "JSONB_PATH_QUERY".into(), args: vec![doc, path], alias: src, columns: vec!["v".into()] };
         Ok(Select { items, from: Some(From { first: source, joins }), ..Select::default() })
+    }
+
+    /// A column, written `col` or `table.col`.
+    fn primary_column(&mut self) -> Result<Expr> {
+        self.column_ref()
     }
 
     fn cast_expr(&mut self) -> Result<Expr> {

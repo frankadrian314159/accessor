@@ -20,6 +20,8 @@ pub enum Tok {
     /// A literal with an exponent.
     Float(f64),
     Str(String),
+    /// An `X'..'` literal whose bytes are not valid UTF-8.
+    Bytes(Vec<u8>),
     Date(i64),
     Sym(&'static str),
     /// `@name` — a query parameter.
@@ -159,9 +161,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 return Err(Error::syntax("an X'...' literal needs an even number of hexadecimal digits"));
             }
             let bytes: Vec<u8> = (0..hex.len()).step_by(2).map(|k| u8::from_str_radix(&hex[k..k + 2], 16).expect("hex digits")).collect();
-            let text = String::from_utf8(bytes)
-                .map_err(|_| Error::syntax("an X'...' literal is read as text, and these bytes are not valid UTF-8 (there is no BLOB type)"))?;
-            out.push(Token { tok: Tok::Str(text), pos });
+            match String::from_utf8(bytes) {
+                Ok(text) => out.push(Token { tok: Tok::Str(text), pos }),
+                Err(e) => out.push(Token { tok: Tok::Bytes(e.into_bytes()), pos }),
+            }
         } else if c == '$' && at(i + 1).is_some_and(|d| d.is_ascii_digit()) {
             // `$1`: the first argument of a PostgreSQL-style function body
             i += 1;

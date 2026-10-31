@@ -520,7 +520,10 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
     Ok(match f {
         UCase => Value::text(&text_of(v0.unwrap()).to_uppercase()),
         LCase => Value::text(&text_of(v0.unwrap()).to_lowercase()),
-        Len => Value::Int(text_of(v0.unwrap()).chars().count() as i64),
+        Len => match v0.unwrap() {
+            Value::Bytes(b) => Value::Int(b.len() as i64),
+            other => Value::Int(text_of(other).chars().count() as i64),
+        },
         Trim => Value::text(text_of(v0.unwrap()).trim()),
         LTrim => Value::text(text_of(v0.unwrap()).trim_start()),
         RTrim => Value::text(text_of(v0.unwrap()).trim_end()),
@@ -769,7 +772,10 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         Sinh => float_result(f64_of(v0.unwrap())?.sinh(), v0.unwrap(), "Sinh")?,
         Cosh => float_result(f64_of(v0.unwrap())?.cosh(), v0.unwrap(), "Cosh")?,
         Tanh => float_result(f64_of(v0.unwrap())?.tanh(), v0.unwrap(), "Tanh")?,
-        OctetLength => Value::Int(text_of(v0.unwrap()).len() as i64),
+        OctetLength => match v0.unwrap() {
+            Value::Bytes(b) => Value::Int(b.len() as i64),
+            other => Value::Int(text_of(other).len() as i64),
+        },
         GroupingBit => {
             let mask = int_of(&vals[0])?;
             let n = vals.len() - 1;

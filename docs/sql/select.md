@@ -61,7 +61,7 @@ FROM ((Customers C INNER JOIN Orders O ON O.CustID = C.ID)
       INNER JOIN Lines L ON L.OrderID = O.ID)
 ```
 
-A list may also stand on the right of an inner join, `A JOIN (B JOIN C ON ..) ON ..`; it is read as the flat join with both conditions kept. A list of left joins may stand on the right of an inner or left join, `A LEFT JOIN (B LEFT JOIN C ON ..) ON ..`; it is read as `A LEFT JOIN B ON .. LEFT JOIN C ON ..`, so the outer condition may not name tables of the list other than the first (that is refused). Other outer joins inside a nested list are not supported.
+A list may also stand on the right of an inner join, `A JOIN (B JOIN C ON ..) ON ..`; it is read as the flat join with both conditions kept. A list of left joins may stand on the right of an inner or left join, `A LEFT JOIN (B LEFT JOIN C ON ..) ON ..`; it is read as `A LEFT JOIN B ON .. LEFT JOIN C ON ..`, so the outer condition may not name tables of the list other than the first (that is refused). Any other list (an inner join list under a left or right join, an outer join list under a right or full join, `t1 LEFT JOIN (t2, t3) ON ..`) is joined first and read as one source whose columns still belong to their own tables (`t2.c` works outside the parentheses); a LATERAL item inside such a list can read the tables inside the list, not the query around it.
 
 ### USING and NATURAL
 

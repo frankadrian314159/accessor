@@ -117,6 +117,16 @@ fn walk_factor(t: &mut TableFactor, f: &mut Visitor) -> Result<()> {
             values.iter_mut().try_for_each(|(v, _)| walk_expr(v, f))
         }
         TableFactor::Unpivot { source, .. } => walk_factor(source, f),
+        TableFactor::Nested { from, .. } => {
+            walk_factor(&mut from.first, f)?;
+            for j in &mut from.joins {
+                walk_factor(&mut j.factor, f)?;
+                if let Some(on) = &mut j.on {
+                    walk_expr(on, f)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 

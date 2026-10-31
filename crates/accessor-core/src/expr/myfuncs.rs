@@ -71,6 +71,11 @@ pub enum MyFn {
     Week,
     ExportSet,
     FoundRows,
+    /// `WEIGHT_STRING(str, kind, n)`: the sort key of a string, in the case-folded form of the default collation
+    /// (not the byte-for-byte weights of MySQL's collation tables, but equal for the strings that compare equal).
+    WeightString,
+    /// `__MATCH_AGAINST(mode, query, col, ..)`: MySQL's `MATCH (col, ..) AGAINST (query)`; a relevance, 0 for no match.
+    MatchAgainst,
     /// `@name := expr` inside an expression: the value, and the variable set when the statement is over.
     AssignVar,
     /// JSON_TABLE `ERROR ON EMPTY`: the value, or an error when the path matched nothing.
@@ -138,6 +143,8 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "WEEK" => (Week, 1, 2),
         "EXPORT_SET" => (ExportSet, 3, 5),
         "FOUND_ROWS" => (FoundRows, 0, 0),
+        "WEIGHT_STRING" => (WeightString, 3, 3),
+        "__MATCH_AGAINST" => (MatchAgainst, 3, usize::MAX),
         "__ASSIGN_VAR" => (AssignVar, 2, 2),
         "__JT_REQUIRE" => (JsonTableRequire, 2, 2),
         "LAST_INSERT_ID" => (LastInsertId, 0, 1),
@@ -150,7 +157,7 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
 impl MyFn {
     /// Functions that get their NULL arguments instead of answering NULL themselves.
     pub fn handles_null(self) -> bool {
-        matches!(self, MyFn::Field | MyFn::Char)
+        matches!(self, MyFn::Field | MyFn::Char | MyFn::MatchAgainst)
     }
 
     /// Functions that give a different answer each time.
@@ -463,6 +470,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
     Ok(match f {
         Hex => match v(0) {
             Value::Int(i) => Value::text(&format!("{:X}", *i as u64)),
+            Value::Bytes(b) => Value::text(&b.iter().map(|b| format!("{b:02X}")).collect::<String>()),
             other => Value::text(&text(other).bytes().map(|b| format!("{b:02X}")).collect::<String>()),
         },
         Unhex => {
@@ -471,7 +479,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 return Ok(Value::Null);
             }
             let bytes: Vec<u8> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0)).collect();
-            Value::text(&String::from_utf8_lossy(&bytes))
+            Value::bytes(bytes)
         }
         Ascii => Value::Int(text(v(0)).bytes().next().map_or(0, i64::from)),
         Space => Value::text(&" ".repeat(int(v(0)).unwrap_or(0).clamp(0, 1 << 20) as usize)),
@@ -684,7 +692,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::DateTime(to.to_local(from.to_utc(local)))
         }
         BitCount => Value::Int(int(v(0)).map_or(0, |n| (n as u64).count_ones() as i64)),
-        BitLength => Value::Int(text(v(0)).len() as i64 * 8),
+        BitLength => Value::Int(v(0).as_bytes().map_or_else(|| text(v(0)).len(), |b| b.len()) as i64 * 8),
         InsertStr => {
             // INSERT(str, pos, len, new): `len` characters from the 1-based `pos` are replaced; a `pos` outside gives `str`
             let (s0, pos, len) = (text(v(0)), int(v(1)).unwrap_or(0), int(v(2)).unwrap_or(0));
@@ -719,6 +727,43 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::text(&parts.join(&sep))
         }
         FoundRows => Value::Int(FOUND_ROWS.with(|c| c.get())),
+        MatchAgainst => {
+            let boolean = text(v(0)) == "boolean";
+            if v(1).is_null() {
+                return Ok(Value::Double(0.0));
+            }
+            let doc: String = vals[2..].iter().filter(|x| !x.is_null()).map(|x| text(x).to_string()).collect::<Vec<_>>().join(" ");
+            Value::Double(fulltext_score(&text(v(1)), &doc, boolean))
+        }
+        WeightString => {
+            let kind = text(v(1)).to_string();
+            let n = match v(2) {
+                Value::Int(n) if *n >= 0 => Some(*n as usize),
+                _ => None,
+            };
+            let raw = v(0).as_bytes().map_or_else(|| text(v(0)).as_bytes().to_vec(), |b| b.to_vec());
+            if kind == "binary" || matches!(v(0), Value::Bytes(_)) {
+                let mut out = raw;
+                if let Some(n) = n {
+                    out.resize(n, 0);
+                }
+                Value::bytes(out)
+            } else {
+                // a character per two bytes, upper-cased so that strings differing in case have the same weight
+                let mut chars: Vec<char> = text(v(0)).chars().collect();
+                if let Some(n) = n {
+                    chars.resize(n, ' ');
+                }
+                let out: Vec<u8> = chars
+                    .into_iter()
+                    .flat_map(|c| {
+                        let w = c.to_uppercase().next().unwrap_or(c) as u32;
+                        [((w >> 8) & 0xFF) as u8, (w & 0xFF) as u8]
+                    })
+                    .collect();
+                Value::bytes(out)
+            }
+        }
         JsonTableRequire => {
             if !matches!(v(0), Value::Bool(true) | Value::Int(1)) {
                 return Err(Error::runtime(format!("no SQL/JSON item found for specified path of column \"{}\"", text(v(1)))));
@@ -823,6 +868,98 @@ thread_local! {
     static FOUND_ROWS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static ASSIGNED: std::cell::RefCell<Vec<(String, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The words of a text, lower-case: runs of letters, digits and underscores (an apostrophe inside a word stays in it).
+fn ft_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let inner_apostrophe = c == '\'' && !cur.is_empty() && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric());
+        if c.is_alphanumeric() || c == '_' || inner_apostrophe {
+            cur.extend(c.to_lowercase());
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The words InnoDB leaves out of a full-text index, and the shortest word it keeps.
+const FT_STOPWORDS: [&str; 36] = [
+    "a", "about", "an", "are", "as", "at", "be", "by", "com", "de", "en", "for", "from", "how", "i", "in", "is", "it", "la", "of", "on", "or", "that", "the", "this",
+    "to", "was", "what", "when", "where", "who", "will", "with", "und", "the", "www",
+];
+const FT_MIN_WORD: usize = 3;
+
+/// The relevance of `doc` to `query`. In natural language mode it is the number of occurrences of the query's words;
+/// in boolean mode `+word` must be there, `-word` must not, `word*` is a prefix, `"a phrase"` is words in a row, and
+/// the others count when they are there (a query of only `-` words matches nothing). 0 is no match.
+fn fulltext_score(query: &str, doc: &str, boolean: bool) -> f64 {
+    let words = ft_words(doc);
+    let indexed: Vec<&String> = words.iter().filter(|w| w.chars().count() >= FT_MIN_WORD && !FT_STOPWORDS.contains(&w.as_str())).collect();
+    let count = |w: &str, prefix: bool| indexed.iter().filter(|x| if prefix { x.starts_with(w) } else { x.as_str() == w }).count() as f64;
+    if !boolean {
+        return ft_words(query).iter().map(|w| count(w, false)).sum();
+    }
+    let (mut required, mut excluded, mut optional) = (Vec::new(), Vec::new(), Vec::new());
+    let q: Vec<char> = query.chars().collect();
+    let mut i = 0;
+    while i < q.len() {
+        let c = q[i];
+        if c.is_whitespace() || c == '(' || c == ')' {
+            i += 1;
+            continue;
+        }
+        let mut sign = ' ';
+        while i < q.len() && matches!(q[i], '+' | '-' | '~' | '<' | '>') {
+            if matches!(q[i], '+' | '-') {
+                sign = q[i];
+            }
+            i += 1;
+        }
+        let term: (Vec<String>, bool) = if i < q.len() && q[i] == '"' {
+            let end = q[i + 1..].iter().position(|&c| c == '"').map_or(q.len(), |p| i + 1 + p);
+            let phrase: String = q[i + 1..end].iter().collect();
+            i = (end + 1).min(q.len());
+            (ft_words(&phrase), false)
+        } else {
+            let start = i;
+            while i < q.len() && !q[i].is_whitespace() && q[i] != '(' && q[i] != ')' && q[i] != '"' {
+                i += 1;
+            }
+            let raw: String = q[start..i].iter().collect();
+            let prefix = raw.ends_with('*');
+            (ft_words(&raw), prefix)
+        };
+        if term.0.is_empty() {
+            continue;
+        }
+        match sign {
+            '+' => required.push(term),
+            '-' => excluded.push(term),
+            _ => optional.push(term),
+        }
+    }
+    let hits = |(ws, prefix): &(Vec<String>, bool)| -> f64 {
+        match ws.as_slice() {
+            [one] => count(one, *prefix),
+            many => words.windows(many.len()).filter(|win| *win == many).count() as f64,
+        }
+    };
+    if excluded.iter().any(|t| hits(t) > 0.0) || required.iter().any(|t| hits(t) == 0.0) {
+        return 0.0;
+    }
+    let score: f64 = required.iter().chain(optional.iter()).map(hits).sum();
+    if required.is_empty() && score == 0.0 {
+        0.0
+    } else {
+        score.max(if required.is_empty() { 0.0 } else { 1.0 })
+    }
 }
 
 /// The user variables that `@name := expr` set while the last statement ran, in order.

@@ -328,7 +328,7 @@ impl Database {
             return Ok(());
         }
         let Some(role) = self.settings.get("role") else { return Ok(()) };
-        if role.is_empty() || self.is_superuser(role) || table.starts_with("information_schema.") {
+        if role.is_empty() || self.is_superuser(role) || table.starts_with("information_schema.") || table.starts_with("performance_schema.") {
             return Ok(());
         }
         for r in self.effective_roles(role) {

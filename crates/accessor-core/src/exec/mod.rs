@@ -17,6 +17,7 @@ pub(crate) mod settings;
 mod routine;
 mod reports;
 mod infoschema;
+mod perfschema;
 mod returning;
 mod prepared;
 mod cursor;

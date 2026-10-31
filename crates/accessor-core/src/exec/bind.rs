@@ -194,6 +194,18 @@ impl Correlator<'_> {
                 match named {
                     Some(n) => frame.push(n),
                     None => match self.db.resolve_factor(f, self.depth) {
+                        Ok(src) if src.names.iter().any(|n| n.contains('\u{1}')) => {
+                            // a nested join list: the columns belong to the tables inside it
+                            let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+                            for n in &src.names {
+                                let (t, c) = n.split_once('\u{1}').unwrap_or((src.alias.as_str(), n.as_str()));
+                                match groups.iter_mut().find(|(g, _)| g == t) {
+                                    Some((_, cols)) => cols.push(c.to_string()),
+                                    None => groups.push((t.to_string(), vec![c.to_string()])),
+                                }
+                            }
+                            frame.extend(groups);
+                        }
                         Ok(src) => frame.push((src.alias, src.names)),
                         // a derived table that reads the outer query cannot be run alone: its columns are named by its items
                         Err(e) => match f {

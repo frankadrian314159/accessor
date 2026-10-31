@@ -4057,7 +4057,9 @@ fn hexadecimal_literals_are_text() {
     assert_eq!(one("SELECT LENGTH(x'303132')"), "3");
     assert!(db.query("SELECT x'3'").is_err(), "an odd number of digits");
     assert!(db.query("SELECT x'zz'").is_err(), "not hexadecimal");
-    assert!(db.query("SELECT x'ff'").is_err(), "not text: there is no BLOB type");
+    // bytes that are not text are a binary value: they show as hex, and have their own length
+    assert_eq!(one("SELECT HEX(x'ff')"), "FF");
+    assert_eq!(one("SELECT LENGTH(x'ff')"), "1");
     // x is still an ordinary name
     assert!(db.query("SELECT x FROM (SELECT 1 AS x) AS t").is_ok());
 }
@@ -6324,4 +6326,39 @@ fn postgresql_set_returning_plpgsql_rows_from_whole_rows_and_tableoid_in_checks(
     db.execute("CREATE TABLE sys (is_cap bool, CHECK (NOT (is_cap AND tableoid::regclass::text = 'sys')))").unwrap();
     db.execute("INSERT INTO sys VALUES (false)").unwrap();
     db.execute("INSERT INTO sys VALUES (true)").unwrap_err();
+}
+
+#[test]
+fn mysql_nested_join_lists_performance_schema_match_against_bytes_and_weight_string() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let rows = |db: &mut Database, sql: &str| -> Vec<String> {
+        let r = db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")).collect()
+    };
+    db.execute("CREATE TABLE t1 (a INT, b INT); CREATE TABLE t2 (a INT, c INT); CREATE TABLE t3 (a INT, d INT)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1,10),(2,20),(3,30); INSERT INTO t2 VALUES (1,100),(2,200); INSERT INTO t3 VALUES (1,1000)").unwrap();
+    // an inner join list under a left join keeps the left rows that match nothing in it
+    assert_eq!(rows(&mut db, "SELECT t1.a, t2.c, t3.d FROM t1 LEFT JOIN (t2 JOIN t3 ON t3.a = t2.a) ON t1.a = t2.a ORDER BY t1.a"), ["1,100,1000", "2,,", "3,,"]);
+    assert_eq!(rows(&mut db, "SELECT t1.a, t3.d FROM t1 RIGHT JOIN (t2 JOIN t3 ON t3.a = t2.a) ON t1.a = t2.a"), ["1,1000"]);
+    assert_eq!(rows(&mut db, "SELECT t1.a, x.c FROM t1 LEFT JOIN (t2 AS x, t3) ON x.a = t1.a AND t3.a = 1 ORDER BY t1.a"), ["1,100", "2,200", "3,"]);
+    assert_eq!(rows(&mut db, "SELECT (SELECT count(*) FROM t1 y LEFT JOIN (t2 JOIN t3 ON t3.a = t2.a) ON y.a = t2.a WHERE t3.d IS NULL AND y.a >= t1.a) FROM t1 ORDER BY t1.a"), ["2", "2", "1"]);
+    // performance_schema
+    assert_eq!(rows(&mut db, "SELECT name, type FROM performance_schema.threads"), ["thread/sql/one_connection,FOREGROUND"]);
+    assert_eq!(rows(&mut db, "SELECT count(*) FROM performance_schema.status_by_thread"), ["0"]);
+    // MATCH ... AGAINST
+    db.execute("CREATE TABLE d (id INT, body TEXT, FULLTEXT KEY ft (body)); CREATE FULLTEXT INDEX ft2 ON d (body)").unwrap();
+    db.execute("INSERT INTO d VALUES (1, 'MySQL tutorial for beginners'), (2, 'Using MySQL and Oracle'), (3, 'Oracle only')").unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM d WHERE MATCH (body) AGAINST ('mysql') ORDER BY id"), ["1", "2"]);
+    assert_eq!(rows(&mut db, "SELECT id FROM d WHERE MATCH (body) AGAINST ('+mysql -oracle' IN BOOLEAN MODE)"), ["1"]);
+    assert_eq!(rows(&mut db, "SELECT id FROM d WHERE MATCH (body) AGAINST ('tut*' IN BOOLEAN MODE)"), ["1"]);
+    assert_eq!(rows(&mut db, "SELECT id FROM d WHERE MATCH (body) AGAINST ('\"oracle only\"' IN BOOLEAN MODE)"), ["3"]);
+    // bytes
+    assert_eq!(rows(&mut db, "SELECT HEX(X'AB1234'), LENGTH(X'AB1234'), HEX(UNHEX('FF00')), X'414243'"), ["AB1234,3,FF00,ABC"]);
+    assert_eq!(rows(&mut db, "SELECT X'AB' = X'AB', X'AB' < X'AC'"), ["1,1"]);
+    db.execute("CREATE TABLE bl (b BLOB); INSERT INTO bl VALUES (X'DEADBEEF')").unwrap();
+    assert_eq!(rows(&mut db, "SELECT HEX(b) FROM bl"), ["DEADBEEF"]);
+    // WEIGHT_STRING: equal for strings that compare equal, padded by the AS clause
+    assert_eq!(rows(&mut db, "SELECT HEX(WEIGHT_STRING('a')) = HEX(WEIGHT_STRING('A')), HEX(WEIGHT_STRING('a' AS CHAR(3))), HEX(WEIGHT_STRING('ab' AS BINARY(4)))"), ["1,004100200020,61620000"]);
 }

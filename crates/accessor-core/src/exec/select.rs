@@ -142,6 +142,10 @@ impl Database {
                     let (names, rows) = self.information_schema(view)?;
                     return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
+                if let Some(view) = name.strip_prefix("performance_schema.") {
+                    let (names, rows) = self.performance_schema(view)?;
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                }
                 if !*only && self.table(name).is_some() && self.has_children(name) {
                     return self.family_source(name, alias, depth);
                 }
@@ -289,6 +293,25 @@ impl Database {
             }
             TableFactor::Materialized { rows, columns, alias } => {
                 Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
+            }
+            TableFactor::Nested { from, alias } => {
+                // the list is joined first; each column keeps the name of the table it came from, written `table\u{1}column`
+                let mut quals: Vec<String> = Vec::new();
+                let mut scope = Scope::default();
+                for f in std::iter::once(&from.first).chain(from.joins.iter().map(|j| &j.factor)) {
+                    let src = self.resolve_source(f, &scope, depth, false)?;
+                    for n in &src.names {
+                        quals.push(src.alias.clone());
+                        scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: false });
+                    }
+                }
+                let inner = Select { items: vec![SelectItem::Wildcard], from: Some((**from).clone()), ..Select::default() };
+                let res = self.run_select_depth(&inner, depth + 1)?;
+                if res.columns.len() != quals.len() {
+                    return Err(Error::runtime("a nested join list gives columns that cannot be told apart"));
+                }
+                let names = quals.iter().zip(&res.columns).map(|(q, c)| format!("{q}\u{1}{c}")).collect();
+                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
         }
     }
@@ -728,7 +751,7 @@ impl Database {
                 let preserved = k > 0 && matches!(from.joins[k - 1].kind, JoinKind::Right | JoinKind::Full);
                 let src = self.resolve_source(f, &scope, depth, few && !preserved)?;
                 for n in &src.names {
-                    scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: n.starts_with(super::viewdml::HIDDEN_COLUMN) });
+                    scope.cols.push(scope_col(&src.alias, n));
                 }
                 sources.push(src);
             }
@@ -737,7 +760,7 @@ impl Database {
             scope.cols.clear();
             for src in &sources {
                 for n in &src.names {
-                    scope.cols.push(ScopeCol { table: src.alias.clone(), name: n.clone(), hidden: n.starts_with(super::viewdml::HIDDEN_COLUMN) });
+                    scope.cols.push(scope_col(&src.alias, n));
                 }
             }
         }
@@ -2714,6 +2737,14 @@ fn combine(op: SetOp, all: bool, a: Vec<Row>, b: Vec<Row>) -> Vec<Row> {
 }
 
 /// Applies a column alias list (`AS t(a, b)`) to a source's column names.
+/// The scope entry of a column of a source; a column of a nested join list is named `table\u{1}column` and belongs to that table.
+fn scope_col(alias: &str, name: &str) -> ScopeCol {
+    match name.split_once('\u{1}') {
+        Some((t, c)) if !t.is_empty() => ScopeCol { table: t.to_string(), name: c.to_string(), hidden: c.starts_with(super::viewdml::HIDDEN_COLUMN) },
+        _ => ScopeCol { table: alias.to_string(), name: name.to_string(), hidden: name.starts_with(super::viewdml::HIDDEN_COLUMN) },
+    }
+}
+
 /// A table function that gives one column names it after the alias (`FROM generate_series(1,3) AS n` has a column `n`).
 fn single_column_alias(mut cols: Vec<String>, function: &str, alias: &str) -> Vec<String> {
     if cols.len() == 1 && !function.starts_with("__") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {

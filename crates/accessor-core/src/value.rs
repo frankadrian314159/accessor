@@ -65,6 +65,9 @@ pub enum Value {
     Json(Arc<str>),
     /// `ARRAY`: a list of values (PostgreSQL's arrays; a nested array is a further dimension).
     Array(Arc<Vec<Value>>),
+    /// Raw bytes that are not valid UTF-8 (MySQL's binary strings, `X'AB12'`); bytes that are valid UTF-8 are `Text`.
+    /// A TEXT column may hold one. Use `Value::bytes` to make one.
+    Bytes(Arc<Vec<u8>>),
 }
 
 // ----- on-disk form ---------------------------------------------------------
@@ -92,6 +95,7 @@ enum Wire {
     Interval(Interval),
     Json(Arc<str>),
     Array(Vec<Value>),
+    Bytes(Vec<u8>),
 }
 
 #[derive(Serialize)]
@@ -113,6 +117,7 @@ enum WireRef<'a> {
     Interval(&'a Interval),
     Json(&'a str),
     Array(&'a [Value]),
+    Bytes(&'a [u8]),
 }
 
 impl From<Wire> for Value {
@@ -135,6 +140,7 @@ impl From<Wire> for Value {
             Wire::Interval(i) => Value::Interval(i),
             Wire::Json(s) => Value::Json(s),
             Wire::Array(a) => Value::Array(Arc::new(a)),
+            Wire::Bytes(b) => Value::Bytes(Arc::new(b)),
         }
     }
 }
@@ -157,6 +163,7 @@ impl Serialize for Value {
             Value::Interval(i) => WireRef::Interval(i),
             Value::Json(s) => WireRef::Json(s),
             Value::Array(a) => WireRef::Array(a),
+            Value::Bytes(b) => WireRef::Bytes(b),
         }
         .serialize(s)
     }
@@ -561,6 +568,23 @@ impl Value {
         Value::Text(Arc::from(s))
     }
 
+    /// Bytes: `Text` when they are valid UTF-8 (so the same bytes are always the same kind of value), else `Bytes`.
+    pub fn bytes(b: Vec<u8>) -> Value {
+        match String::from_utf8(b) {
+            Ok(s) => Value::Text(Arc::from(s)),
+            Err(e) => Value::Bytes(Arc::new(e.into_bytes())),
+        }
+    }
+
+    /// The bytes of a text or binary value.
+    pub fn as_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Value::Text(s) => Some(std::borrow::Cow::Borrowed(s.as_bytes())),
+            Value::Bytes(b) => Some(std::borrow::Cow::Borrowed(b.as_slice())),
+            _ => None,
+        }
+    }
+
     /// An `INTEGER` if the number is whole and fits, else a `DECIMAL` (or
     /// `BIGNUM` for a whole number that is too large). Used for results whose
     /// type is "whatever the number needs", such as parsed text.
@@ -641,7 +665,7 @@ impl Value {
             Value::Interval(_) => DataType::Interval,
             Value::Json(_) => DataType::Json,
             Value::Array(a) => DataType::Array(a.iter().find_map(Value::data_type).map_or(ArrayOf::Any, ArrayOf::of)),
-            Value::Text(_) => DataType::Text,
+            Value::Text(_) | Value::Bytes(_) => DataType::Text,
         })
     }
 
@@ -654,7 +678,7 @@ impl Value {
             Value::Null => 0,
             Value::Bool(_) => 1,
             Value::DateTime(_) | Value::TimestampTz(_) => 3,
-            Value::Text(_) => 4,
+            Value::Text(_) | Value::Bytes(_) => 4,
             Value::Interval(_) => 5,
             Value::Json(_) => 6,
             Value::Array(_) => 7,
@@ -810,6 +834,9 @@ impl Value {
             // false < true; asql keeps Access's, where Yes is -1 and so Yes < No
             (Value::Bool(a), Value::Bool(b)) if crate::dialect::current() != Dialect::Asql => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Bytes(a), Value::Bytes(b)) => a.as_slice().cmp(b.as_slice()),
+            (Value::Bytes(a), Value::Text(t)) => a.as_slice().cmp(t.as_bytes()),
+            (Value::Text(t), Value::Bytes(b)) => t.as_bytes().cmp(b.as_slice()),
             (Value::Array(a), Value::Array(b)) => array_cmp(a, b),
             (Value::Array(a), Value::Text(t)) => match Value::parse_array(t, ArrayOf::Any) {
                 Some(Value::Array(b)) => array_cmp(a, &b),
@@ -873,7 +900,7 @@ impl Value {
             // A calculated field holds whatever its expression produced.
             DataType::Calculated => Ok(self.clone()),
             DataType::Text => Ok(match self {
-                Text(_) => self.clone(),
+                Text(_) | Bytes(_) => self.clone(),
                 v => Value::text(&v.to_string()),
             }),
             DataType::YesNo => match self {
@@ -1136,6 +1163,9 @@ impl Ord for Value {
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Array(a), Value::Array(b)) => a.iter().cmp(b.iter()),
             (Value::Text(a), Value::Text(b)) => ci_cmp(a, b),
+            (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+            (Value::Bytes(a), Value::Text(t)) => a.as_slice().cmp(t.as_bytes()),
+            (Value::Text(t), Value::Bytes(b)) => t.as_bytes().cmp(b.as_slice()),
             (Value::Null, Value::Null) => Ordering::Equal,
             (a, b) if a.is_numeric() && b.is_numeric() => num_cmp(a, b),
             _ => Ordering::Equal,
@@ -1206,6 +1236,10 @@ impl Hash for Value {
                 6u8.hash(state);
                 s.hash(state);
             }
+            Value::Bytes(b) => {
+                4u8.hash(state);
+                b.hash(state);
+            }
             Value::Array(a) => {
                 7u8.hash(state);
                 a.len().hash(state);
@@ -1261,6 +1295,7 @@ impl fmt::Display for Value {
             Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
             Value::Interval(i) => write!(f, "{i}"),
             Value::Json(s) => f.write_str(s),
+            Value::Bytes(b) => f.write_str(&String::from_utf8_lossy(b)),
             Value::Array(a) => {
                 f.write_str("{")?;
                 for (i, x) in a.iter().enumerate() {
