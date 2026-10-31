@@ -392,6 +392,13 @@ pub enum ProcStmt {
     SelectRecord { name: String, select: Box<Select>, strict: bool, targets: Vec<String> },
     /// `FOR rec IN SELECT ... LOOP body END LOOP`: the body runs once per row, with `rec.column` set.
     ForRecord { name: String, select: Box<Select>, body: Vec<ProcStmt> },
+    /// `RETURN NEXT expr` (one row of one column) or `RETURN NEXT` (the output columns as they are now), in a function
+    /// that returns a set.
+    ReturnNext(Option<Expr>),
+    /// `RETURN NEXT rec`: the fields of a record variable are a row.
+    ReturnNextRecord(String),
+    /// `RETURN QUERY select`: the rows of the query are rows of the result.
+    ReturnQuery(Box<Select>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -17,6 +17,8 @@ use crate::value::{ArrayOf, DataType, Value};
 pub enum ArrFn {
     /// `ARRAY[a, b, ...]`
     Ctor,
+    /// `__ROWTEXT(a, b, ..)`: the fields as PostgreSQL writes a row, `(1,"a b",)`; what a whole-row reference `t` gives.
+    RowText,
     /// `a[i]`
     Subscript,
     /// `a[lo:hi]`, either bound NULL for open
@@ -59,6 +61,7 @@ pub fn lookup(name: &str) -> Option<(ArrFn, usize, usize)> {
     use ArrFn::*;
     Some(match name {
         "__ARRAY" => (Ctor, 0, usize::MAX),
+        "__ROWTEXT" => (RowText, 1, usize::MAX),
         "__SUBSCRIPT" => (Subscript, 2, 2),
         "__SLICE" => (Slice, 3, 3),
         "ARRAY_LENGTH" => (Length, 2, 2),
@@ -131,7 +134,7 @@ impl ArrFn {
     /// Functions that get their NULL arguments instead of answering NULL themselves.
     pub fn handles_null(self) -> bool {
         use ArrFn::*;
-        matches!(self, Ctor | Append | Prepend | Cat | Remove | Replace | Position | Positions | Fill | ToString | Quant(_) | JsonArrayAppend | JsonArrayInsert | JsonInsert | JsonReplace)
+        matches!(self, Ctor | RowText | Append | Prepend | Cat | Remove | Replace | Position | Positions | Fill | ToString | Quant(_) | JsonArrayAppend | JsonArrayInsert | JsonInsert | JsonReplace)
     }
 }
 
@@ -250,6 +253,23 @@ pub fn call(f: ArrFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
     use ArrFn::*;
     let v = |i: usize| -> &Value { &vals[i] };
     Ok(match f {
+        RowText => {
+            let fields: Vec<String> = vals
+                .iter()
+                .map(|x| match x.as_ref() {
+                    Value::Null => String::new(),
+                    other => {
+                        let s = other.to_string();
+                        if s.is_empty() || s.chars().any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace()) {
+                            format!("\"{}\"", s.replace('"', "\"\""))
+                        } else {
+                            s
+                        }
+                    }
+                })
+                .collect();
+            Value::text(&format!("({})", fields.join(",")))
+        }
         Ctor => array(vals.iter().map(|x| x.as_ref().clone()).collect()),
         Subscript => {
             let a = items(v(0))?;

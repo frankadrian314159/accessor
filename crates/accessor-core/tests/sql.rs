@@ -6294,3 +6294,34 @@ fn postgresql_json_table_errors_and_pg_input_error_info() {
     let good = db.execute("SELECT * FROM pg_input_error_info('12', 'integer')").unwrap();
     assert!(good.rows[0][0].is_null());
 }
+
+#[test]
+fn postgresql_set_returning_plpgsql_rows_from_whole_rows_and_tableoid_in_checks() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let rows = |db: &mut Database, sql: &str| -> Vec<String> {
+        let r = db.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")).collect()
+    };
+    // RETURN NEXT / RETURN QUERY: output columns as variables, a record, a plain value, and in a view
+    db.execute("CREATE TABLE tt (f1 text, f4 int); INSERT INTO tt VALUES ('foo', 42), ('x', 7)").unwrap();
+    db.execute("CREATE FUNCTION ttf() RETURNS SETOF tt AS $$ DECLARE r record; BEGIN FOR r IN SELECT * FROM tt LOOP RETURN NEXT r; END LOOP; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("CREATE VIEW ttv AS SELECT t.* FROM ttf() t").unwrap();
+    assert_eq!(rows(&mut db, "SELECT * FROM ttv ORDER BY f4"), ["x,7", "foo,42"]);
+    db.execute("CREATE FUNCTION sq(n int) RETURNS TABLE(i int, s int) AS $$ BEGIN FOR i IN 1..n LOOP s := i * i; RETURN NEXT; END LOOP; RETURN QUERY SELECT 100, 10000; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(rows(&mut db, "SELECT * FROM sq(3)"), ["1,1", "2,4", "3,9", "100,10000"]);
+    db.execute("CREATE FUNCTION tens(n int) RETURNS SETOF int AS $$ DECLARE k int := 0; BEGIN WHILE k < n LOOP k := k + 1; RETURN NEXT k * 10; END LOOP; RETURN; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(rows(&mut db, "SELECT sum(x) FROM tens(4) x"), ["100"]);
+    db.execute("CREATE FUNCTION bad() RETURNS SETOF int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql").unwrap_err();
+    // ROWS FROM zips the functions, padding the shorter, and WITH ORDINALITY numbers the rows
+    assert_eq!(rows(&mut db, "SELECT * FROM ROWS FROM (generate_series(1, 3), unnest(ARRAY['a', 'b'])) WITH ORDINALITY AS z(a, b, o)"), ["1,a,1", "2,b,2", "3,,3"]);
+    assert_eq!(rows(&mut db, "SELECT * FROM (VALUES (1), (2)) v(r), ROWS FROM (generate_series(r, 3), generate_series(10, 11)) AS f(x, y) ORDER BY 1, 2"), ["1,1,10", "1,2,11", "1,3,", "2,2,10", "2,3,11"]);
+    // a table's name alone is its row, as text
+    assert_eq!(rows(&mut db, "SELECT * FROM tt i, LATERAL (VALUES (i)) ss ORDER BY f4"), ["x,7,\"(x,7)\"", "foo,42,\"(foo,42)\""].map(|s| s.replace('"', "")));
+    db.execute("CREATE VIEW wr AS SELECT * FROM tt i, LATERAL (VALUES (i)) ss").unwrap();
+    // tableoid in a CHECK is the table the row is in
+    db.execute("CREATE TABLE sys (is_cap bool, CHECK (NOT (is_cap AND tableoid::regclass::text = 'sys')))").unwrap();
+    db.execute("INSERT INTO sys VALUES (false)").unwrap();
+    db.execute("INSERT INTO sys VALUES (true)").unwrap_err();
+}

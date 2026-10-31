@@ -133,6 +133,17 @@ struct Frame {
     last: Option<QueryResult>,
     returned: Option<Value>,
     iterations: u64,
+    /// A function that returns a set: the names of its output columns, and the rows `RETURN NEXT` / `RETURN QUERY` made.
+    set_names: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    /// The columns of each record variable, in order.
+    rec_cols: HashMap<String, Vec<String>>,
+}
+
+impl Frame {
+    fn new(vars: HashMap<String, Value>) -> Frame {
+        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new() }
+    }
 }
 
 impl Database {
@@ -188,7 +199,7 @@ impl Database {
         if self.call_depth.load(Ordering::Relaxed) >= MAX_CALLS {
             return Err(Error::runtime("trigger functions are nested too deeply"));
         }
-        let mut frame = Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0 };
+        let mut frame = Frame::new(vars);
         self.call_depth.fetch_add(1, Ordering::Relaxed);
         let outcome = self.run_block(body, &mut frame);
         self.call_depth.fetch_sub(1, Ordering::Relaxed);
@@ -209,6 +220,13 @@ impl Database {
         }
         let mut copy = st.clone();
         let mut any = false;
+        if self.routines.values().any(|r| r.function && !r.set_columns.is_empty() && matches!(r.body, RoutineBody::Block(_))) {
+            match &mut copy {
+                Statement::Select(s) => any |= self.materialise_set_calls(s, 0, false)?,
+                Statement::Insert { source: crate::sql::ast::InsertSource::Select(s), .. } => any |= self.materialise_set_calls(s, 0, false)?,
+                _ => {}
+            }
+        }
         for _ in 0..8 {
             let mut changed = false;
             crate::sql::walk::walk_statement(&mut copy, &mut |e| {
@@ -242,6 +260,83 @@ impl Database {
             }
         }
         Ok(any.then_some(copy))
+    }
+
+    /// Runs the calls in FROM of functions that return a set with a block for a body (`RETURN NEXT`), when their arguments
+    /// are known, and puts their rows in their place; the same inside views, derived tables and sub-queries.
+    pub(crate) fn materialise_set_calls(&mut self, s: &mut crate::sql::ast::Select, depth: u32, dry: bool) -> Result<bool> {
+        use crate::sql::ast::TableFactor;
+        if depth > 8 {
+            return Ok(false);
+        }
+        let mut any = false;
+        if let Some(with) = &mut s.with {
+            for cte in &mut with.ctes {
+                any |= self.materialise_set_calls(&mut cte.query, depth + 1, dry)?;
+            }
+        }
+        for u in &mut s.unions {
+            any |= self.materialise_set_calls(&mut u.select, depth + 1, dry)?;
+        }
+        let mut subqueries: Vec<*mut crate::sql::ast::Select> = Vec::new();
+        let mut collect = |e: &mut Expr| {
+            match e {
+                Expr::Subquery(q) | Expr::Exists { query: q, .. } | Expr::InSelect { query: q, .. } => subqueries.push(&mut **q as *mut _),
+                _ => {}
+            }
+            Ok(())
+        };
+        if let Some(f) = &mut s.filter {
+            crate::sql::walk::walk_expr(f, &mut collect)?;
+        }
+        for item in &mut s.items {
+            if let crate::sql::ast::SelectItem::Expr { expr, .. } = item {
+                crate::sql::walk::walk_expr(expr, &mut collect)?;
+            }
+        }
+        for q in subqueries {
+            // SAFETY: each pointer is to a sub-query boxed inside `s`, which is not touched while this runs
+            any |= self.materialise_set_calls(unsafe { &mut *q }, depth + 1, dry)?;
+        }
+        let Some(from) = &mut s.from else { return Ok(any) };
+        let factors = std::iter::once(&mut from.first).chain(from.joins.iter_mut().map(|j| &mut j.factor));
+        for f in factors {
+            match f {
+                TableFactor::Function { name, args, alias, .. } => {
+                    let Some(def) = self.routine_def(name).filter(|d| d.function && !d.set_columns.is_empty() && matches!(d.body, RoutineBody::Block(_))) else { continue };
+                    let mut vals = Vec::with_capacity(args.len());
+                    let mut known = true;
+                    for a in args.iter() {
+                        match self.eval_const(a) {
+                            Ok(v) => vals.push(v),
+                            Err(_) => {
+                                known = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !known {
+                        continue;
+                    }
+                    let (columns, rows) = if dry { (self.set_columns_of(&def), Vec::new()) } else { self.run_set_block(&def, &vals)? };
+                    let columns = if columns.len() == 1 && crate::dialect::current() == crate::dialect::Dialect::Postgresql { vec![alias.clone()] } else { columns };
+                    *f = TableFactor::Materialized { rows: Arc::new(rows), columns, alias: alias.clone() };
+                    any = true;
+                }
+                TableFactor::Derived { query, .. } => any |= self.materialise_set_calls(query, depth + 1, dry)?,
+                TableFactor::Named { name, alias, .. } if self.table(name).is_none() => {
+                    let Some(sql) = self.view_sql(name).map(str::to_string) else { continue };
+                    let Ok(mut statements) = crate::sql::parse_script(&sql) else { continue };
+                    let Some(Statement::Select(mut inner)) = statements.pop() else { continue };
+                    if self.materialise_set_calls(&mut inner, depth + 1, dry)? {
+                        *f = TableFactor::Derived { query: Box::new(inner), alias: alias.clone().unwrap_or_else(|| name.clone()), columns: Vec::new(), lateral: false };
+                        any = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(any)
     }
 
     pub(crate) fn call_routine(&mut self, name: &str, args: &[(Option<String>, Expr)], allow_function: bool) -> Result<Option<QueryResult>> {
@@ -281,7 +376,7 @@ impl Database {
                 return Err(Error::runtime(format!("the parameter @{} was supplied twice", def.params[at].name)));
             }
         }
-        let mut frame = Frame { vars: HashMap::new(), types: HashMap::new(), last: None, returned: None, iterations: 0 };
+        let mut frame = Frame::new(HashMap::new());
         for (p, v) in def.params.iter().zip(given) {
             let v = match (v, &p.default) {
                 (Some(v), _) => v,
@@ -419,6 +514,24 @@ impl Database {
                     }
                 }
             }
+            ProcStmt::ReturnNext(value) => {
+                let row = match value {
+                    Some(e) => vec![self.eval_in(e, frame)?],
+                    None => frame.set_names.iter().map(|n| frame.vars.get(&n.to_ascii_lowercase()).cloned().unwrap_or(Value::Null)).collect(),
+                };
+                self.add_set_row(frame, row)?;
+            }
+            ProcStmt::ReturnNextRecord(name) => {
+                let cols = frame.rec_cols.get(name).cloned().unwrap_or_default();
+                let row = cols.iter().map(|c| frame.vars.get(&format!("{name}.{c}")).cloned().unwrap_or(Value::Null)).collect();
+                self.add_set_row(frame, row)?;
+            }
+            ProcStmt::ReturnQuery(select) => {
+                let (_, rows) = self.record_query(select, frame)?;
+                for row in rows {
+                    self.add_set_row(frame, row)?;
+                }
+            }
             ProcStmt::Sql(Statement::Raise(message)) => {
                 let text = self.eval_in(message, frame)?;
                 return Err(Error::constraint(text.to_string()));
@@ -441,7 +554,66 @@ impl Database {
     }
 
     /// Sets the variables `name.column` from `row` (NULL for all of them when there is none).
+    fn add_set_row(&self, frame: &mut Frame, row: Vec<Value>) -> Result<()> {
+        frame.iterations += 1;
+        if frame.iterations > MAX_ITERATIONS {
+            return Err(Error::runtime("a function returned more than a million rows"));
+        }
+        frame.rows.push(row);
+        Ok(())
+    }
+
+    /// Runs a function that returns a set of rows (`RETURN NEXT` / `RETURN QUERY`) and gives the rows.
+    pub(crate) fn run_set_block(&mut self, def: &RoutineDef, args: &[Value]) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        let RoutineBody::Block(body) = &def.body else { return Err(Error::catalog(format!("'{}' does not return rows", def.name))) };
+        if args.len() > def.params.len() {
+            return Err(Error::runtime(format!("{} takes {} argument(s), not {}", def.name, def.params.len(), args.len())));
+        }
+        let mut frame = Frame::new(HashMap::new());
+        for (i, p) in def.params.iter().enumerate() {
+            let v = match (args.get(i), &p.default) {
+                (Some(v), _) => v.clone(),
+                (None, Some(d)) => self.eval_const(d)?,
+                (None, None) => return Err(Error::runtime(format!("{} needs a value for @{}", def.name, p.name))),
+            };
+            let k = p.name.to_ascii_lowercase();
+            let v = match p.data_type {
+                Some(t) => {
+                    frame.types.insert(k.clone(), t);
+                    if v.is_null() { v } else { v.coerce_to(t)? }
+                }
+                None => v,
+            };
+            frame.vars.insert(k, v);
+        }
+        let names = self.set_columns_of(def);
+        for n in def.set_columns.iter().filter(|c| !c.starts_with('\u{1}')) {
+            frame.vars.insert(n.to_ascii_lowercase(), Value::Null);
+        }
+        frame.set_names = names.clone();
+        if self.call_depth.load(Ordering::Relaxed) >= MAX_CALLS {
+            return Err(Error::runtime("functions are nested too deeply"));
+        }
+        self.call_depth.fetch_add(1, Ordering::Relaxed);
+        let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| ()));
+        self.call_depth.fetch_sub(1, Ordering::Relaxed);
+        outcome?;
+        Ok((names, frame.rows))
+    }
+
+    /// The output columns of a function that returns a set: those it names, or the columns of the table it returns.
+    pub(crate) fn set_columns_of(&self, def: &RoutineDef) -> Vec<String> {
+        match def.set_columns.as_slice() {
+            [one] if one.starts_with('\u{1}') => {
+                let table = &one["\u{1}setof:".len()..];
+                self.table(table).map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect()).unwrap_or_default()
+            }
+            cols => cols.to_vec(),
+        }
+    }
+
     fn set_record(&self, frame: &mut Frame, name: &str, columns: &[String], row: Option<Vec<Value>>) {
+        frame.rec_cols.insert(name.to_ascii_lowercase(), columns.iter().map(|c| c.to_ascii_lowercase()).collect());
         for (i, c) in columns.iter().enumerate() {
             let v = row.as_ref().and_then(|r| r.get(i).cloned()).unwrap_or(Value::Null);
             frame.vars.insert(format!("{}.{}", name.to_ascii_lowercase(), c.to_ascii_lowercase()), v);

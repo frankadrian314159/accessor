@@ -401,6 +401,8 @@ impl Database {
         if decls.is_empty() {
             let mut probe = select.clone();
             probe.limit = Some(0);
+            // a function that returns a set with a block for a body is not run, only its columns are looked at
+            self.materialise_set_calls(&mut probe, 0, true)?;
             self.unlogged(|| self.run_select_depth(&probe, 1))?;
         }
         self.apply_all(vec![Op::CreateView { name: name.to_string(), sql: sql.to_string() }])?;

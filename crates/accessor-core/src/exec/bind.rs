@@ -180,7 +180,12 @@ impl Correlator<'_> {
                 let named = match f {
                     TableFactor::Function { name, alias, columns, .. } => Some((
                         alias.clone(),
-                        if columns.is_empty() { self.db.table_function_columns(name).unwrap_or_default() } else { columns.clone() },
+                        if columns.is_empty() {
+                            let cols = self.db.table_function_columns(name).unwrap_or_default();
+                            if cols.len() == 1 && !name.starts_with("__") && crate::dialect::current() == crate::dialect::Dialect::Postgresql { vec![alias.clone()] } else { cols }
+                        } else {
+                            columns.clone()
+                        },
                     )),
                     TableFactor::Derived { alias, columns, lateral: true, .. } => Some((alias.clone(), columns.clone())),
                     TableFactor::Pivot { alias, .. } | TableFactor::Unpivot { alias, .. } => Some((alias.clone(), Vec::new())),
@@ -291,6 +296,19 @@ impl Correlator<'_> {
                             }
                         };
                         *e = Expr::Param(param);
+                    } else if table.is_none() && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                        // a table's name alone is its whole row, of the outer query
+                        let fields: Vec<Expr> = self
+                            .outer
+                            .cols
+                            .iter()
+                            .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(name))
+                            .map(|c| Expr::Column { table: Some(c.table.clone()), name: c.name.clone() })
+                            .collect();
+                        if !fields.is_empty() {
+                            *e = Expr::Function { name: "__ROWTEXT".into(), args: fields, distinct: false, star: false };
+                            return self.expr(e);
+                        }
                     }
                 }
                 Ok(())
@@ -460,7 +478,26 @@ impl<'a> Binder<'a> {
                 // group (the first), exactly as `ANY_VALUE(column)` would give it.
                 return self.bind_agg(AggFn::First, std::slice::from_ref(e), false, false);
             }
-            Expr::Column { table, name } => BExpr::Col(self.scope.resolve(table.as_deref(), name)?),
+            Expr::Column { table, name } => match self.scope.resolve(table.as_deref(), name) {
+                Ok(i) => BExpr::Col(i),
+                Err(err) => {
+                    // PostgreSQL: a table's name alone is its whole row, written as text `(1,2)`
+                    let fields: Vec<Expr> = match table {
+                        None if crate::dialect::current() == crate::dialect::Dialect::Postgresql => self
+                            .scope
+                            .cols
+                            .iter()
+                            .filter(|c| !c.hidden && c.table.eq_ignore_ascii_case(name))
+                            .map(|c| Expr::Column { table: Some(c.table.clone()), name: c.name.clone() })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if fields.is_empty() {
+                        return Err(err);
+                    }
+                    return self.bind(&Expr::Function { name: "__ROWTEXT".into(), args: fields, distinct: false, star: false });
+                }
+            },
             Expr::Neg(a) => BExpr::Neg(self.boxed(a)?),
             Expr::Not(a) => BExpr::Not(self.boxed(a)?),
             Expr::Binary { op, left, right } => BExpr::Bin(*op, self.boxed(left)?, self.boxed(right)?),

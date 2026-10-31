@@ -30,6 +30,10 @@ The document may be a column of a table earlier in the FROM list: `FROM t, JSON_
 
 `pg_input_error_info(text, type)` tries to convert the text to the type and returns one row with the columns `message`, `detail`, `hint` and `sql_error_code`: the error that the conversion gives (the code is always `22P02`), or NULLs when it converts. `pg_input_is_valid(text, type)` gives only the yes or no. The type may carry a size, which is ignored.
 
+## ROWS FROM
+
+`ROWS FROM (f(..) [AS (col type, ..)], g(..), ...) [WITH ORDINALITY] [AS] alias [(columns)]` runs several table functions side by side: row *n* has the *n*th row of each, the shorter ones padded with NULLs. The columns are those of the functions in order, and `WITH ORDINALITY` adds the row number last. It may read the columns of tables before it in FROM. In the postgresql dialect a function that gives one column names it after the alias (`FROM generate_series(1,3) AS n` has a column `n`).
+
 ## GENERATE_SERIES
 
 `GENERATE_SERIES(start, stop [, step])` returns a column `generate_series` with `start`, `start + step`, ... while the value has not passed `stop`. The step defaults to 1 and may be negative; it must not be zero.

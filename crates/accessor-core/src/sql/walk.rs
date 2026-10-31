@@ -267,6 +267,11 @@ impl RowContext<'_> {
             return Ok(());
         };
         let row = row.ok_or_else(|| Error::runtime(format!("{which} is not available in this kind of trigger")))?;
+        // PostgreSQL: NEW.tableoid is the table the row is in
+        if self.schema.column_index(name).is_none() && name.eq_ignore_ascii_case("tableoid") {
+            *e = Expr::Literal(crate::value::Value::text(&self.schema.name));
+            return Ok(());
+        }
         let pos = self.schema.column_index(name).ok_or_else(|| {
             Error::catalog(format!("the field '{name}' does not exist in table '{}'", self.schema.name))
         })?;

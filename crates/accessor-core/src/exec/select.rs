@@ -85,6 +85,23 @@ impl Source<'_> {
     }
 }
 
+/// The functions of a `ROWS FROM` (name, number of arguments, column names given) and whether it numbers the rows.
+fn rows_from_spec(spec: &str) -> (bool, Vec<(String, usize, Vec<String>)>) {
+    let (flag, rest) = spec.split_once(';').unwrap_or(("", spec));
+    let parts = rest
+        .split(';')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut it = p.splitn(3, ':');
+            let name = it.next().unwrap_or("").to_string();
+            let n = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            let names = it.next().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            (name, n, names)
+        })
+        .collect();
+    (flag == "ord", parts)
+}
+
 /// Why the text is not the name of a type for `regtype` (PostgreSQL's message and code), or `None` when it is.
 fn regtype_error(text: &str) -> Option<(String, &'static str)> {
     let t = text.trim();
@@ -253,7 +270,7 @@ impl Database {
                     vals.push(Binder::new(self, &scope, depth).bind(a)?.eval(&[])?.into_owned());
                 }
                 let (cols, rows) = self.table_function(name, &vals)?;
-                let names = rename_columns(cols, columns, alias)?;
+                let names = rename_columns(single_column_alias(cols, name, alias), columns, alias)?;
                 Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
             }
             TableFactor::Derived { query, alias, columns, lateral } => {
@@ -311,7 +328,7 @@ impl Database {
                 if outer.is_empty() {
                     return self.resolve_factor(f, depth);
                 }
-                let cols = self.table_function_columns(name)?;
+                let cols = single_column_alias(self.table_function_columns(name)?, name, alias);
                 let names = rename_columns(cols, columns, alias)?;
                 Ok(Source {
                     keep: None,
@@ -356,14 +373,30 @@ impl Database {
         let mut sel = sel.clone();
         crate::sql::walk::bind_params_select(&mut sel, &values)?;
         let res = self.run_select(&sel)?;
-        if res.columns.len() != def.set_columns.len() {
-            return Err(Error::runtime(format!("{} returns {} column(s) but its query gives {}", def.name, def.set_columns.len(), res.columns.len())));
+        let wanted = self.set_columns_of(def);
+        if res.columns.len() != wanted.len() {
+            return Err(Error::runtime(format!("{} returns {} column(s) but its query gives {}", def.name, wanted.len(), res.columns.len())));
         }
-        Ok((def.set_columns.clone(), res.rows))
+        Ok((wanted, res.rows))
     }
 
     /// The column names a table function produces.
     pub(crate) fn table_function_columns(&self, name: &str) -> Result<Vec<String>> {
+        if let Some(spec) = name.strip_prefix("__ROWS_FROM:") {
+            let (ordinality, parts) = rows_from_spec(spec);
+            let mut cols = Vec::new();
+            for (f, _, names) in parts {
+                if names.is_empty() {
+                    cols.extend(self.table_function_columns(&f)?);
+                } else {
+                    cols.extend(names);
+                }
+            }
+            if ordinality {
+                cols.push("ordinality".into());
+            }
+            return Ok(cols);
+        }
         Ok(match name.to_ascii_uppercase().as_str() {
             "GENERATE_SERIES" => vec!["generate_series".into()],
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
@@ -371,7 +404,7 @@ impl Database {
             "UNNEST" => vec!["unnest".into()],
             "PG_INPUT_ERROR_INFO" => vec!["message".into(), "detail".into(), "hint".into(), "sql_error_code".into()],
             "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => vec!["jsonb_path_query".into()],
-            other if self.set_function(other).is_some() => self.set_function(other).expect("checked").set_columns.clone(),
+            other if self.set_function(other).is_some() => self.set_columns_of(&self.set_function(other).expect("checked")),
             other => return Err(Error::catalog(format!("'{other}' is not a table function (GENERATE_SERIES, SPLIT_STRING and JSON_EACH are available)"))),
         })
     }
@@ -379,6 +412,40 @@ impl Database {
     /// Runs a table function on already evaluated arguments.
     pub(crate) fn table_function(&self, name: &str, args: &[Value]) -> Result<(Vec<String>, Vec<Row>)> {
         const MAX_ROWS: usize = 10_000_000;
+        if let Some(spec) = name.strip_prefix("__ROWS_FROM:") {
+            // each function's rows side by side, the shorter ones padded with NULLs
+            let (ordinality, parts) = rows_from_spec(spec);
+            let mut cols = Vec::new();
+            let mut sets: Vec<(usize, Vec<Row>)> = Vec::new();
+            let mut at = 0;
+            for (f, n, names) in parts {
+                let (fcols, rows) = self.table_function(&f, &args[at..at + n])?;
+                at += n;
+                let width = fcols.len();
+                cols.extend(if names.is_empty() { fcols } else { names });
+                sets.push((width, rows));
+            }
+            let height = sets.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
+            let rows = (0..height)
+                .map(|i| {
+                    let mut row: Row = Vec::new();
+                    for (width, rows) in &sets {
+                        match rows.get(i) {
+                            Some(r) => row.extend(r.iter().cloned()),
+                            None => row.extend(std::iter::repeat_n(Value::Null, *width)),
+                        }
+                    }
+                    if ordinality {
+                        row.push(Value::Int(i as i64 + 1));
+                    }
+                    row
+                })
+                .collect();
+            if ordinality {
+                cols.push("ordinality".into());
+            }
+            return Ok((cols, rows));
+        }
         if let Some(def) = self.set_function(name) {
             return self.run_set_function(&def, args);
         }
@@ -2647,6 +2714,14 @@ fn combine(op: SetOp, all: bool, a: Vec<Row>, b: Vec<Row>) -> Vec<Row> {
 }
 
 /// Applies a column alias list (`AS t(a, b)`) to a source's column names.
+/// A table function that gives one column names it after the alias (`FROM generate_series(1,3) AS n` has a column `n`).
+fn single_column_alias(mut cols: Vec<String>, function: &str, alias: &str) -> Vec<String> {
+    if cols.len() == 1 && !function.starts_with("__") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+        cols[0] = alias.to_string();
+    }
+    cols
+}
+
 fn rename_columns(actual: Vec<String>, wanted: &[String], what: &str) -> Result<Vec<String>> {
     if wanted.is_empty() {
         return Ok(actual);

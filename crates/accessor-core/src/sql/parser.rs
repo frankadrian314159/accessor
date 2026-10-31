@@ -4650,10 +4650,10 @@ impl<'a> Parser<'a> {
                     let col = if up == "GENERATE_SERIES" { "generate_series" } else { "jsonb_path_query" };
                     let label = alias.clone().unwrap_or_else(|| name.to_ascii_lowercase());
                     sel.from = Some(From {
-                        first: TableFactor::Function { name: up, args: args.clone(), alias: "srf".into(), columns: Vec::new() },
+                        first: TableFactor::Function { name: up, args: args.clone(), alias: col.into(), columns: Vec::new() },
                         joins: Vec::new(),
                     });
-                    sel.items = vec![SelectItem::Expr { expr: Expr::Column { table: Some("srf".into()), name: col.into() }, alias: Some(label) }];
+                    sel.items = vec![SelectItem::Expr { expr: Expr::Column { table: Some(col.into()), name: col.into() }, alias: Some(label) }];
                 }
             }
         }
@@ -5340,6 +5340,67 @@ impl<'a> Parser<'a> {
             };
             return Ok(TableFactor::Derived { query, alias, columns, lateral });
         }
+        // ROWS FROM (f(..) [AS (col type, ..)], g(..), ..) [WITH ORDINALITY] [AS] alias [(columns)]: the functions side by side
+        if self.peek_kw("ROWS") && self.peek_kw_at(1, "FROM") && matches!(self.peek_at(2), Tok::Sym("(")) {
+            self.advance();
+            self.advance();
+            self.advance();
+            let mut spec = String::new();
+            let mut args = Vec::new();
+            loop {
+                let fname = self.ident()?.to_ascii_uppercase();
+                self.expect_sym("(")?;
+                let mut n = 0;
+                if !self.peek_sym(")") {
+                    args.push(self.expr()?);
+                    n += 1;
+                    while self.eat_sym(",") {
+                        args.push(self.expr()?);
+                        n += 1;
+                    }
+                }
+                self.expect_sym(")")?;
+                // `AS (name type, ..)`: the names of the columns it gives
+                let mut names = Vec::new();
+                if self.eat_kw("AS") {
+                    self.expect_sym("(")?;
+                    loop {
+                        names.push(self.ident()?);
+                        self.type_name()?;
+                        if self.eat_sym("(") {
+                            while !self.peek_sym(")") && !self.at_eof() {
+                                self.advance();
+                            }
+                            self.expect_sym(")")?;
+                        }
+                        if !self.eat_sym(",") {
+                            break;
+                        }
+                    }
+                    self.expect_sym(")")?;
+                }
+                spec.push_str(&format!("{fname}:{n}:{};", names.join(",")));
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.expect_sym(")")?;
+            let ordinality = self.peek_kw("WITH") && self.peek_kw_at(1, "ORDINALITY");
+            if ordinality {
+                self.advance();
+                self.advance();
+            }
+            let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { "rows".to_string() };
+            let columns = if self.eat_sym("(") {
+                let c = self.ident_list()?;
+                self.expect_sym(")")?;
+                c
+            } else {
+                Vec::new()
+            };
+            let name = format!("__ROWS_FROM:{}{spec}", if ordinality { "ord;" } else { ";" });
+            return Ok(TableFactor::Function { name, args, alias, columns });
+        }
         // A table function: name(arguments) [AS] alias [(columns)].
         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Sym("(")) {
             let name = self.ident()?.to_ascii_uppercase();
@@ -5376,7 +5437,7 @@ impl<'a> Parser<'a> {
                 };
                 let query = Select {
                     items: vec![SelectItem::Wildcard, SelectItem::Expr { expr: number, alias: Some("ordinality".into()) }],
-                    from: Some(From { first: TableFactor::Function { name, args, alias: "__f".into(), columns: Vec::new() }, joins: Vec::new() }),
+                    from: Some(From { first: TableFactor::Function { name, args, alias: alias.clone(), columns: Vec::new() }, joins: Vec::new() }),
                     ..Select::default()
                 };
                 return Ok(TableFactor::Derived { query: Box::new(query), alias, columns, lateral: true });

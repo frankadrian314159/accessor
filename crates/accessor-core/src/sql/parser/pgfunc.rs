@@ -36,6 +36,8 @@ struct Names {
     trigger: bool,
     /// Record variables: `r.col` is the variable named `r.col`.
     records: Vec<String>,
+    /// A function that returns a set of rows: `RETURN` takes no value.
+    set: bool,
 }
 
 impl Names {
@@ -169,8 +171,13 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_sym(")")?;
             } else if self.eat_kw("SETOF") {
-                self.pg_type()?;
-                set_columns.push(name.clone());
+                // a type gives one column named like the function; a table gives its columns, known when it is called
+                if is_type_word(self.peek()) {
+                    self.pg_type()?;
+                    set_columns.push(name.clone());
+                } else {
+                    set_columns.push(format!("\u{1}setof:{}", self.table_ident()?));
+                }
             } else if self.peek_kw("EVENT_TRIGGER") {
                 return Err(Error::syntax("event triggers are not supported"));
             } else if self.eat_kw("TRIGGER") {
@@ -255,6 +262,7 @@ impl<'a> Parser<'a> {
             params: params.iter().map(|p| p.name.clone()).collect(),
             trigger: is_trigger,
             records: Vec::new(),
+            set: !set_columns.is_empty(),
         };
         if is_trigger {
             if language != "plpgsql" {
@@ -266,7 +274,13 @@ impl<'a> Parser<'a> {
         }
         let routine_body = match language.as_str() {
             "sql" => sql_body(&body, &names, returns.is_some())?,
-            "plpgsql" if !set_columns.is_empty() => return Err(Error::syntax("a plpgsql function that returns a set of rows is not supported; write it in sql")),
+            "plpgsql" if !set_columns.is_empty() => {
+                // the output columns are variables of the body
+                for c in set_columns.iter().filter(|c| !c.starts_with('\u{1}')) {
+                    names.all.push(c.clone());
+                }
+                plpgsql_body(&body, names, false)?
+            }
             "plpgsql" => plpgsql_body(&body, names, returns.is_some())?,
             other => return Err(Error::syntax(format!("the language '{other}' is not available (use sql or plpgsql)"))),
         };
@@ -433,10 +447,35 @@ impl<'a> Parser<'a> {
             return self.end_stmt();
         }
         if self.eat_kw("RETURN") {
-            if self.peek_kw("NEXT") || self.peek_kw("QUERY") {
-                return Err(Error::syntax("RETURN NEXT and RETURN QUERY (set-returning functions) are not supported"));
+            if self.eat_kw("NEXT") {
+                if self.peek_sym(";") || self.at_eof() {
+                    out.push(ProcStmt::ReturnNext(None));
+                } else if let (Tok::Ident(r), true) = (self.peek().clone(), self.peek_sym_at(1, ";") || self.peek_kw_at(1, "END")) {
+                    if names.records.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+                        self.advance();
+                        out.push(ProcStmt::ReturnNextRecord(r.to_ascii_lowercase()));
+                    } else {
+                        out.push(ProcStmt::ReturnNext(Some(self.pl_expr(names)?)));
+                    }
+                } else {
+                    out.push(ProcStmt::ReturnNext(Some(self.pl_expr(names)?)));
+                }
+                return self.end_stmt();
+            }
+            if self.eat_kw("QUERY") {
+                if self.peek_kw("EXECUTE") {
+                    return Err(Error::syntax("RETURN QUERY EXECUTE is not supported"));
+                }
+                let mut st = self.statement()?;
+                names.statement(&mut st)?;
+                let Statement::Select(sel) = st else { return Err(Error::syntax("RETURN QUERY needs a SELECT")) };
+                out.push(ProcStmt::ReturnQuery(Box::new(sel)));
+                return self.end_stmt();
             }
             let value = if self.peek_sym(";") || self.at_eof() { None } else { Some(self.pl_expr(names)?) };
+            if names.set && value.is_some() {
+                return Err(Error::syntax("RETURN cannot have a parameter in a function returning a set; use RETURN NEXT"));
+            }
             out.push(ProcStmt::Return(value));
             return self.end_stmt();
         }
@@ -928,7 +967,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new() };
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false };
         let stmts = self.my_body(&mut names)?;
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
@@ -942,7 +981,7 @@ impl<'a> Parser<'a> {
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
     /// are variables.
     pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
-        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new() };
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false };
         let body = self.my_body(&mut names)?;
         fn check(list: &[ProcStmt]) -> Result<()> {
             for s in list {

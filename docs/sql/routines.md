@@ -153,12 +153,13 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `WHILE c LOOP ... END LOOP;`, `LOOP ... END LOOP;` | `EXIT [WHEN c];` leaves the innermost loop (a label is read and ignored) |
 | `FOR i IN [REVERSE] a..b [BY n] LOOP ... END LOOP;` | `i` is an integer; `FOR r IN query` is not available |
 | `RETURN [expr];` | |
+| `RETURN NEXT expr;`, `RETURN NEXT;`, `RETURN NEXT rec;`, `RETURN QUERY select;` | in a function that `RETURNS TABLE (...)` or `RETURNS SETOF type | table`: adds a row to the result. `RETURN NEXT;` takes the output columns, which are variables of the body; `RETURN` alone ends it. The function is called in FROM (also through a view); it is run once, before the query, when its arguments are known then, so a call that reads a column of another table in FROM (`LATERAL`) is not supported |
 | `RAISE [level] 'format %', args;` | `EXCEPTION` (the default) stops with that message and undoes the call; the levels `NOTICE`, `INFO`, `WARNING`, `LOG`, `DEBUG` do nothing; `USING MESSAGE = ...` works, the other `USING` options are ignored |
 | `PERFORM query;` | runs the query and discards it |
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, `RETURN NEXT`/`RETURN QUERY`, arrays, assigning a whole record (`r := new`), set-returning functions written in `plpgsql` (`RETURN NEXT`/`RETURN QUERY`; in `sql` they work, see below), event triggers, and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, arrays, assigning a whole record (`r := new`), `RETURN QUERY EXECUTE`, event triggers, and every language except `sql` and `plpgsql`.
 
 ### Trigger functions
 

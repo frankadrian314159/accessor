@@ -8,7 +8,7 @@ A session speaks one of three dialects. `asql` is the default and is what the re
 | `#2024-01-02#` | a date literal | not read | not read |
 | a boolean as text | `Yes` / `No` | `true` / `false` (`t` / `f` in the shell's result tables) | `1` / `0` |
 | a table with no columns | refused | `CREATE TABLE t ()` is allowed | refused |
-| `tableoid` | not a column | the name of the table a row was read from (also through a parent or a partitioned table) | not a column |
+| `tableoid` | not a column | the name of the table a row was read from (also through a parent or a partitioned table); also in a `CHECK` and in a trigger's `WHEN` (`NEW.tableoid`). A table's name alone in a query (`SELECT i FROM t i`, `LATERAL (VALUES (i))`) is its row written as text, `(1,2)` | not a column |
 | `NOT NULL` on a generated column | refused | allowed (a `DEFAULT` stands for it in `INSERT ... VALUES`) | refused |
 | arrays | `ARRAY[...]`, `int[]`, `a[i]`, `ANY (array)`, `@>`, `<@`, `ARRAY_OVERLAPS(a, b)` (`&&` is a slip for `&` here) | the same, with `a && b` for overlap | not read: MySQL's arrays are JSON (`MEMBER OF`, `JSON_ARRAY_APPEND`, `JSON_OVERLAPS`) |
 | comparing booleans | Access's: Yes is -1, so `TRUE > FALSE` is No | `FALSE < TRUE` | `FALSE < TRUE` |
