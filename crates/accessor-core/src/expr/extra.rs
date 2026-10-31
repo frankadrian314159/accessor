@@ -6,12 +6,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use num_bigint::BigInt;
-use regex::{Regex, RegexBuilder};
+use fancy_regex::{Regex as Inner, RegexBuilder};
 
 use crate::decimal::Decimal;
 use crate::error::{Error, Result};
 
-type PatternCache = RefCell<HashMap<(String, String), Rc<Regex>>>;
+type PatternCache = RefCell<HashMap<(String, String), Rc<Re>>>;
 
 // Compiled patterns, so that a pattern used for every row is compiled once.
 thread_local! {
@@ -21,29 +21,73 @@ thread_local! {
 /// A regular expression. Like `LIKE` and text comparison in ASQL, matching ignores case unless the
 /// flags say otherwise: `c` (case-sensitive), `i` (ignore case), `n` (a dot also matches a line
 /// break), `m` (`^` and `$` match at each line).
-pub(crate) fn pattern(pattern: &str, flags: &str) -> Result<Rc<Regex>> {
+/// A compiled regular expression; backreferences (`\1`) are supported.
+pub(crate) struct Re(Inner);
+
+impl Re {
+    pub(crate) fn is_match(&self, text: &str) -> bool {
+        self.0.is_match(text).unwrap_or(false)
+    }
+
+    /// The byte ranges of the successive non-overlapping matches.
+    pub(crate) fn find_all(&self, text: &str) -> Vec<(usize, usize)> {
+        self.0.find_iter(text).map_while(|m| m.ok()).map(|m| (m.start(), m.end())).collect()
+    }
+
+    /// The text of group `n` (0 is the whole match) of the first match.
+    pub(crate) fn group(&self, text: &str, n: usize) -> Option<String> {
+        let caps = self.0.captures(text).ok().flatten()?;
+        caps.get(n).map(|m| m.as_str().to_string())
+    }
+
+    pub(crate) fn replace_all(&self, text: &str, with: &str) -> String {
+        self.0.replace_all(text, with).into_owned()
+    }
+}
+
+pub(crate) fn pattern(pattern: &str, flags: &str) -> Result<Rc<Re>> {
     let key = (pattern.to_string(), flags.to_string());
     if let Some(r) = PATTERNS.with(|c| c.borrow().get(&key).cloned()) {
         return Ok(r);
     }
-    let mut b = RegexBuilder::new(pattern);
+    let mut prefix = String::new();
     let mut ignore_case = true;
     for f in flags.chars() {
         match f {
             'c' => ignore_case = false,
             'i' => ignore_case = true,
             'n' | 's' => {
-                b.dot_matches_new_line(true);
+                prefix.push_str("(?s)");
             }
             'm' => {
-                b.multi_line(true);
+                prefix.push_str("(?m)");
             }
             other => return Err(Error::runtime(format!("'{other}' is not a regular-expression flag (use c, i, n or m)"))),
         }
     }
-    b.case_insensitive(ignore_case);
-    b.size_limit(10 * 1024 * 1024);
-    let re = Rc::new(b.build().map_err(|e| Error::runtime(format!("not a valid regular expression: {e}")))?);
+    if ignore_case {
+        prefix.push_str("(?i)");
+    }
+    // \Z is the end of the text or just before a final line break (ICU, Perl)
+    let mut body = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            body.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Z') => body.push_str(r"(?=\n?\z)"),
+            Some(e) => {
+                body.push('\\');
+                body.push(e);
+            }
+            None => body.push('\\'),
+        }
+    }
+    let mut b = RegexBuilder::new(&format!("{prefix}{body}"));
+    b.delegate_size_limit(10 * 1024 * 1024);
+    let re = Rc::new(b.build().map(Re).map_err(|e| Error::runtime(format!("not a valid regular expression: {e}")))?);
     PATTERNS.with(|c| {
         let mut c = c.borrow_mut();
         if c.len() >= 128 {

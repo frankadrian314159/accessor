@@ -1001,7 +1001,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             if f == RegexpLike {
                 Value::Bool(re.is_match(&text))
             } else {
-                Value::Int(re.find_iter(&text).count() as i64)
+                Value::Int(re.find_all(&text).len() as i64)
             }
         }
         SimilarTo => {
@@ -1019,7 +1019,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 Some(g) => int_of(g)?.max(0) as usize,
                 None => 0,
             };
-            match re.captures(&text_of(&vals[0])).and_then(|c| c.get(group).map(|m| m.as_str().to_string())) {
+            match re.group(&text_of(&vals[0]), group) {
                 Some(m) => Value::text(&m),
                 None => Value::Null,
             }

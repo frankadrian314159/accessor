@@ -431,7 +431,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let end_option = vals.get(4).map(|x| int(x)).transpose()?.unwrap_or(0);
             let chars: Vec<(usize, char)> = s.char_indices().collect();
             let from = chars.get(start - 1).map_or(s.len(), |&(b, _)| b);
-            let found = re.find_iter(&s[from..]).nth(nth - 1).map(|m| (m.start(), m.end()));
+            let found = re.find_all(&s[from..]).get(nth - 1).copied();
             match found {
                 Some((a, b)) => {
                     let byte = from + if end_option == 1 { b } else { a };

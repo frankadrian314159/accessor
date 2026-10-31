@@ -1,6 +1,6 @@
 # Regular expressions
 
-Regular expressions (the syntax of the Rust `regex` crate: [documentation](https://docs.rs/regex/latest/regex/#syntax)) match text more precisely than `LIKE`. Like `LIKE` and text comparison in ASQL, **matching ignores case** unless the flags ask otherwise.
+Regular expressions (the syntax of the Rust `regex` crate: [documentation](https://docs.rs/regex/latest/regex/#syntax)) match text more precisely than `LIKE`. A pattern may also use backreferences (`(a+)\1`, `\k<name>`), look-ahead and look-behind (`(?=..)`, `(?<!..)`), and atomic groups, which the `regex` crate alone lacks (they come from `fancy-regex`); patterns without them run as plain `regex` patterns. A match that needs too much backtracking counts as no match. Like `LIKE` and text comparison in ASQL, **matching ignores case** unless the flags ask otherwise.
 
 ## Flags
 

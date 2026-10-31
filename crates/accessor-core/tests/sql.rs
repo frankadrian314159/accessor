@@ -6633,3 +6633,14 @@ fn mysql_vector_xml_invisible_columns_and_row_count() {
     assert_eq!(one(&mut db, r"SELECT 'it\'s\tok'"), "it's\tok");
     assert_eq!(one(&mut db, r"SELECT 'a\%b'"), r"a\%b");
 }
+
+#[test]
+fn regular_expressions_have_backreferences_and_lookaround() {
+    let mut db = Database::in_memory();
+    db.set_dialect(accessor_core::dialect::Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, r"SELECT REGEXP_LIKE('abab', '^(ab)\\1$')"), "1");
+    assert_eq!(one(&mut db, r"SELECT REGEXP_LIKE('abac', '^(ab)\\1$')"), "0");
+    assert_eq!(one(&mut db, r"SELECT REGEXP_REPLACE('aa bb cd', '(.)\\1', '<$1>')"), "<a> <b> cd");
+    assert_eq!(one(&mut db, "SELECT REGEXP_SUBSTR('foobar', 'foo(?=bar)')"), "foo");
+}
