@@ -123,7 +123,7 @@ pub enum MyFn {
 
 pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
     use MyFn::*;
-    if let Some((n, lo, hi)) = super::geom::lookup(name) {
+    if let Some((n, lo, hi)) = super::geom::lookup(name).filter(|_| crate::dialect::current() == crate::dialect::Dialect::Mysql) {
         return Some((Geo(n), lo, hi));
     }
     Some(match name {

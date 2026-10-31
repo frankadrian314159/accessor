@@ -737,6 +737,9 @@ impl Table {
             return Err(Error::catalog("multiple primary key defined"));
         }
         if column.autonumber || column.primary_key {
+            if crate::dialect::current() != crate::dialect::Dialect::Mysql {
+                return Err(Error::catalog("AutoNumber and primary key columns cannot be added to an existing table"));
+            }
             // the records are numbered in the order they are kept; only an AutoNumber can fill a key that is new
             if !column.autonumber && self.live > 1 {
                 return Err(Error::catalog("a primary key column cannot be added to a table that has records"));
