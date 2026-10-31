@@ -1,15 +1,15 @@
 //! Design view (edit the structure of an existing table) and the
 //! "new table" designer.
 
-use accessor_core::{DataType, Database, RefAction};
+use accessor_core::{ArrayOf, DataType, Database, RefAction};
 use egui::RichText;
 
 use crate::ui::{bracket, Event};
 
-/// Tall enough to show every type at once; the default drop-down height would hide the last few.
+/// The drop-down scrolls: there are the thirteen types and an array of each.
 const TYPE_LIST_HEIGHT: f32 = 340.0;
 
-const TYPES: [DataType; 13] = [
+const TYPES: [DataType; 27] = [
     DataType::Integer,
     DataType::Bignum,
     DataType::Float,
@@ -23,11 +23,26 @@ const TYPES: [DataType; 13] = [
     DataType::TimestampTz,
     DataType::Interval,
     DataType::Json,
+    DataType::Array(ArrayOf::Any),
+    DataType::Array(ArrayOf::Integer),
+    DataType::Array(ArrayOf::Bignum),
+    DataType::Array(ArrayOf::Float),
+    DataType::Array(ArrayOf::Double),
+    DataType::Array(ArrayOf::Decimal),
+    DataType::Array(ArrayOf::Currency),
+    DataType::Array(ArrayOf::Rational),
+    DataType::Array(ArrayOf::Text),
+    DataType::Array(ArrayOf::YesNo),
+    DataType::Array(ArrayOf::DateTime),
+    DataType::Array(ArrayOf::TimestampTz),
+    DataType::Array(ArrayOf::Interval),
+    DataType::Array(ArrayOf::Json),
 ];
 
-/// Types offered for a new field. An existing field can only be converted to the
-/// ordinary types (`TYPES`); a field becomes calculated by being created that way.
-const NEW_TYPES: [DataType; 14] = [
+/// Types offered for a new field, Calculated after the thirteen plain ones (so it is in view without scrolling) and the
+/// arrays after it. An existing field can only be converted to the ordinary types (`TYPES`); a field becomes
+/// calculated by being created that way.
+const NEW_TYPES: [DataType; 28] = [
     DataType::Integer,
     DataType::Bignum,
     DataType::Float,
@@ -42,6 +57,20 @@ const NEW_TYPES: [DataType; 14] = [
     DataType::Interval,
     DataType::Json,
     DataType::Calculated,
+    DataType::Array(ArrayOf::Any),
+    DataType::Array(ArrayOf::Integer),
+    DataType::Array(ArrayOf::Bignum),
+    DataType::Array(ArrayOf::Float),
+    DataType::Array(ArrayOf::Double),
+    DataType::Array(ArrayOf::Decimal),
+    DataType::Array(ArrayOf::Currency),
+    DataType::Array(ArrayOf::Rational),
+    DataType::Array(ArrayOf::Text),
+    DataType::Array(ArrayOf::YesNo),
+    DataType::Array(ArrayOf::DateTime),
+    DataType::Array(ArrayOf::TimestampTz),
+    DataType::Array(ArrayOf::Interval),
+    DataType::Array(ArrayOf::Json),
 ];
 
 pub struct Design {
@@ -148,11 +177,11 @@ impl Design {
                     egui::ComboBox::from_id_salt(("design_ty", &self.table, &c.name)).height(TYPE_LIST_HEIGHT)
                         .selected_text(ty.to_string())
                         .show_ui(ui, |ui| {
-                            for t in TYPES {
+                            for (i, t) in TYPES.into_iter().enumerate() {
+                                if i == 13 && can_calculate {
+                                    ui.selectable_value(&mut ty, DataType::Calculated, DataType::Calculated.to_string());
+                                }
                                 ui.selectable_value(&mut ty, t, t.to_string());
-                            }
-                            if can_calculate {
-                                ui.selectable_value(&mut ty, DataType::Calculated, DataType::Calculated.to_string());
                             }
                         });
                     if ty != c.data_type {
@@ -868,5 +897,25 @@ mod tests {
         let (_, events) = frame(&ctx, &mut design, &db, click(add), time);
         let sql: Vec<&str> = events.iter().filter_map(|e| if let Event::Execute { sql, .. } = e { Some(sql.as_str()) } else { None }).collect();
         assert_eq!(sql, ["ALTER TABLE [Album] ADD COLUMN [Title] CALCULATED AS (Name & ' (' & Year & ')')"]);
+    }
+
+    /// Every type the engine has (in asql, the default dialect) is offered, an array of each included, and each one
+    /// makes a column the engine accepts.
+    #[test]
+    fn the_type_lists_hold_every_engine_type() {
+        for t in TYPES {
+            assert!(NEW_TYPES.contains(&t), "{t} is offered for a new field but not for an existing one");
+            if t != DataType::Calculated {
+                let array = DataType::Array(ArrayOf::of(t));
+                assert!(TYPES.contains(&array), "no {array}");
+            }
+        }
+        assert!(TYPES.contains(&DataType::Array(ArrayOf::Any)));
+        assert!(NEW_TYPES.contains(&DataType::Calculated));
+        let mut db = Database::in_memory();
+        for (i, t) in TYPES.iter().enumerate() {
+            db.execute(&format!("CREATE TABLE [T{i}] ([A] {})", t.sql_name())).unwrap_or_else(|e| panic!("{t}: {e}"));
+            assert_eq!(db.table(&format!("T{i}")).unwrap().schema().columns[0].data_type, *t);
+        }
     }
 }

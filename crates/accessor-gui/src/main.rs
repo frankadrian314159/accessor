@@ -12,7 +12,17 @@ mod sample;
 mod ui;
 
 fn main() -> Result<(), eframe::Error> {
-    let path = std::env::args().nth(1);
+    // `accessor-gui [--asql|--postgresql|--mysql] [FILE.adb]`: the dialect is asql unless one is named
+    let mut dialect = accessor_core::dialect::Dialect::Asql;
+    let mut path = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--asql" => dialect = accessor_core::dialect::Dialect::Asql,
+            "--postgresql" => dialect = accessor_core::dialect::Dialect::Postgresql,
+            "--mysql" => dialect = accessor_core::dialect::Dialect::Mysql,
+            _ => path = Some(arg),
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 760.0])
@@ -20,5 +30,5 @@ fn main() -> Result<(), eframe::Error> {
             .with_title("Accessor"),
         ..Default::default()
     };
-    eframe::run_native("Accessor", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, path)))))
+    eframe::run_native("Accessor", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, path, dialect)))))
 }

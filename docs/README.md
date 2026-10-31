@@ -138,7 +138,7 @@ The first build downloads the dependencies and takes a minute or two; the graphi
 cargo run --release -p accessor-gui
 ```
 
-The window opens on an empty, in-memory database; the status bar says so. Nothing is saved until you create or open a file. Choose **File › New database…** to name a file ending in `.adb`, or **File › Load sample data** to fill the current database with a small shop (customers, products, orders, order details and two saved queries) so you have something to explore.
+`cargo run --release -p accessor-gui -- [--asql|--postgresql|--mysql] [FILE.adb]` names the SQL dialect of the session and a file to open; the default is asql. The data type lists in the designers offer every type of the engine, thirteen plain ones and an array of each (`INTEGER[]`, `TEXT[]`, … and the untyped `ARRAY`), plus Calculated for a new or existing field. The window opens on an empty, in-memory database; the status bar says so. Nothing is saved until you create or open a file. Choose **File › New database…** to name a file ending in `.adb`, or **File › Load sample data** to fill the current database with a small shop (customers, products, orders, order details and two saved queries) so you have something to explore.
 
 Double-click a table in the left pane to open its datasheet. Right-click it for the form view, the design view, or to delete it. Double-click a cell to edit it, press `Enter` to keep the change or `Esc` to cancel. The section on [the desktop app](#the-desktop-app) goes through each view.
 

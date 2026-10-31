@@ -84,11 +84,19 @@ pub struct App {
     new_table: Option<NewTable>,
     confirm: Option<Confirm>,
     about: bool,
+    /// The SQL dialect of the session; a database that is opened gets it too.
+    dialect: accessor_core::dialect::Dialect,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, path: Option<String>) -> Self {
-        Self::with_context(&cc.egui_ctx, path)
+    pub fn new(cc: &eframe::CreationContext<'_>, path: Option<String>, dialect: accessor_core::dialect::Dialect) -> Self {
+        let mut app = Self::with_context(&cc.egui_ctx, None);
+        app.dialect = dialect;
+        app.db.set_dialect(dialect);
+        if let Some(p) = path {
+            app.open_db(PathBuf::from(p));
+        }
+        app
     }
 
     /// Builds the application for an egui context; split from `new` so tests need no window.
@@ -100,6 +108,7 @@ impl App {
         ctx.set_visuals(visuals);
 
         let mut app = App {
+            dialect: accessor_core::dialect::Dialect::Asql,
             db: Database::in_memory(),
             path: None,
             tabs: Vec::new(),
@@ -174,6 +183,7 @@ impl App {
             Ok(db) => {
                 self.status = format!("Opened {}", path.display());
                 self.db = db;
+                self.db.set_dialect(self.dialect);
                 self.path = Some(path);
                 self.error = None;
             }

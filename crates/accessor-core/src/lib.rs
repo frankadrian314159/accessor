@@ -54,4 +54,4 @@ pub use report::ReportFormat;
 pub use shared::{Connection, SharedDatabase};
 pub use storage::stats::ColumnStats;
 pub use storage::{RowId, Table};
-pub use value::{DataType, Row, Value};
+pub use value::{ArrayOf, DataType, Row, Value};
