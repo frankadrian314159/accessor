@@ -85,6 +85,37 @@ impl Source<'_> {
     }
 }
 
+/// Why the text is not the name of a type for `regtype` (PostgreSQL's message and code), or `None` when it is.
+fn regtype_error(text: &str) -> Option<(String, &'static str)> {
+    let t = text.trim();
+    let (base, modifiers) = match t.find('(') {
+        Some(i) => (t[..i].trim_end(), Some(&t[i..])),
+        None => (t, None),
+    };
+    if base.is_empty() || base.chars().any(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '"')) {
+        let near = base.split_whitespace().nth(1).unwrap_or(base);
+        return Some((format!("syntax error at or near \"{near}\""), "42601"));
+    }
+    let parts: Vec<&str> = base.split('.').collect();
+    if parts.len() > 3 {
+        return Some((format!("improper qualified name (too many dotted names): {base}"), "42601"));
+    }
+    if parts.len() == 3 {
+        return Some((format!("cross-database references are not implemented: {base}"), "0A000"));
+    }
+    let name = parts[parts.len() - 1].trim_matches('"').to_ascii_lowercase();
+    if let Some(m) = modifiers {
+        let count = m.trim_matches(|c| c == '(' || c == ')').split(',').count();
+        if matches!(name.as_str(), "numeric" | "decimal") && count > 2 {
+            return Some(("invalid NUMERIC type modifier".to_string(), "22023"));
+        }
+    }
+    if crate::value::DataType::from_sql_name(&name).is_none() && crate::sql::usertypes::lookup(&name).is_none() {
+        return Some((format!("type \"{name}\" does not exist"), "42704"));
+    }
+    None
+}
+
 impl Database {
     pub(crate) fn resolve_factor(&self, f: &TableFactor, depth: u32) -> Result<Source<'_>> {
         match f {
@@ -388,6 +419,11 @@ impl Database {
             }
             let name = args[1].to_string().to_ascii_lowercase();
             let name = name.split('(').next().unwrap_or("").trim().to_string();
+            if name == "regtype" {
+                if let Some((message, code)) = regtype_error(&args[0].to_string()) {
+                    return Ok((cols, vec![vec![Value::text(&message), Value::Null, Value::Null, Value::text(code)]]));
+                }
+            }
             let (ty, _) = crate::value::DataType::from_sql_name(&name).ok_or_else(|| Error::catalog(format!("type \"{name}\" does not exist")))?;
             let row = match Value::text(&args[0].to_string()).coerce_to(ty) {
                 Ok(_) => vec![Value::Null; 4],

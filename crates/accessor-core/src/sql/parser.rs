@@ -6480,7 +6480,8 @@ impl<'a> Parser<'a> {
                     let number = Expr::Window { func: Box::new(call("row_number", Vec::new())), spec: WindowSpec::default() };
                     items.push(SelectItem::Expr { expr: number, alias: Some(name) });
                 } else {
-                    let tn = self.type_name()?;
+                    let declared = self.type_name()?;
+                    let tn = crate::sql::usertypes::lookup(&declared).map(|u| u.base).unwrap_or_else(|| declared.clone());
                     let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
                     let mut hints = Vec::new();
                     if self.eat_sym("(") {
@@ -6523,7 +6524,8 @@ impl<'a> Parser<'a> {
                     // PostgreSQL gives the "false" of EXISTS as a boolean, which only some types take
                     if exists
                         && crate::dialect::current() == crate::dialect::Dialect::Postgresql
-                        && !["int", "int4", "integer", "bool", "boolean", "text", "varchar", "json", "jsonb"].contains(&tn.to_ascii_lowercase().as_str())
+                        && !["int", "int4", "integer", "bool", "boolean", "text", "varchar", "json", "jsonb"]
+                            .contains(&crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or_else(|| tn.clone()).to_ascii_lowercase().as_str())
                     {
                         return Err(Error::syntax("could not coerce ON ERROR expression (FALSE) to the RETURNING type"));
                     }

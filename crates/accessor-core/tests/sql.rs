@@ -6282,6 +6282,15 @@ fn postgresql_json_table_errors_and_pg_input_error_info() {
     assert_eq!(bad.columns, ["message", "detail", "hint", "sql_error_code"]);
     assert_eq!(bad.rows[0][3].to_string(), "22P02");
     assert!(!bad.rows[0][0].is_null());
+    // a domain over int takes EXISTS PATH like int does
+    db.execute("CREATE DOMAIN dint4 AS int").unwrap();
+    db.execute(r#"SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a dint4 EXISTS PATH '$.a'))"#).unwrap();
+    // regtype names that are not types
+    for (text, code) in [("incorrect type name syntax", "42601"), ("numeric(1,2,3)", "22023"), ("way.too.many.names", "42601"), ("no_such_catalog.schema.name", "0A000"), ("no_such_type", "42704")] {
+        let r = db.execute(&format!("SELECT * FROM pg_input_error_info('{text}', 'regtype')")).unwrap();
+        assert_eq!(r.rows[0][3].to_string(), code, "{text}");
+    }
+    assert!(db.execute("SELECT * FROM pg_input_error_info('int4', 'regtype')").unwrap().rows[0][0].is_null());
     let good = db.execute("SELECT * FROM pg_input_error_info('12', 'integer')").unwrap();
     assert!(good.rows[0][0].is_null());
 }
