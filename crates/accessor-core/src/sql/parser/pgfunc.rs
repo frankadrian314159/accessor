@@ -1034,8 +1034,14 @@ impl<'a> Parser<'a> {
         }
         self.expect_kw("BEGIN")?;
         self.eat_kw("ATOMIC");
+        if self.depth > 100 {
+            return Err(Error::syntax("the blocks are nested too deeply"));
+        }
+        self.depth += 1;
         let saved = std::mem::take(&mut names.handlers);
-        let inner = self.my_stmts(names, &["END"])?;
+        let inner = self.my_stmts(names, &["END"]);
+        self.depth -= 1;
+        let inner = inner?;
         let handlers = std::mem::replace(&mut names.handlers, saved);
         if handlers.is_empty() && label.is_none() {
             out.extend(inner);
