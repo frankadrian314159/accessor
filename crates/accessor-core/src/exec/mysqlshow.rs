@@ -164,8 +164,11 @@ impl Database {
             "create table" => {
                 let schema = self.show_schema(&target)?;
                 let mut lines: Vec<String> = Vec::new();
+                let invisible = self.invisible_columns(&schema.name);
                 for c in &schema.columns {
-                    let mut l = format!("  {} {}", quoted(&c.name), mysql_type(c.data_type));
+                    let hidden = invisible.iter().any(|h| h.eq_ignore_ascii_case(&c.name));
+                    let ty = if hidden && c.autonumber && c.name == "my_row_id" { "bigint unsigned" } else { mysql_type(c.data_type) };
+                    let mut l = format!("  {} {}", quoted(&c.name), ty);
                     if c.not_null || c.primary_key {
                         l.push_str(" NOT NULL");
                     }
@@ -177,6 +180,9 @@ impl Database {
                         l.push_str(&format!(" DEFAULT '{}'", v.to_string().replace('\'', "''")));
                     } else if !(c.not_null || c.primary_key) {
                         l.push_str(" DEFAULT NULL");
+                    }
+                    if hidden {
+                        l.push_str(" /*!80023 INVISIBLE */");
                     }
                     lines.push(l);
                 }

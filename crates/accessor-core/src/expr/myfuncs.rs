@@ -119,6 +119,35 @@ pub enum MyFn {
     IntervalIdx,
     /// `GET_FORMAT(DATE | TIME | DATETIME, 'USA' | 'EUR' | 'JIS' | 'ISO' | 'INTERNAL')`.
     GetFormat,
+    ExtractValue,
+    UpdateXml,
+    ToVector,
+    FromVector,
+    VectorDim,
+    VectorDistance,
+    /// `ROW_COUNT()`: the rows the last statement changed (-1 for a query).
+    RowCount,
+}
+
+fn mysql() -> bool {
+    crate::dialect::current() == crate::dialect::Dialect::Mysql
+}
+
+/// The floats of a vector value (little-endian 32-bit floats).
+fn vector_floats(v: &Value) -> Result<Vec<f32>> {
+    let b = raw(v);
+    if b.len() % 4 != 0 {
+        return Err(Error::runtime("Invalid vector value"));
+    }
+    Ok(b.chunks(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// `1.00000e+00`: five digits after the point and an exponent with a sign and two digits, as MySQL prints a vector.
+fn sci(x: f32) -> String {
+    let s = format!("{:.5e}", x);
+    let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+    let e: i32 = e.parse().unwrap_or(0);
+    format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
 }
 
 pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
@@ -222,6 +251,13 @@ pub fn lookup(name: &str) -> Option<(MyFn, usize, usize)> {
         "__BINARY" => (Binary, 1, 1),
         "INTERVAL" => (IntervalIdx, 2, usize::MAX),
         "GET_FORMAT" => (GetFormat, 2, 2),
+        "EXTRACTVALUE" if mysql() => (ExtractValue, 2, 2),
+        "UPDATEXML" if mysql() => (UpdateXml, 3, 3),
+        "TO_VECTOR" | "STRING_TO_VECTOR" if mysql() => (ToVector, 1, 1),
+        "FROM_VECTOR" | "VECTOR_TO_STRING" if mysql() => (FromVector, 1, 1),
+        "VECTOR_DIM" if mysql() => (VectorDim, 1, 1),
+        "ROW_COUNT" if mysql() => (RowCount, 0, 0),
+        "DISTANCE" if mysql() => (VectorDistance, 3, 3),
         "CURRENT_TIME" => (CurTime, 0, 1),
         "TO_BASE64" => (ToBase64, 1, 1),
         "FROM_BASE64" => (FromBase64, 1, 1),
@@ -237,7 +273,7 @@ impl MyFn {
 
     /// Functions that give a different answer each time.
     pub fn is_volatile(self) -> bool {
-        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::JsonTableRequire | MyFn::LastInsertId | MyFn::CurTime)
+        matches!(self, MyFn::Uuid | MyFn::Sleep | MyFn::Lock | MyFn::UnixTimestamp | MyFn::FoundRows | MyFn::AssignVar | MyFn::JsonTableRequire | MyFn::LastInsertId | MyFn::CurTime | MyFn::RowCount)
     }
 }
 
@@ -810,6 +846,51 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let iv = vals.get(2).map(|x| raw(x));
             super::bytefuncs::aes_decrypt(&raw(v(0)), &raw(v(1)), iv.as_deref(), 128).map_or(Value::Null, Value::bytes)
         }
+        ExtractValue => match super::xmlfuncs::extract_value(&text(v(0)), &text(v(1)))? {
+            Some(s) => Value::text(&s),
+            None => Value::Null,
+        },
+        UpdateXml => match super::xmlfuncs::update_xml(&text(v(0)), &text(v(1)), &text(v(2)))? {
+            Some(s) => Value::text(&s),
+            None => Value::Null,
+        },
+        ToVector => {
+            let s = text(v(0));
+            let inner = s.trim().strip_prefix('[').and_then(|x| x.strip_suffix(']')).ok_or_else(|| Error::runtime("Data cannot be converted to a valid vector"))?;
+            let mut bytes = Vec::new();
+            if !inner.trim().is_empty() {
+                for part in inner.split(',') {
+                    let f: f32 = part.trim().parse().map_err(|_| Error::runtime("Data cannot be converted to a valid vector"))?;
+                    if !f.is_finite() {
+                        return Err(Error::runtime("Data cannot be converted to a valid vector"));
+                    }
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            Value::bytes(bytes)
+        }
+        FromVector => {
+            let f = vector_floats(v(0))?;
+            Value::text(&format!("[{}]", f.iter().map(|x| sci(*x)).collect::<Vec<_>>().join(",")))
+        }
+        VectorDim => Value::Int(vector_floats(v(0))?.len() as i64),
+        VectorDistance => {
+            let (a, b) = (vector_floats(v(0))?, vector_floats(v(1))?);
+            if a.len() != b.len() {
+                return Err(Error::runtime("Cannot calculate distance between vectors of different dimensions"));
+            }
+            let dot: f64 = a.iter().zip(&b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+            match text(v(2)).to_ascii_uppercase().as_str() {
+                "DOT" => Value::Double(dot),
+                "EUCLIDEAN" => Value::Double(a.iter().zip(&b).map(|(x, y)| (f64::from(*x) - f64::from(*y)).powi(2)).sum::<f64>().sqrt()),
+                "COSINE" => {
+                    let (na, nb) = (a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt(), b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt());
+                    Value::Double(if na == 0.0 || nb == 0.0 { f64::NAN } else { 1.0 - dot / (na * nb) })
+                }
+                other => return Err(Error::runtime(format!("Invalid distance metric '{other}'"))),
+            }
+        }
+        RowCount => Value::Int(ROW_COUNT.with(|c| c.get())),
         IntervalIdx => match v(0) {
             Value::Null => Value::Int(-1),
             n => {
@@ -1250,6 +1331,7 @@ fn from_base64(s: &str) -> Option<Vec<u8>> {
 thread_local! {
     static FOUND_ROWS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static LAST_INSERT_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static ROW_COUNT: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
     static ASSIGNED: std::cell::RefCell<Vec<(String, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -1353,6 +1435,11 @@ pub(crate) fn take_assignments() -> Vec<(String, Value)> {
 /// Remembers the number of rows of the last query, for `FOUND_ROWS()`.
 pub(crate) fn set_found_rows(n: usize) {
     FOUND_ROWS.with(|c| c.set(n as i64));
+}
+
+/// Remembers how many rows the last statement changed (-1 for a query), for `ROW_COUNT()`.
+pub(crate) fn set_row_count(n: i64) {
+    ROW_COUNT.with(|c| c.set(n));
 }
 
 /// Remembers the last number an AutoNumber column was given, for `LAST_INSERT_ID()`.

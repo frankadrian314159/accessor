@@ -57,7 +57,23 @@ impl Database {
         let mut last = QueryResult::default();
         let _hint = budget::hinted_time(sql).map(budget::limit);
         for st in self.parse_cached(sql)?.iter() {
-            last = self.execute_statement(st)?;
+            match self.execute_statement(st) {
+                Ok(r) => {
+                    if !matches!(st, Statement::GetDiagnostics { .. }) {
+                        self.last_diag = None;
+                    }
+                    crate::expr::myfuncs::set_row_count(match st {
+                        Statement::Select(_) | Statement::SelectInto { .. } | Statement::Show(_) => -1,
+                        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Upsert { .. } | Statement::DeleteMulti { .. } | Statement::UpdateMulti { .. } => r.affected as i64,
+                        _ => 0,
+                    });
+                    last = r;
+                }
+                Err(e) => {
+                    self.last_diag = Some(e.diag());
+                    return Err(e);
+                }
+            }
         }
         Ok(last)
     }
@@ -338,6 +354,18 @@ impl Database {
             Statement::Parameters(_) => Ok(QueryResult::default()),
             Statement::Exec { name, args } => self.exec_exec(name, args),
             Statement::Raise(_) => Err(Error::runtime("RAISE can only be used inside a trigger")),
+            Statement::InsertSelectExtend { table, select } => self.exec_insert_select_extend(table, select),
+            Statement::Signal { resignal, state, items } => {
+                let current = self.last_diag.clone();
+                Err(self.signal_error(*resignal, state, items, current.as_ref()).unwrap_or_else(|e| e))
+            }
+            Statement::GetDiagnostics { stacked, condition, items } => {
+                let diag = self.last_diag.clone();
+                for ((name, _), value) in self.diagnostics_values(*stacked, condition.as_ref(), items, diag.as_ref(), 0)? {
+                    self.user_vars.insert(name.to_ascii_lowercase(), value);
+                }
+                Ok(QueryResult::default())
+            }
             Statement::CreateTrigger(def) => self.exec_create_trigger(def),
             Statement::DropTrigger(name) => self.exec_drop_trigger(name),
             Statement::Upsert { insert, conflict } => self.exec_upsert(insert, conflict),

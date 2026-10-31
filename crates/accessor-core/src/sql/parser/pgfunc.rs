@@ -1168,6 +1168,7 @@ impl<'a> Parser<'a> {
                 return self.my_end();
             }
             let ty = self.pg_type()?;
+            while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") {}
             self.skip_charset();
             let init = if self.eat_kw("DEFAULT") { Some(self.pl_expr(names)?) } else { None };
             for v in vars {
@@ -1259,6 +1260,20 @@ impl<'a> Parser<'a> {
             self.expect_kw("LOOP")?;
             out.push(ProcStmt::While { cond: lit_true(), body });
             wrap(label, out);
+            return self.my_end();
+        }
+        if self.peek_kw("GET") && (self.peek_kw_at(1, "DIAGNOSTICS") || self.peek_kw_at(1, "CURRENT") || self.peek_kw_at(1, "STACKED")) {
+            self.advance();
+            let st = self.get_diagnostics()?;
+            out.push(ProcStmt::Sql(st));
+            return self.my_end();
+        }
+        if self.peek_kw("SIGNAL") || self.peek_kw("RESIGNAL") {
+            let resignal = self.peek_kw("RESIGNAL");
+            self.advance();
+            let mut st = self.signal_statement(resignal, &names.conditions)?;
+            names.statement(&mut st)?;
+            out.push(ProcStmt::Sql(st));
             return self.my_end();
         }
         if self.eat_kw("LEAVE") {

@@ -25,6 +25,8 @@ pub struct ScopeCol {
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     pub cols: Vec<ScopeCol>,
+    /// Columns left out of `*` but there to be named: (table alias, column), both in lower case.
+    pub invisible: Vec<(String, String)>,
 }
 
 impl Scope {
@@ -49,7 +51,7 @@ impl Scope {
     }
 
     pub fn prefix(&self, n: usize) -> Scope {
-        Scope { cols: self.cols[..n].to_vec() }
+        Scope { cols: self.cols[..n].to_vec(), invisible: Vec::new() }
     }
 }
 

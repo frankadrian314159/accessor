@@ -9,6 +9,7 @@ pub mod arrays;
 pub mod bytefuncs;
 pub mod geom;
 pub mod tsearch;
+pub mod xmlfuncs;
 pub mod myfuncs;
 pub mod pgfuncs;
 

@@ -259,6 +259,8 @@ pub struct ColumnDef {
     pub expression: Option<String>,
     /// Source text of a column `CHECK (...)`.
     pub check: Option<String>,
+    /// MySQL's `INVISIBLE`: left out of `SELECT *` and of an `INSERT` with no column list.
+    pub invisible: bool,
 }
 
 /// `FOREIGN KEY (columns) REFERENCES ref_table (ref_columns)`; an empty
@@ -278,6 +280,8 @@ pub struct ForeignKeyDef {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterAction {
     AddColumn(ColumnDef),
+    /// `ALTER COLUMN c SET INVISIBLE | VISIBLE` (MySQL).
+    SetInvisible { name: String, invisible: bool },
     /// `FIRST` (`after` is `None`) or `AFTER c` for a field just added.
     MoveColumn { name: String, after: Option<String> },
     DropColumn(String),
@@ -590,6 +594,14 @@ pub enum Statement {
     SetRole(Option<String>),
     /// `SET @name = expr` (MySQL's user variable).
     SetVar { name: String, expr: Expr },
+    /// `CREATE TABLE t (cols) SELECT ...`: the rows of the query go to the fields of their names, and a column of the query that
+    /// the table has no field for is added to it.
+    InsertSelectExtend { table: String, select: Box<Select> },
+    /// `SIGNAL` / `RESIGNAL [SQLSTATE 'x' | condition] [SET item = expr, ...]`.
+    Signal { resignal: bool, state: Option<String>, items: Vec<(String, Expr)> },
+    /// `GET [CURRENT | STACKED] DIAGNOSTICS [CONDITION n] target = item, ...`; a target is a variable name and whether it is a
+    /// user variable (`@x`).
+    GetDiagnostics { stacked: bool, condition: Option<Expr>, items: Vec<((String, bool), String)> },
     /// `SET name = expr` where the value is an expression to evaluate.
     SetParameterExpr { name: String, expr: Expr },
     /// `SELECT ... INTO @a, @b`.

@@ -50,6 +50,8 @@ pub(crate) struct Source<'a> {
     pub(crate) data: SourceData<'a>,
     /// Conditions that belong to the source itself (a merged view's `WHERE`), written for its columns.
     pub(crate) intrinsic: Vec<BExpr>,
+    /// Columns left out of `SELECT *` (MySQL's invisible columns), by lower-case name.
+    pub(crate) hidden: Vec<String>,
     pub(crate) alias: String,
     pub(crate) names: Vec<String>,
 }
@@ -140,11 +142,11 @@ impl Database {
                 let alias = alias.clone().unwrap_or_else(|| name.clone());
                 if let Some(view) = name.strip_prefix("information_schema.") {
                     let (names, rows) = self.information_schema(view)?;
-                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
                 if let Some(view) = name.strip_prefix("performance_schema.") {
                     let (names, rows) = self.performance_schema(view)?;
-                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
                 if !*only && self.table(name).is_some() && self.has_children(name) {
                     return self.family_source(name, alias, depth);
@@ -164,7 +166,7 @@ impl Database {
                             }
                         }
                         let names = schema.columns.iter().map(|c| c.name.clone()).collect();
-                        return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                        return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
                     }
                     let mut names: Vec<String> = t.schema().columns.iter().map(|c| c.name.clone()).collect();
                     if crate::dialect::wants_tableoid() {
@@ -178,9 +180,10 @@ impl Database {
                                 r
                             })
                             .collect();
-                        return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                        return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
                     }
-                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Table(t), alias, names });
+                    let hidden = self.invisible_columns(t.name());
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), hidden, data: SourceData::Table(t), alias, names });
                 }
                 if self.view_sql(name).is_some() {
                     self.require_privilege(name, "select")?;
@@ -191,7 +194,7 @@ impl Database {
                         )));
                     }
                     let res = self.without_privileges(|| self.run_select_depth(&q, depth + 1))?;
-                    return Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
@@ -233,7 +236,7 @@ impl Database {
                         res.columns[heads.len() + i] = l.clone();
                     }
                 }
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names: res.columns })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names: res.columns })
             }
             TableFactor::Unpivot { source, value_col, name_col, columns, include_nulls, alias } => {
                 let inner = self.resolve_factor(source, depth)?;
@@ -265,7 +268,7 @@ impl Database {
                         out.push(r);
                     }
                 }
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(out), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(out), alias: alias.clone(), names })
             }
             TableFactor::Function { name, args, alias, columns } => {
                 let scope = Scope::default();
@@ -275,7 +278,7 @@ impl Database {
                 }
                 let (cols, rows) = self.table_function(name, &vals)?;
                 let names = rename_columns(single_column_alias(cols, name, alias), columns, alias)?;
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
             }
             TableFactor::Derived { query, alias, columns, lateral } => {
                 // conditions of the outer WHERE on this table's columns are applied inside it, before it is built
@@ -289,10 +292,10 @@ impl Database {
                 }
                 let res = self.run_select_depth(pushed.as_ref().unwrap_or(query), depth + 1)?;
                 let names = rename_columns(res.columns, columns, alias)?;
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
             TableFactor::Materialized { rows, columns, alias } => {
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows.as_ref().clone()), alias: alias.clone(), names: columns.clone() })
             }
             TableFactor::Nested { from, alias } => {
                 // the list is joined first; each column keeps the name of the table it came from, written `table\u{1}column`
@@ -322,7 +325,7 @@ impl Database {
                     };
                     names.push(format!("{q}\u{1}{c}"));
                 }
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(res.rows), alias: alias.clone(), names })
             }
         }
     }
@@ -354,7 +357,7 @@ impl Database {
                 probe.limit = Some(0);
                 let probed = self.unlogged(|| self.run_select_depth(&probe, depth + 1))?;
                 let names = rename_columns(probed.columns, columns, alias)?;
-                Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Query(q), outer })), alias: alias.clone(), names })
             }
             TableFactor::Function { name, args, alias, columns } => {
                 let mut a = args.clone();
@@ -367,6 +370,7 @@ impl Database {
                 Ok(Source {
                     keep: None,
                     intrinsic: Vec::new(),
+                    hidden: Vec::new(),
                     data: SourceData::Lateral(Box::new(Lateral { kind: LateralKind::Func(name.clone(), a), outer })),
                     alias: alias.clone(),
                     names,
@@ -762,6 +766,9 @@ impl Database {
                 let preserved = k > 0 && matches!(from.joins[k - 1].kind, JoinKind::Right | JoinKind::Full);
                 let src = self.resolve_source(f, &scope, depth, few && !preserved)?;
                 for n in &src.names {
+                    if src.hidden.iter().any(|h| h.eq_ignore_ascii_case(n)) {
+                        scope.invisible.push((src.alias.to_ascii_lowercase(), n.to_ascii_lowercase()));
+                    }
                     scope.cols.push(scope_col(&src.alias, n));
                 }
                 sources.push(src);
@@ -771,6 +778,9 @@ impl Database {
             scope.cols.clear();
             for src in &sources {
                 for n in &src.names {
+                    if src.hidden.iter().any(|h| h.eq_ignore_ascii_case(n)) {
+                        scope.invisible.push((src.alias.to_ascii_lowercase(), n.to_ascii_lowercase()));
+                    }
                     scope.cols.push(scope_col(&src.alias, n));
                 }
             }
@@ -1985,13 +1995,13 @@ pub(crate) fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, E
                 if scope.cols.is_empty() {
                     return Err(Error::runtime("SELECT * requires a FROM clause"));
                 }
-                for c in scope.cols.iter().filter(|c| !c.hidden) {
+                for c in scope.cols.iter().filter(|c| !c.hidden && !scope.invisible.contains(&(c.table.to_ascii_lowercase(), c.name.to_ascii_lowercase()))) {
                     out.push((c.name.clone(), Expr::Column { table: Some(c.table.clone()), name: c.name.clone() }));
                 }
             }
             SelectItem::QualifiedWildcard(t) => {
                 let before = out.len();
-                for c in scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(t) && !c.name.starts_with(super::viewdml::HIDDEN_COLUMN)) {
+                for c in scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(t) && !c.name.starts_with(super::viewdml::HIDDEN_COLUMN) && !scope.invisible.contains(&(c.table.to_ascii_lowercase(), c.name.to_ascii_lowercase()))) {
                     out.push((c.name.clone(), Expr::Column { table: Some(c.table.clone()), name: c.name.clone() }));
                 }
                 if out.len() == before {

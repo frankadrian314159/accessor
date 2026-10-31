@@ -30,6 +30,7 @@ impl Database {
         };
         let real = table.name().to_string();
         let scope = Scope {
+            invisible: Vec::new(),
             cols: table
                 .schema()
                 .columns

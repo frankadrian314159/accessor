@@ -115,7 +115,7 @@ impl Database {
     fn lock_candidates(&self, sel: &Select, table: &str, alias: &str) -> Result<Vec<RowId>> {
         let t = self.table_checked(table)?;
         let schema = t.schema();
-        let scope = Scope { cols: schema.columns.iter().map(|c| ScopeCol { table: alias.to_string(), name: c.name.clone(), hidden: false }).collect() };
+        let scope = Scope { cols: schema.columns.iter().map(|c| ScopeCol { table: alias.to_string(), name: c.name.clone(), hidden: false }).collect(), invisible: Vec::new() };
         let mut binder = Binder::new(self, &scope, 0);
         binder.allow_corr = true;
         let filter = sel.filter.as_ref().map(|f| binder.bind(f)).transpose()?;

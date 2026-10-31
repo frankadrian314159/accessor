@@ -277,6 +277,7 @@ impl Database {
                     references: None,
                     expression: None,
                     check: None,
+                    invisible: false,
                 });
             }
         }
@@ -297,6 +298,7 @@ impl Database {
                     references: None,
                     expression: None,
                     check: None,
+                    invisible: false,
                 });
             }
         }
@@ -415,6 +417,7 @@ impl Database {
                 references: None,
                 expression: None,
                 check: None,
+                invisible: false,
             })
             .collect();
         let create = Statement::CreateTable {
@@ -575,7 +578,7 @@ impl Database {
                 rows.push(r);
             }
         }
-        Ok(Source { keep: None, intrinsic: Vec::new(), data: SourceData::Rows(rows), alias, names })
+        Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names })
     }
 
     pub(crate) fn dml_members(&self, table: &str, filter: Option<&Expr>) -> Vec<String> {
@@ -728,6 +731,7 @@ impl Database {
                 // an expression of the columns
                 None => {
                     let scope = super::bind::Scope {
+            invisible: Vec::new(),
                         cols: schema.columns.iter().map(|k| super::bind::ScopeCol { table: schema.name.clone(), name: k.name.clone(), hidden: false }).collect(),
                     };
                     let bound = super::bind::Binder::new(self, &scope, 0).bind(&crate::sql::parse_expression(c)?)?;

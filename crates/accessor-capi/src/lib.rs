@@ -118,7 +118,7 @@ impl From<Error> for Failure {
             Error::Catalog(_) => ACC_ERR_CATALOG,
             Error::Constraint(_) => ACC_ERR_CONSTRAINT,
             Error::Type(_) => ACC_ERR_TYPE,
-            Error::Runtime(_) => ACC_ERR_RUNTIME,
+            Error::Runtime(_) | Error::Signal { .. } => ACC_ERR_RUNTIME,
             Error::Io(_) => ACC_ERR_IO,
             Error::Corrupt(_) => ACC_ERR_CORRUPT,
             Error::Locked(_) => ACC_ERR_LOCKED,

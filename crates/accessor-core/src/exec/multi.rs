@@ -119,6 +119,42 @@ fn requalify_to(e: &mut Expr, from: &str, to: &str) {
 }
 
 impl Database {
+    /// `CREATE TABLE t (cols) SELECT ...`: see [`Statement::InsertSelectExtend`].
+    pub(crate) fn exec_insert_select_extend(&mut self, table: &str, select: &Select) -> Result<QueryResult> {
+        let res = self.run_select(select)?;
+        let schema = self.table_checked(table)?.schema().clone();
+        let missing: Vec<usize> = (0..res.columns.len()).filter(|&i| schema.column_index(&res.columns[i]).is_none()).collect();
+        if missing.is_empty() && res.columns.len() == schema.columns.len() || missing.is_empty() && !res.columns.is_empty() {
+            let rows: Vec<Vec<Expr>> = res.rows.iter().map(|r| r.iter().cloned().map(Expr::Literal).collect()).collect();
+            if rows.is_empty() {
+                return Ok(QueryResult::default());
+            }
+            return self.execute_statement(&Statement::Insert { table: table.to_string(), columns: Some(res.columns.clone()), source: crate::sql::ast::InsertSource::Values(rows) });
+        }
+        for i in missing {
+            let data_type = res.rows.iter().find_map(|r| r[i].data_type()).unwrap_or(crate::value::DataType::Text);
+            let def = crate::sql::ast::ColumnDef {
+                name: res.columns[i].clone(),
+                data_type,
+                not_null: false,
+                primary_key: false,
+                unique: false,
+                autonumber: false,
+                default: None,
+                references: None,
+                expression: None,
+                check: None,
+                invisible: false,
+            };
+            self.execute_statement(&Statement::AlterTable { table: table.to_string(), action: crate::sql::ast::AlterAction::AddColumn(def) })?;
+        }
+        let rows: Vec<Vec<Expr>> = res.rows.iter().map(|r| r.iter().cloned().map(Expr::Literal).collect()).collect();
+        if rows.is_empty() {
+            return Ok(QueryResult::default());
+        }
+        self.execute_statement(&Statement::Insert { table: table.to_string(), columns: Some(res.columns.clone()), source: crate::sql::ast::InsertSource::Values(rows) })
+    }
+
     /// MySQL's `HANDLER`: a cursor over a table, kept by name until it is closed. Rows come in the order they are kept.
     pub(crate) fn exec_handler(&mut self, h: &crate::sql::ast::HandlerStmt) -> Result<QueryResult> {
         use crate::sql::ast::HandlerAction;

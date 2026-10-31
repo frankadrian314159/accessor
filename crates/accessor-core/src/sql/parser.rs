@@ -1907,7 +1907,7 @@ impl<'a> Parser<'a> {
             self.advance();
             if self.eat_kw("PRIMARY") {
                 self.advance();
-                return Ok(Some(Statement::DropIndex { name: format!("{}_pkey", table.replace('.', "_")), table: Some(table) }));
+                return Ok(Some(Statement::DropIndex { name: "PrimaryKey".into(), table: Some(table) }));
             }
             self.advance();
             let name = self.ident()?;
@@ -1933,6 +1933,9 @@ impl<'a> Parser<'a> {
             def.name = if change { def.name } else { old };
             all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::AlterColumn { name: def.name.clone(), data_type: def.data_type } });
             all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::SetNotNull { name: def.name.clone(), not_null: def.not_null } });
+            if def.invisible {
+                all.push(Statement::AlterTable { table: table.clone(), action: AlterAction::SetInvisible { name: def.name.clone(), invisible: true } });
+            }
             if let Some(after) = place {
                 all.push(Statement::AlterTable { table, action: AlterAction::MoveColumn { name: def.name.clone(), after } });
             }
@@ -2147,8 +2150,88 @@ impl<'a> Parser<'a> {
         Ok(Statement::Fetch { name, direction, move_only })
     }
 
+    /// After `SIGNAL` / `RESIGNAL`: `[SQLSTATE [VALUE] 'x' | condition] [SET item = expr, ...]`. `conditions` are the
+    /// named conditions of the routine being read.
+    pub(crate) fn signal_statement(&mut self, resignal: bool, conditions: &[(String, HandlerCond)]) -> Result<Statement> {
+        let mut state = None;
+        if self.eat_kw("SQLSTATE") {
+            self.eat_kw("VALUE");
+            match self.advance() {
+                Tok::Str(s) => state = Some(s),
+                _ => {
+                    self.pos = self.pos.saturating_sub(1);
+                    return Err(self.unexpected("a SQLSTATE value"));
+                }
+            }
+        } else if matches!(self.peek(), Tok::Ident(w) if !w.eq_ignore_ascii_case("SET")) {
+            let name = self.ident()?;
+            match conditions.iter().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                Some((_, HandlerCond::SqlState(s))) => state = Some(s.clone()),
+                Some((_, HandlerCond::Code(_))) => return Err(Error::syntax("SIGNAL needs a condition with a SQLSTATE value")),
+                _ => return Err(Error::syntax(format!("the condition '{name}' is not declared"))),
+            }
+        } else if !resignal {
+            return Err(self.unexpected("SQLSTATE"));
+        }
+        let mut items = Vec::new();
+        if self.eat_kw("SET") {
+            loop {
+                let item = self.ident()?.to_ascii_uppercase();
+                self.expect_sym("=")?;
+                items.push((item, self.expr()?));
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        Ok(Statement::Signal { resignal, state, items })
+    }
+
+    /// After `GET`: `[CURRENT | STACKED] DIAGNOSTICS [CONDITION n] target = item, ...`.
+    pub(crate) fn get_diagnostics(&mut self) -> Result<Statement> {
+        let stacked = if self.eat_kw("STACKED") {
+            true
+        } else {
+            self.eat_kw("CURRENT");
+            false
+        };
+        self.expect_kw("DIAGNOSTICS")?;
+        let condition = if self.eat_kw("CONDITION") { Some(self.primary()?) } else { None };
+        let mut items = Vec::new();
+        loop {
+            let target = match self.advance() {
+                Tok::Param(n) => (n, true),
+                Tok::Ident(n) | Tok::Quoted(n) => (n, false),
+                _ => {
+                    self.pos = self.pos.saturating_sub(1);
+                    return Err(self.unexpected("a variable"));
+                }
+            };
+            self.expect_sym("=")?;
+            items.push((target, self.ident()?.to_ascii_uppercase()));
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        Ok(Statement::GetDiagnostics { stacked, condition, items })
+    }
+
     fn statement_inner(&mut self) -> Result<Statement> {
+        if self.eat_kw("SIGNAL") {
+            return self.signal_statement(false, &[]);
+        }
+        if self.eat_kw("RESIGNAL") {
+            return self.signal_statement(true, &[]);
+        }
+        if self.peek_kw("GET") && (self.peek_kw_at(1, "DIAGNOSTICS") || ((self.peek_kw_at(1, "CURRENT") || self.peek_kw_at(1, "STACKED")) && self.peek_kw_at(2, "DIAGNOSTICS"))) {
+            self.advance();
+            return self.get_diagnostics();
+        }
         // PostgreSQL's text search objects (configurations, dictionaries, parsers, templates): the search uses its built-in ones
+        if self.peek_kw("ALTER") && ["FUNCTION", "PROCEDURE", "EVENT", "INSTANCE", "TABLESPACE", "SERVER", "LOGFILE", "RESOURCE"].iter().any(|k| self.peek_kw_at(1, k)) && crate::dialect::current() == crate::dialect::Dialect::Mysql {
+            // routine characteristics (COMMENT, SQL SECURITY, ...), events and the like: nothing to change here
+            return Ok(self.ignore_rest("ALTER"));
+        }
         if (self.peek_kw("CREATE") || self.peek_kw("ALTER") || self.peek_kw("DROP")) && self.peek_kw_at(1, "TEXT") && self.peek_kw_at(2, "SEARCH") {
             return Ok(self.ignore_rest("TEXT SEARCH"));
         }
@@ -2621,7 +2704,7 @@ impl<'a> Parser<'a> {
             self.advance();
             self.advance();
             InsertSource::DefaultValues
-        } else if self.eat_kw("VALUES") {
+        } else if self.eat_kw("VALUES") || (crate::dialect::current() == crate::dialect::Dialect::Mysql && self.eat_kw("VALUE")) {
             let mut rows = Vec::new();
             loop {
                 self.expect_sym("(")?;
@@ -3704,7 +3787,7 @@ impl<'a> Parser<'a> {
         // KEY / INDEX in the table definition: indexes made after the table
         let mut all = vec![main];
         if let Some(q) = trailing_select {
-            all.push(Statement::Insert { table: table_name.clone(), columns: None, source: InsertSource::Select(q) });
+            all.push(Statement::InsertSelectExtend { table: table_name.clone(), select: q });
         }
         let mut used: Vec<String> = Vec::new();
         for (n, cols, descending, unique) in indexes {
@@ -3931,6 +4014,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 not_null_columns.push(self.ident()?);
                 while self.skip_constraint_option() {}
+            } else if self.peek_kw("CONSTRAINT") && self.peek_kw_at(1, "CHECK") && matches!(self.peek_at(2), Tok::Sym("(")) {
+                self.advance();
+                checks.push((None, self.check_clause()?));
             } else if self.peek_kw("CONSTRAINT") && self.peek_kw_at(2, "CHECK") {
                 self.advance();
                 let cname = self.ident()?;
@@ -4107,6 +4193,13 @@ impl<'a> Parser<'a> {
         drop
     }
 
+    /// Reads the word at the cursor and tells whether it is `word`.
+    fn advance_kw_drop_is(&mut self, word: &str) -> bool {
+        let is = self.peek_kw(word);
+        self.advance();
+        is
+    }
+
     /// `NULLS FIRST` or `NULLS LAST` after an ORDER BY item.
     fn nulls_clause(&mut self) -> Result<Option<bool>> {
         if !self.eat_kw("NULLS") {
@@ -4133,7 +4226,15 @@ impl<'a> Parser<'a> {
     }
 
     fn column_def(&mut self) -> Result<ColumnDef> {
-        let name = self.ident()?;
+        // MySQL does not reserve OFFSET (or the other words reserved here for LIMIT ... OFFSET)
+        let name = if crate::dialect::current() == crate::dialect::Dialect::Mysql && self.peek_kw("OFFSET") && !matches!(self.peek_at(1), Tok::Sym(_)) {
+            match self.advance() {
+                Tok::Ident(n) => n,
+                _ => unreachable!("checked"),
+            }
+        } else {
+            self.ident()?
+        };
         let mut type_name = self.type_name()?;
         // MySQL's TIME holds a length of time (`-838:59:59`, `10:11:12.5`), which a date-time cannot: it is kept as text
         if type_name.eq_ignore_ascii_case("TIME") && crate::dialect::current() == crate::dialect::Dialect::Mysql {
@@ -4207,6 +4308,7 @@ impl<'a> Parser<'a> {
             references: None,
             expression,
             check: None,
+            invisible: false,
         };
         if let Some(l) = labels {
             let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();
@@ -4283,7 +4385,9 @@ impl<'a> Parser<'a> {
             } else if self.peek_kw("KEY") {
                 self.advance();
                 def.primary_key = true;
-            } else if self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("VISIBLE") || self.eat_kw("INVISIBLE") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {
+            } else if self.eat_kw("INVISIBLE") {
+                def.invisible = true;
+            } else if self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") || self.eat_kw("VISIBLE") || self.eat_kw("BINARY") || self.eat_kw("ASCII") || self.eat_kw("UNICODE") {
             } else if self.eat_kw("CHARACTER") {
                 self.expect_kw("SET")?;
                 self.advance();
@@ -4498,6 +4602,9 @@ impl<'a> Parser<'a> {
         let action = if self.eat_kw("ADD") {
             if self.peek_kw("CHECK") {
                 AlterAction::AddCheck { name: None, expr: self.check_clause()? }
+            } else if self.peek_kw("CONSTRAINT") && self.peek_kw_at(1, "CHECK") && matches!(self.peek_at(2), Tok::Sym("(")) {
+                self.advance();
+                AlterAction::AddCheck { name: None, expr: self.check_clause()? }
             } else if self.peek_kw("CONSTRAINT") && self.peek_kw_at(2, "CHECK") {
                 self.advance();
                 let name = self.ident()?;
@@ -4560,6 +4667,12 @@ impl<'a> Parser<'a> {
             }
             self.eat_kw("COLUMN");
             let name = self.ident()?;
+            if self.peek_kw("SET") && (self.peek_kw_at(1, "VISIBLE") || self.peek_kw_at(1, "INVISIBLE")) {
+                // MySQL: ALTER COLUMN c SET VISIBLE | INVISIBLE
+                self.advance();
+                let invisible = self.advance_kw_drop_is("INVISIBLE");
+                return Ok(Statement::AlterTable { table, action: AlterAction::SetInvisible { name, invisible } });
+            }
             if self.peek_kw("SET") && self.peek_kw_at(1, "DATA") {
                 self.advance();
                 self.advance();
@@ -6909,6 +7022,18 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_sym(")")?;
+        }
+        // CHAR(10) CHARACTER SET utf8mb4 / CHARSET x / COLLATE y / BINARY
+        loop {
+            if self.eat_kw("CHARSET") || self.eat_kw("COLLATE") {
+                self.advance();
+            } else if self.peek_kw("CHARACTER") && self.peek_kw_at(1, "SET") {
+                self.advance();
+                self.advance();
+                self.advance();
+            } else {
+                break;
+            }
         }
         let ty = self.array_suffix(ty);
         Ok(make_cast(e, ty, &hints))

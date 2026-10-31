@@ -84,6 +84,8 @@ pub struct Database {
     pub(crate) priv_suspended: std::sync::atomic::AtomicU32,
     /// MySQL's `@name` user variables.
     pub(crate) user_vars: BTreeMap<String, crate::value::Value>,
+    /// The condition the last statement raised (what `GET DIAGNOSTICS` reads outside a routine).
+    pub(crate) last_diag: Option<crate::error::Diag>,
     /// MySQL's open `HANDLER`s: the name, the table and the position of the next row to read.
     pub(crate) handlers: BTreeMap<String, (String, usize)>,
     /// Open cursors (`DECLARE name CURSOR FOR query`) by lowercase name.
@@ -143,6 +145,7 @@ impl Database {
             call_depth: std::sync::atomic::AtomicU32::new(0),
             priv_suspended: std::sync::atomic::AtomicU32::new(0),
             user_vars: BTreeMap::new(),
+            last_diag: None,
             handlers: BTreeMap::new(),
             cursors: BTreeMap::new(),
             only_dml: std::sync::atomic::AtomicBool::new(false),

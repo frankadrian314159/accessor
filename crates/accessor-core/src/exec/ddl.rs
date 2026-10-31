@@ -19,6 +19,35 @@ impl Database {
         foreign_keys: &[ForeignKeyDef],
     ) -> Result<QueryResult> {
         self.check_schema_exists(name)?;
+        // MySQL's sql_generate_invisible_primary_key: a table with no primary key gets an invisible one
+        let generated: Vec<ColumnDef>;
+        let (defs, primary_key) = if crate::dialect::current() == crate::dialect::Dialect::Mysql
+            && matches!(self.settings.get("sql_generate_invisible_primary_key").map(|v| v.to_ascii_lowercase()).as_deref(), Some("on" | "1" | "true"))
+            && primary_key.is_empty()
+            && !defs.iter().any(|d| d.primary_key)
+        {
+            if defs.iter().any(|d| d.name.eq_ignore_ascii_case("my_row_id")) {
+                return Err(Error::catalog("Failed to generate invisible primary key. Column 'my_row_id' already exists."));
+            }
+            let mut all = vec![ColumnDef {
+                name: "my_row_id".into(),
+                data_type: DataType::Integer,
+                not_null: true,
+                primary_key: true,
+                unique: false,
+                autonumber: true,
+                default: None,
+                references: None,
+                expression: None,
+                check: None,
+                invisible: true,
+            }];
+            all.extend(defs.iter().cloned());
+            generated = all;
+            (&generated[..], primary_key)
+        } else {
+            (defs, primary_key)
+        };
         let mut columns = Vec::with_capacity(defs.len());
         for d in defs {
             if d.data_type == DataType::Calculated {
@@ -91,6 +120,9 @@ impl Database {
         let mut ops = vec![Op::CreateTable(schema)];
         ops.extend(timing);
         self.apply_all(ops)?;
+        for d in defs.iter().filter(|d| d.invisible) {
+            self.set_invisible(name, &d.name, true)?;
+        }
         Ok(QueryResult::default())
     }
 
@@ -110,6 +142,7 @@ impl Database {
             )));
         }
         self.apply_all(vec![Op::DropTable(real.clone())])?;
+        self.forget_invisible(&real)?;
         self.forget_family_links(&real)?;
         Ok(QueryResult::default())
     }
@@ -134,6 +167,9 @@ impl Database {
                 c.primary_key = d.primary_key;
                 c.autonumber = d.autonumber;
                 c.default = d.default.clone();
+                if d.invisible {
+                    self.set_invisible(&table, &d.name, true)?;
+                }
                 let mut ops = Vec::with_capacity(3);
                 if let Some(def) = &d.references {
                     // Plan against the schema as it will look once the column exists.
@@ -161,6 +197,13 @@ impl Database {
                     ops.push(Op::AddColumn { table, column: c });
                 }
                 ops
+            }
+            AlterAction::SetInvisible { name, invisible } => {
+                if self.table_checked(&table)?.schema().column_index(name).is_none() {
+                    return Err(Error::catalog(format!("the field '{name}' does not exist in table '{table}'")));
+                }
+                self.set_invisible(&table, name, *invisible)?;
+                return Ok(QueryResult::default());
             }
             AlterAction::MoveColumn { name, after } => {
                 vec![Op::MoveColumn { table, name: name.clone(), after: after.clone() }]
@@ -300,7 +343,8 @@ impl Database {
             }
         }
         let same_set = |a: &[usize], b: &[usize]| a.len() == b.len() && a.iter().all(|c| b.contains(c));
-        if !parent.indexes.iter().any(|ix| ix.unique && same_set(&ix.columns, &ref_columns)) {
+        let non_standard = crate::dialect::current() == crate::dialect::Dialect::Mysql;
+        if !parent.indexes.iter().any(|ix| (ix.unique || non_standard) && same_set(&ix.columns, &ref_columns)) {
             return Err(Error::catalog(format!(
                 "the referenced fields of '{}' must be its primary key or have a unique index",
                 parent.name
@@ -359,7 +403,17 @@ impl Database {
                 }
             }
         };
-        self.apply_all(vec![Op::DropIndex { table: real, name: name.to_string() }])?;
+        // DROP PRIMARY KEY: the key made with the table, or the one added later
+        let mut name = name.to_string();
+        if name == "PrimaryKey" && self.table_checked(&real)?.index_position(&name).is_none() {
+            let added = format!("{}_pkey", real.replace('.', "_"));
+            if self.table_checked(&real)?.index_position(&added).is_some() {
+                name = added;
+            } else {
+                return Err(Error::catalog("Can't DROP 'PRIMARY'; check that column/key exists"));
+            }
+        }
+        self.apply_all(vec![Op::DropIndex { table: real, name }])?;
         Ok(QueryResult::default())
     }
 

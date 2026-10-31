@@ -296,6 +296,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                             break;
                         }
                     }
+                    Some('\\') if dialect::current() == Dialect::Mysql && at(i + 1).is_some() => {
+                        // MySQL: \n \t \r \0 \b \Z, and a backslash before any other character is that character
+                        // (\% and \_ keep the backslash, for LIKE)
+                        let e = at(i + 1).expect("checked");
+                        match e {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            'r' => s.push('\r'),
+                            '0' => s.push('\0'),
+                            'b' => s.push('\u{8}'),
+                            'Z' => s.push('\u{1a}'),
+                            '%' | '_' => {
+                                s.push('\\');
+                                s.push(e);
+                            }
+                            other => s.push(other),
+                        }
+                        i += 2;
+                    }
                     Some(ch) => {
                         s.push(ch);
                         i += 1;

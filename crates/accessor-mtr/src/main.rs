@@ -810,7 +810,7 @@ fn run_test(root: &Path, name: &str, progress: Option<&Path>, skip: &[(String, u
     let units = split_test(&test);
     let mut vars = HashMap::new();
     vars.insert("MYSQL_TEST_DIR".to_string(), root.display().to_string());
-    vars.insert("MYSQLTEST_VARDIR".to_string(), std::env::temp_dir().display().to_string());
+    vars.insert("MYSQLTEST_VARDIR".to_string(), std::env::temp_dir().display().to_string().replace('\\', "/"));
     let mut run = Runner {
         db: {
             accessor_core::schema::set_lenient(false);

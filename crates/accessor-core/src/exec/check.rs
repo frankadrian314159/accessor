@@ -49,6 +49,7 @@ impl Database {
 
         // Every existing record must pass.
         let scope = Scope {
+            invisible: Vec::new(),
             cols: schema
                 .columns
                 .iter()

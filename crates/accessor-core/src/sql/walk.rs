@@ -199,6 +199,8 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
         Statement::Exec { args, .. } => args.iter_mut().try_for_each(|(_, e)| walk_expr(e, f)),
         Statement::Raise(e) => walk_expr(e, f),
         Statement::SetVar { expr, .. } => walk_expr(expr, f),
+        Statement::Signal { items, .. } => items.iter_mut().try_for_each(|(_, e)| walk_expr(e, f)),
+        Statement::GetDiagnostics { condition, .. } => condition.iter_mut().try_for_each(|e| walk_expr(e, f)),
         Statement::Guarded { stmt, .. } => walk_statement(stmt, f),
         Statement::Upsert { insert, conflict } => {
             walk_statement(insert, f)?;

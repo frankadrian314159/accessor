@@ -42,6 +42,7 @@ impl CalcCache {
 
 fn scope_of(schema: &TableSchema) -> Scope {
     Scope {
+        invisible: Vec::new(),
         cols: schema
             .columns
             .iter()

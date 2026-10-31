@@ -132,6 +132,8 @@ const MYSQL_VARIABLES: &[(&str, &str)] = &[
     ("collation_server", "utf8mb4_0900_ai_ci"),
     ("collation_database", "utf8mb4_0900_ai_ci"),
     ("foreign_key_checks", "1"),
+    ("restrict_fk_on_non_standard_key", "1"),
+    ("sql_generate_invisible_primary_key", "0"),
     ("unique_checks", "1"),
     ("sql_auto_is_null", "0"),
     ("sql_safe_updates", "0"),

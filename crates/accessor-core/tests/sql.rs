@@ -6565,3 +6565,71 @@ fn postgresql_full_text_search() {
     assert_eq!(db.execute("SELECT id FROM docs WHERE tsv @@ to_tsquery('english', 'fox | dog') ORDER BY id").unwrap().rows.len(), 2);
     assert_eq!(db.execute("SELECT id FROM docs WHERE tsv @@ to_tsquery('english', 'foxes')").unwrap().rows.len(), 1);
 }
+
+#[test]
+fn mysql_signal_resignal_get_diagnostics_and_warnings() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let row = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    db.execute(
+        "CREATE PROCEDURE p1() BEGIN
+           DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN
+             GET DIAGNOSTICS CONDITION 1 @st = RETURNED_SQLSTATE, @msg = MESSAGE_TEXT, @no = MYSQL_ERRNO;
+           END;
+           SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'boom', MYSQL_ERRNO = 1234;
+           SET @after = 1;
+         END",
+    )
+    .unwrap();
+    db.execute("CALL p1()").unwrap();
+    assert_eq!(row(&mut db, "SELECT @st, @msg, @no, @after"), vec!["45000", "boom", "1234", "1"]);
+    db.execute("CREATE PROCEDURE p2() BEGIN DECLARE w INT DEFAULT 0; DECLARE CONTINUE HANDLER FOR SQLWARNING SET w = 1; SIGNAL SQLSTATE '01000' SET MESSAGE_TEXT = 'careful'; SET @w = w; END").unwrap();
+    db.execute("CALL p2()").unwrap();
+    assert_eq!(row(&mut db, "SELECT @w"), vec!["1"]);
+    // an unhandled warning stops nothing; an unhandled exception does
+    db.execute("CREATE PROCEDURE p3() BEGIN SIGNAL SQLSTATE '01000'; SET @ran = 1; END").unwrap();
+    db.execute("CALL p3()").unwrap();
+    assert_eq!(row(&mut db, "SELECT @ran"), vec!["1"]);
+    db.execute("CREATE PROCEDURE p4() BEGIN DECLARE EXIT HANDLER FOR SQLSTATE '45000' RESIGNAL SET MESSAGE_TEXT = 'again'; SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'first'; END").unwrap();
+    assert_eq!(db.execute("CALL p4()").unwrap_err().to_string(), "again");
+    assert_eq!(db.execute("SIGNAL SQLSTATE '45000'").unwrap_err().to_string(), "Unhandled user-defined exception condition");
+    assert!(db.execute("RESIGNAL").is_err());
+    // outside a routine GET DIAGNOSTICS reads the last error
+    assert!(db.execute("SELECT * FROM nope").is_err());
+    db.execute("GET DIAGNOSTICS CONDITION 1 @s = RETURNED_SQLSTATE").unwrap();
+    assert_eq!(row(&mut db, "SELECT @s"), vec!["42S02"]);
+}
+
+#[test]
+fn mysql_vector_xml_invisible_columns_and_row_count() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT FROM_VECTOR(TO_VECTOR('[1,2.5,-3]'))"), "[1.00000e+00,2.50000e+00,-3.00000e+00]");
+    assert_eq!(one(&mut db, "SELECT VECTOR_DIM(TO_VECTOR('[1,2,3]'))"), "3");
+    assert_eq!(one(&mut db, "SELECT DISTANCE(TO_VECTOR('[3,0]'), TO_VECTOR('[0,4]'), 'EUCLIDEAN')"), "5");
+    assert_eq!(one(&mut db, "SELECT EXTRACTVALUE('<a><b>X</b><b>Y</b></a>', '/a/b[2]')"), "Y");
+    assert_eq!(one(&mut db, "SELECT UPDATEXML('<a><b>X</b></a>', '/a/b', '<c/>')"), "<a><c/></a>");
+    // invisible columns and the generated invisible primary key
+    db.execute("CREATE TABLE inv (a INT, b INT INVISIBLE); INSERT INTO inv VALUES (1); INSERT INTO inv (a, b) VALUES (2, 20)").unwrap();
+    assert_eq!(db.execute("SELECT * FROM inv").unwrap().columns, vec!["a"]);
+    assert_eq!(one(&mut db, "SELECT b FROM inv WHERE a = 2"), "20");
+    db.execute("ALTER TABLE inv ALTER COLUMN b SET VISIBLE").unwrap();
+    assert_eq!(db.execute("SELECT * FROM inv").unwrap().columns, vec!["a", "b"]);
+    db.execute("SET sql_generate_invisible_primary_key = ON; CREATE TABLE gipk (x INT, y INT); INSERT INTO gipk VALUES (7, 8), (9, 10)").unwrap();
+    assert_eq!(db.execute("SELECT * FROM gipk").unwrap().columns, vec!["x", "y"]);
+    assert_eq!(one(&mut db, "SELECT my_row_id FROM gipk WHERE x = 9"), "2");
+    assert!(db.execute("SHOW CREATE TABLE gipk").unwrap().rows[0][1].to_string().contains("/*!80023 INVISIBLE */"));
+    assert!(db.execute("CREATE TABLE bad (my_row_id INT)").is_err());
+    // ROW_COUNT, CREATE TABLE .. SELECT with new columns, string escapes
+    db.execute("INSERT INTO inv (a) VALUES (3), (4)").unwrap();
+    assert_eq!(one(&mut db, "SELECT ROW_COUNT()"), "2");
+    assert_eq!(one(&mut db, "SELECT ROW_COUNT()"), "-1");
+    db.execute("UPDATE inv SET a = a + 10").unwrap();
+    db.execute("CREATE TABLE ext (a INT, b INT) SELECT 1 AS b, 2 AS c").unwrap();
+    assert_eq!(db.execute("SELECT * FROM ext").unwrap().columns, vec!["a", "b", "c"]);
+    assert_eq!(one(&mut db, r"SELECT 'it\'s\tok'"), "it's\tok");
+    assert_eq!(one(&mut db, r"SELECT 'a\%b'"), r"a\%b");
+}

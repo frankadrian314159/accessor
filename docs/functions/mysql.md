@@ -62,6 +62,9 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `COMPRESS(s)`, `UNCOMPRESS(s)`, `UNCOMPRESSED_LENGTH(s)` | a length and a zlib stream made of stored (uncompressed) blocks, so the bytes differ from MySQL's but `UNCOMPRESS(COMPRESS(s))` is `s` |
 | `INET6_ATON(s)`, `INET6_NTOA(b)`, `IS_IPV4_MAPPED(b)`, `IS_IPV4_COMPAT(b)` | IPv4 and IPv6 addresses as 4 or 16 bytes |
 | `IS_UUID(s)`, `UUID_TO_BIN(s [, swap])`, `BIN_TO_UUID(b [, swap])` | a UUID as 16 bytes (the time parts swapped round with the flag) |
+| `EXTRACTVALUE(xml, xpath)`, `UPDATEXML(xml, xpath, new)` | the text of the nodes an XPath path selects (joined by spaces; `count(path)` counts), and the XML with the one element it selects replaced. The path may use `/`, `//`, `*`, `@attr`, `text()`, `.`, `..` and the predicates `[n]`, `[last()]`, `[@a='v']`, `[child='v']`, `[position()<n]`; XML that is not well formed gives NULL |
+| `TO_VECTOR(s)`, `FROM_VECTOR(v)`, `VECTOR_DIM(v)`, `DISTANCE(a, b, 'COSINE' \| 'DOT' \| 'EUCLIDEAN')` | a vector is its 32-bit floats (little-endian bytes), written `[1.00000e+00,2.00000e+00]`; the string forms are `STRING_TO_VECTOR` and `VECTOR_TO_STRING` |
+| `ROW_COUNT()` | the rows the last statement changed, -1 after a query |
 | `BINARY expr` | the text as bytes: compared and sorted byte for byte, so `BINARY 'a' = 'A'` is 0 |
 | `ST_*`, `MBR*`, `POINT(x, y)`, ... | spatial values and relations, see [spatial values](../sql/mysql.md#spatial-values) |
 | `a \| b`, `~a`, `a << b`, `a >> b` | bitwise OR, NOT, and shifts (`&` joins text and `^` is a power, so there is no AND or XOR operator) |

@@ -192,6 +192,7 @@ impl Database {
                 };
                 let schema = self.table_checked(&base)?.schema().clone();
                 let scope = Scope {
+            invisible: Vec::new(),
                     cols: schema
                         .columns
                         .iter()
@@ -256,6 +257,7 @@ impl Database {
             names[p] = shown.clone();
         }
         let scope = Scope {
+            invisible: Vec::new(),
             cols: schema
                 .columns
                 .iter()
@@ -274,6 +276,7 @@ impl Database {
         Ok(Some(Source {
             keep: None,
             intrinsic,
+            hidden: Vec::new(),
             data: SourceData::Table(base),
             alias: alias.to_string(),
             names,

@@ -131,50 +131,15 @@ enum Flow {
     Return,
 }
 
-/// The SQLSTATE of an error, as far as it can be told from what went wrong.
-fn sqlstate_of(e: &Error) -> &'static str {
-    let m = e.to_string().to_ascii_lowercase();
-    if m.starts_with("no data to fetch") {
-        "02000"
-    } else if m.contains("duplicate") {
-        "23000"
-    } else if m.contains("cannot contain a null") || m.contains("cannot be null") || m.contains("null value") {
-        "23000"
-    } else if m.contains("already exists") {
-        "42S01"
-    } else if m.contains("does not exist") || m.contains("was not found") {
-        "42S02"
-    } else if m.contains("division by zero") {
-        "22012"
-    } else if m.starts_with("syntax error") {
-        "42000"
-    } else {
-        "HY000"
-    }
-}
-
-/// The MySQL error number of an error, as far as it can be told.
-fn errcode_of(e: &Error) -> i64 {
-    match sqlstate_of(e) {
-        "02000" => 1329,
-        "42S01" => 1050,
-        "42S02" => 1146,
-        "22012" => 1365,
-        "23000" if e.to_string().to_ascii_lowercase().contains("duplicate") => 1062,
-        "23000" => 1048,
-        "42000" => 1064,
-        _ => 1105,
-    }
-}
-
 fn handler_matches(h: &Handler, e: &Error) -> bool {
-    let not_found = sqlstate_of(e) == "02000";
+    let state = e.sqlstate();
+    let class = state.get(..2).unwrap_or("");
     h.conditions.iter().any(|c| match c {
-        HandlerCond::SqlException => !not_found,
-        HandlerCond::SqlWarning => false,
-        HandlerCond::NotFound => not_found,
-        HandlerCond::SqlState(s) => s == sqlstate_of(e),
-        HandlerCond::Code(n) => *n == errcode_of(e),
+        HandlerCond::SqlException => !matches!(class, "00" | "01" | "02"),
+        HandlerCond::SqlWarning => class == "01",
+        HandlerCond::NotFound => class == "02",
+        HandlerCond::SqlState(s) => *s == state,
+        HandlerCond::Code(n) => *n == e.errno(),
     })
 }
 
@@ -199,11 +164,15 @@ struct Frame {
     cursors: HashMap<String, (crate::sql::ast::Select, Option<(Vec<Vec<Value>>, usize)>)>,
     /// The label of the loop about to run.
     loop_label: Option<String>,
+    /// The condition a handler is dealing with (what `GET DIAGNOSTICS` and `RESIGNAL` read).
+    diag: Option<crate::error::Diag>,
+    /// The handlers of the blocks being run, innermost last.
+    handlers: Vec<Handler>,
 }
 
 impl Frame {
     fn new(vars: HashMap<String, Value>) -> Frame {
-        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), loop_label: None }
+        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), loop_label: None, diag: None, handlers: Vec::new() }
     }
 }
 
@@ -497,12 +466,21 @@ impl Database {
     /// A block with handlers: an error in one of its statements goes to the first handler that answers to it; a `CONTINUE`
     /// handler lets the block go on with the next statement, an `EXIT` handler ends the block.
     fn run_block_handled(&mut self, body: &[ProcStmt], handlers: &[Handler], frame: &mut Frame) -> Result<Flow> {
+        let depth = frame.handlers.len();
+        frame.handlers.extend(handlers.iter().cloned());
+        let flow = self.run_block_handled_inner(body, handlers, frame);
+        frame.handlers.truncate(depth);
+        flow
+    }
+
+    fn run_block_handled_inner(&mut self, body: &[ProcStmt], handlers: &[Handler], frame: &mut Frame) -> Result<Flow> {
         for st in body {
             match self.run_proc_stmt(st, frame) {
                 Ok(Flow::Normal) => {}
                 Ok(other) => return Ok(other),
                 Err(e) => {
                     let Some(h) = handlers.iter().find(|h| handler_matches(h, &e)) else { return Err(e) };
+                    frame.diag = Some(e.diag());
                     match self.run_block(&h.body, frame)? {
                         Flow::Normal => {}
                         other => return Ok(other),
@@ -688,6 +666,41 @@ impl Database {
                 let text = self.eval_in(message, frame)?;
                 return Err(Error::constraint(text.to_string()));
             }
+            ProcStmt::Sql(stmt @ (Statement::Signal { .. } | Statement::GetDiagnostics { .. })) => {
+                let mut stmt = stmt.clone();
+                bind_params(&mut stmt, &frame.vars)?;
+                match &stmt {
+                    Statement::Signal { resignal, state, items } => {
+                        let err = self.signal_error(*resignal, state, items, frame.diag.as_ref()).unwrap_or_else(|e| e);
+                        // a warning (class 01) stops nothing unless a handler is there for it
+                        if err.sqlstate().starts_with("01") && !frame.handlers.iter().any(|h| handler_matches(h, &err)) {
+                            frame.diag = Some(err.diag());
+                            return Ok(Flow::Normal);
+                        }
+                        return Err(err);
+                    }
+                    Statement::GetDiagnostics { stacked, condition, items } => {
+                        let affected = frame.last.as_ref().map_or(0, |r| r.affected as i64);
+                        let diag = frame.diag.clone();
+                        for ((name, user), value) in self.diagnostics_values(*stacked, condition.as_ref(), items, diag.as_ref(), affected)? {
+                            if user {
+                                self.user_vars.insert(name.to_ascii_lowercase(), value);
+                            } else {
+                                let k = name.to_ascii_lowercase();
+                                if !frame.vars.contains_key(&k) {
+                                    return Err(Error::runtime(format!("@{name} has not been declared (use DECLARE @{name})")));
+                                }
+                                let value = match frame.types.get(&k) {
+                                    Some(t) if !value.is_null() => value.coerce_to(*t)?,
+                                    _ => value,
+                                };
+                                frame.vars.insert(k, value);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             ProcStmt::Sql(stmt) => {
                 let mut stmt = stmt.clone();
                 bind_params(&mut stmt, &frame.vars)?;
@@ -695,6 +708,111 @@ impl Database {
             }
         }
         Ok(Flow::Normal)
+    }
+
+    /// The error `SIGNAL` / `RESIGNAL` raises. `current` is the condition a `RESIGNAL` starts from.
+    pub(crate) fn signal_error(&self, resignal: bool, state: &Option<String>, items: &[(String, Expr)], current: Option<&crate::error::Diag>) -> Result<Error> {
+        let mut base = if resignal {
+            match current {
+                Some(d) => d.clone(),
+                None => return Err(Error::signal("0K000", 1645, "RESIGNAL when handler not active".into(), Vec::new())),
+            }
+        } else {
+            crate::error::Diag { state: String::new(), errno: 0, message: String::new(), items: Vec::new() }
+        };
+        if let Some(s) = state {
+            let ok = s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase()) && !s.starts_with("00");
+            if !ok {
+                return Err(Error::signal("42000", 1407, format!("Bad SQLSTATE: '{s}'"), Vec::new()));
+            }
+            base.state = s.clone();
+            if !resignal {
+                base.errno = 0;
+                base.message.clear();
+            }
+        }
+        let mut explicit_errno = false;
+        for (item, e) in items {
+            let v = self.eval_const(e)?;
+            let text = if v.is_null() { String::new() } else { v.to_string() };
+            match item.as_str() {
+                "MESSAGE_TEXT" => {
+                    if v.is_null() {
+                        return Err(Error::signal("42000", 1231, "Variable 'MESSAGE_TEXT' can't be set to the value of 'NULL'".into(), Vec::new()));
+                    }
+                    base.message = text;
+                }
+                "MYSQL_ERRNO" => {
+                    let n = text.trim().parse::<i64>().ok().filter(|n| *n > 0).ok_or_else(|| Error::signal("42000", 1231, format!("Variable 'MYSQL_ERRNO' can't be set to the value of '{text}'"), Vec::new()))?;
+                    base.errno = n;
+                    explicit_errno = true;
+                }
+                "CLASS_ORIGIN" | "SUBCLASS_ORIGIN" | "CONSTRAINT_CATALOG" | "CONSTRAINT_SCHEMA" | "CONSTRAINT_NAME" | "CATALOG_NAME" | "SCHEMA_NAME" | "TABLE_NAME" | "COLUMN_NAME" | "CURSOR_NAME" => {
+                    base.items.retain(|(k, _)| k != item);
+                    base.items.push((item.clone(), text));
+                }
+                other => return Err(Error::signal("42000", 1064, format!("You have an error in your SQL syntax near '{other}'"), Vec::new())),
+            }
+        }
+        let class = base.state.get(..2).unwrap_or("").to_string();
+        if base.errno == 0 && !explicit_errno {
+            base.errno = match class.as_str() {
+                "01" => 1642,
+                "02" => 1643,
+                _ => 1644,
+            };
+        }
+        if base.message.is_empty() {
+            base.message = match class.as_str() {
+                "01" => "Unhandled user-defined warning condition",
+                "02" => "Unhandled user-defined not found condition",
+                _ => "Unhandled user-defined exception condition",
+            }
+            .to_string();
+        }
+        Ok(Error::signal(&base.state, base.errno, base.message, base.items))
+    }
+
+    /// The values `GET DIAGNOSTICS` assigns: `(target, value)` for each item.
+    pub(crate) fn diagnostics_values(
+        &self,
+        _stacked: bool,
+        condition: Option<&Expr>,
+        items: &[((String, bool), String)],
+        diag: Option<&crate::error::Diag>,
+        affected: i64,
+    ) -> Result<Vec<((String, bool), Value)>> {
+        let mut out = Vec::new();
+        let n = match condition {
+            Some(e) => Some(self.eval_const(e)?.to_f64().unwrap_or(0.0) as i64),
+            None => None,
+        };
+        let mut condition_diag = diag;
+        if let Some(n) = n {
+            if n < 1 || n > i64::from(diag.is_some()) {
+                condition_diag = None;
+                if n < 1 || diag.is_some() || n > 1 {
+                    return Err(Error::signal("35000", 1758, "Invalid condition number".into(), Vec::new()));
+                }
+            }
+        }
+        for (target, item) in items {
+            let value = if condition.is_none() {
+                match item.as_str() {
+                    "NUMBER" => Value::Int(i64::from(diag.is_some())),
+                    "ROW_COUNT" => Value::Int(affected),
+                    other => return Err(Error::syntax(format!("'{other}' is not a statement information item"))),
+                }
+            } else {
+                match (condition_diag, item.as_str()) {
+                    (Some(d), "MYSQL_ERRNO") => Value::Int(d.errno),
+                    (Some(d), i) => d.item(i).map_or(Value::Null, |t| Value::text(&t)),
+                    (None, _) => Value::Null,
+                }
+            };
+            out.push((target.clone(), value));
+        }
+        Ok(out)
     }
 
     /// Runs the query of a record variable's `SELECT ... INTO` / `FOR ... IN`, with the variables filled in.

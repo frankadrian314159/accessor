@@ -65,6 +65,7 @@ fn combine_filters(a: Option<&Expr>, b: Option<Expr>) -> Option<Expr> {
 
 pub(crate) fn table_scope(schema: &TableSchema) -> Scope {
     Scope {
+            invisible: Vec::new(),
         cols: schema
             .columns
             .iter()
@@ -227,7 +228,10 @@ impl Database {
                 _ if matches!(source, InsertSource::DefaultValues) => Vec::new(),
                 Some(cols) => cols.iter().map(|c| column_pos(schema, c)).collect::<Result<_>>()?,
                 // Without a field list, the values are for the fields you can set.
-                None => (0..schema.columns.len()).filter(|&i| !schema.columns[i].is_calculated()).collect(),
+                None => {
+                    let hidden = self.invisible_columns(table);
+                    (0..schema.columns.len()).filter(|&i| !schema.columns[i].is_calculated() && !hidden.iter().any(|h| h.eq_ignore_ascii_case(&schema.columns[i].name))).collect()
+                }
             };
             let value_rows: Vec<Vec<Value>> = match source {
                 InsertSource::Values(rows) => {

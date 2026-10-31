@@ -31,6 +31,36 @@ fn describe(kind: &str) -> &str {
 }
 
 impl Database {
+    /// The invisible columns of a table (MySQL's `INVISIBLE`), by lower-case name.
+    pub(crate) fn invisible_columns(&self, table: &str) -> Vec<String> {
+        let prefix = format!("{}.", key(table));
+        self.catalog
+            .keys()
+            .filter(|(k, _)| k == "invisible")
+            .filter_map(|(_, n)| n.strip_prefix(&prefix))
+            .filter(|c| !c.contains('.'))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Makes a column of a table invisible or visible again.
+    pub(crate) fn set_invisible(&mut self, table: &str, column: &str, invisible: bool) -> Result<()> {
+        let name = format!("{}.{}", key(table), column.to_ascii_lowercase());
+        let present = self.catalog_has("invisible", &name);
+        if invisible != present {
+            self.catalog_set("invisible", &name, invisible.then(|| "1".to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Forgets the invisible columns of a table that is dropped.
+    pub(crate) fn forget_invisible(&mut self, table: &str) -> Result<()> {
+        for c in self.invisible_columns(table) {
+            self.set_invisible(table, &c, false)?;
+        }
+        Ok(())
+    }
+
     fn catalog_has(&self, kind: &str, name: &str) -> bool {
         self.catalog.contains_key(&(kind.to_string(), key(name)))
     }
