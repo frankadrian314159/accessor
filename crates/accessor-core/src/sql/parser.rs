@@ -1035,7 +1035,11 @@ impl<'a> Parser<'a> {
                     if option == "subtype" {
                         subtype = Some(self.type_name()?);
                     } else if option == "multirange_type_name" {
-                        multi_name = Some(self.ident()?);
+                        let mut n = self.ident()?;
+                        while self.eat_sym(".") {
+                            n = self.ident()?;
+                        }
+                        multi_name = Some(n);
                     } else {
                         let mut depth = 0usize;
                         while !self.at_eof() && !(depth == 0 && (self.peek_sym(",") || self.peek_sym(")"))) {

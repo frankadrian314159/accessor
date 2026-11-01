@@ -472,15 +472,15 @@ fn construct(kind: Kind, vals: &[Cow<'_, Value>]) -> Result<Value> {
 fn cast(kind: Kind, v: &Value) -> Result<Value> {
     let s = v.to_string();
     let mut r = parse(&s).ok_or_else(|| Error::type_err(format!("malformed range literal: \"{s}\"")))?;
+    // the bounds of a built-in range are numbers or dates, which may have space around them
+    let tidy = |b: String| if kind == Kind::Custom { b } else { bound_text(kind, &Value::text(b.trim())) };
+    r.lo = r.lo.map(tidy);
+    r.hi = r.hi.map(tidy);
     if let (Some(lo), Some(hi)) = (&r.lo, &r.hi) {
         if !r.empty && cmp_bound(lo, hi) == Ordering::Greater {
             return Err(Error::runtime("range lower bound must be less than or equal to range upper bound"));
         }
     }
-    // the bounds of a built-in range are numbers or dates, which may have space around them
-    let tidy = |b: String| if kind == Kind::Custom { b } else { bound_text(kind, &Value::text(b.trim())) };
-    r.lo = r.lo.map(tidy);
-    r.hi = r.hi.map(tidy);
     for b in r.lo.iter().chain(r.hi.iter()) {
         check_bound(kind, b)?;
     }
