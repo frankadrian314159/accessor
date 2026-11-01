@@ -6936,3 +6936,26 @@ fn postgresql_exclude_composite_types_out_parameters_and_infinity() {
     assert_eq!(one(&mut db, "SELECT arrayrange(ARRAY[1,2], ARRAY[2,1])"), "[\"{1,2}\",\"{2,1}\")");
     assert!(db.execute("SELECT '(),a)'::int4range").is_err());
 }
+
+#[test]
+fn postgresql_a_column_of_an_array_of_a_composite_domain_can_be_made_and_dropped() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TYPE it AS (if1 int, if2 int[])").unwrap();
+    db.execute("CREATE DOMAIN d AS it CHECK ((VALUE).if2[1] IS NOT NULL)").unwrap();
+    db.execute("CREATE TABLE b (f3 d, f4 d[])").unwrap();
+    db.execute("INSERT INTO b VALUES (ROW(1, ARRAY[2]), ARRAY[ROW(1, ARRAY[3])::it])").unwrap();
+    db.execute("DROP TABLE b").unwrap();
+}
+
+#[test]
+fn postgresql_returns_record_with_out_parameters_gives_their_columns() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE FUNCTION two(IN x int, OUT a int, OUT b int) RETURNS record AS $$ SELECT x + 1, x + 2 $$ LANGUAGE sql").unwrap();
+    let r = db.execute("SELECT * FROM two(1)").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "2");
+    assert_eq!(r.rows[0][1].to_string(), "3");
+}

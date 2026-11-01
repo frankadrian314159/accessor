@@ -32,6 +32,9 @@ pub struct UserType {
     /// `CREATE TYPE t AS (a int, b text)`: the name and type of each field (the type itself is text in record form).
     #[serde(default)]
     pub fields: Vec<(String, String)>,
+    /// `CREATE DOMAIN d AS t` over a composite type `t`: the name of `t`.
+    #[serde(default)]
+    pub over: Option<String>,
 }
 
 thread_local! {

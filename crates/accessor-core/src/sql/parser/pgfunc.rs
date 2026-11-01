@@ -286,6 +286,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_sym(")")?;
+            } else if !outs.is_empty() && (self.eat_kw("RECORD") || (self.peek_kw("SETOF") && self.peek_kw_at(1, "RECORD") && {
+                self.advance();
+                self.advance();
+                true
+            })) {
+                // the OUT parameters are the columns
             } else if self.eat_kw("SETOF") {
                 // a type gives one column named like the function; a table gives its columns, known when it is called
                 if is_type_word(self.peek()) {
@@ -311,7 +317,11 @@ impl<'a> Parser<'a> {
             _ if returns.is_none() && set_columns.is_empty() => {
                 set_columns = outs.iter().enumerate().map(|(i, (n, _))| n.clone().unwrap_or_else(|| format!("column{}", i + 1))).collect();
             }
-            _ => return Err(Error::syntax("OUT parameters cannot be combined with RETURNS")),
+            // RETURNS record (or SETOF record) with OUT parameters: the parameters are the columns
+            _ => {
+                set_columns = outs.iter().enumerate().map(|(i, (n, _))| n.clone().unwrap_or_else(|| format!("column{}", i + 1))).collect();
+                returns = None;
+            }
         }
         let (mut language, mut body) = (None::<String>, None::<String>);
         loop {

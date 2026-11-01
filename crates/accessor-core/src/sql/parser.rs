@@ -991,6 +991,7 @@ impl<'a> Parser<'a> {
                 type_name.push_str("[]");
             }
             let mut t = match crate::sql::usertypes::lookup(&type_name) {
+                Some(base) if !base.fields.is_empty() => UserType { domain: true, over: Some(type_name.clone()), fields: Vec::new(), ..base },
                 Some(base) => UserType { domain: true, ..base },
                 None => {
                     crate::sql::usertypes::resolve(&type_name).ok_or_else(|| Error::syntax(format!("unknown data type '{type_name}'")))?;
@@ -4809,12 +4810,18 @@ impl<'a> Parser<'a> {
         if let Some(u) = user {
             // a domain or an enum: its base type, and what it requires of the column
             def.not_null = u.not_null;
+            if let Some(over) = &u.over {
+                if def.range.is_none() && crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(def.data_type, DataType::Array(_)) {
+                    def.range = Some(over.clone());
+                }
+            }
             if let Some(d) = &u.default {
                 if let Ok(Expr::Literal(v)) = parse_expression(d) {
                     def.default = Some(v);
                 }
             }
-            let checks = u.checks_for(&def.name);
+            // a column of an array of the domain would need the checks for each element, which a CHECK cannot express: they are not applied
+            let checks = if matches!(def.data_type, DataType::Array(_)) && u.labels.is_empty() { Vec::new() } else { u.checks_for(&def.name) };
             if !checks.is_empty() {
                 def.check = Some(checks.iter().map(|c| format!("({c})")).collect::<Vec<_>>().join(" AND "));
             }
