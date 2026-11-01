@@ -1083,7 +1083,17 @@ impl<'a> Parser<'a> {
                 if !self.peek_sym(")") {
                     loop {
                         let f = self.ident()?;
-                        let ty = self.type_name()?;
+                        let mut ty = self.type_name()?;
+                        if self.peek_sym("(") {
+                            self.skip_parens()?;
+                        }
+                        while self.eat_sym("[") {
+                            while !self.peek_sym("]") && !self.at_eof() {
+                                self.advance();
+                            }
+                            self.expect_sym("]")?;
+                            ty.push_str("[]");
+                        }
                         fields.push((f, ty));
                         if !self.eat_sym(",") {
                             break;
@@ -4465,7 +4475,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_sym(")")?;
+                let options_from = self.pos;
                 while self.skip_constraint_option() {}
+                let deferrable = (options_from..self.pos).any(|k| {
+                    let word = |k: usize, x: &str| matches!(&self.toks[k].tok, Tok::Ident(w) if w.eq_ignore_ascii_case(x));
+                    (word(k, "DEFERRABLE") && !word(k.saturating_sub(1), "NOT")) || word(k, "DEFERRED")
+                });
                 if self.eat_kw("WITH") {
                     self.skip_parens()?;
                 }
@@ -4476,7 +4491,10 @@ impl<'a> Parser<'a> {
                     encoded.push_str(&format!("\u{4}{}", self.src[start..self.toks[self.pos].pos].trim()));
                     self.expect_sym(")")?;
                 }
-                checks.push((cname, encoded));
+                // a deferrable constraint is checked at the end of the transaction, which is not done: it is read and ignored
+                if !deferrable {
+                    checks.push((cname, encoded));
+                }
             } else if self.peek_kw_at(named, "NOT") && self.peek_kw_at(named + 1, "NULL") && matches!(self.peek_at(named + 2), Tok::Ident(_) | Tok::Quoted(_)) {
                 // [CONSTRAINT name] NOT NULL column [NO INHERIT]
                 if named > 0 {
@@ -4782,7 +4800,7 @@ impl<'a> Parser<'a> {
             expression,
             check: None,
             invisible: false,
-            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && (crate::expr::ranges::cast_function_for(&type_name).is_some() || crate::expr::composite::is_composite(&type_name)) { Some(type_name.clone()) } else { None },
+            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(data_type, DataType::Array(_)) && (crate::expr::ranges::cast_function_for(&type_name).is_some() || crate::expr::composite::is_composite(&type_name)) { Some(type_name.clone()) } else { None },
         };
         if let Some(l) = labels {
             let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();

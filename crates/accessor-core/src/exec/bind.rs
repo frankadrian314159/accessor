@@ -830,7 +830,9 @@ impl<'a> Binder<'a> {
                     Some(t) => t.clone(),
                     None => self.scope.cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?.table.clone(),
                 };
-                crate::expr::ranges::column_type(&alias, name).filter(|t| crate::expr::composite::is_composite(t))
+                let found = crate::expr::ranges::column_type(&alias, name);
+                let found = if found.is_none() && (alias.eq_ignore_ascii_case("NEW") || alias.eq_ignore_ascii_case("OLD")) { crate::expr::ranges::column_type_anywhere(name) } else { found };
+                found.filter(|t| crate::expr::composite::is_composite(t))
             }
             _ => None,
         }
@@ -852,7 +854,15 @@ impl<'a> Binder<'a> {
                 return self.bind(&Expr::Function { name: "__NTH".into(), args: vec![rowtext, Expr::Literal(Value::Int(n as i64)), Expr::Literal(Value::text("text"))], distinct: false, star: false });
             }
         }
-        let type_name = self.composite_type_of(base).ok_or_else(|| Error::catalog(format!("could not identify column \"{field}\" in record data type")))?;
+        // where the value's type is not at hand (a variable of a trigger, say), the one composite type with the field is it
+        let type_name = self
+            .composite_type_of(base)
+            .or_else(|| {
+                let mut found = crate::sql::usertypes::snapshot().into_iter().filter(|(_, t)| t.fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(field)));
+                let first = found.next()?;
+                found.next().is_none().then_some(first.0)
+            })
+            .ok_or_else(|| Error::catalog(format!("could not identify column \"{field}\" in record data type")))?;
         let fields = crate::expr::composite::fields_of(&type_name).unwrap_or_default();
         let at = fields
             .iter()

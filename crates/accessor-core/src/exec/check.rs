@@ -40,6 +40,11 @@ impl Database {
             if first.is_empty() {
                 first = element.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
             }
+            // an operator other than `=` is only known for the range types; for a type the engine lacks (a box, a circle)
+            // the constraint is read and ignored
+            if op.trim() != "=" && crate::expr::ranges::column_type(&real, element.trim()).is_none() {
+                return Ok(());
+            }
             let (a, b) = (qualify_columns(element, "__o", &is_col)?, qualify_columns(element, "NEW", &is_col)?);
             pairs.push(format!("{a} {op} {b}"));
         }

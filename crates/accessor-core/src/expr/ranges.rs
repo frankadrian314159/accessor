@@ -782,6 +782,18 @@ pub(crate) fn forget_table(table: &str) {
     COLUMNS.with(|c| c.borrow_mut().retain(|(tb, _), _| *tb != t));
 }
 
+/// The type of the columns called `column` in the tables of this session, when they all have the same one (for `NEW.col`
+/// in a trigger, where the table is not named).
+pub(crate) fn column_type_anywhere(column: &str) -> Option<String> {
+    let col = column.to_ascii_lowercase();
+    COLUMNS.with(|c| {
+        let c = c.borrow();
+        let mut types = c.iter().filter(|((_, n), _)| *n == col).map(|(_, t)| t);
+        let first = types.next()?;
+        types.all(|t| t == first).then(|| first.clone())
+    })
+}
+
 pub(crate) fn column_type(table: &str, column: &str) -> Option<String> {
     COLUMNS.with(|c| {
         let c = c.borrow();
