@@ -58,6 +58,9 @@ impl Zone {
 
     /// The wall-clock reading (as a `DATETIME` value) of the instant `utc`.
     pub fn to_local(self, utc: i64) -> i64 {
+        if datetime::is_infinite(utc) {
+            return utc;
+        }
         utc + self.offset_at(utc)
     }
 
@@ -65,6 +68,9 @@ impl Zone {
     /// twice (the clock went back) is taken at its first occurrence; one that never occurs
     /// (the clock jumped forward) is read with the offset from before the jump.
     pub fn to_utc(self, local: i64) -> i64 {
+        if datetime::is_infinite(local) {
+            return local;
+        }
         match self {
             Zone::Fixed(o) => local - o as i64,
             Zone::Named(_) => {
@@ -168,6 +174,9 @@ pub fn format_timestamptz(utc: i64) -> String {
 }
 
 pub fn format_in(utc: i64, zone: Zone) -> String {
+    if datetime::is_infinite(utc) {
+        return datetime::format(utc);
+    }
     let off = zone.offset_at(utc);
     let (y, mo, d, h, mi, s) = datetime::components(utc + off);
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{}", format_offset(off))

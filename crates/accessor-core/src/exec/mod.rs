@@ -10,7 +10,7 @@ mod mysqlshow;
 mod catalog;
 pub(crate) mod pushdown;
 mod inherit;
-mod check;
+pub(crate) mod check;
 mod ddl;
 mod merge;
 mod seq;

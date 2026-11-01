@@ -620,8 +620,16 @@ impl<'a> Binder<'a> {
                 };
             }
             Expr::Window { func, spec } => return self.bind_window(func, spec),
+            Expr::Function { name, args, distinct, star } if name == "__ROW" && crate::dialect::current() == crate::dialect::Dialect::Postgresql => {
+                // a row value that is not compared: PostgreSQL's record text
+                return self.bind(&Expr::Function { name: "__ROWTEXT".into(), args: args.clone(), distinct: *distinct, star: *star });
+            }
             Expr::Function { name, .. } if name == "__ROW" => {
                 return Err(Error::runtime("a row value (a, b) can only be compared with another row value or used with IN"))
+            }
+            Expr::Function { name, args, .. } if name == "__FIELD" && args.len() == 2 => {
+                let Expr::Literal(Value::Text(field)) = &args[1] else { return Err(Error::runtime("a field name is expected")) };
+                return self.bind_field(&args[0], field);
             }
             Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("GROUPING") && self.group.is_some() => {
                 let saved = self.group.take();
@@ -803,6 +811,60 @@ impl<'a> Binder<'a> {
         self.allow_win = saved;
         self.wins.push(result?);
         Ok(BExpr::Col(WIN_BASE + self.wins.len() - 1))
+    }
+
+    /// The type name of a composite value, when it can be told from the expression.
+    fn composite_type_of(&self, e: &Expr) -> Option<String> {
+        match e {
+            Expr::Function { name, args, .. } if name == "__ROWCAST" => match args.get(1) {
+                Some(Expr::Literal(Value::Text(t))) => Some(t.to_string()),
+                _ => None,
+            },
+            Expr::Function { name, args, .. } if name == "__FIELD" => {
+                let Some(Expr::Literal(Value::Text(f))) = args.get(1) else { return None };
+                let outer = self.composite_type_of(&args[0])?;
+                crate::expr::composite::fields_of(&outer)?.into_iter().find(|(n, _)| n.eq_ignore_ascii_case(f)).map(|(_, t)| t)
+            }
+            Expr::Column { table, name } => {
+                let alias = match table {
+                    Some(t) => t.clone(),
+                    None => self.scope.cols.iter().find(|c| c.name.eq_ignore_ascii_case(name))?.table.clone(),
+                };
+                crate::expr::ranges::column_type(&alias, name).filter(|t| crate::expr::composite::is_composite(t))
+            }
+            _ => None,
+        }
+    }
+
+    /// `(base).field`: the field of a table's row, or of a composite value.
+    fn bind_field(&mut self, base: &Expr, field: &str) -> Result<BExpr> {
+        if let Expr::Column { table: None, name } = base {
+            if self.scope.resolve(None, name).is_err() && self.scope.cols.iter().any(|c| c.table.eq_ignore_ascii_case(name)) {
+                return self.bind(&Expr::Column { table: Some(name.clone()), name: field.to_string() });
+            }
+        }
+        // ROW(a, b).f1
+        if let Expr::Function { name, args, .. } = base {
+            if name == "__ROW" {
+                let n = field.strip_prefix('f').and_then(|x| x.parse::<usize>().ok()).filter(|n| (1..=args.len()).contains(n));
+                let Some(n) = n else { return Err(Error::catalog(format!("could not identify column \"{field}\" in record data type"))) };
+                let rowtext = Expr::Function { name: "__ROWTEXT".into(), args: args.clone(), distinct: false, star: false };
+                return self.bind(&Expr::Function { name: "__NTH".into(), args: vec![rowtext, Expr::Literal(Value::Int(n as i64)), Expr::Literal(Value::text("text"))], distinct: false, star: false });
+            }
+        }
+        let type_name = self.composite_type_of(base).ok_or_else(|| Error::catalog(format!("could not identify column \"{field}\" in record data type")))?;
+        let fields = crate::expr::composite::fields_of(&type_name).unwrap_or_default();
+        let at = fields
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(field))
+            .ok_or_else(|| Error::catalog(format!("column \"{field}\" not found in data type {type_name}")))?;
+        let call = Expr::Function {
+            name: "__NTH".into(),
+            args: vec![base.clone(), Expr::Literal(Value::Int(at as i64 + 1)), Expr::Literal(Value::text(&fields[at].1))],
+            distinct: false,
+            star: false,
+        };
+        self.bind(&call)
     }
 
     /// A call of an aggregate made with `CREATE AGGREGATE`: the argument rows are collected (as `ARRAY_AGG` does, with

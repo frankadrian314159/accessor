@@ -230,15 +230,24 @@ impl<'a> Parser<'a> {
         let name = self.table_ident()?;
         self.expect_sym("(")?;
         let mut params: Vec<RoutineParam> = Vec::new();
-        let mut outs: Vec<DataType> = Vec::new();
+        let mut outs: Vec<(Option<String>, DataType)> = Vec::new();
         if !self.peek_sym(")") {
             loop {
                 let mut out = false;
+                let mut also_in = false;
                 if self.eat_kw("IN") {
+                    // IN OUT is INOUT
+                    if self.eat_kw("OUT") {
+                        out = true;
+                        also_in = true;
+                    }
                 } else if self.eat_kw("OUT") {
                     out = true;
-                } else if self.peek_kw("INOUT") || self.peek_kw("VARIADIC") {
-                    return Err(Error::syntax("INOUT and VARIADIC parameters are not supported"));
+                } else if self.eat_kw("INOUT") {
+                    out = true;
+                    also_in = true;
+                } else if self.peek_kw("VARIADIC") {
+                    return Err(Error::syntax("VARIADIC parameters are not supported"));
                 }
                 let named = matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_))
                     && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_))
@@ -247,8 +256,9 @@ impl<'a> Parser<'a> {
                 let pname = if named { Some(self.ident()?) } else { None };
                 let ty = self.pg_type()?;
                 if out {
-                    outs.push(ty);
-                } else {
+                    outs.push((pname.clone(), ty));
+                }
+                if !out || also_in {
                     let default = if self.eat_kw("DEFAULT") || self.eat_sym("=") { Some(self.expr()?) } else { None };
                     let pname = pname.unwrap_or_else(|| format!("${}", params.len() + 1));
                     if params.iter().any(|p| p.name.eq_ignore_ascii_case(&pname)) {
@@ -296,8 +306,12 @@ impl<'a> Parser<'a> {
         }
         match outs.len() {
             0 => {}
-            1 if returns.is_none() => returns = Some(outs[0]),
-            _ => return Err(Error::syntax("OUT parameters that return several columns are not supported")),
+            1 if returns.is_none() => returns = Some(outs[0].1),
+            // several OUT parameters are the columns of the one row the function returns
+            _ if returns.is_none() && set_columns.is_empty() => {
+                set_columns = outs.iter().enumerate().map(|(i, (n, _))| n.clone().unwrap_or_else(|| format!("column{}", i + 1))).collect();
+            }
+            _ => return Err(Error::syntax("OUT parameters cannot be combined with RETURNS")),
         }
         let (mut language, mut body) = (None::<String>, None::<String>);
         loop {

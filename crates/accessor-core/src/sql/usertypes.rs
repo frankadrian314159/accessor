@@ -29,6 +29,9 @@ pub struct UserType {
     /// The name given to the multirange type of a range type (`multirange_type_name = ..`).
     #[serde(default)]
     pub multi_name: Option<String>,
+    /// `CREATE TYPE t AS (a int, b text)`: the name and type of each field (the type itself is text in record form).
+    #[serde(default)]
+    pub fields: Vec<(String, String)>,
 }
 
 thread_local! {

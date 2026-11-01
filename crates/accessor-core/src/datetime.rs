@@ -96,7 +96,21 @@ pub fn weekday(secs: i64) -> i64 {
     (secs.div_euclid(SECS_PER_DAY) + 4).rem_euclid(7) + 1
 }
 
+/// PostgreSQL's `infinity` and `-infinity`: the largest and smallest readings, which compare with every other one.
+pub const INFINITY: i64 = i64::MAX;
+pub const NEG_INFINITY: i64 = -i64::MAX;
+
+pub fn is_infinite(secs: i64) -> bool {
+    secs >= INFINITY || secs <= NEG_INFINITY
+}
+
 pub fn format(secs: i64) -> String {
+    if secs >= INFINITY {
+        return "infinity".into();
+    }
+    if secs <= NEG_INFINITY {
+        return "-infinity".into();
+    }
     let (y, mo, d, h, mi, s) = components(secs);
     if h == 0 && mi == 0 && s == 0 {
         format!("{y:04}-{mo:02}-{d:02}")
@@ -108,6 +122,14 @@ pub fn format(secs: i64) -> String {
 /// Parses `YYYY-MM-DD[ T]HH:MM[:SS]` and US-style `M/D/YYYY [h:mm[:ss] [AM|PM]]`.
 pub fn parse(input: &str) -> Option<i64> {
     let s = input.trim();
+    if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+        if s.eq_ignore_ascii_case("infinity") || s.eq_ignore_ascii_case("+infinity") {
+            return Some(INFINITY);
+        }
+        if s.eq_ignore_ascii_case("-infinity") {
+            return Some(NEG_INFINITY);
+        }
+    }
     let (date_part, time_part) = match s.find(['T', ' ']) {
         Some(i) => (&s[..i], s[i + 1..].trim()),
         None => (s, ""),

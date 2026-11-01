@@ -6894,3 +6894,45 @@ fn postgresql_ranges_in_columns_compare_sort_and_subtract_into_rows() {
     assert_eq!(one(&mut db, "SELECT pg_input_is_valid('(1,4', 'int4range')"), "false");
     assert_eq!(one(&mut db, "SELECT message FROM pg_input_error_info('(4,zed)', 'int4range')"), "invalid input syntax for type integer: \"zed\"");
 }
+
+#[test]
+fn postgresql_exclude_composite_types_out_parameters_and_infinity() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    // EXCLUDE
+    db.execute("CREATE TABLE e (room int4range, d tsrange, EXCLUDE USING gist (room WITH =, d WITH &&))").unwrap();
+    db.execute("INSERT INTO e VALUES (int4range(1, 2, '[]'), '[2010-01-02 10:00, 2010-01-02 11:00)')").unwrap();
+    assert!(db.execute("INSERT INTO e VALUES (int4range(1, 2, '[]'), '[2010-01-02 10:30, 2010-01-02 12:00)')").is_err());
+    db.execute("INSERT INTO e VALUES (int4range(2, 3, '[]'), '[2010-01-02 10:30, 2010-01-02 12:00)')").unwrap();
+    db.execute("UPDATE e SET d = '[2010-01-02 10:00, 2010-01-02 10:15)' WHERE room = int4range(1, 3)").unwrap();
+    // composite types
+    db.execute("CREATE TYPE two_ints AS (a int, b int)").unwrap();
+    assert_eq!(one(&mut db, "SELECT ROW(1, 2)::two_ints"), "(1,2)");
+    assert_eq!(one(&mut db, "SELECT (ROW(1, 2)::two_ints).b"), "2");
+    db.execute("CREATE TABLE ct (id int, v two_ints)").unwrap();
+    db.execute("INSERT INTO ct VALUES (1, ROW(3, 4)), (2, '(5, 6)')").unwrap();
+    assert_eq!(one(&mut db, "SELECT (v).a FROM ct WHERE id = 2"), "5");
+    assert_eq!(one(&mut db, "SELECT v FROM ct WHERE id = 2"), "(5,6)");
+    assert!(db.execute("SELECT '(1)'::two_ints").is_err());
+    db.execute("ALTER TYPE two_ints ADD ATTRIBUTE c text").unwrap();
+    assert_eq!(one(&mut db, "SELECT '(1,2,x)'::two_ints"), "(1,2,x)");
+    assert_eq!(one(&mut db, "SELECT (ROW(1, 'x')).f2"), "x");
+    // OUT and INOUT parameters
+    db.execute("CREATE FUNCTION o1(i int, OUT r int, OUT t text) AS $$ SELECT $1 + 1, 'foo'::text $$ LANGUAGE sql").unwrap();
+    let r = db.execute("SELECT * FROM o1(4)").unwrap();
+    assert_eq!((r.rows[0][0].to_string(), r.rows[0][1].to_string()), ("5".to_string(), "foo".to_string()));
+    db.execute("CREATE FUNCTION io(INOUT x int) AS $$ SELECT $1 * 2 $$ LANGUAGE sql").unwrap();
+    assert_eq!(one(&mut db, "SELECT io(21)"), "42");
+    // infinity
+    assert_eq!(one(&mut db, "SELECT 'infinity'::date > CURRENT_DATE"), "true");
+    assert_eq!(one(&mut db, "SELECT '-infinity'::timestamp"), "-infinity");
+    assert_eq!(one(&mut db, "SELECT daterange('-infinity'::date, '2000-01-01'::date, '()')"), "[-infinity,2000-01-01)");
+    // a float range writes its bounds as floats; a range of arrays
+    db.execute("CREATE TYPE float8range AS RANGE (subtype = float8)").unwrap();
+    assert_eq!(one(&mut db, "SELECT float8range(-100.00007, '1.111113e9')"), "[-100.00007,1111113000)");
+    db.execute("CREATE TYPE arrayrange AS RANGE (subtype = int4[])").unwrap();
+    assert_eq!(one(&mut db, "SELECT arrayrange(ARRAY[1,2], ARRAY[2,1])"), "[\"{1,2}\",\"{2,1}\")");
+    assert!(db.execute("SELECT '(),a)'::int4range").is_err());
+}

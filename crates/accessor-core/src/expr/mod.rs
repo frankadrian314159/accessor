@@ -6,6 +6,7 @@ pub(crate) mod extra;
 pub mod func;
 pub mod like;
 pub mod arrays;
+pub mod composite;
 pub mod ranges;
 pub mod bytefuncs;
 pub mod geom;

@@ -307,6 +307,15 @@ fn requalify(st: &mut Statement, alias: &str, table: &str) -> Result<()> {
 /// part of has been parsed; it never reaches the executor.
 const ROW_MARKER: &str = "__ROW";
 
+/// `e::type` for a composite type: a `ROW(..)` is written out as record text first.
+fn composite_cast(e: Expr, type_name: &str) -> Expr {
+    let e = match e {
+        Expr::Function { name, args, distinct, star } if name == ROW_MARKER => Expr::Function { name: "__ROWTEXT".into(), args, distinct, star },
+        other => other,
+    };
+    Expr::Function { name: "__ROWCAST".into(), args: vec![e, Expr::Literal(Value::text(type_name))], distinct: false, star: false }
+}
+
 fn row_value(items: Vec<Expr>) -> Expr {
     Expr::Function { name: ROW_MARKER.into(), args: items, distinct: false, star: false }
 }
@@ -1033,7 +1042,12 @@ impl<'a> Parser<'a> {
                     let option = self.ident()?.to_ascii_lowercase();
                     self.expect_sym("=")?;
                     if option == "subtype" {
-                        subtype = Some(self.type_name()?);
+                        let mut ty = self.type_name()?;
+                        while self.eat_sym("[") {
+                            self.expect_sym("]")?;
+                            ty.push_str("[]");
+                        }
+                        subtype = Some(ty);
                     } else if option == "multirange_type_name" {
                         let mut n = self.ident()?;
                         while self.eat_sym(".") {
@@ -1062,8 +1076,28 @@ impl<'a> Parser<'a> {
                 let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
                 return Ok(Some(change("type", name, value)));
             }
+            if self.peek_sym("(") {
+                // CREATE TYPE t AS (a int, b text): a composite type
+                self.advance();
+                let mut fields = Vec::new();
+                if !self.peek_sym(")") {
+                    loop {
+                        let f = self.ident()?;
+                        let ty = self.type_name()?;
+                        fields.push((f, ty));
+                        if !self.eat_sym(",") {
+                            break;
+                        }
+                    }
+                }
+                self.expect_sym(")")?;
+                let t = UserType { base: "TEXT".into(), fields, ..Default::default() };
+                crate::sql::usertypes::register(&name, t.clone());
+                let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
+                return Ok(Some(change("type", name, value)));
+            }
             if !self.eat_kw("ENUM") {
-                return Err(Error::syntax("only enumerated types can be created with CREATE TYPE; composite, range and base types are not available"));
+                return Err(Error::syntax("only enumerated types can be created with CREATE TYPE; base types are not available"));
             }
             self.expect_sym("(")?;
             let mut labels = Vec::new();
@@ -1297,6 +1331,62 @@ impl<'a> Parser<'a> {
                 Err(p.unexpected("a label in quotes"))
             }
         };
+        if let Some(mut t) = crate::sql::usertypes::lookup(&name).filter(|t| !t.fields.is_empty()) {
+            // a composite type: ADD ATTRIBUTE a type, DROP ATTRIBUTE a, ALTER ATTRIBUTE a [SET DATA] TYPE t, RENAME ATTRIBUTE a TO b
+            let mut changed = false;
+            loop {
+                if self.eat_kw("ADD") {
+                    self.expect_kw("ATTRIBUTE")?;
+                    let f = self.ident()?;
+                    let ty = self.type_name()?;
+                    if t.fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(&f)) {
+                        return Err(Error::catalog(format!("column \"{f}\" of relation \"{name}\" already exists")));
+                    }
+                    t.fields.push((f, ty));
+                } else if self.eat_kw("DROP") {
+                    self.expect_kw("ATTRIBUTE")?;
+                    if self.eat_kw("IF") {
+                        self.expect_kw("EXISTS")?;
+                    }
+                    let f = self.ident()?;
+                    t.fields.retain(|(n, _)| !n.eq_ignore_ascii_case(&f));
+                } else if self.eat_kw("ALTER") {
+                    self.expect_kw("ATTRIBUTE")?;
+                    let f = self.ident()?;
+                    if self.eat_kw("SET") {
+                        self.expect_kw("DATA")?;
+                    }
+                    self.expect_kw("TYPE")?;
+                    let ty = self.type_name()?;
+                    if let Some(x) = t.fields.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&f)) {
+                        x.1 = ty;
+                    }
+                } else if self.eat_kw("RENAME") {
+                    self.expect_kw("ATTRIBUTE")?;
+                    let f = self.ident()?;
+                    self.expect_kw("TO")?;
+                    let to = self.ident()?;
+                    if let Some(x) = t.fields.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&f)) {
+                        x.0 = to;
+                    }
+                } else {
+                    break;
+                }
+                changed = true;
+                while !self.at_eof() && !self.peek_sym(",") && !self.peek_sym(";") && !self.peek_kw("ADD") && !self.peek_kw("DROP") && !self.peek_kw("ALTER") && !self.peek_kw("RENAME") {
+                    self.advance();
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            if changed {
+                crate::sql::usertypes::register(&name, t.clone());
+                let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
+                return Ok(Statement::Catalog(Box::new(CatalogChange { kind: "type", names: vec![name], value: Some(value), replace: true, cascade: false })));
+            }
+            return Ok(self.ignore_rest("ALTER TYPE"));
+        }
         let add = self.peek_kw("ADD") && self.peek_kw_at(1, "VALUE");
         let rename = self.peek_kw("RENAME") && self.peek_kw_at(1, "VALUE");
         if !add && !rename {
@@ -4337,23 +4427,56 @@ impl<'a> Parser<'a> {
         loop {
             let named = usize::from(self.peek_kw("CONSTRAINT")) * 2;
             if self.peek_kw_at(named, "EXCLUDE") && (self.peek_kw_at(named + 1, "USING") || matches!(self.peek_at(named + 1), Tok::Sym("("))) {
-                // EXCLUDE [USING method] (element WITH operator, ...) [options] [WHERE (...)]: read, and not kept
+                // EXCLUDE [USING method] (element WITH operator, ...) [options] [WHERE (...)]: kept as a check of a special form
+                let mut cname = None;
                 if named > 0 {
                     self.advance();
-                    self.advance();
+                    cname = Some(self.ident()?);
                 }
                 self.advance();
                 if self.eat_kw("USING") {
                     self.ident()?;
                 }
-                self.skip_parens()?;
+                self.expect_sym("(")?;
+                let mut encoded = String::from(crate::exec::check::EXCLUDE_PREFIX);
+                loop {
+                    let start = self.toks[self.pos].pos;
+                    self.expr()?;
+                    let element = self.src[start..self.toks[self.pos].pos].trim().to_string();
+                    // an operator class and ordering words may follow the element
+                    while !self.peek_kw("WITH") && !self.at_eof() {
+                        self.advance();
+                    }
+                    self.expect_kw("WITH")?;
+                    let op_start = self.toks[self.pos].pos;
+                    let mut depth = 0usize;
+                    while !self.at_eof() && !(depth == 0 && (self.peek_sym(",") || self.peek_sym(")"))) {
+                        if self.peek_sym("(") {
+                            depth += 1;
+                        } else if self.peek_sym(")") {
+                            depth -= 1;
+                        }
+                        self.advance();
+                    }
+                    let op = self.src[op_start..self.toks[self.pos].pos].trim().to_string();
+                    encoded.push_str(&format!("{element}\u{3}{op}\u{2}"));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
                 while self.skip_constraint_option() {}
                 if self.eat_kw("WITH") {
                     self.skip_parens()?;
                 }
                 if self.eat_kw("WHERE") {
-                    self.skip_parens()?;
+                    self.expect_sym("(")?;
+                    let start = self.toks[self.pos].pos;
+                    self.expr()?;
+                    encoded.push_str(&format!("\u{4}{}", self.src[start..self.toks[self.pos].pos].trim()));
+                    self.expect_sym(")")?;
                 }
+                checks.push((cname, encoded));
             } else if self.peek_kw_at(named, "NOT") && self.peek_kw_at(named + 1, "NULL") && matches!(self.peek_at(named + 2), Tok::Ident(_) | Tok::Quoted(_)) {
                 // [CONSTRAINT name] NOT NULL column [NO INHERIT]
                 if named > 0 {
@@ -4659,7 +4782,7 @@ impl<'a> Parser<'a> {
             expression,
             check: None,
             invisible: false,
-            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && crate::expr::ranges::cast_function_for(&type_name).is_some() { Some(type_name.clone()) } else { None },
+            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && (crate::expr::ranges::cast_function_for(&type_name).is_some() || crate::expr::composite::is_composite(&type_name)) { Some(type_name.clone()) } else { None },
         };
         if let Some(l) = labels {
             let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();
@@ -6542,7 +6665,14 @@ impl<'a> Parser<'a> {
     }
 
     fn power(&mut self) -> Result<Expr> {
+        let parenthesized = self.peek_sym("(");
         let mut base = self.primary()?;
+        // `(row).field`: a field of a composite value
+        while parenthesized && self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            self.advance();
+            let field = self.ident()?;
+            base = Expr::Function { name: "__FIELD".into(), args: vec![base, Expr::Literal(Value::text(&field))], distinct: false, star: false };
+        }
         // `a[i]`, `a[lo:hi]`: an element or a slice of an array
         while self.peek_sym("[") {
             self.advance();
@@ -7412,6 +7542,10 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
             return Ok(Expr::Function { name: "__TIMEOF".into(), args: vec![e], distinct: false, star: false });
         }
+        if crate::expr::composite::is_composite(&tn) {
+            self.expect_sym(")")?;
+            return Ok(composite_cast(e, &tn));
+        }
         if let Some(name) = crate::expr::ranges::cast_function_for(&tn) {
             self.expect_sym(")")?;
             return Ok(Expr::Function { name, args: vec![e], distinct: false, star: false });
@@ -7442,6 +7576,9 @@ impl<'a> Parser<'a> {
         if tn.eq_ignore_ascii_case("tsvector") || tn.eq_ignore_ascii_case("tsquery") {
             let name = if tn.eq_ignore_ascii_case("tsvector") { "TSVECTOR_IN" } else { "TSQUERY_IN" };
             return Ok(Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false });
+        }
+        if crate::expr::composite::is_composite(&tn) {
+            return Ok(composite_cast(e, &tn));
         }
         if let Some(name) = crate::expr::ranges::cast_function_for(&tn) {
             return Ok(Expr::Function { name, args: vec![e], distinct: false, star: false });

@@ -21,6 +21,8 @@ pub enum Kind {
     Tstz,
     /// A range made with `CREATE TYPE .. AS RANGE`: continuous, with no canonical form.
     Custom,
+    /// The same over a floating-point subtype, whose bounds are written the way a float is.
+    Float,
 }
 
 impl Kind {
@@ -113,15 +115,23 @@ pub fn lookup(name: &str) -> Option<(RangeFn, usize, usize)> {
     }
     // a range type of the user's
     let custom = |n: &str| crate::sql::usertypes::lookup(n).is_some_and(|t| t.range.is_some());
+    let kind_of = |n: &str| {
+        let sub = crate::sql::usertypes::lookup(n).and_then(|t| t.range).unwrap_or_default().to_ascii_lowercase();
+        if matches!(sub.as_str(), "float4" | "float8" | "real" | "double" | "double precision" | "float") {
+            Kind::Float
+        } else {
+            Kind::Custom
+        }
+    };
     if let Some(n) = name.strip_prefix("__RANGE_CAST_") {
         if custom(n) {
-            return Some((Cast(Kind::Custom), 1, 1));
+            return Some((Cast(kind_of(n)), 1, 1));
         }
         if crate::sql::usertypes::is_multirange_name(n) {
             return Some((MultiCast(Kind::Custom), 1, 1));
         }
     } else if custom(name) {
-        return Some((Ctor(Kind::Custom), 0, 3));
+        return Some((Ctor(kind_of(name)), 0, 3));
     } else if crate::sql::usertypes::is_multirange_name(name) {
         return Some((MultiCtor(Kind::Custom), 0, usize::MAX));
     }
@@ -264,6 +274,7 @@ fn parse(s: &str) -> Option<Range> {
             }
             '\\' => parts.last_mut()?.0.push(it.next()?),
             ',' if !quoted => parts.push((String::new(), false)),
+            ')' | ']' if !quoted => return None,
             c => parts.last_mut()?.0.push(c),
         }
     }
@@ -356,6 +367,11 @@ fn intersect(a: &Range, b: &Range) -> Range {
 
 fn bound_text(kind: Kind, v: &Value) -> String {
     let s = v.to_string();
+    if kind == Kind::Float {
+        if let Ok(f) = s.trim().parse::<f64>() {
+            return f.to_string();
+        }
+    }
     if kind == Kind::Date && s.len() > 10 && s.as_bytes().get(4) == Some(&b'-') {
         return s[..10].to_string();
     }
@@ -374,7 +390,7 @@ fn check_bound(kind: Kind, b: &str) -> Result<()> {
                 return Err(Error::runtime("value out of range for type bigint"));
             }
         }
-        Kind::Num => {
+        Kind::Num | Kind::Float => {
             if b.parse::<f64>().is_err() && !b.eq_ignore_ascii_case("nan") {
                 return Err(Error::type_err(format!("invalid input syntax for type numeric: \"{b}\"")));
             }
@@ -394,6 +410,9 @@ fn check_bound(kind: Kind, b: &str) -> Result<()> {
 }
 
 fn next_bound(kind: Kind, s: &str) -> Result<String> {
+    if s.ends_with("infinity") {
+        return Ok(s.to_string());
+    }
     match kind {
         Kind::Int4 | Kind::Int8 => {
             let n: i128 = s.parse().map_err(|_| Error::type_err(format!("invalid input syntax for type integer: \"{s}\"")))?;
@@ -775,6 +794,9 @@ pub(crate) fn column_type(table: &str, column: &str) -> Option<String> {
 
 /// A text put in the form of the range or multirange type `tn`.
 pub(crate) fn normalize(tn: &str, v: &Value) -> Result<Value> {
+    if super::composite::is_composite(tn) {
+        return Ok(Value::text(&super::composite::cast_text(tn, &v.to_string())?));
+    }
     let Some(f) = cast_function_for(tn) else { return Ok(v.clone()) };
     let Some((func, _, _)) = lookup(&f) else { return Ok(v.clone()) };
     call(func, &[Cow::Borrowed(v)])
