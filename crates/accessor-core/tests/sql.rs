@@ -6789,3 +6789,36 @@ fn postgresql_create_aggregate_folds_a_state_function_over_the_rows() {
     db.execute("DROP AGGREGATE newsum(int4)").unwrap();
     assert!(db.execute("SELECT newsum(a) FROM t").is_err());
 }
+
+#[test]
+fn postgresql_range_types_are_text_with_constructors_operators_and_casts() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT int4range(1, 5, '[]')"), "[1,6)");
+    assert_eq!(one(&mut db, "SELECT numrange(1.5, 2.5)"), "[1.5,2.5)");
+    assert_eq!(one(&mut db, "SELECT daterange('2000-01-01', '2000-01-31', '[]')"), "[2000-01-01,2000-02-01)");
+    assert_eq!(one(&mut db, "SELECT int4range(NULL, 7)"), "(,7)");
+    assert_eq!(one(&mut db, "SELECT '[1,5]'::int4range"), "[1,6)");
+    assert_eq!(one(&mut db, "SELECT CAST('(3,3]' AS numrange)"), "empty");
+    assert_eq!(one(&mut db, "SELECT lower(int4range(2, 9))"), "2");
+    assert_eq!(one(&mut db, "SELECT upper(int4range(2, 9))"), "9");
+    assert_eq!(one(&mut db, "SELECT isempty(int4range(3, 3))"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 10) @> 5"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 10) @> int4range(2, 4)"), "true");
+    assert_eq!(one(&mut db, "SELECT 5 <@ int4range(6, 10)"), "false");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 5) && int4range(4, 9)"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 5) << int4range(5, 9)"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(6, 9) >> int4range(1, 5)"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 5) &< int4range(3, 9)"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 5) -|- int4range(5, 9)"), "true");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 5) + int4range(5, 9)"), "[1,9)");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 8) * int4range(5, 12)"), "[5,8)");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 8) - int4range(5, 12)"), "[1,5)");
+    assert!(db.execute("SELECT int4range(1, 3) + int4range(5, 9)").is_err());
+    db.execute("CREATE TABLE r (id int, during daterange)").unwrap();
+    db.execute("INSERT INTO r VALUES (1, daterange('2000-01-01', '2000-02-01')), (2, '[2000-03-01,2000-04-01)')").unwrap();
+    assert_eq!(one(&mut db, "SELECT id FROM r WHERE during @> '2000-03-15'::date"), "2");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM r WHERE during && daterange('2000-01-15', '2000-03-15')"), "2");
+}

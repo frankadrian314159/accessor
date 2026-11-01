@@ -438,6 +438,21 @@ fn arith_checked(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
     }
+    // ranges: union, difference and intersection
+    if let (Value::Text(_), Value::Text(_)) = (a, b) {
+        use crate::expr::ranges::{try_op, RangeOp};
+        let range_op = match op {
+            BinOp::Add => Some(RangeOp::Union),
+            BinOp::Sub => Some(RangeOp::Minus),
+            BinOp::Mul => Some(RangeOp::Intersect),
+            _ => None,
+        };
+        if let Some(o) = range_op {
+            if let Some(r) = try_op(o, a, b)? {
+                return Ok(r);
+            }
+        }
+    }
     // Intervals and zoned timestamps.
     if let Some(v) = interval_arith(op, a, b)? {
         return Ok(v);

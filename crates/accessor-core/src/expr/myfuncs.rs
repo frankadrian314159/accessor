@@ -1072,6 +1072,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let s: String = vals.iter().filter_map(|x| int(x)).filter_map(|n| char::from_u32(n as u32)).collect();
             Value::text(&s)
         }
+        BitShl | BitShr if shift_range(f, v(0), v(1))?.is_some() => shift_range(f, v(0), v(1))?.unwrap_or(Value::Null),
         BitShl => Value::Int(int(v(0)).unwrap_or(0).checked_shl(int(v(1)).unwrap_or(0).clamp(0, 64) as u32).unwrap_or(0)),
         BitShr => Value::Int(((int(v(0)).unwrap_or(0) as u64).checked_shr(int(v(1)).unwrap_or(0).clamp(0, 64) as u32).unwrap_or(0)) as i64),
         BitOr => Value::Int(int(v(0)).unwrap_or(0) | int(v(1)).unwrap_or(0)),
@@ -1496,4 +1497,10 @@ fn mysql_week(d: chrono::NaiveDate, mode: i64) -> i64 {
         }
     }
     days / 7 + 1
+}
+
+/// `a << b` and `a >> b` on two ranges (PostgreSQL's strictly left / right of).
+fn shift_range(f: MyFn, a: &Value, b: &Value) -> Result<Option<Value>> {
+    let op = if f == MyFn::BitShl { super::ranges::RangeOp::Left } else { super::ranges::RangeOp::Right };
+    super::ranges::try_op(op, a, b)
 }

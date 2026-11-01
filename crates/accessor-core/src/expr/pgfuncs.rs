@@ -45,6 +45,8 @@ pub enum PgFn {
     My(super::myfuncs::MyFn),
     /// One of the array functions ([`super::arrays`]).
     Arr(super::arrays::ArrFn),
+    /// One of the range functions ([`super::ranges`]).
+    Range(super::ranges::RangeFn),
     /// A function that always gives the same text (`DATABASE()`, `VERSION()`, `CURRENT_USER()`).
     Text(&'static str),
     JsonPathArray,
@@ -105,6 +107,7 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
             return super::tsearch::lookup(name)
                 .map(|(n, a, b)| (Ts(n), a, b))
                 .or_else(|| super::arrays::lookup(name).map(|(m, a, b)| (Arr(m), a, b)))
+                .or_else(|| super::ranges::lookup(name).map(|(m, a, b)| (Range(m), a, b)))
                 .or_else(|| super::myfuncs::lookup(name).map(|(m, a, b)| (My(m), a, b)))
         }
     })
@@ -116,6 +119,7 @@ impl PgFn {
         match self {
             PgFn::My(m) => m.handles_null(),
             PgFn::Arr(a) => a.handles_null(),
+            PgFn::Range(r) => r.handles_null(),
             _ => matches!(self, PgFn::ConcatWs | PgFn::TypeOf | PgFn::Nothing),
         }
     }
@@ -335,6 +339,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         }
         My(m) => return super::myfuncs::call(m, vals),
         Arr(a) => return super::arrays::call(a, vals),
+        Range(r) => return super::ranges::call(r, vals),
         Text(s) => Value::text(s),
         Zero => Value::Int(0),
         Same => v(0).clone(),

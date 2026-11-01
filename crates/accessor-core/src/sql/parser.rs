@@ -6147,6 +6147,18 @@ impl<'a> Parser<'a> {
                 };
                 continue;
             }
+            if let Tok::Sym(s @ ("&<" | "&>" | "-|-")) = self.peek().clone() {
+                // range operators: does not extend to the right / left of, is adjacent to
+                self.advance();
+                let right = self.concat()?;
+                let name = match s {
+                    "&<" => "__RANGE_NOTRIGHT",
+                    "&>" => "__RANGE_NOTLEFT",
+                    _ => "__RANGE_ADJACENT",
+                };
+                left = Expr::Function { name: name.into(), args: vec![left, right], distinct: false, star: false };
+                continue;
+            }
             if let Tok::Sym(s @ ("@>" | "<@" | "&&")) = self.peek().clone() {
                 // array (and JSON) containment, contained by, and overlap
                 self.advance();
@@ -7355,6 +7367,10 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
             return Ok(Expr::Function { name: "__TIMEOF".into(), args: vec![e], distinct: false, star: false });
         }
+        if crate::expr::ranges::Kind::from_name(&tn).is_some() {
+            self.expect_sym(")")?;
+            return Ok(Expr::Function { name: format!("__RANGE_CAST_{}", tn.to_ascii_uppercase()), args: vec![e], distinct: false, star: false });
+        }
         let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         let mut hints = Vec::new();
         if self.eat_sym("(") {
@@ -7381,6 +7397,9 @@ impl<'a> Parser<'a> {
         if tn.eq_ignore_ascii_case("tsvector") || tn.eq_ignore_ascii_case("tsquery") {
             let name = if tn.eq_ignore_ascii_case("tsvector") { "TSVECTOR_IN" } else { "TSQUERY_IN" };
             return Ok(Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false });
+        }
+        if crate::expr::ranges::Kind::from_name(&tn).is_some() {
+            return Ok(Expr::Function { name: format!("__RANGE_CAST_{}", tn.to_ascii_uppercase()), args: vec![e], distinct: false, star: false });
         }
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
         let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;

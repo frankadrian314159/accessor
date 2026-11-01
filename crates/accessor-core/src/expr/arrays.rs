@@ -431,6 +431,15 @@ pub fn call(f: ArrFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             array(a[..a.len() - n as usize].to_vec())
         }
         Contains | ContainedBy | Overlap => {
+            // ranges (text in their own form) use the same operators
+            let op = match f {
+                Contains => super::ranges::RangeOp::Contains,
+                ContainedBy => super::ranges::RangeOp::ContainedBy,
+                _ => super::ranges::RangeOp::Overlap,
+            };
+            if let Some(r) = super::ranges::try_op(op, v(0), v(1))? {
+                return Ok(r);
+            }
             // JSON documents use the same operators
             if let (Value::Json(_), Value::Json(_)) = (v(0), v(1)) {
                 let (a, b) = (crate::json::document(v(0))?, crate::json::document(v(1))?);

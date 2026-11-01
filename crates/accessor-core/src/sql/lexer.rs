@@ -420,6 +420,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 out.push(Token { tok: Tok::Sym("||"), pos });
                 continue;
             }
+            if dialect::current() == Dialect::Postgresql {
+                if let Some(sym) = ["-|-", "&<", "&>"].into_iter().find(|s| rest.starts_with(*s)) {
+                    i += sym.len();
+                    out.push(Token { tok: Tok::Sym(sym), pos });
+                    continue;
+                }
+            }
             let array_op = match dialect::current() {
                 Dialect::Mysql => None,
                 // `&&` is a slip for `&` in asql (the error says so), so it means overlap in postgresql only

@@ -536,8 +536,14 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
     let v0 = vals.first().map(|v| &**v);
 
     Ok(match f {
-        UCase => Value::text(&text_of(v0.unwrap()).to_uppercase()),
-        LCase => Value::text(&text_of(v0.unwrap()).to_lowercase()),
+        UCase => match super::ranges::try_bound(v0.unwrap(), true) {
+            Some(b) => b,
+            None => Value::text(&text_of(v0.unwrap()).to_uppercase()),
+        },
+        LCase => match super::ranges::try_bound(v0.unwrap(), false) {
+            Some(b) => b,
+            None => Value::text(&text_of(v0.unwrap()).to_lowercase()),
+        },
         Len => match v0.unwrap() {
             Value::Bytes(b) => Value::Int(b.len() as i64),
             other => Value::Int(text_of(other).chars().count() as i64),
