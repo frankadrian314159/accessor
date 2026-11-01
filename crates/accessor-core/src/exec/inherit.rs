@@ -278,6 +278,7 @@ impl Database {
                     expression: None,
                     check: None,
                     invisible: false,
+                    range: None,
                 });
             }
         }
@@ -299,6 +300,7 @@ impl Database {
                     expression: None,
                     check: None,
                     invisible: false,
+                    range: None,
                 });
             }
         }
@@ -437,6 +439,7 @@ impl Database {
                 expression: None,
                 check: None,
                 invisible: false,
+                range: None,
             })
             .collect();
         let create = Statement::CreateTable {

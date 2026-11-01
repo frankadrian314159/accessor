@@ -117,8 +117,16 @@ pub fn lookup(name: &str) -> Option<(RangeFn, usize, usize)> {
         if custom(n) {
             return Some((Cast(Kind::Custom), 1, 1));
         }
+        if crate::sql::usertypes::is_multirange_name(n) {
+            return Some((MultiCast(Kind::Custom), 1, 1));
+        }
     } else if custom(name) {
         return Some((Ctor(Kind::Custom), 0, 3));
+    } else if crate::sql::usertypes::is_multirange_name(name) {
+        return Some((MultiCtor(Kind::Custom), 0, usize::MAX));
+    }
+    if let Some(op) = mixed_name(name) {
+        return Some((Op(op), 2, 2));
     }
     Some(match name {
         "ISEMPTY" => (IsEmpty, 1, 1),
@@ -139,6 +147,30 @@ pub fn lookup(name: &str) -> Option<(RangeFn, usize, usize)> {
         "RANGE_UNION" => (Op(RangeOp::Union), 2, 2),
         "RANGE_INTERSECT" => (Op(RangeOp::Intersect), 2, 2),
         "RANGE_MINUS" => (Op(RangeOp::Minus), 2, 2),
+        _ => return None,
+    })
+}
+
+/// The operator behind `multirange_contains_elem`, `range_before_multirange`, `elem_contained_by_multirange` and the like.
+fn mixed_name(name: &str) -> Option<RangeOp> {
+    let parts: Vec<&str> = name.split('_').collect();
+    if !name.contains("MULTIRANGE") || parts.len() < 3 {
+        return None;
+    }
+    let kind = |w: &str| matches!(w, "RANGE" | "MULTIRANGE" | "ELEM");
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !kind(first) || !kind(last) {
+        return None;
+    }
+    Some(match parts[1..parts.len() - 1].join("_").as_str() {
+        "CONTAINS" => RangeOp::Contains,
+        "CONTAINED_BY" => RangeOp::ContainedBy,
+        "OVERLAPS" => RangeOp::Overlap,
+        "BEFORE" => RangeOp::Left,
+        "AFTER" => RangeOp::Right,
+        "OVERLEFT" => RangeOp::NotRight,
+        "OVERRIGHT" => RangeOp::NotLeft,
+        "ADJACENT" => RangeOp::Adjacent,
         _ => return None,
     })
 }
@@ -170,12 +202,12 @@ impl Range {
 }
 
 fn needs_quotes(s: &str) -> bool {
-    s.is_empty() || s.chars().any(|c| matches!(c, ',' | '(' | ')' | '[' | ']' | '"' | '\\') || c.is_whitespace())
+    s.is_empty() || s.eq_ignore_ascii_case("empty") || s.chars().any(|c| matches!(c, ',' | '(' | ')' | '[' | ']' | '"' | '\\') || c.is_whitespace())
 }
 
 fn quoted(s: &str) -> String {
     if needs_quotes(s) {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\"\""))
     } else {
         s.to_string()
     }
@@ -197,6 +229,7 @@ impl std::fmt::Display for Range {
     }
 }
 
+/// Reads a range literal. Space around the whole literal is ignored, but space inside the brackets belongs to the bounds.
 fn parse(s: &str) -> Option<Range> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("empty") {
@@ -214,17 +247,22 @@ fn parse(s: &str) -> Option<Range> {
         _ => return None,
     };
     let inner = chars.as_str();
-    // two bounds, separated by a comma outside quotes
+    // two bounds, separated by a comma outside quotes; a backslash takes the next character as it is, and a doubled quote
+    // inside quotes is a quote
     let mut parts: Vec<(String, bool)> = vec![(String::new(), false)];
     let mut quoted = false;
-    let mut it = inner.chars();
+    let mut it = inner.chars().peekable();
     while let Some(c) = it.next() {
         match c {
+            '"' if quoted && it.peek() == Some(&'"') => {
+                it.next();
+                parts.last_mut()?.0.push('"');
+            }
             '"' => {
                 quoted = !quoted;
                 parts.last_mut()?.1 = true;
             }
-            '\\' if quoted => parts.last_mut()?.0.push(it.next()?),
+            '\\' => parts.last_mut()?.0.push(it.next()?),
             ',' if !quoted => parts.push((String::new(), false)),
             c => parts.last_mut()?.0.push(c),
         }
@@ -233,30 +271,22 @@ fn parse(s: &str) -> Option<Range> {
         return None;
     }
     let bound = |(text, was_quoted): &(String, bool)| -> Option<String> {
-        let t = if *was_quoted { text.clone() } else { text.trim().to_string() };
-        if t.is_empty() && !*was_quoted {
+        if text.is_empty() && !*was_quoted {
             None
         } else {
-            Some(t)
+            Some(text.clone())
         }
     };
     Some(Range { empty: false, lo: bound(&parts[0]), lo_inc, hi: bound(&parts[1]), hi_inc })
 }
 
-fn is_range_text(v: &Value) -> Option<Range> {
-    let Value::Text(s) = v else { return None };
-    let t = s.trim();
-    if !(t.starts_with('[') || t.starts_with('(') || t.eq_ignore_ascii_case("empty")) {
-        return None;
-    }
-    parse(t)
-}
-
 fn cmp_bound(a: &str, b: &str) -> Ordering {
-    if let (Ok(x), Ok(y)) = (a.parse::<i128>(), b.parse::<i128>()) {
+    // numbers may have space around them; other bounds (text) are compared as they are
+    let (ta, tb) = (a.trim(), b.trim());
+    if let (Ok(x), Ok(y)) = (ta.parse::<i128>(), tb.parse::<i128>()) {
         return x.cmp(&y);
     }
-    if let (Ok(x), Ok(y)) = (a.parse::<f64>(), b.parse::<f64>()) {
+    if let (Ok(x), Ok(y)) = (ta.parse::<f64>(), tb.parse::<f64>()) {
         return x.partial_cmp(&y).unwrap_or(Ordering::Equal);
     }
     a.cmp(b)
@@ -330,6 +360,37 @@ fn bound_text(kind: Kind, v: &Value) -> String {
         return s[..10].to_string();
     }
     s
+}
+
+/// Does the text read as a value of the subtype of `kind`?
+fn check_bound(kind: Kind, b: &str) -> Result<()> {
+    match kind {
+        Kind::Int4 | Kind::Int8 => {
+            let n: i128 = b.parse().map_err(|_| Error::type_err(format!("invalid input syntax for type {}: \"{b}\"", if kind == Kind::Int4 { "integer" } else { "bigint" })))?;
+            if kind == Kind::Int4 && i32::try_from(n).is_err() {
+                return Err(Error::runtime("value out of range for type integer"));
+            }
+            if kind == Kind::Int8 && i64::try_from(n).is_err() {
+                return Err(Error::runtime("value out of range for type bigint"));
+            }
+        }
+        Kind::Num => {
+            if b.parse::<f64>().is_err() && !b.eq_ignore_ascii_case("nan") {
+                return Err(Error::type_err(format!("invalid input syntax for type numeric: \"{b}\"")));
+            }
+        }
+        Kind::Date => {
+            if b.eq_ignore_ascii_case("infinity") || b.eq_ignore_ascii_case("-infinity") {
+                return Ok(());
+            }
+            let year: i64 = b.split('-').next().and_then(|y| y.parse().ok()).ok_or_else(|| Error::type_err(format!("invalid input syntax for type date: \"{b}\"")))?;
+            if year > 5_874_897 {
+                return Err(Error::runtime("date out of range"));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn next_bound(kind: Kind, s: &str) -> Result<String> {
@@ -416,8 +477,13 @@ fn cast(kind: Kind, v: &Value) -> Result<Value> {
             return Err(Error::runtime("range lower bound must be less than or equal to range upper bound"));
         }
     }
-    r.lo = r.lo.map(|b| bound_text(kind, &Value::text(&b)));
-    r.hi = r.hi.map(|b| bound_text(kind, &Value::text(&b)));
+    // the bounds of a built-in range are numbers or dates, which may have space around them
+    let tidy = |b: String| if kind == Kind::Custom { b } else { bound_text(kind, &Value::text(b.trim())) };
+    r.lo = r.lo.map(tidy);
+    r.hi = r.hi.map(tidy);
+    for b in r.lo.iter().chain(r.hi.iter()) {
+        check_bound(kind, b)?;
+    }
     Ok(Value::text(&canonical(kind, r)?.to_string()))
 }
 
@@ -522,10 +588,7 @@ fn shape(v: &Value) -> Option<(Vec<Range>, bool)> {
 
 fn multi_cast(kind: Kind, v: &Value) -> Result<Value> {
     let s = v.to_string();
-    let (list, multi) = read_ranges(&s).ok_or_else(|| Error::type_err(format!("malformed multirange literal: \"{s}\"")))?;
-    if !multi {
-        return Err(Error::type_err(format!("malformed multirange literal: \"{s}\"")));
-    }
+    let (list, _) = read_ranges(&s).ok_or_else(|| Error::type_err(format!("malformed multirange literal: \"{s}\"")))?;
     let mut out = Vec::new();
     for r in list {
         let one = cast(kind, &Value::text(&r.to_string()))?;
@@ -558,6 +621,28 @@ fn element(v: &Value, like: &[Range]) -> Vec<Range> {
     vec![Range::point(s)]
 }
 
+/// Orders two texts that are ranges (or two multiranges) the way PostgreSQL does: an empty one first, then by the lower
+/// bound and by the upper bound. `None` when they are not both ranges.
+pub(crate) fn order(a: &str, b: &str) -> Option<Ordering> {
+    let bracket = |s: &str| matches!(s.trim_start().as_bytes().first(), Some(b'[' | b'(' | b'{'));
+    if !(bracket(a) || bracket(b)) || !in_postgresql() {
+        return None;
+    }
+    let (la, ma) = read_ranges(a)?;
+    let (lb, mb) = read_ranges(b)?;
+    // a bare {} beside a plain array is not a multirange
+    if (ma && la.is_empty() && !mb && lb.is_empty() && b.trim() != "empty") || (mb && lb.is_empty() && !ma && la.is_empty() && a.trim() != "empty") {
+        return None;
+    }
+    for (x, y) in la.iter().zip(lb.iter()) {
+        let o = lo_cmp(x, y).then_with(|| hi_cmp(x, y));
+        if o != Ordering::Equal {
+            return Some(o);
+        }
+    }
+    Some(la.len().cmp(&lb.len()))
+}
+
 fn in_postgresql() -> bool {
     crate::dialect::current() == crate::dialect::Dialect::Postgresql
 }
@@ -569,7 +654,10 @@ fn apply(op: RangeOp, a: &Value, b: &Value) -> Result<Option<Value>> {
     // `{}` alone is an empty array as much as an empty multirange: it is a multirange only beside one that has ranges
     let bare = |v: &Value| matches!(v, Value::Text(s) if s.trim() == "{}");
     let has_ranges = |s: &Option<(Vec<Range>, bool)>| s.as_ref().is_some_and(|x| !x.0.is_empty() || !x.1);
-    if (bare(a) && !has_ranges(&sb)) || (bare(b) && !has_ranges(&sa)) {
+    // (the operators that arrays have too; beside a number or a date the `{}` is a multirange)
+    let like_array = |v: &Value| matches!(v, Value::Text(_) | Value::Array(_));
+    let arrays_have = matches!(op, RangeOp::Contains | RangeOp::ContainedBy | RangeOp::Overlap);
+    if arrays_have && ((bare(a) && !has_ranges(&sb) && like_array(b)) || (bare(b) && !has_ranges(&sa) && like_array(a))) {
         return Ok(None);
     }
     let ((la, ma), (lb, mb)) = match (op, sa, sb) {
@@ -652,6 +740,57 @@ pub(crate) fn multirange_items(v: &Value) -> Option<Vec<Value>> {
     }
 }
 
+/// The ranges that are left of `a` when `b` is taken out, one row each (`range_minus_multi`).
+pub(crate) fn minus_multi(a: &Value, b: &Value) -> Result<Vec<Value>> {
+    if a.is_null() || b.is_null() {
+        return Ok(Vec::new());
+    }
+    let (Some((la, _)), Some((lb, _))) = (shape(a), shape(b)) else { return Err(Error::type_err("this function takes ranges")) };
+    Ok(l_minus(&la, &lb).iter().map(|r| Value::text(&r.to_string())).collect())
+}
+
+thread_local! {
+    /// The range or multirange type of the columns made in this session: (table, column) to type name.
+    static COLUMNS: std::cell::RefCell<std::collections::HashMap<(String, String), String>> = std::cell::RefCell::new(Default::default());
+}
+
+pub(crate) fn register_column(table: &str, column: &str, type_name: &str) {
+    COLUMNS.with(|c| c.borrow_mut().insert((table.to_ascii_lowercase(), column.to_ascii_lowercase()), type_name.to_string()));
+}
+
+pub(crate) fn forget_table(table: &str) {
+    let t = table.to_ascii_lowercase();
+    COLUMNS.with(|c| c.borrow_mut().retain(|(tb, _), _| *tb != t));
+}
+
+pub(crate) fn column_type(table: &str, column: &str) -> Option<String> {
+    COLUMNS.with(|c| {
+        let c = c.borrow();
+        if c.is_empty() {
+            return None;
+        }
+        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase())).cloned()
+    })
+}
+
+/// A text put in the form of the range or multirange type `tn`.
+pub(crate) fn normalize(tn: &str, v: &Value) -> Result<Value> {
+    let Some(f) = cast_function_for(tn) else { return Ok(v.clone()) };
+    let Some((func, _, _)) = lookup(&f) else { return Ok(v.clone()) };
+    call(func, &[Cow::Borrowed(v)])
+}
+
+/// Does `text` read as a value of the range or multirange type `name`? `None` when `name` is not one.
+pub(crate) fn input_check(name: &str, text: &str) -> Option<std::result::Result<(), String>> {
+    let f = cast_function_for(name)?;
+    let (func, _, _) = lookup(&f)?;
+    let args = [Cow::Owned(Value::text(text))];
+    Some(call(func, &args).map(|_| ()).map_err(|e| {
+        let m = e.to_string();
+        m.strip_prefix("Type mismatch: ").unwrap_or(&m).to_string()
+    }))
+}
+
 /// The intersection of two ranges (the step of `range_intersect_agg`).
 pub(crate) fn intersect_values(a: &Value, b: &Value) -> Result<Value> {
     apply(RangeOp::Intersect, a, b)?.ok_or_else(|| Error::type_err("range_intersect_agg needs ranges"))
@@ -732,6 +871,6 @@ pub fn call(f: RangeFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
 pub(crate) fn cast_function_for(tn: &str) -> Option<String> {
     let up = tn.to_ascii_uppercase();
     let known = KINDS.iter().any(|(n, _)| *n == up) || MULTI.iter().any(|(n, _)| *n == up);
-    let custom = crate::sql::usertypes::lookup(tn).is_some_and(|t| t.range.is_some());
+    let custom = crate::sql::usertypes::lookup(tn).is_some_and(|t| t.range.is_some()) || crate::sql::usertypes::is_multirange_name(tn);
     (known || custom).then(|| format!("__RANGE_CAST_{up}"))
 }

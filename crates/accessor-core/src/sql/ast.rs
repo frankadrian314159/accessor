@@ -277,6 +277,8 @@ pub struct ColumnDef {
     pub check: Option<String>,
     /// MySQL's `INVISIBLE`: left out of `SELECT *` and of an `INSERT` with no column list.
     pub invisible: bool,
+    /// PostgreSQL's range or multirange type of the column, whose values are put in the type's form.
+    pub range: Option<String>,
 }
 
 /// `FOREIGN KEY (columns) REFERENCES ref_table (ref_columns)`; an empty

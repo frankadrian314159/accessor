@@ -267,6 +267,11 @@ impl TableSchema {
             )));
         }
         for (v, c) in row.iter_mut().zip(&self.columns) {
+            if let Value::Text(_) = &*v {
+                if let Some(tn) = crate::expr::ranges::column_type(&self.name, &c.name) {
+                    *v = crate::expr::ranges::normalize(&tn, v)?;
+                }
+            }
             if v.data_type() != Some(c.data_type) && !v.is_null() && !c.is_calculated() {
                 *v = match v.coerce_to(c.data_type) {
                     Ok(x) => x,

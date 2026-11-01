@@ -41,6 +41,7 @@ impl Database {
                 expression: None,
                 check: None,
                 invisible: true,
+                range: None,
             }];
             all.extend(defs.iter().cloned());
             generated = all;
@@ -58,6 +59,9 @@ impl Database {
             c.primary_key = d.primary_key;
             c.not_null = d.not_null || d.primary_key;
             c.autonumber = d.autonumber;
+            if let Some(tn) = &d.range {
+                crate::expr::ranges::register_column(name, &d.name, tn);
+            }
             if let Some(Value::Text(t)) = &d.default {
                 if let Some(seq) = (**t).strip_prefix(crate::schema::SEQUENCE_DEFAULT) {
                     if !crate::sequence::exists(&self.seqs, seq) {
@@ -142,6 +146,7 @@ impl Database {
             )));
         }
         self.apply_all(vec![Op::DropTable(real.clone())])?;
+        crate::expr::ranges::forget_table(&real);
         self.forget_invisible(&real)?;
         self.forget_family_links(&real)?;
         Ok(QueryResult::default())
@@ -166,6 +171,9 @@ impl Database {
                 c.not_null = d.not_null;
                 c.primary_key = d.primary_key;
                 c.autonumber = d.autonumber;
+                if let Some(tn) = &d.range {
+                    crate::expr::ranges::register_column(&table, &d.name, tn);
+                }
                 c.default = d.default.clone();
                 if d.invisible {
                     self.set_invisible(&table, &d.name, true)?;

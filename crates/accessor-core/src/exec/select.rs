@@ -440,6 +440,8 @@ impl Database {
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
             "JSON_EACH" => vec!["key".into(), "value".into()],
             "UNNEST" => vec!["unnest".into()],
+            "RANGE_MINUS_MULTI" => vec!["range_minus_multi".into()],
+            "MULTIRANGE_MINUS_MULTI" => vec!["multirange_minus_multi".into()],
             "PG_INPUT_ERROR_INFO" => vec!["message".into(), "detail".into(), "hint".into(), "sql_error_code".into()],
             "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" => vec!["jsonb_path_query".into()],
             other if self.set_function(other).is_some() => self.set_columns_of(&self.set_function(other).expect("checked")),
@@ -487,6 +489,14 @@ impl Database {
         if let Some(def) = self.set_function(name) {
             return self.run_set_function(&def, args);
         }
+        if name.eq_ignore_ascii_case("RANGE_MINUS_MULTI") || name.eq_ignore_ascii_case("MULTIRANGE_MINUS_MULTI") {
+            let cols = self.table_function_columns(name)?;
+            if args.len() != 2 {
+                return Err(Error::runtime(format!("wrong number of arguments for {}", name.to_ascii_uppercase())));
+            }
+            let rows = crate::expr::ranges::minus_multi(&args[0], &args[1])?.into_iter().map(|v| vec![v]).collect();
+            return Ok((cols, rows));
+        }
         if name.eq_ignore_ascii_case("UNNEST") {
             // one column per array, the arrays side by side and the shorter ones padded with NULLs
             fn flat(v: &Value, out: &mut Vec<Value>) {
@@ -531,6 +541,13 @@ impl Database {
                 if let Some((message, code)) = regtype_error(&args[0].to_string()) {
                     return Ok((cols, vec![vec![Value::text(&message), Value::Null, Value::Null, Value::text(code)]]));
                 }
+            }
+            if let Some(r) = crate::expr::ranges::input_check(&name, &args[0].to_string()) {
+                let row = match r {
+                    Ok(()) => vec![Value::Null; 4],
+                    Err(m) => vec![Value::text(&m), Value::Null, Value::Null, Value::text("22P02")],
+                };
+                return Ok((cols, vec![row]));
             }
             let (ty, _) = crate::value::DataType::from_sql_name(&name).ok_or_else(|| Error::catalog(format!("type \"{name}\" does not exist")))?;
             let row = match Value::text(&args[0].to_string()).coerce_to(ty) {

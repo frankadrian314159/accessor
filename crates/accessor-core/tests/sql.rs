@@ -6864,3 +6864,33 @@ fn postgresql_empty_array_literal_is_still_an_array_beside_arrays() {
     assert_eq!(one(&mut db, "SELECT '{}'::int[] <@ ARRAY[1,2]"), "true");
     assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 3)) @> '{}'::int4multirange"), "true");
 }
+
+#[test]
+fn postgresql_ranges_in_columns_compare_sort_and_subtract_into_rows() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    let col = |db: &mut Database, q: &str| db.execute(q).unwrap().rows.iter().map(|r| r[0].to_string()).collect::<Vec<_>>().join(" ");
+    db.execute("CREATE TYPE textrange AS RANGE (subtype = text)").unwrap();
+    db.execute("CREATE TABLE nt (nr numrange)").unwrap();
+    db.execute("INSERT INTO nt VALUES ('[,)'), ('[3,]'), ('[, 5)'), (numrange(1.1, 2.2)), ('empty')").unwrap();
+    // a literal put in a range column is stored in the type's form, and ranges sort as ranges
+    assert_eq!(col(&mut db, "SELECT nr FROM nt ORDER BY nr"), "empty (,5) (,) [1.1,2.2) [3,)");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM nt WHERE nr = '[1.1, 2.2)'"), "1");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM nt WHERE nr < 'empty'"), "0");
+    // the space inside the brackets belongs to a text bound
+    assert_eq!(one(&mut db, "SELECT '[ , ]'::textrange"), "[\" \",\" \"]");
+    assert_eq!(one(&mut db, "SELECT ' ( empty, empty ) '::textrange"), "(\" empty\",\" empty \")");
+    // the multirange type of a range type
+    assert_eq!(one(&mut db, "SELECT '{[a,b), [b,e]}'::textmultirange"), "{[a,e]}");
+    assert_eq!(one(&mut db, "SELECT int4range(1, 3)::int4multirange"), "{[1,3)}");
+    assert_eq!(one(&mut db, "SELECT multirange_contains_elem(nummultirange(numrange(1, 3)), 2.0)"), "true");
+    assert_eq!(one(&mut db, "SELECT nummultirange() + nummultirange()"), "{}");
+    // set-returning functions
+    assert_eq!(col(&mut db, "SELECT range_minus_multi(numrange(1, 3), numrange(1.5, 2))"), "[1,1.5) [2,3)");
+    assert_eq!(col(&mut db, "SELECT unnest(int4multirange(int4range(5, 6), int4range(1, 2)))"), "[1,2) [5,6)");
+    // input checks
+    assert_eq!(one(&mut db, "SELECT pg_input_is_valid('(1,4', 'int4range')"), "false");
+    assert_eq!(one(&mut db, "SELECT message FROM pg_input_error_info('(4,zed)', 'int4range')"), "invalid input syntax for type integer: \"zed\"");
+}

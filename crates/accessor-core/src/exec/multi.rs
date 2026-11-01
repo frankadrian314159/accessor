@@ -145,6 +145,7 @@ impl Database {
                 expression: None,
                 check: None,
                 invisible: false,
+                range: None,
             };
             self.execute_statement(&Statement::AlterTable { table: table.to_string(), action: crate::sql::ast::AlterAction::AddColumn(def) })?;
         }

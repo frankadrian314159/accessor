@@ -176,6 +176,9 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         InputIsValid => {
             let name = text(v(1)).to_ascii_lowercase();
             let name = name.split('(').next().unwrap_or("").trim().to_string();
+            if let Some(r) = crate::expr::ranges::input_check(&name, &text(v(0))) {
+                return Ok(Value::Bool(r.is_ok()));
+            }
             let (ty, _) = DataType::from_sql_name(&name).ok_or_else(|| Error::catalog(format!("type \"{name}\" does not exist")))?;
             Value::Bool(Value::text(&text(v(0))).coerce_to(ty).is_ok())
         }

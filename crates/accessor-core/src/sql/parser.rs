@@ -1028,11 +1028,14 @@ impl<'a> Parser<'a> {
                 // CREATE TYPE r AS RANGE (SUBTYPE = t, ...): the other options are read and ignored
                 self.expect_sym("(")?;
                 let mut subtype = None;
+                let mut multi_name = None;
                 loop {
                     let option = self.ident()?.to_ascii_lowercase();
                     self.expect_sym("=")?;
                     if option == "subtype" {
                         subtype = Some(self.type_name()?);
+                    } else if option == "multirange_type_name" {
+                        multi_name = Some(self.ident()?);
                     } else {
                         let mut depth = 0usize;
                         while !self.at_eof() && !(depth == 0 && (self.peek_sym(",") || self.peek_sym(")"))) {
@@ -1050,7 +1053,7 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_sym(")")?;
                 let subtype = subtype.ok_or_else(|| Error::syntax("a range type needs SUBTYPE"))?;
-                let t = UserType { base: "TEXT".into(), range: Some(subtype), ..Default::default() };
+                let t = UserType { base: "TEXT".into(), range: Some(subtype), multi_name, ..Default::default() };
                 crate::sql::usertypes::register(&name, t.clone());
                 let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
                 return Ok(Some(change("type", name, value)));
@@ -4652,6 +4655,7 @@ impl<'a> Parser<'a> {
             expression,
             check: None,
             invisible: false,
+            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && crate::expr::ranges::cast_function_for(&type_name).is_some() { Some(type_name.clone()) } else { None },
         };
         if let Some(l) = labels {
             let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();
@@ -5208,8 +5212,14 @@ impl<'a> Parser<'a> {
         if sel.from.is_none() && sel.items.len() == 1 {
             if let SelectItem::Expr { expr: Expr::Function { name, args, .. }, alias } = &sel.items[0] {
                 let up = name.to_ascii_uppercase();
-                if matches!(up.as_str(), "GENERATE_SERIES" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ") {
-                    let col = if up == "GENERATE_SERIES" { "generate_series" } else { "jsonb_path_query" };
+                if matches!(up.as_str(), "GENERATE_SERIES" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" | "UNNEST" | "RANGE_MINUS_MULTI" | "MULTIRANGE_MINUS_MULTI") {
+                    let col = match up.as_str() {
+                        "GENERATE_SERIES" => "generate_series",
+                        "UNNEST" => "unnest",
+                        "RANGE_MINUS_MULTI" => "range_minus_multi",
+                        "MULTIRANGE_MINUS_MULTI" => "multirange_minus_multi",
+                        _ => "jsonb_path_query",
+                    };
                     let label = alias.clone().unwrap_or_else(|| name.to_ascii_lowercase());
                     sel.from = Some(From {
                         first: TableFactor::Function { name: up, args: args.clone(), alias: col.into(), columns: Vec::new() },

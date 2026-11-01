@@ -26,6 +26,9 @@ pub struct UserType {
     /// `CREATE TYPE .. AS RANGE (subtype = t)`: the name of the subtype (the type itself is text).
     #[serde(default)]
     pub range: Option<String>,
+    /// The name given to the multirange type of a range type (`multirange_type_name = ..`).
+    #[serde(default)]
+    pub multi_name: Option<String>,
 }
 
 thread_local! {
@@ -96,6 +99,23 @@ pub(crate) fn unregister(name: &str) {
 
 pub(crate) fn lookup(name: &str) -> Option<UserType> {
     TYPES.with(|m| m.borrow().get(&name.to_ascii_lowercase()).cloned())
+}
+
+/// The name of the multirange type of the range type `name`: `textrange` has `textmultirange`, and `r` has `r_multirange`.
+pub(crate) fn default_multirange_name(name: &str) -> String {
+    let n = name.to_ascii_lowercase();
+    match n.strip_suffix("range") {
+        Some(stem) => format!("{stem}multirange"),
+        None => format!("{n}_multirange"),
+    }
+}
+
+/// Is `name` the multirange type of a range type made with `CREATE TYPE .. AS RANGE`?
+pub(crate) fn is_multirange_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    TYPES.with(|m| {
+        m.borrow().iter().any(|(k, t)| t.range.is_some() && t.multi_name.as_ref().map_or_else(|| default_multirange_name(k), |x| x.to_ascii_lowercase()) == n)
+    })
 }
 
 impl UserType {

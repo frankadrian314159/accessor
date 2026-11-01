@@ -495,6 +495,11 @@ pub(crate) fn parse_num(s: &str) -> Option<Value> {
     })
 }
 
+/// Texts compare case-insensitively, except that ranges (PostgreSQL) compare as ranges.
+fn text_cmp(a: &str, b: &str) -> Ordering {
+    crate::expr::ranges::order(a, b).unwrap_or_else(|| ci_cmp(a, b))
+}
+
 fn ci_cmp(a: &str, b: &str) -> Ordering {
     a.bytes()
         .map(|c| c.to_ascii_lowercase())
@@ -805,7 +810,7 @@ impl Value {
             return None;
         }
         Some(match (self, other) {
-            (Value::Text(a), Value::Text(b)) => ci_cmp(a, b),
+            (Value::Text(a), Value::Text(b)) => text_cmp(a, b),
             (Value::Text(t), Value::DateTime(d)) => match datetime::parse(t) {
                 Some(p) => p.cmp(d),
                 None => Ordering::Greater,
@@ -1162,7 +1167,7 @@ impl Ord for Value {
             (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Array(a), Value::Array(b)) => a.iter().cmp(b.iter()),
-            (Value::Text(a), Value::Text(b)) => ci_cmp(a, b),
+            (Value::Text(a), Value::Text(b)) => text_cmp(a, b),
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
             (Value::Bytes(a), Value::Text(t)) => a.as_slice().cmp(t.as_bytes()),
             (Value::Text(t), Value::Bytes(b)) => t.as_bytes().cmp(b.as_slice()),
