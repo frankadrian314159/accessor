@@ -207,6 +207,7 @@ impl Database {
             for (kind, name, value) in l.catalog {
                 db.catalog.insert((kind, name), value);
             }
+            db.register_column_types();
             for (_, sql) in l.reports {
                 let def = parse_report(&sql)?;
                 db.reports.insert(key(&def.name), Arc::new(def));
@@ -234,6 +235,7 @@ impl Database {
                     .map_err(|e| Error::Corrupt(format!("replaying the write-ahead log failed: {e}")))?;
             }
         }
+        db.register_column_types();
         let mut compacted = persist.needs_upgrade;
         for t in db.tables.values_mut() {
             if t.tombstones() > 0 {

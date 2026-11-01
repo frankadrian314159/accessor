@@ -61,6 +61,33 @@ impl Database {
         Ok(())
     }
 
+    /// Records that a column is of a range or composite type, so that a database opened again still puts values in its form.
+    pub(crate) fn set_column_type(&mut self, table: &str, column: &str, type_name: &str) -> Result<()> {
+        let name = format!("{}.{}", key(table), column.to_ascii_lowercase());
+        self.catalog_set("coltype", &name, Some(type_name.to_string()))
+    }
+
+    /// Forgets the column types of a table that is dropped.
+    pub(crate) fn forget_column_types(&mut self, table: &str) -> Result<()> {
+        let prefix = format!("{}.", key(table));
+        let names: Vec<String> = self.catalog.keys().filter(|(k, n)| k == "coltype" && n.starts_with(&prefix)).map(|(_, n)| n.clone()).collect();
+        for n in names {
+            self.catalog_set("coltype", &n, None)?;
+        }
+        Ok(())
+    }
+
+    /// Puts the range and composite column types of the catalog in the registry of this session.
+    pub(crate) fn register_column_types(&self) {
+        for ((k, n), v) in &self.catalog {
+            if k == "coltype" {
+                if let Some((table, column)) = n.rsplit_once('.') {
+                    crate::expr::ranges::register_column(table, column, v);
+                }
+            }
+        }
+    }
+
     fn catalog_has(&self, kind: &str, name: &str) -> bool {
         self.catalog.contains_key(&(kind.to_string(), key(name)))
     }

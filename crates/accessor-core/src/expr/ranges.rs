@@ -590,6 +590,24 @@ fn read_ranges(s: &str) -> Option<(Vec<Range>, bool)> {
     Some((if r.empty { Vec::new() } else { vec![r] }, false))
 }
 
+/// The elements of the text of an array of ranges (`"[1,2)","[3,4)"` or `[1,2),[3,4)`), without their quotes.
+fn split_array_elements(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut cur, mut quoted, mut chars) = (String::new(), false, inner.chars().peekable());
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => quoted = !quoted,
+            '\\' if quoted => cur.extend(chars.next()),
+            ',' if !quoted && cur.chars().last().is_none_or(|l| matches!(l, ')' | ']')) && !cur.is_empty() => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 fn write_ranges(v: &[Range], multi: bool) -> Value {
     if multi {
         Value::text(&format!("{{{}}}", v.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(",")))
@@ -607,7 +625,16 @@ fn shape(v: &Value) -> Option<(Vec<Range>, bool)> {
 
 fn multi_cast(kind: Kind, v: &Value) -> Result<Value> {
     let s = v.to_string();
-    let (list, _) = read_ranges(&s).ok_or_else(|| Error::type_err(format!("malformed multirange literal: \"{s}\"")))?;
+    // an array of ranges (`{"[1,2)","[5,6)"}`, from VARIADIC) has its ranges in quotes
+    let unquoted = || {
+        let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
+        if !(inner.starts_with('"') && inner.ends_with('"')) {
+            return None;
+        }
+        let items: Option<Vec<Range>> = split_array_elements(inner).iter().map(|x| parse(x)).collect();
+        Some((norm(items?), true))
+    };
+    let (list, _) = read_ranges(&s).or_else(unquoted).ok_or_else(|| Error::type_err(format!("malformed multirange literal: \"{s}\"")))?;
     let mut out = Vec::new();
     for r in list {
         let one = cast(kind, &Value::text(&r.to_string()))?;
@@ -858,6 +885,17 @@ pub fn call(f: RangeFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         }
         RangeFn::MultiCtor(k) => {
             let mut all = Vec::new();
+            // nummultirange(VARIADIC '{"[1,2)","[3,4)"}'::numrange[]): the ranges are the elements of an array
+            let from_array: Vec<Value>;
+            let vals: &[Cow<'_, Value>] = match vals {
+                [one] if !one.is_null() && { let t = one.to_string(); let t = t.trim(); t == "{}" || t.starts_with("{\"") } => {
+                    let s = one.to_string();
+                    let inner = s.trim().trim_start_matches('{').trim_end_matches('}');
+                    from_array = split_array_elements(inner).into_iter().map(|x| Value::text(&x)).collect();
+                    &from_array.iter().map(Cow::Borrowed).collect::<Vec<_>>()
+                }
+                _ => vals,
+            };
             for v in vals {
                 if v.is_null() {
                     continue;

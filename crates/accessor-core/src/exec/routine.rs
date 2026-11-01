@@ -58,8 +58,29 @@ fn uses(body: &Expr, name: &str) -> usize {
     n
 }
 
+/// The arguments of a call of a function with a `VARIADIC` parameter: the ones from that parameter on go into one array
+/// (unless the call says `VARIADIC array`, or gives a single array).
+pub(crate) fn pack_variadic(def: &RoutineDef, args: &[Expr]) -> Vec<Expr> {
+    let unwrap = |e: &Expr| match e {
+        Expr::Function { name, args, .. } if name == "__VARIADIC" && args.len() == 1 => args[0].clone(),
+        other => other.clone(),
+    };
+    let Some(at) = def.params.iter().position(|p| p.variadic) else { return args.iter().map(unwrap).collect() };
+    if args.len() < at {
+        return args.iter().map(unwrap).collect();
+    }
+    let is_array = |e: &Expr| matches!(e, Expr::Function { name, .. } if name == "__VARIADIC" || name == "__ARRAY");
+    if args.len() == at + 1 && is_array(&args[at]) {
+        return args.iter().map(unwrap).collect();
+    }
+    let mut out: Vec<Expr> = args[..at].iter().map(unwrap).collect();
+    out.push(Expr::Function { name: "__ARRAY".into(), args: args[at..].to_vec(), distinct: false, star: false });
+    out
+}
+
 /// A function's body with its parameters replaced by the arguments of a call.
 pub(crate) fn inline_call(def: &RoutineDef, args: &[Expr]) -> Result<Expr> {
+    let args = &pack_variadic(def, args)[..];
     let RoutineBody::Expr(body) = &def.body else {
         return Err(Error::catalog(if def.function {
             format!("the function '{}' has statements for a body, so it can only be called with arguments that are known before the query runs (not columns), and not by query()", def.name)
@@ -336,7 +357,8 @@ impl Database {
                     let Some(def) = self.routine_def(name).filter(|d| returns_rows_by_statements(d)) else { continue };
                     let mut vals = Vec::with_capacity(args.len());
                     let mut known = true;
-                    for a in args.iter() {
+                    let packed = pack_variadic(&def, args);
+                    for a in packed.iter() {
                         match self.eval_const(a) {
                             Ok(v) => vals.push(v),
                             Err(_) => {

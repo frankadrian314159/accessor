@@ -211,7 +211,7 @@ impl<'a> Parser<'a> {
         }
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
-        let params = (0..nargs).map(|i| RoutineParam { name: format!("${}", i + 1), data_type: None, default: None, out: false }).collect();
+        let params = (0..nargs).map(|i| RoutineParam { name: format!("${}", i + 1), data_type: None, default: None, out: false, variadic: false }).collect();
         let aggregate = Some(Box::new(AggregateDef { sfunc, stype, finalfunc, initcond, nargs }));
         Ok(Statement::CreateRoutine(Box::new(RoutineDef {
             name,
@@ -235,6 +235,7 @@ impl<'a> Parser<'a> {
             loop {
                 let mut out = false;
                 let mut also_in = false;
+                let mut variadic = false;
                 if self.eat_kw("IN") {
                     // IN OUT is INOUT
                     if self.eat_kw("OUT") {
@@ -246,8 +247,8 @@ impl<'a> Parser<'a> {
                 } else if self.eat_kw("INOUT") {
                     out = true;
                     also_in = true;
-                } else if self.peek_kw("VARIADIC") {
-                    return Err(Error::syntax("VARIADIC parameters are not supported"));
+                } else if self.eat_kw("VARIADIC") {
+                    variadic = true;
                 }
                 let named = matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_))
                     && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_))
@@ -264,7 +265,7 @@ impl<'a> Parser<'a> {
                     if params.iter().any(|p| p.name.eq_ignore_ascii_case(&pname)) {
                         return Err(Error::syntax(format!("the parameter {pname} is declared twice")));
                     }
-                    params.push(RoutineParam { name: pname, data_type: Some(ty), default, out: false });
+                    params.push(RoutineParam { name: pname, data_type: Some(ty), default, out: false, variadic });
                 }
                 if !self.eat_sym(",") {
                     break;
@@ -1076,7 +1077,7 @@ impl<'a> Parser<'a> {
                 let ty = self.pg_type()?;
                 while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") {}
                 self.skip_charset();
-                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None, out: out_param });
+                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None, out: out_param, variadic: false });
                 if !self.eat_sym(",") {
                     break;
                 }

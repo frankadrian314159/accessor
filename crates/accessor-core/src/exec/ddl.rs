@@ -127,6 +127,11 @@ impl Database {
         for d in defs.iter().filter(|d| d.invisible) {
             self.set_invisible(name, &d.name, true)?;
         }
+        for d in defs.iter() {
+            if let Some(tn) = &d.range {
+                self.set_column_type(name, &d.name, tn)?;
+            }
+        }
         Ok(QueryResult::default())
     }
 
@@ -148,6 +153,7 @@ impl Database {
         self.apply_all(vec![Op::DropTable(real.clone())])?;
         crate::expr::ranges::forget_table(&real);
         self.forget_invisible(&real)?;
+        self.forget_column_types(&real)?;
         self.forget_family_links(&real)?;
         Ok(QueryResult::default())
     }
@@ -173,6 +179,7 @@ impl Database {
                 c.autonumber = d.autonumber;
                 if let Some(tn) = &d.range {
                     crate::expr::ranges::register_column(&table, &d.name, tn);
+                    self.set_column_type(&table, &d.name, tn)?;
                 }
                 c.default = d.default.clone();
                 if d.invisible {

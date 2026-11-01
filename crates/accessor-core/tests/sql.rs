@@ -6959,3 +6959,63 @@ fn postgresql_returns_record_with_out_parameters_gives_their_columns() {
     assert_eq!(r.rows[0][0].to_string(), "2");
     assert_eq!(r.rows[0][1].to_string(), "3");
 }
+
+#[test]
+fn postgresql_range_and_composite_column_types_survive_reopening() {
+    use accessor_core::dialect::Dialect;
+    let path = std::env::temp_dir().join(format!("accessor_coltype_{}.adb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let mut db = Database::open(&p).unwrap();
+        db.set_dialect(Dialect::Postgresql);
+        db.execute("CREATE TYPE two AS (a int, b text)").unwrap();
+        db.execute("CREATE TABLE t (r int4range, c two)").unwrap();
+    })
+    .join()
+    .unwrap();
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let mut db = Database::open(&p).unwrap();
+        db.set_dialect(Dialect::Postgresql);
+        db.execute("INSERT INTO t VALUES ('[1,3]', '( 1,x)')").unwrap();
+        let r = db.execute("SELECT r, c FROM t").unwrap();
+        assert_eq!(r.rows[0][0].to_string(), "[1,4)");
+        assert_eq!(r.rows[0][1].to_string(), "(1,x)");
+    })
+    .join()
+    .unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn postgresql_variadic_parameters_take_the_rest_of_the_arguments() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE FUNCTION firstof(VARIADIC xs int[]) RETURNS int AS $$ SELECT xs[1] $$ LANGUAGE sql").unwrap();
+    db.execute("CREATE FUNCTION cnt(sep text, VARIADIC xs int[]) RETURNS int AS $$ SELECT array_length(xs, 1) $$ LANGUAGE sql").unwrap();
+    assert_eq!(db.execute("SELECT firstof(7, 8, 9)").unwrap().rows[0][0].to_string(), "7");
+    assert_eq!(db.execute("SELECT cnt('a', 7, 8, 9)").unwrap().rows[0][0].to_string(), "3");
+    assert_eq!(db.execute("SELECT cnt('a', VARIADIC ARRAY[1, 2])").unwrap().rows[0][0].to_string(), "2");
+}
+
+#[test]
+fn postgresql_multirange_constructors_take_variadic_arrays() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    assert_eq!(db.execute("SELECT nummultirange(VARIADIC '{}'::numrange[])").unwrap().rows[0][0].to_string(), "{}");
+    assert_eq!(db.execute("SELECT int4multirange(VARIADIC ARRAY[int4range(1, 2), int4range(5, 6)])").unwrap().rows[0][0].to_string(), "{[1,2),[5,6)}");
+}
+
+#[test]
+fn postgresql_multirange_minus_multi_gives_one_multirange() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let r = db.execute("SELECT multirange_minus_multi(int4multirange(int4range(1, 8)), int4multirange(int4range(2, 3), int4range(5, 6)))").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0][0].to_string(), "{[1,2),[3,5),[6,8)}");
+    assert_eq!(db.execute("SELECT multirange_minus_multi(int4multirange(int4range(1, 2)), int4multirange(int4range(1, 2)))").unwrap().rows.len(), 0);
+}

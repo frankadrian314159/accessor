@@ -403,6 +403,8 @@ pub struct RoutineParam {
     pub default: Option<Expr>,
     /// `OUT` or `INOUT` (MySQL): the value at the end goes back to the variable the caller gave.
     pub out: bool,
+    /// `VARIADIC` (PostgreSQL): the last parameter, an array, takes the rest of the arguments of a call.
+    pub variadic: bool,
 }
 
 /// What a `DECLARE ... HANDLER` answers to.

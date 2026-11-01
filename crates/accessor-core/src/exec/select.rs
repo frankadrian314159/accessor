@@ -494,7 +494,12 @@ impl Database {
             if args.len() != 2 {
                 return Err(Error::runtime(format!("wrong number of arguments for {}", name.to_ascii_uppercase())));
             }
-            let rows = crate::expr::ranges::minus_multi(&args[0], &args[1])?.into_iter().map(|v| vec![v]).collect();
+            let mut parts = crate::expr::ranges::minus_multi(&args[0], &args[1])?;
+            // multirange_minus_multi gives the difference as one multirange, and no row when it is empty
+            if name.eq_ignore_ascii_case("MULTIRANGE_MINUS_MULTI") && !parts.is_empty() {
+                parts = vec![crate::expr::ranges::multirange_of(&parts)?];
+            }
+            let rows = parts.into_iter().map(|v| vec![v]).collect();
             return Ok((cols, rows));
         }
         if name.eq_ignore_ascii_case("UNNEST") {

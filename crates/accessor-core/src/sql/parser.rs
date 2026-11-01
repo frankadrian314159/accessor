@@ -3569,7 +3569,7 @@ impl<'a> Parser<'a> {
                 }
                 let data_type = if matches!(self.peek(), Tok::Ident(_)) && !self.peek_kw("DEFAULT") { Some(self.data_type_name()?) } else { None };
                 let default = if self.eat_sym("=") || self.eat_kw("DEFAULT") { Some(self.expr()?) } else { None };
-                params.push(RoutineParam { name: pname, data_type, default, out: false });
+                params.push(RoutineParam { name: pname, data_type, default, out: false, variadic: false });
                 if !self.eat_sym(",") {
                     break;
                 }
@@ -7189,6 +7189,13 @@ impl<'a> Parser<'a> {
     /// An argument of a call: an expression, or `name => expression` (also `name := expression`), which is
     /// kept as `__NAMED('name', expression)` for the binder to put in the place of the parameter.
     fn call_arg(&mut self) -> Result<Expr> {
+        // f(VARIADIC arr): the array goes in as it is, which a call with one array argument does anyway
+        if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+            if self.eat_kw("VARIADIC") {
+                let e = self.call_arg()?;
+                return Ok(Expr::Function { name: "__VARIADIC".into(), args: vec![e], distinct: false, star: false });
+            }
+        }
         if let (Tok::Ident(n), true) = (self.peek().clone(), self.pos + 2 < self.toks.len()) {
             let arrow = match (self.peek_at(1), self.peek_at(2)) {
                 (Tok::Sym("="), Tok::Sym(">")) => self.toks[self.pos + 2].pos == self.toks[self.pos + 1].pos + 1,
@@ -7284,6 +7291,16 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(")")?;
         let up = name.to_ascii_uppercase();
+        // the range constructors take an array with VARIADIC: the array is the argument
+        if up.ends_with("MULTIRANGE") {
+            for a in args.iter_mut() {
+                if let Expr::Function { name: n, args: inner, .. } = a {
+                    if n == "__VARIADIC" && inner.len() == 1 {
+                        *a = inner.remove(0);
+                    }
+                }
+            }
+        }
         if let Some(unit) = unit_word {
             if up == "TIMESTAMPADD" {
                 let code = match unit.as_str() {
@@ -7606,6 +7623,12 @@ impl<'a> Parser<'a> {
             return Ok(composite_cast(e, &tn));
         }
         if let Some(name) = crate::expr::ranges::cast_function_for(&tn) {
+            // an array of ranges (`'{}'::numrange[]`) is text in the form of an array already
+            if self.peek_sym("[") && matches!(self.peek_at(1), Tok::Sym("]")) {
+                self.advance();
+                self.advance();
+                return Ok(e);
+            }
             return Ok(Expr::Function { name, args: vec![e], distinct: false, star: false });
         }
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
