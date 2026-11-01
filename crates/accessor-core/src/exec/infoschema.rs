@@ -10,6 +10,10 @@ use crate::error::{Error, Result};
 use crate::sql::ast::{TriggerEvent, TriggerTiming};
 use crate::value::{Row, Value};
 
+thread_local! {
+    static PROBING_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The views of the schema, for the error message.
 const VIEWS: &str = "TABLES, COLUMNS, VIEWS, TABLE_CONSTRAINTS, KEY_COLUMN_USAGE, REFERENTIAL_CONSTRAINTS, INDEXES, ROUTINES, PARAMETERS, SEQUENCES, TRIGGERS, REPORTS, SCHEMATA, STATISTICS, CHARACTER_SETS, COLLATIONS, ENGINES, PARTITIONS, CHECK_CONSTRAINTS, PROCESSLIST and the empty MySQL views (COLUMN_STATISTICS, USER_PRIVILEGES, EVENTS, ...)";
 
@@ -150,8 +154,10 @@ impl Database {
                         ]);
                     }
                 }
-                // The columns of a query are what it returns.
-                for (name, _) in self.views.values() {
+                // The columns of a query are what it returns. (A view that reads this very view, as one over
+                // INFORMATION_SCHEMA.COLUMNS does, would never finish: inside the probe, views add no columns.)
+                let probing = PROBING_VIEWS.with(|p| p.replace(true));
+                for (name, _) in self.views.values().filter(|_| !probing) {
                     let probe = crate::sql::ast::Select {
                         items: vec![crate::sql::ast::SelectItem::Wildcard],
                         from: Some(crate::sql::ast::From {
@@ -191,6 +197,7 @@ impl Database {
                         }
                     }
                 }
+                PROBING_VIEWS.with(|p| p.set(probing));
                 names(&["table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default", "is_primary_key", "is_autonumber", "calculated_expression", "table_catalog", "table_schema", "column_type", "column_key", "extra", "character_set_name", "collation_name", "column_comment", "character_maximum_length", "numeric_precision", "numeric_scale", "datetime_precision", "generation_expression", "privileges"])
             }
             "views" => {

@@ -760,6 +760,10 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             for v in &vals {
                 if !v.is_null() {
                     s.push_str(&text_of(v));
+                    if s.len() > extra::PACKET_LIMIT && crate::dialect::current() == crate::dialect::Dialect::Mysql {
+                        // MySQL: a result longer than max_allowed_packet is NULL
+                        return Ok(Value::Null);
+                    }
                 }
             }
             Value::text(&s)
@@ -984,7 +988,14 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             let fill = vals.get(2).map(|f| text_of(f).into_owned()).unwrap_or_else(|| " ".to_string());
             Value::text(&extra::pad(&text_of(&vals[0]), int_of(&vals[1])?, &fill, f == Lpad)?)
         }
-        Repeat => Value::text(&extra::repeat(&text_of(&vals[0]), int_of(&vals[1])?)?),
+        Repeat => {
+            let (s, n) = (text_of(&vals[0]), int_of(&vals[1])?);
+            // MySQL: a result longer than max_allowed_packet is NULL
+            if crate::dialect::current() == crate::dialect::Dialect::Mysql && n > 0 && (s.len() as u128) * (n as u128) > extra::PACKET_LIMIT as u128 {
+                return Ok(Value::Null);
+            }
+            Value::text(&extra::repeat(&s, n)?)
+        }
         Reverse => Value::text(&text_of(&vals[0]).chars().rev().collect::<String>()),
         Overlay => {
             let len = match vals.get(3) {

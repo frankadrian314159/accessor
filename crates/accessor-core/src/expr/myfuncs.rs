@@ -1186,7 +1186,12 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let bits = int(v(0)).unwrap_or(0) as u64;
             let sep = if vals.len() > 3 { text(v(3)) } else { ",".to_string() };
             let n = if vals.len() > 4 { int(v(4)).unwrap_or(64).clamp(0, 64) } else { 64 };
-            let parts: Vec<String> = (0..n).map(|i| if bits >> i & 1 == 1 { text(v(1)) } else { text(v(2)) }).collect();
+            let (on, off) = (text(v(1)), text(v(2)));
+            let total: usize = (0..n).map(|i| if bits >> i & 1 == 1 { on.len() } else { off.len() }).sum();
+            if total > super::extra::PACKET_LIMIT {
+                return Ok(Value::Null);
+            }
+            let parts: Vec<String> = (0..n).map(|i| if bits >> i & 1 == 1 { on.clone() } else { off.clone() }).collect();
             Value::text(&parts.join(&sep))
         }
         FoundRows => Value::Int(FOUND_ROWS.with(|c| c.get())),

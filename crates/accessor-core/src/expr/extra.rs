@@ -162,6 +162,9 @@ pub(crate) fn replacement(r: &str) -> String {
     out
 }
 
+/// MySQL's default `max_allowed_packet`: a longer string result is NULL.
+pub(crate) const PACKET_LIMIT: usize = 64 * 1024 * 1024;
+
 /// The longest text a function may build, in characters.
 const MAX_TEXT: usize = 100_000_000;
 

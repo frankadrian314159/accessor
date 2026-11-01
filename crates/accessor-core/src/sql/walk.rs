@@ -254,8 +254,12 @@ pub fn bind_params_select(s: &mut Select, values: &HashMap<String, Value>) -> Re
 
 fn bind_param(e: &mut Expr, values: &HashMap<String, Value>) -> Result<()> {
     if let Expr::Param(name) = e {
+        // @@name is a system variable, which the binder reads; __out.. stands for an OUT argument of CALL
+        if name.starts_with("@@") || name.starts_with("__out") {
+            return Ok(());
+        }
         if crate::dialect::current() == crate::dialect::Dialect::Mysql && !values.contains_key(&name.to_ascii_lowercase()) {
-            *e = Expr::Literal(Value::Null);
+            // a user variable (@x) the binder reads, as NULL when it was never set
             return Ok(());
         }
         let v = values.get(&name.to_ascii_lowercase()).ok_or_else(|| {

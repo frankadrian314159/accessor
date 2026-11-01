@@ -6654,3 +6654,38 @@ fn mysql_regexp_operator_and_binary_introducers() {
     assert_eq!(one(&mut db, "SELECT 'abc' NOT RLIKE 'x'"), "1");
     assert_eq!(one(&mut db, "SELECT HEX(_utf16 x'0000ffff')"), "0000FFFF");
 }
+
+#[test]
+fn mysql_procedures_see_user_and_system_variables_and_out_arguments_reach_local_variables() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    db.execute("CREATE TABLE t1 (c1 INT)").unwrap();
+    db.execute("SET @x = 5").unwrap();
+    db.execute("CREATE PROCEDURE p() BEGIN SET @y = @x + 1; INSERT INTO t1 SELECT @x + @y; SELECT @y; END").unwrap();
+    assert_eq!(one(&mut db, "CALL p()"), "6");
+    assert_eq!(one(&mut db, "SELECT c1 FROM t1"), "11");
+    db.execute("CREATE PROCEDURE m() BEGIN DECLARE v BIGINT DEFAULT 0; SELECT @@session.max_heap_table_size INTO v; SELECT v; END").unwrap();
+    assert_eq!(one(&mut db, "CALL m()"), "16777216");
+    db.execute("CREATE PROCEDURE o(n INT, OUT pp INT) BEGIN SET pp = n * 2; END").unwrap();
+    db.execute("CREATE PROCEDURE q() BEGIN DECLARE k INT DEFAULT 0; DECLARE r INT DEFAULT 0; WHILE k < 3 DO CALL o(k, r); SET k = k + 1; END WHILE; SELECT r; END").unwrap();
+    assert_eq!(one(&mut db, "CALL q()"), "4");
+    // a string longer than max_allowed_packet is NULL
+    assert_eq!(one(&mut db, "SELECT REPEAT('ab', 100000000) IS NULL"), "1");
+}
+
+#[test]
+fn a_view_over_information_schema_columns_can_read_itself_and_set_var_limits_the_time() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute(r#"CREATE VIEW v2 (c) AS SELECT column_name FROM information_schema.columns WHERE table_name = "v2" ORDER BY column_name"#).unwrap();
+    assert_eq!(db.execute("SELECT * FROM v2").unwrap().rows[0][0].to_string(), "c");
+    db.execute("CREATE TABLE t1 (a INT)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1),(2),(3),(4)").unwrap();
+    for _ in 0..11 {
+        db.execute("INSERT INTO t1 SELECT * FROM t1").unwrap();
+    }
+    assert!(db.execute("SELECT /*+ SET_VAR(max_execution_time=1) */ * FROM t1 a, t1 b").is_err());
+}

@@ -703,8 +703,45 @@ impl Database {
             }
             ProcStmt::Sql(stmt) => {
                 let mut stmt = stmt.clone();
+                // CALL p(v): an OUT or INOUT argument that names a variable of this routine goes through a
+                // temporary user variable, and comes back into the variable afterwards
+                let mut outs: Vec<(String, String)> = Vec::new();
+                if let Statement::Exec { name, args } = &mut stmt {
+                    if let Some(def) = self.routines.get(&key(name)).cloned() {
+                        let mut next = 0;
+                        for (pname, e) in args.iter_mut() {
+                            let at = match pname {
+                                Some(pn) => def.params.iter().position(|p| p.name.eq_ignore_ascii_case(pn)),
+                                None => {
+                                    next += 1;
+                                    Some(next - 1)
+                                }
+                            };
+                            let is_out = at.and_then(|i| def.params.get(i)).is_some_and(|p| p.out);
+                            if let (true, Expr::Param(var)) = (is_out, &*e) {
+                                let k = var.to_ascii_lowercase();
+                                if let Some(v) = frame.vars.get(&k).cloned() {
+                                    let tmp = format!("__out{}_{k}", outs.len());
+                                    self.user_vars.insert(tmp.clone(), v);
+                                    *e = Expr::Param(tmp.clone());
+                                    outs.push((k, tmp));
+                                }
+                            }
+                        }
+                    }
+                }
                 bind_params(&mut stmt, &frame.vars)?;
-                frame.last = Some(self.execute_statement(&stmt)?);
+                let result = self.execute_statement(&stmt);
+                for (k, tmp) in outs {
+                    if let Some(v) = self.user_vars.remove(&tmp) {
+                        let v = match frame.types.get(&k) {
+                            Some(t) if !v.is_null() => v.coerce_to(*t).unwrap_or(v),
+                            _ => v,
+                        };
+                        frame.vars.insert(k, v);
+                    }
+                }
+                frame.last = Some(result?);
             }
         }
         Ok(Flow::Normal)

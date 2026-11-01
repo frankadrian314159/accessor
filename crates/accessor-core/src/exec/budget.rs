@@ -101,7 +101,11 @@ pub(crate) fn hinted_time(sql: &str) -> Option<Duration> {
     let start = sql.find("/*+")?;
     let end = sql[start..].find("*/")? + start;
     let hint = sql[start..end].to_ascii_uppercase();
-    let at = hint.find("MAX_EXECUTION_TIME(")? + "MAX_EXECUTION_TIME(".len();
+    // MAX_EXECUTION_TIME(n) and SET_VAR(max_execution_time=n)
+    let at = match hint.find("MAX_EXECUTION_TIME(") {
+        Some(i) => i + "MAX_EXECUTION_TIME(".len(),
+        None => hint.find("SET_VAR(MAX_EXECUTION_TIME")? + "SET_VAR(MAX_EXECUTION_TIME".len() + hint[hint.find("SET_VAR(MAX_EXECUTION_TIME")? + "SET_VAR(MAX_EXECUTION_TIME".len()..].find('=')? + 1,
+    };
     let ms: u64 = hint[at..].split(')').next()?.trim().parse().ok()?;
     (ms > 0).then(|| Duration::from_millis(ms))
 }
