@@ -514,7 +514,8 @@ fn run_test(ctx: &mut Ctx, name: &str) {
                 let lead_word = lead(&sql);
                 // COPY: loaded here, not by the engine
                 if lead_word == "COPY" {
-                    if let Some((table, cols, file)) = parse_copy(&sql) {
+                    // COPY FROM STDIN is loaded here; COPY with a file is the engine's
+                    if let Some((table, cols, file)) = parse_copy(&sql).filter(|(_, _, f)| f.is_none()) {
                         match file {
                             Some(f) => {
                                 let data = std::fs::read(&f).map(|b| String::from_utf8_lossy(&b).into_owned());

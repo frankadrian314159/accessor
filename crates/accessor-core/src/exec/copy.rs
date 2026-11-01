@@ -256,6 +256,27 @@ impl Database {
 type Record = Vec<Option<String>>;
 
 fn parse_text_records(text: &str, o: &Options) -> Vec<Record> {
+    fn decode(raw: &str) -> String {
+        let mut out = String::new();
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{8}'),
+                Some('f') => out.push('\u{c}'),
+                Some('v') => out.push('\u{b}'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        }
+        out
+    }
     let mut out = Vec::new();
     for line in text.lines() {
         if line == "\\." {
@@ -264,35 +285,27 @@ fn parse_text_records(text: &str, o: &Options) -> Vec<Record> {
         if line.is_empty() {
             continue;
         }
+        // split at the delimiter, but not at a backslash-escaped one; the NULL marker is compared before the escapes are read
         let mut fields: Record = Vec::new();
-        let mut cur = String::new();
-        let mut raw_null = true;
-        let mut chars = line.chars().peekable();
-        let finish = |cur: &mut String, fields: &mut Record, raw_null: &mut bool| {
-            fields.push(if *raw_null && *cur == o.null { None } else { Some(std::mem::take(cur)) });
-            cur.clear();
-            *raw_null = true;
+        let mut raw = String::new();
+        let mut chars = line.chars();
+        let finish = |raw: &mut String, fields: &mut Record| {
+            fields.push(if *raw == o.null { None } else { Some(decode(raw)) });
+            raw.clear();
         };
         while let Some(c) = chars.next() {
             if c == o.delimiter {
-                finish(&mut cur, &mut fields, &mut raw_null);
+                finish(&mut raw, &mut fields);
             } else if c == '\\' {
-                match chars.next() {
-                    Some('n') => cur.push('\n'),
-                    Some('t') => cur.push('\t'),
-                    Some('r') => cur.push('\r'),
-                    Some('b') => cur.push('\u{8}'),
-                    Some('f') => cur.push('\u{c}'),
-                    Some('v') => cur.push('\u{b}'),
-                    Some(other) => cur.push(other),
-                    None => cur.push('\\'),
+                raw.push(c);
+                if let Some(next) = chars.next() {
+                    raw.push(next);
                 }
-                raw_null = false;
             } else {
-                cur.push(c);
+                raw.push(c);
             }
         }
-        finish(&mut cur, &mut fields, &mut raw_null);
+        finish(&mut raw, &mut fields);
         out.push(fields);
     }
     out

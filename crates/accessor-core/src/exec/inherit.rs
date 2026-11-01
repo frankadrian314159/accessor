@@ -368,11 +368,14 @@ impl Database {
                     a.sort();
                     b.sort();
                     if a == b {
-                        for (i, name) in pcols.iter().enumerate() {
-                            let now = self.table_checked(&child_name)?.schema().columns.iter().position(|c| c.name.eq_ignore_ascii_case(name));
-                            if now != Some(i) {
-                                let after = if i == 0 { None } else { Some(pcols[i - 1].clone()) };
-                                self.exec_alter_table(&child_name, &crate::sql::ast::AlterAction::MoveColumn { name: name.clone(), after })?;
+                        // the child's own partitions and descendants follow, as they are stored by position too
+                        for member in self.family(&child_name) {
+                            for (i, name) in pcols.iter().enumerate() {
+                                let Some(now) = self.table(&member).map(|t| t.schema().columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))) else { break };
+                                if now.is_some() && now != Some(i) {
+                                    let after = if i == 0 { None } else { Some(pcols[i - 1].clone()) };
+                                    self.exec_alter_table(&member, &crate::sql::ast::AlterAction::MoveColumn { name: name.clone(), after })?;
+                                }
                             }
                         }
                     }
