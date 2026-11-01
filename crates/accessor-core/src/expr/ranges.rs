@@ -566,6 +566,12 @@ fn in_postgresql() -> bool {
 /// values are not ranges.
 fn apply(op: RangeOp, a: &Value, b: &Value) -> Result<Option<Value>> {
     let (sa, sb) = (shape(a), shape(b));
+    // `{}` alone is an empty array as much as an empty multirange: it is a multirange only beside one that has ranges
+    let bare = |v: &Value| matches!(v, Value::Text(s) if s.trim() == "{}");
+    let has_ranges = |s: &Option<(Vec<Range>, bool)>| s.as_ref().is_some_and(|x| !x.0.is_empty() || !x.1);
+    if (bare(a) && !has_ranges(&sb)) || (bare(b) && !has_ranges(&sa)) {
+        return Ok(None);
+    }
     let ((la, ma), (lb, mb)) = match (op, sa, sb) {
         (RangeOp::Contains, Some(x), Some(y)) => (x, y),
         (RangeOp::Contains, Some(x), None) if !b.is_null() => {

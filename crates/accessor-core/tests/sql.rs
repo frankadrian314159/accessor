@@ -6853,3 +6853,14 @@ fn postgresql_multiranges_custom_range_types_and_range_aggregates() {
     assert_eq!(one(&mut db, "SELECT '[1,5)'::intr @> 3"), "true");
     assert_eq!(one(&mut db, "SELECT intr(1, 5) && intr(4, 9)"), "true");
 }
+
+#[test]
+fn postgresql_empty_array_literal_is_still_an_array_beside_arrays() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT ARRAY[1,2] <@ '{}'"), "false");
+    assert_eq!(one(&mut db, "SELECT '{}'::int[] <@ ARRAY[1,2]"), "true");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 3)) @> '{}'::int4multirange"), "true");
+}
