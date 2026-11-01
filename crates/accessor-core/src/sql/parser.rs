@@ -3569,7 +3569,7 @@ impl<'a> Parser<'a> {
                 }
                 let data_type = if matches!(self.peek(), Tok::Ident(_)) && !self.peek_kw("DEFAULT") { Some(self.data_type_name()?) } else { None };
                 let default = if self.eat_sym("=") || self.eat_kw("DEFAULT") { Some(self.expr()?) } else { None };
-                params.push(RoutineParam { name: pname, data_type, default, out: false, variadic: false });
+                params.push(RoutineParam { name: pname, data_type, default, out: false, variadic: false, poly: String::new() });
                 if !self.eat_sym(",") {
                     break;
                 }
@@ -5317,8 +5317,10 @@ impl<'a> Parser<'a> {
             let function = self.peek_kw("FUNCTION");
             self.advance();
             self.if_exists_clause(false, guarded)?;
-            let name = self.table_ident()?;
-            self.skip_argument_types()?;
+            let mut name = self.table_ident()?;
+            if let Some(types) = self.drop_signature()? {
+                name = format!("{name}\u{2}{types}");
+            }
             self.eat_kw("CASCADE");
             self.eat_kw("RESTRICT");
             Ok(Statement::DropRoutine { name, function })

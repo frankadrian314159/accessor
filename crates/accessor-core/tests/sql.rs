@@ -7019,3 +7019,28 @@ fn postgresql_multirange_minus_multi_gives_one_multirange() {
     assert_eq!(r.rows[0][0].to_string(), "{[1,2),[3,5),[6,8)}");
     assert_eq!(db.execute("SELECT multirange_minus_multi(int4multirange(int4range(1, 2)), int4multirange(int4range(1, 2)))").unwrap().rows.len(), 0);
 }
+
+#[test]
+fn postgresql_functions_can_be_overloaded_and_take_polymorphic_types() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    db.execute("CREATE FUNCTION f(a int) RETURNS text AS $$ SELECT 'int' $$ LANGUAGE sql").unwrap();
+    db.execute("CREATE FUNCTION f(a text) RETURNS text AS $$ SELECT 'text' $$ LANGUAGE sql").unwrap();
+    db.execute("CREATE FUNCTION f(a int, b int) RETURNS text AS $$ SELECT 'two' $$ LANGUAGE sql").unwrap();
+    assert!(db.execute("CREATE FUNCTION f(a int) RETURNS text AS $$ SELECT 'again' $$ LANGUAGE sql").is_err());
+    assert_eq!(one(&mut db, "SELECT f(1)"), "int");
+    assert_eq!(one(&mut db, "SELECT f('x'::text)"), "text");
+    assert_eq!(one(&mut db, "SELECT f(1, 2)"), "two");
+    db.execute("CREATE OR REPLACE FUNCTION f(a text) RETURNS text AS $$ SELECT 'text2' $$ LANGUAGE sql").unwrap();
+    assert_eq!(one(&mut db, "SELECT f('x'::text)"), "text2");
+    db.execute("DROP FUNCTION f(int)").unwrap();
+    assert_eq!(one(&mut db, "SELECT f(1, 2)"), "two");
+    assert_eq!(one(&mut db, "SELECT f('x'::text)"), "text2");
+    // polymorphic
+    db.execute("CREATE FUNCTION pick(a anyelement, b anyelement) RETURNS anyelement AS $$ SELECT b $$ LANGUAGE sql").unwrap();
+    assert_eq!(one(&mut db, "SELECT pick(1, 2)"), "2");
+    assert_eq!(one(&mut db, "SELECT pick('a', 'b')"), "b");
+    assert_eq!(one(&mut db, "SELECT pick(1.5, 2.5)"), "2.5");
+}

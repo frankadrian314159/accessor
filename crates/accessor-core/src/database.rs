@@ -214,7 +214,8 @@ impl Database {
             }
             for (_, sql) in l.routines {
                 let def = parse_routine(&sql)?;
-                db.routines.insert(key(&def.name), Arc::new(def));
+                let slot = db.routine_slot(&def)?;
+                db.routines.insert(slot, Arc::new(def));
             }
             for (_, sql) in l.triggers {
                 let def = parse_trigger(&sql)?;
@@ -548,10 +549,7 @@ impl Database {
             }
             Op::CreateRoutine { name, sql } => {
                 let def = parse_routine(sql)?;
-                let k = key(name);
-                if self.routines.contains_key(&k) {
-                    return Err(Error::catalog(format!("the function or procedure '{name}' already exists")));
-                }
+                let k = self.routine_slot(&def)?;
                 self.routines.insert(k, Arc::new(def));
                 self.sync_aggregates();
                 Ok(None)

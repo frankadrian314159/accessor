@@ -78,6 +78,28 @@ pub(crate) fn pack_variadic(def: &RoutineDef, args: &[Expr]) -> Vec<Expr> {
     out
 }
 
+fn is_number(t: DataType) -> bool {
+    matches!(t, DataType::Integer | DataType::Bignum | DataType::Decimal | DataType::Float | DataType::Double)
+}
+
+/// The type of an argument when it is plain to see: a literal, or a cast.
+fn static_type(e: &Expr) -> Option<DataType> {
+    match e {
+        Expr::Literal(v) => v.data_type(),
+        Expr::Function { name, .. } => {
+            let up = name.to_ascii_uppercase();
+            [DataType::Integer, DataType::Bignum, DataType::Decimal, DataType::Float, DataType::Double, DataType::Text, DataType::YesNo, DataType::DateTime, DataType::Json]
+                .into_iter()
+                .find(|t| match t {
+                    DataType::Integer => up == "CAST_INTEGER",
+                    DataType::Bignum => up == "CAST_BIGNUM",
+                    t => cast_function(*t).is_some_and(|c| c.eq_ignore_ascii_case(&up)),
+                })
+        }
+        _ => None,
+    }
+}
+
 /// A function's body with its parameters replaced by the arguments of a call.
 pub(crate) fn inline_call(def: &RoutineDef, args: &[Expr]) -> Result<Expr> {
     let args = &pack_variadic(def, args)[..];
@@ -199,10 +221,11 @@ impl Frame {
 
 impl Database {
     pub(crate) fn exec_create_routine(&mut self, def: &RoutineDef) -> Result<QueryResult> {
-        let k = key(&def.name);
-        if self.routines.contains_key(&k) {
+        // only PostgreSQL has several functions of a name
+        if crate::dialect::current() != crate::dialect::Dialect::Postgresql && !self.routines_named(&def.name).is_empty() {
             return Err(Error::catalog(format!("the function or procedure '{}' already exists", def.name)));
         }
+        self.routine_slot(def)?;
         if def.function && ScalarFn::lookup(&def.name).is_some() || crate::exec::agg::AggFn::from_name(&def.name).is_some() {
             return Err(Error::catalog(format!("'{}' is the name of a built-in function", def.name)));
         }
@@ -226,20 +249,111 @@ impl Database {
     }
 
     pub(crate) fn exec_drop_routine(&mut self, name: &str, function: bool) -> Result<QueryResult> {
+        let (name, types) = match name.split_once('\u{2}') {
+            Some((n, t)) => (n, Some(t)),
+            None => (name, None),
+        };
+        let types: Option<Vec<Option<DataType>>> = types.map(|t| t.split('\u{3}').filter(|x| !x.is_empty()).map(|x| DataType::from_sql_name(x).map(|(t, _)| t)).collect());
         let found = self
-            .routines
-            .get(&key(name))
-            .filter(|r| r.function == function)
-            .map(|r| r.name.clone())
+            .routine_slot_of(name, types.as_deref().unwrap_or(&[]), types.is_some())
+            .filter(|k| self.routines.get(k).is_some_and(|r| r.function == function))
             .ok_or_else(|| Error::catalog(format!("the {} '{name}' does not exist", if function { "function" } else { "procedure" })))?;
         self.apply_all(vec![crate::storage::Op::DropRoutine(found)])?;
         Ok(QueryResult::default())
     }
 
     /// `CALL name (args)` for a stored procedure, or `None` if there is no such procedure.
-    /// A stored function or procedure of any kind.
+    /// A stored function or procedure of any kind (the first, where there are several of the name).
     pub(crate) fn routine_def(&self, name: &str) -> Option<Arc<RoutineDef>> {
-        self.routines.get(&key(name)).cloned()
+        self.routines_named(name).into_iter().next()
+    }
+
+    /// Every routine called `name`: the versions of an overloaded function are kept under `name`, `name\u{1}signature`.
+    pub(crate) fn routines_named(&self, name: &str) -> Vec<Arc<RoutineDef>> {
+        let k = key(name);
+        let overload = format!("{k}\u{1}");
+        self.routines.range(k.clone()..).take_while(|(x, _)| **x == k || x.starts_with(&overload)).map(|(_, r)| r.clone()).collect()
+    }
+
+    /// The version of `name` that a call with `args` is for: the ones that take that many arguments, then the one whose
+    /// parameter types fit the arguments whose types are plain to see (a literal, a cast).
+    pub(crate) fn routine_def_for(&self, name: &str, args: &[Expr]) -> Option<Arc<RoutineDef>> {
+        let all = self.routines_named(name);
+        if all.len() <= 1 {
+            return all.into_iter().next();
+        }
+        let fits = |d: &RoutineDef| {
+            let variadic = d.params.iter().any(|p| p.variadic);
+            let required = d.params.iter().filter(|p| p.default.is_none() && !p.variadic).count();
+            args.len() >= required && (variadic || args.len() <= d.params.len())
+        };
+        let score = |d: &RoutineDef| -> i32 {
+            let mut s = 0;
+            for (a, p) in args.iter().zip(d.params.iter()) {
+                if !p.poly.is_empty() {
+                    // a polymorphic parameter: an array wants an array, a range wants a range
+                    let is_array = matches!(a, Expr::Function { name, .. } if name == "__ARRAY");
+                    let is_range = matches!(a, Expr::Function { name, .. } if crate::expr::ranges::lookup(&name.to_ascii_uppercase()).is_some());
+                    s += match p.poly.as_str() {
+                        w if w.ends_with("array") && is_array => 3,
+                        w if (w.ends_with("range") || w.ends_with("multirange")) && is_range => 3,
+                        w if w.ends_with("array") || w.ends_with("range") || w.ends_with("multirange") => -2,
+                        _ if is_array || is_range => 0,
+                        _ => 1,
+                    };
+                    continue;
+                }
+                let (Some(want), Some(have)) = (p.data_type, static_type(a)) else {
+                    s += if p.data_type.is_none() { 0 } else { 1 };
+                    continue;
+                };
+                s += if want == have {
+                    4
+                } else if is_number(want) && is_number(have) {
+                    2
+                } else if have == DataType::Text && matches!(a, Expr::Literal(_)) {
+                    1
+                } else {
+                    -8
+                };
+            }
+            // an exact number of arguments over one that needs defaults or packing
+            if args.len() == d.params.len() && !d.params.iter().any(|p| p.variadic) {
+                s += 1;
+            }
+            s
+        };
+        let candidates: Vec<Arc<RoutineDef>> = all.iter().filter(|d| fits(d)).cloned().collect();
+        let pool = if candidates.is_empty() { all } else { candidates };
+        pool.into_iter().max_by_key(|d| score(d))
+    }
+
+    /// The signature that tells the versions of an overloaded routine apart.
+    pub(crate) fn signature(def: &RoutineDef) -> String {
+        def.params.iter().map(|p| if p.poly.is_empty() { format!("{:?}", p.data_type) } else { p.poly.clone() }).collect::<Vec<_>>().join(",").to_ascii_lowercase()
+    }
+
+    /// Where a routine is kept: under its name, or under the name and signature when another version holds the name.
+    pub(crate) fn routine_slot(&self, def: &RoutineDef) -> Result<String> {
+        let base = key(&def.name);
+        let mine = Self::signature(def);
+        if self.routines_named(&def.name).iter().any(|r| Self::signature(r) == mine) {
+            return Err(Error::catalog(format!("the function or procedure '{}' already exists", def.name)));
+        }
+        Ok(if self.routines.contains_key(&base) { format!("{base}\u{1}{mine}") } else { base })
+    }
+
+    /// The version of `name` called by `DROP FUNCTION name(types)`; without types, the first.
+    pub(crate) fn routine_slot_of(&self, name: &str, types: &[Option<DataType>], listed: bool) -> Option<String> {
+        let k = key(name);
+        let overload = format!("{k}\u{1}");
+        self.routines
+            .range(k.clone()..)
+            .take_while(|(x, _)| **x == k || x.starts_with(&overload))
+            .find(|(_, r)| {
+                !listed || (r.params.len() == types.len() && r.params.iter().zip(types).all(|(p, t)| t.is_none() || p.data_type.is_none() || p.data_type == *t))
+            })
+            .map(|(x, _)| x.clone())
     }
 
     /// Runs a trigger function's block with `vars` as its variables; gives what it returned and the variables as they ended.
@@ -282,7 +396,7 @@ impl Database {
             let mut changed = false;
             crate::sql::walk::walk_statement(&mut copy, &mut |e| {
                 let Expr::Function { name, args, .. } = e else { return Ok(()) };
-                let Some(def) = self.function_def(name) else { return Ok(()) };
+                let Some(def) = self.function_def_for(name, args) else { return Ok(()) };
                 if !matches!(def.body, RoutineBody::Block(_)) {
                     return Ok(());
                 }
@@ -354,7 +468,7 @@ impl Database {
         for f in factors {
             match f {
                 TableFactor::Function { name, args, alias, .. } => {
-                    let Some(def) = self.routine_def(name).filter(|d| returns_rows_by_statements(d)) else { continue };
+                    let Some(def) = self.routine_def_for(name, args).filter(|d| returns_rows_by_statements(d)) else { continue };
                     let mut vals = Vec::with_capacity(args.len());
                     let mut known = true;
                     let packed = pack_variadic(&def, args);
@@ -392,7 +506,8 @@ impl Database {
     }
 
     pub(crate) fn call_routine(&mut self, name: &str, args: &[(Option<String>, Expr)], allow_function: bool) -> Result<Option<QueryResult>> {
-        let Some(def) = self.routines.get(&key(name)).cloned() else { return Ok(None) };
+        let arg_exprs_for_pick: Vec<Expr> = args.iter().map(|(_, e)| e.clone()).collect();
+        let Some(def) = self.routine_def_for(name, &arg_exprs_for_pick) else { return Ok(None) };
         if def.function && !allow_function {
             return Err(Error::catalog(format!("'{name}' is a function; use it in an expression")));
         }
@@ -951,7 +1066,7 @@ impl Database {
 
     /// The aggregate made with `CREATE AGGREGATE` called `name`.
     pub(crate) fn aggregate_def(&self, name: &str) -> Option<Arc<RoutineDef>> {
-        self.routines.get(&key(name)).filter(|r| r.aggregate.is_some()).cloned()
+        self.routines_named(name).into_iter().find(|r| r.aggregate.is_some())
     }
 
     /// Tells the parser and binder (through a thread-local) which names are user-defined aggregates.
@@ -962,6 +1077,11 @@ impl Database {
 
     /// The routine called `name`, if it is a function.
     pub(crate) fn function_def(&self, name: &str) -> Option<Arc<RoutineDef>> {
-        self.routines.get(&key(name)).filter(|r| r.function && r.aggregate.is_none()).cloned()
+        self.routines_named(name).into_iter().find(|r| r.function && r.aggregate.is_none())
+    }
+
+    /// The version of the function `name` that a call with `args` is for.
+    pub(crate) fn function_def_for(&self, name: &str, args: &[Expr]) -> Option<Arc<RoutineDef>> {
+        self.routine_def_for(name, args).filter(|r| r.function && r.aggregate.is_none())
     }
 }

@@ -405,6 +405,8 @@ pub struct RoutineParam {
     pub out: bool,
     /// `VARIADIC` (PostgreSQL): the last parameter, an array, takes the rest of the arguments of a call.
     pub variadic: bool,
+    /// The polymorphic pseudo-type the parameter was declared with (`anyelement`, `anyrange`, ...), empty for a plain type.
+    pub poly: String,
 }
 
 /// What a `DECLARE ... HANDLER` answers to.

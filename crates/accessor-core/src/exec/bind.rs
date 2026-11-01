@@ -668,7 +668,7 @@ impl<'a> Binder<'a> {
                 }
                 let Some((f, min, max)) = ScalarFn::lookup(name) else {
                     // A stored function: its body, with the arguments in place of the parameters.
-                    let Some(def) = self.db.function_def(name) else {
+                    let Some(def) = self.db.function_def_for(name, args) else {
                         // `float8(x)`, `int4(x)`, `name(x)`: a type name used as a function is a cast
                         if args.len() == 1 {
                             if let Some((ty, auto)) = crate::value::DataType::from_sql_name(name) {

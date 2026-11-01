@@ -211,7 +211,7 @@ impl<'a> Parser<'a> {
         }
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
-        let params = (0..nargs).map(|i| RoutineParam { name: format!("${}", i + 1), data_type: None, default: None, out: false, variadic: false }).collect();
+        let params = (0..nargs).map(|i| RoutineParam { name: format!("${}", i + 1), data_type: None, default: None, out: false, variadic: false, poly: String::new() }).collect();
         let aggregate = Some(Box::new(AggregateDef { sfunc, stype, finalfunc, initcond, nargs }));
         Ok(Statement::CreateRoutine(Box::new(RoutineDef {
             name,
@@ -255,7 +255,10 @@ impl<'a> Parser<'a> {
                     && !self.peek_kw_at(1, "DEFAULT")
                     && !(is_type_word(self.peek()) && !is_type_word(self.peek_at(1)));
                 let pname = if named { Some(self.ident()?) } else { None };
-                let ty = self.pg_type()?;
+                // anyelement, anyarray and the like take whatever type the argument has
+                let poly_name = self.polymorphic_type().unwrap_or_default();
+                let poly = !poly_name.is_empty();
+                let ty = if poly { DataType::Text } else { self.pg_type()? };
                 if out {
                     outs.push((pname.clone(), ty));
                 }
@@ -265,7 +268,7 @@ impl<'a> Parser<'a> {
                     if params.iter().any(|p| p.name.eq_ignore_ascii_case(&pname)) {
                         return Err(Error::syntax(format!("the parameter {pname} is declared twice")));
                     }
-                    params.push(RoutineParam { name: pname, data_type: Some(ty), default, out: false, variadic });
+                    params.push(RoutineParam { name: pname, data_type: if poly { None } else { Some(ty) }, default, out: false, variadic, poly: poly_name });
                 }
                 if !self.eat_sym(",") {
                     break;
@@ -274,6 +277,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(")")?;
         let mut returns: Option<DataType> = None;
+        let mut poly_result = false;
         let mut is_trigger = false;
         let mut set_columns: Vec<String> = Vec::new();
         if self.eat_kw("RETURNS") {
@@ -307,6 +311,9 @@ impl<'a> Parser<'a> {
                 is_trigger = true;
             } else if self.peek_kw("VOID") {
                 self.advance();
+            } else if self.polymorphic_type().is_some() {
+                // the result is left as it comes
+                poly_result = true;
             } else {
                 returns = Some(self.pg_type()?);
             }
@@ -406,7 +413,7 @@ impl<'a> Parser<'a> {
             }
         }
         let routine_body = match language.as_str() {
-            "sql" => sql_body(&body, &names, returns.is_some())?,
+            "sql" => sql_body(&body, &names, returns.is_some() || poly_result)?,
             "plpgsql" if !set_columns.is_empty() => {
                 // the output columns are variables of the body
                 for c in set_columns.iter().filter(|c| !c.starts_with('\u{1}')) {
@@ -414,7 +421,7 @@ impl<'a> Parser<'a> {
                 }
                 plpgsql_body(&body, names, false)?
             }
-            "plpgsql" => plpgsql_body(&body, names, returns.is_some())?,
+            "plpgsql" => plpgsql_body(&body, names, returns.is_some() || poly_result)?,
             "internal" => {
                 // a function of the server that is given a new name: AS 'int4eq' stands for the operator it implements
                 let inner = body.trim();
@@ -423,7 +430,7 @@ impl<'a> Parser<'a> {
                     Some(t) => t,
                     None => format!("{inner}({})", args.join(", ")),
                 };
-                sql_body(&format!("SELECT {text}"), &names, returns.is_some())?
+                sql_body(&format!("SELECT {text}"), &names, returns.is_some() || poly_result)?
             }
             other => return Err(Error::syntax(format!("the language '{other}' is not available (use sql or plpgsql)"))),
         };
@@ -431,6 +438,66 @@ impl<'a> Parser<'a> {
     }
 
     /// `DROP FUNCTION name (argument types)`: the types are read and ignored (functions are known by name).
+    /// The argument types of `DROP FUNCTION f(int, text)`, as their names joined by `\u{3}` (`None` without a list).
+    pub(super) fn drop_signature(&mut self) -> Result<Option<String>> {
+        if !self.eat_sym("(") {
+            return Ok(None);
+        }
+        let mut types: Vec<String> = Vec::new();
+        let mut depth = 0usize;
+        let mut start = self.toks[self.pos].pos;
+        loop {
+            let end = self.toks[self.pos].pos;
+            let at_end = self.at_eof() || (depth == 0 && (self.peek_sym(",") || self.peek_sym(")")));
+            if at_end {
+                let chunk = self.src[start..end].trim();
+                if !chunk.is_empty() {
+                    let mut words: Vec<&str> = chunk.split_whitespace().collect();
+                    // an OUT parameter is not part of the signature
+                    let is_out = words.first().is_some_and(|w| w.eq_ignore_ascii_case("out"));
+                    while words.first().is_some_and(|w| ["in", "out", "inout", "variadic"].contains(&w.to_ascii_lowercase().as_str())) {
+                        words.remove(0);
+                    }
+                    let whole = words.join(" ");
+                    let name = if DataType::from_sql_name(&whole).is_some() || words.len() < 2 { whole } else { words[1..].join(" ") };
+                    if !is_out {
+                        types.push(name.to_ascii_lowercase());
+                    }
+                }
+                if self.at_eof() || self.peek_sym(")") {
+                    break;
+                }
+                self.advance();
+                start = self.toks[self.pos].pos;
+                continue;
+            }
+            match self.peek() {
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth -= 1,
+                _ => {}
+            }
+            self.advance();
+        }
+        self.expect_sym(")")?;
+        Ok(Some(types.join("\u{3}")))
+    }
+
+    /// Reads a polymorphic pseudo-type (`anyelement`, `anyarray`, `anycompatible`, ..., with an optional `[]`).
+    fn polymorphic_type(&mut self) -> Option<String> {
+        let name = match self.peek() {
+            Tok::Ident(w) => w.to_ascii_lowercase(),
+            _ => return None,
+        };
+        if !["anyelement", "anyarray", "anynonarray", "anyenum", "anyrange", "anymultirange", "anycompatible", "anycompatiblearray", "anycompatiblenonarray", "anycompatiblerange", "anycompatiblemultirange"].contains(&name.as_str()) {
+            return None;
+        }
+        self.advance();
+        while self.eat_sym("[") {
+            self.eat_sym("]");
+        }
+        Some(name)
+    }
+
     pub(super) fn skip_argument_types(&mut self) -> Result<()> {
         if self.eat_sym("(") {
             while !self.peek_sym(")") && !self.at_eof() {
@@ -1077,7 +1144,7 @@ impl<'a> Parser<'a> {
                 let ty = self.pg_type()?;
                 while self.eat_kw("UNSIGNED") || self.eat_kw("SIGNED") || self.eat_kw("ZEROFILL") {}
                 self.skip_charset();
-                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None, out: out_param, variadic: false });
+                params.push(RoutineParam { name: pname, data_type: Some(ty), default: None, out: out_param, variadic: false, poly: String::new() });
                 if !self.eat_sym(",") {
                     break;
                 }

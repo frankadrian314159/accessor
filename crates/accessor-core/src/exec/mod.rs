@@ -242,11 +242,15 @@ impl Database {
                     Statement::CreateRoutine(def) => {
                         let name = def.name.clone();
                         self.atomically(|db| {
-                            if let Some(old) = db.routines.get(&crate::database::key(&name)).cloned() {
+                            let mine = Database::signature(def);
+                            let base = crate::database::key(&name);
+                            let overload = format!("{base}\u{1}");
+                            let same = db.routines.iter().find(|(k, r)| (**k == base || k.starts_with(&overload)) && Database::signature(r) == mine).map(|(k, r)| (k.clone(), r.clone()));
+                            if let Some((slot, old)) = same {
                                 if old.function != def.function {
                                     return Err(Error::catalog(format!("'{name}' exists as a {}; drop it first", if old.function { "function" } else { "procedure" })));
                                 }
-                                db.exec_drop_routine(&name, old.function)?;
+                                db.apply_all(vec![crate::storage::Op::DropRoutine(slot)])?;
                             }
                             db.execute_statement(&inner)
                         })
