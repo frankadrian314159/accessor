@@ -6822,3 +6822,34 @@ fn postgresql_range_types_are_text_with_constructors_operators_and_casts() {
     assert_eq!(one(&mut db, "SELECT id FROM r WHERE during @> '2000-03-15'::date"), "2");
     assert_eq!(one(&mut db, "SELECT count(*) FROM r WHERE during && daterange('2000-01-15', '2000-03-15')"), "2");
 }
+
+#[test]
+fn postgresql_multiranges_custom_range_types_and_range_aggregates() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(5, 7), int4range(1, 3), int4range(3, 4))"), "{[1,4),[5,7)}");
+    assert_eq!(one(&mut db, "SELECT '{[1,3), [2,5)}'::int4multirange"), "{[1,5)}");
+    assert_eq!(one(&mut db, "SELECT int4multirange() = '{}'::int4multirange"), "true");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 3), int4range(6, 9)) @> 7"), "true");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 3), int4range(6, 9)) @> 4"), "false");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 3)) && int4range(2, 8)"), "true");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 3)) + int4multirange(int4range(6, 9))"), "{[1,3),[6,9)}");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 10)) - int4multirange(int4range(3, 5))"), "{[1,3),[5,10)}");
+    assert_eq!(one(&mut db, "SELECT int4multirange(int4range(1, 10)) * int4multirange(int4range(3, 12))"), "{[3,10)}");
+    assert_eq!(one(&mut db, "SELECT lower(int4multirange(int4range(2, 4), int4range(8, 9)))"), "2");
+    assert_eq!(one(&mut db, "SELECT upper(int4multirange(int4range(2, 4), int4range(8, 9)))"), "9");
+    assert_eq!(one(&mut db, "SELECT range_merge(int4multirange(int4range(2, 4), int4range(8, 9)))"), "[2,9)");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM unnest(int4multirange(int4range(2, 4), int4range(8, 9)))"), "2");
+    assert_eq!(one(&mut db, "SELECT range_adjacent(numrange(2.0, 3.0), numrange(3.0, 4.0))"), "true");
+    assert_eq!(one(&mut db, "SELECT range_minus(numrange(1, 10), numrange(5, 20))"), "[1,5)");
+    db.execute("CREATE TABLE n (r int4range)").unwrap();
+    db.execute("INSERT INTO n VALUES (int4range(1, 10)), (int4range(5, 20)), (int4range(7, 8))").unwrap();
+    assert_eq!(one(&mut db, "SELECT range_intersect_agg(r) FROM n"), "[7,8)");
+    assert_eq!(one(&mut db, "SELECT range_agg(r) FROM n"), "{[1,20)}");
+    db.execute("CREATE TYPE intr AS RANGE (subtype = int)").unwrap();
+    assert_eq!(one(&mut db, "SELECT intr(1, 5, '[]')"), "[1,5]");
+    assert_eq!(one(&mut db, "SELECT '[1,5)'::intr @> 3"), "true");
+    assert_eq!(one(&mut db, "SELECT intr(1, 5) && intr(4, 9)"), "true");
+}

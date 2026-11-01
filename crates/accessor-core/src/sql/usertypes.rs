@@ -23,6 +23,9 @@ pub struct UserType {
     pub checks: Vec<String>,
     /// The labels of an enum, in order.
     pub labels: Vec<String>,
+    /// `CREATE TYPE .. AS RANGE (subtype = t)`: the name of the subtype (the type itself is text).
+    #[serde(default)]
+    pub range: Option<String>,
 }
 
 thread_local! {

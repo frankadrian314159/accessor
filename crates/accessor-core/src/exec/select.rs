@@ -500,6 +500,9 @@ impl Database {
                 let mut items = Vec::new();
                 match a {
                     Value::Null => {}
+                    Value::Text(_) if crate::expr::ranges::multirange_items(a).is_some() => {
+                        items = crate::expr::ranges::multirange_items(a).unwrap_or_default();
+                    }
                     Value::Array(_) => flat(a, &mut items),
                     other => match other.coerce_to(crate::value::DataType::Array(crate::value::ArrayOf::Any))? {
                         arr @ Value::Array(_) => flat(&arr, &mut items),

@@ -1024,6 +1024,37 @@ impl<'a> Parser<'a> {
             if !self.eat_kw("AS") {
                 return Err(Error::syntax("only CREATE TYPE name AS ENUM (...) is supported"));
             }
+            if self.eat_kw("RANGE") {
+                // CREATE TYPE r AS RANGE (SUBTYPE = t, ...): the other options are read and ignored
+                self.expect_sym("(")?;
+                let mut subtype = None;
+                loop {
+                    let option = self.ident()?.to_ascii_lowercase();
+                    self.expect_sym("=")?;
+                    if option == "subtype" {
+                        subtype = Some(self.type_name()?);
+                    } else {
+                        let mut depth = 0usize;
+                        while !self.at_eof() && !(depth == 0 && (self.peek_sym(",") || self.peek_sym(")"))) {
+                            if self.peek_sym("(") {
+                                depth += 1;
+                            } else if self.peek_sym(")") {
+                                depth -= 1;
+                            }
+                            self.advance();
+                        }
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                let subtype = subtype.ok_or_else(|| Error::syntax("a range type needs SUBTYPE"))?;
+                let t = UserType { base: "TEXT".into(), range: Some(subtype), ..Default::default() };
+                crate::sql::usertypes::register(&name, t.clone());
+                let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
+                return Ok(Some(change("type", name, value)));
+            }
             if !self.eat_kw("ENUM") {
                 return Err(Error::syntax("only enumerated types can be created with CREATE TYPE; composite, range and base types are not available"));
             }
@@ -7367,9 +7398,9 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
             return Ok(Expr::Function { name: "__TIMEOF".into(), args: vec![e], distinct: false, star: false });
         }
-        if crate::expr::ranges::Kind::from_name(&tn).is_some() {
+        if let Some(name) = crate::expr::ranges::cast_function_for(&tn) {
             self.expect_sym(")")?;
-            return Ok(Expr::Function { name: format!("__RANGE_CAST_{}", tn.to_ascii_uppercase()), args: vec![e], distinct: false, star: false });
+            return Ok(Expr::Function { name, args: vec![e], distinct: false, star: false });
         }
         let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         let mut hints = Vec::new();
@@ -7398,8 +7429,8 @@ impl<'a> Parser<'a> {
             let name = if tn.eq_ignore_ascii_case("tsvector") { "TSVECTOR_IN" } else { "TSQUERY_IN" };
             return Ok(Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false });
         }
-        if crate::expr::ranges::Kind::from_name(&tn).is_some() {
-            return Ok(Expr::Function { name: format!("__RANGE_CAST_{}", tn.to_ascii_uppercase()), args: vec![e], distinct: false, star: false });
+        if let Some(name) = crate::expr::ranges::cast_function_for(&tn) {
+            return Ok(Expr::Function { name, args: vec![e], distinct: false, star: false });
         }
         let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
         let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;

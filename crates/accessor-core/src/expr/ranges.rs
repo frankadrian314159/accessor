@@ -19,6 +19,8 @@ pub enum Kind {
     Date,
     Ts,
     Tstz,
+    /// A range made with `CREATE TYPE .. AS RANGE`: continuous, with no canonical form.
+    Custom,
 }
 
 impl Kind {
@@ -58,6 +60,12 @@ pub enum RangeOp {
 pub enum RangeFn {
     Ctor(Kind),
     Cast(Kind),
+    /// `int4multirange(r, ..)`
+    MultiCtor(Kind),
+    /// `'{[1,3),[5,7)}'::int4multirange`
+    MultiCast(Kind),
+    /// `multirange(r)`
+    AsMulti,
     IsEmpty,
     LowerInc,
     UpperInc,
@@ -76,6 +84,15 @@ const KINDS: [(&str, Kind); 6] = [
     ("TSTZRANGE", Kind::Tstz),
 ];
 
+const MULTI: [(&str, Kind); 6] = [
+    ("INT4MULTIRANGE", Kind::Int4),
+    ("INT8MULTIRANGE", Kind::Int8),
+    ("NUMMULTIRANGE", Kind::Num),
+    ("DATEMULTIRANGE", Kind::Date),
+    ("TSMULTIRANGE", Kind::Ts),
+    ("TSTZMULTIRANGE", Kind::Tstz),
+];
+
 pub fn lookup(name: &str) -> Option<(RangeFn, usize, usize)> {
     use RangeFn::*;
     for (n, k) in KINDS {
@@ -86,18 +103,42 @@ pub fn lookup(name: &str) -> Option<(RangeFn, usize, usize)> {
             return Some((Cast(k), 1, 1));
         }
     }
+    for (n, k) in MULTI {
+        if name == n {
+            return Some((MultiCtor(k), 0, usize::MAX));
+        }
+        if name.strip_prefix("__RANGE_CAST_") == Some(n) {
+            return Some((MultiCast(k), 1, 1));
+        }
+    }
+    // a range type of the user's
+    let custom = |n: &str| crate::sql::usertypes::lookup(n).is_some_and(|t| t.range.is_some());
+    if let Some(n) = name.strip_prefix("__RANGE_CAST_") {
+        if custom(n) {
+            return Some((Cast(Kind::Custom), 1, 1));
+        }
+    } else if custom(name) {
+        return Some((Ctor(Kind::Custom), 0, 3));
+    }
     Some(match name {
         "ISEMPTY" => (IsEmpty, 1, 1),
         "LOWER_INC" => (LowerInc, 1, 1),
         "UPPER_INC" => (UpperInc, 1, 1),
         "LOWER_INF" => (LowerInf, 1, 1),
         "UPPER_INF" => (UpperInf, 1, 1),
-        "RANGE_MERGE" => (Merge, 2, 2),
-        "__RANGE_LEFT" => (Op(RangeOp::Left), 2, 2),
-        "__RANGE_RIGHT" => (Op(RangeOp::Right), 2, 2),
-        "__RANGE_NOTRIGHT" => (Op(RangeOp::NotRight), 2, 2),
-        "__RANGE_NOTLEFT" => (Op(RangeOp::NotLeft), 2, 2),
-        "__RANGE_ADJACENT" => (Op(RangeOp::Adjacent), 2, 2),
+        "RANGE_MERGE" => (Merge, 1, 2),
+        "MULTIRANGE" => (AsMulti, 1, 1),
+        "__RANGE_LEFT" | "RANGE_BEFORE" => (Op(RangeOp::Left), 2, 2),
+        "__RANGE_RIGHT" | "RANGE_AFTER" => (Op(RangeOp::Right), 2, 2),
+        "__RANGE_NOTRIGHT" | "RANGE_OVERLEFT" => (Op(RangeOp::NotRight), 2, 2),
+        "__RANGE_NOTLEFT" | "RANGE_OVERRIGHT" => (Op(RangeOp::NotLeft), 2, 2),
+        "__RANGE_ADJACENT" | "RANGE_ADJACENT" => (Op(RangeOp::Adjacent), 2, 2),
+        "RANGE_CONTAINS" => (Op(RangeOp::Contains), 2, 2),
+        "RANGE_CONTAINED_BY" => (Op(RangeOp::ContainedBy), 2, 2),
+        "RANGE_OVERLAPS" => (Op(RangeOp::Overlap), 2, 2),
+        "RANGE_UNION" => (Op(RangeOp::Union), 2, 2),
+        "RANGE_INTERSECT" => (Op(RangeOp::Intersect), 2, 2),
+        "RANGE_MINUS" => (Op(RangeOp::Minus), 2, 2),
         _ => return None,
     })
 }
@@ -272,21 +313,6 @@ fn contains(a: &Range, b: &Range) -> bool {
     !a.empty && lo_cmp(a, b) != Ordering::Greater && hi_cmp(a, b) != Ordering::Less
 }
 
-fn union(a: &Range, b: &Range, merge: bool) -> Result<Range> {
-    if a.empty {
-        return Ok(b.clone());
-    }
-    if b.empty {
-        return Ok(a.clone());
-    }
-    if !merge && !overlaps(a, b) && !adjacent(a, b) {
-        return Err(Error::runtime("result of range union would not be contiguous"));
-    }
-    let lo = if lo_cmp(a, b) != Ordering::Greater { a } else { b };
-    let hi = if hi_cmp(a, b) != Ordering::Less { a } else { b };
-    Ok(Range { empty: false, lo: lo.lo.clone(), lo_inc: lo.lo_inc, hi: hi.hi.clone(), hi_inc: hi.hi_inc })
-}
-
 fn intersect(a: &Range, b: &Range) -> Range {
     if !overlaps(a, b) {
         return Range::empty();
@@ -294,26 +320,6 @@ fn intersect(a: &Range, b: &Range) -> Range {
     let lo = if lo_cmp(a, b) != Ordering::Less { a } else { b };
     let hi = if hi_cmp(a, b) != Ordering::Greater { a } else { b };
     Range { empty: false, lo: lo.lo.clone(), lo_inc: lo.lo_inc, hi: hi.hi.clone(), hi_inc: hi.hi_inc }
-}
-
-fn minus(a: &Range, b: &Range) -> Result<Range> {
-    if a.empty || b.empty || !overlaps(a, b) {
-        return Ok(a.clone());
-    }
-    let starts_before = lo_cmp(a, b) == Ordering::Less;
-    let ends_after = hi_cmp(a, b) == Ordering::Greater;
-    if starts_before && ends_after {
-        return Err(Error::runtime("result of range difference would not be contiguous"));
-    }
-    if !starts_before && !ends_after {
-        return Ok(Range::empty());
-    }
-    if !starts_before {
-        // the front of `a` is cut off
-        Ok(Range { empty: false, lo: b.hi.clone(), lo_inc: !b.hi_inc, hi: a.hi.clone(), hi_inc: a.hi_inc })
-    } else {
-        Ok(Range { empty: false, lo: a.lo.clone(), lo_inc: a.lo_inc, hi: b.lo.clone(), hi_inc: !b.lo_inc })
-    }
 }
 
 // ----- construction ----------------------------------------------------------------------------
@@ -415,6 +421,119 @@ fn cast(kind: Kind, v: &Value) -> Result<Value> {
     Ok(Value::text(&canonical(kind, r)?.to_string()))
 }
 
+// ----- lists of ranges (a multirange is a sorted list of ranges that neither overlap nor touch) --------
+
+/// Sorts the ranges, drops the empty ones and joins those that overlap or touch.
+fn norm(mut v: Vec<Range>) -> Vec<Range> {
+    v.retain(|r| !r.empty);
+    v.sort_by(lo_cmp);
+    let mut out: Vec<Range> = Vec::with_capacity(v.len());
+    for r in v {
+        match out.last_mut() {
+            Some(last) if overlaps(last, &r) || adjacent(last, &r) => {
+                if hi_cmp(&r, last) == Ordering::Greater {
+                    last.hi = r.hi;
+                    last.hi_inc = r.hi_inc;
+                }
+            }
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+fn subtract(p: &Range, y: &Range) -> Vec<Range> {
+    if !overlaps(p, y) {
+        return vec![p.clone()];
+    }
+    let mut out = Vec::new();
+    if lo_cmp(p, y) == Ordering::Less {
+        out.push(Range { empty: false, lo: p.lo.clone(), lo_inc: p.lo_inc, hi: y.lo.clone(), hi_inc: !y.lo_inc });
+    }
+    if hi_cmp(p, y) == Ordering::Greater {
+        out.push(Range { empty: false, lo: y.hi.clone(), lo_inc: !y.hi_inc, hi: p.hi.clone(), hi_inc: p.hi_inc });
+    }
+    out
+}
+
+fn l_minus(a: &[Range], b: &[Range]) -> Vec<Range> {
+    let mut out = Vec::new();
+    for x in a {
+        let mut pieces = vec![x.clone()];
+        for y in b {
+            pieces = pieces.iter().flat_map(|p| subtract(p, y)).collect();
+        }
+        out.extend(pieces);
+    }
+    norm(out)
+}
+
+fn l_intersect(a: &[Range], b: &[Range]) -> Vec<Range> {
+    norm(a.iter().flat_map(|x| b.iter().map(move |y| intersect(x, y))).collect())
+}
+
+/// Reads a range or a multirange (`{[1,3),[5,7)}`); the flag says which it was.
+fn read_ranges(s: &str) -> Option<(Vec<Range>, bool)> {
+    let t = s.trim();
+    if let Some(inner) = t.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        let mut out = Vec::new();
+        let (mut depth_quote, mut start) = (false, 0usize);
+        let bytes: Vec<char> = inner.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                '"' => depth_quote = !depth_quote,
+                '\\' if depth_quote => i += 1,
+                ',' if !depth_quote && i > 0 && matches!(bytes[i - 1], ')' | ']') => {
+                    out.push(bytes[start..i].iter().collect::<String>());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if !inner.trim().is_empty() {
+            out.push(bytes[start..].iter().collect::<String>());
+        }
+        let ranges: Option<Vec<Range>> = out.iter().map(|p| parse(p)).collect();
+        return Some((norm(ranges?), true));
+    }
+    if !(t.starts_with('[') || t.starts_with('(') || t.eq_ignore_ascii_case("empty")) {
+        return None;
+    }
+    let r = parse(t)?;
+    Some((if r.empty { Vec::new() } else { vec![r] }, false))
+}
+
+fn write_ranges(v: &[Range], multi: bool) -> Value {
+    if multi {
+        Value::text(&format!("{{{}}}", v.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(",")))
+    } else {
+        Value::text(&v.first().map_or("empty".to_string(), |r| r.to_string()))
+    }
+}
+
+fn shape(v: &Value) -> Option<(Vec<Range>, bool)> {
+    match v {
+        Value::Text(s) => read_ranges(s),
+        _ => None,
+    }
+}
+
+fn multi_cast(kind: Kind, v: &Value) -> Result<Value> {
+    let s = v.to_string();
+    let (list, multi) = read_ranges(&s).ok_or_else(|| Error::type_err(format!("malformed multirange literal: \"{s}\"")))?;
+    if !multi {
+        return Err(Error::type_err(format!("malformed multirange literal: \"{s}\"")));
+    }
+    let mut out = Vec::new();
+    for r in list {
+        let one = cast(kind, &Value::text(&r.to_string()))?;
+        out.extend(read_ranges(&one.to_string()).map(|x| x.0).unwrap_or_default());
+    }
+    Ok(write_ranges(&norm(out), true))
+}
+
 // ----- operators -------------------------------------------------------------------------------
 
 fn as_value(s: &str) -> Value {
@@ -430,17 +549,75 @@ fn as_value(s: &str) -> Value {
 }
 
 /// The element `v` as a one-point range, written like the bounds of `like`.
-fn element(v: &Value, like: &Range) -> Range {
+fn element(v: &Value, like: &[Range]) -> Vec<Range> {
     let mut s = v.to_string();
     let date_like = |b: &Option<String>| b.as_ref().is_some_and(|b| b.len() == 10 && b.as_bytes().get(4) == Some(&b'-'));
-    if (date_like(&like.lo) || date_like(&like.hi)) && s.len() > 10 && s.as_bytes().get(4) == Some(&b'-') {
+    if like.iter().any(|r| date_like(&r.lo) || date_like(&r.hi)) && s.len() > 10 && s.as_bytes().get(4) == Some(&b'-') {
         s.truncate(10);
     }
-    Range::point(s)
+    vec![Range::point(s)]
 }
 
 fn in_postgresql() -> bool {
     crate::dialect::current() == crate::dialect::Dialect::Postgresql
+}
+
+/// `a op b` for ranges and multiranges. A value on the other side of `@>` / `<@` may be an element. `None` when the
+/// values are not ranges.
+fn apply(op: RangeOp, a: &Value, b: &Value) -> Result<Option<Value>> {
+    let (sa, sb) = (shape(a), shape(b));
+    let ((la, ma), (lb, mb)) = match (op, sa, sb) {
+        (RangeOp::Contains, Some(x), Some(y)) => (x, y),
+        (RangeOp::Contains, Some(x), None) if !b.is_null() => {
+            let e = element(b, &x.0);
+            (x, (e, false))
+        }
+        (RangeOp::ContainedBy, Some(x), Some(y)) => (x, y),
+        (RangeOp::ContainedBy, None, Some(y)) if !a.is_null() => {
+            let e = element(a, &y.0);
+            ((e, false), y)
+        }
+        (RangeOp::Contains | RangeOp::ContainedBy, _, _) => return Ok(None),
+        (_, Some(x), Some(y)) => (x, y),
+        _ => return Ok(None),
+    };
+    let multi = ma || mb;
+    let t = |x: bool| Ok(Some(Value::Bool(x)));
+    let (fa, ea) = (la.first(), la.last());
+    let (fb, eb) = (lb.first(), lb.last());
+    let both = !la.is_empty() && !lb.is_empty();
+    let list = |v: Vec<Range>, strict: bool| -> Result<Option<Value>> {
+        if !multi && strict && v.len() > 1 {
+            return Err(Error::runtime("result of range operation would not be contiguous"));
+        }
+        Ok(Some(write_ranges(&v, multi)))
+    };
+    match op {
+        RangeOp::Contains => t(lb.iter().all(|y| la.iter().any(|x| contains(x, y)))),
+        RangeOp::ContainedBy => t(la.iter().all(|y| lb.iter().any(|x| contains(x, y)))),
+        RangeOp::Overlap => t(la.iter().any(|x| lb.iter().any(|y| overlaps(x, y)))),
+        RangeOp::Left => t(both && before(ea.expect("not empty"), fb.expect("not empty"))),
+        RangeOp::Right => t(both && before(eb.expect("not empty"), fa.expect("not empty"))),
+        RangeOp::NotRight => t(both && hi_cmp(ea.expect("not empty"), eb.expect("not empty")) != Ordering::Greater),
+        RangeOp::NotLeft => t(both && lo_cmp(fa.expect("not empty"), fb.expect("not empty")) != Ordering::Less),
+        RangeOp::Adjacent => t(both && (adjacent(ea.expect("not empty"), fb.expect("not empty")) || adjacent(eb.expect("not empty"), fa.expect("not empty")))),
+        RangeOp::Union => {
+            let all: Vec<Range> = la.iter().chain(lb.iter()).cloned().collect();
+            let joined = norm(all);
+            if !multi && joined.len() > 1 {
+                return Err(Error::runtime("result of range union would not be contiguous"));
+            }
+            list(joined, false)
+        }
+        RangeOp::Intersect => list(l_intersect(&la, &lb), false),
+        RangeOp::Minus => {
+            let out = l_minus(&la, &lb);
+            if !multi && out.len() > 1 {
+                return Err(Error::runtime("result of range difference would not be contiguous"));
+            }
+            list(out, false)
+        }
+    }
 }
 
 /// `a op b` when either side is a range written as text (PostgreSQL only), `None` when this is not a range operation.
@@ -448,57 +625,49 @@ pub(crate) fn try_op(op: RangeOp, a: &Value, b: &Value) -> Result<Option<Value>>
     if !in_postgresql() {
         return Ok(None);
     }
-    let (ra, rb) = (is_range_text(a), is_range_text(b));
-    let (ra, rb) = match (op, ra, rb) {
-        (RangeOp::Contains, Some(x), Some(y)) => (x, y),
-        (RangeOp::Contains, Some(x), None) if !b.is_null() => {
-            let e = element(b, &x);
-            (x, e)
-        }
-        (RangeOp::ContainedBy, Some(x), Some(y)) => (x, y),
-        (RangeOp::ContainedBy, None, Some(y)) if !a.is_null() => {
-            let e = element(a, &y);
-            (e, y)
-        }
-        (RangeOp::Contains | RangeOp::ContainedBy, _, _) => return Ok(None),
-        (_, Some(x), Some(y)) => (x, y),
-        _ => return Ok(None),
-    };
-    let t = |b: bool| Ok(Some(Value::Bool(b)));
-    match op {
-        RangeOp::Contains => t(contains(&ra, &rb)),
-        RangeOp::ContainedBy => t(contains(&rb, &ra)),
-        RangeOp::Overlap => t(overlaps(&ra, &rb)),
-        RangeOp::Left => t(!ra.empty && !rb.empty && before(&ra, &rb)),
-        RangeOp::Right => t(!ra.empty && !rb.empty && before(&rb, &ra)),
-        RangeOp::NotRight => t(!ra.empty && !rb.empty && hi_cmp(&ra, &rb) != Ordering::Greater),
-        RangeOp::NotLeft => t(!ra.empty && !rb.empty && lo_cmp(&ra, &rb) != Ordering::Less),
-        RangeOp::Adjacent => t(adjacent(&ra, &rb)),
-        RangeOp::Union => Ok(Some(Value::text(&union(&ra, &rb, false)?.to_string()))),
-        RangeOp::Intersect => Ok(Some(Value::text(&intersect(&ra, &rb).to_string()))),
-        RangeOp::Minus => Ok(Some(Value::text(&minus(&ra, &rb)?.to_string()))),
-    }
+    apply(op, a, b)
 }
 
-/// `lower(r)` or `upper(r)` when the argument is a range (PostgreSQL only).
+/// `lower(r)` or `upper(r)` when the argument is a range or multirange (PostgreSQL only).
 pub(crate) fn try_bound(v: &Value, upper: bool) -> Option<Value> {
     if !in_postgresql() {
         return None;
     }
-    let t = v.to_string();
-    let t = t.trim();
-    if !(t.starts_with('[') || t.starts_with('(')) {
-        return None;
+    let (list, _) = shape(v)?;
+    let r = if upper { list.last() } else { list.first() };
+    Some(r.and_then(|r| if upper { r.hi.as_ref() } else { r.lo.as_ref() }).map(|b| as_value(b)).unwrap_or(Value::Null))
+}
+
+/// The ranges of a multirange, for `unnest`.
+pub(crate) fn multirange_items(v: &Value) -> Option<Vec<Value>> {
+    match shape(v)? {
+        (list, true) => Some(list.iter().map(|r| Value::text(&r.to_string())).collect()),
+        _ => None,
     }
-    let r = parse(t)?;
-    let b = if upper { r.hi } else { r.lo };
-    Some(b.map(|b| as_value(&b)).unwrap_or(Value::Null))
+}
+
+/// The intersection of two ranges (the step of `range_intersect_agg`).
+pub(crate) fn intersect_values(a: &Value, b: &Value) -> Result<Value> {
+    apply(RangeOp::Intersect, a, b)?.ok_or_else(|| Error::type_err("range_intersect_agg needs ranges"))
+}
+
+/// The multirange of the ranges (the result of `range_agg`).
+pub(crate) fn multirange_of(items: &[Value]) -> Result<Value> {
+    let mut all = Vec::new();
+    for v in items {
+        if v.is_null() {
+            continue;
+        }
+        let (list, _) = shape(v).ok_or_else(|| Error::type_err("range_agg needs ranges"))?;
+        all.extend(list);
+    }
+    Ok(write_ranges(&norm(all), true))
 }
 
 pub fn call(f: RangeFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
-    let range = |i: usize| -> Result<Range> {
+    let ranges = |i: usize| -> Result<(Vec<Range>, bool)> {
         let s = vals[i].to_string();
-        parse(&s).ok_or_else(|| Error::type_err(format!("malformed range literal: \"{s}\"")))
+        read_ranges(&s).ok_or_else(|| Error::type_err(format!("malformed range literal: \"{s}\"")))
     };
     Ok(match f {
         RangeFn::Ctor(k) => return construct(k, vals),
@@ -508,36 +677,55 @@ pub fn call(f: RangeFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             }
             return cast(k, &vals[0]);
         }
-        RangeFn::IsEmpty => Value::Bool(range(0)?.empty),
-        RangeFn::LowerInc => {
-            let r = range(0)?;
-            Value::Bool(!r.empty && r.lo_inc)
+        RangeFn::MultiCtor(k) => {
+            let mut all = Vec::new();
+            for v in vals {
+                if v.is_null() {
+                    continue;
+                }
+                let one = cast(k, v)?;
+                all.extend(read_ranges(&one.to_string()).map(|x| x.0).unwrap_or_default());
+            }
+            write_ranges(&norm(all), true)
         }
-        RangeFn::UpperInc => {
-            let r = range(0)?;
-            Value::Bool(!r.empty && r.hi_inc)
+        RangeFn::MultiCast(k) => {
+            if vals[0].is_null() {
+                return Ok(Value::Null);
+            }
+            return multi_cast(k, &vals[0]);
         }
-        RangeFn::LowerInf => {
-            let r = range(0)?;
-            Value::Bool(!r.empty && r.lo.is_none())
+        RangeFn::AsMulti => write_ranges(&ranges(0)?.0, true),
+        RangeFn::IsEmpty => Value::Bool(ranges(0)?.0.is_empty()),
+        RangeFn::LowerInc => Value::Bool(ranges(0)?.0.first().is_some_and(|r| r.lo_inc)),
+        RangeFn::UpperInc => Value::Bool(ranges(0)?.0.last().is_some_and(|r| r.hi_inc)),
+        RangeFn::LowerInf => Value::Bool(ranges(0)?.0.first().is_some_and(|r| r.lo.is_none())),
+        RangeFn::UpperInf => Value::Bool(ranges(0)?.0.last().is_some_and(|r| r.hi.is_none())),
+        RangeFn::Merge => {
+            let mut all = ranges(0)?.0;
+            if vals.len() > 1 {
+                all.extend(ranges(1)?.0);
+            }
+            match (all.iter().min_by(|a, b| lo_cmp(a, b)), all.iter().max_by(|a, b| hi_cmp(a, b))) {
+                (Some(lo), Some(hi)) => write_ranges(&[Range { empty: false, lo: lo.lo.clone(), lo_inc: lo.lo_inc, hi: hi.hi.clone(), hi_inc: hi.hi_inc }], false),
+                _ => Value::text("empty"),
+            }
         }
-        RangeFn::UpperInf => {
-            let r = range(0)?;
-            Value::Bool(!r.empty && r.hi.is_none())
-        }
-        RangeFn::Merge => Value::text(&union(&range(0)?, &range(1)?, true)?.to_string()),
         RangeFn::Op(op) => {
-            // these have no other meaning: both sides are ranges
-            let (a, b) = (range(0)?, range(1)?);
-            let t = |x: bool| Value::Bool(x);
-            match op {
-                RangeOp::Left => t(!a.empty && !b.empty && before(&a, &b)),
-                RangeOp::Right => t(!a.empty && !b.empty && before(&b, &a)),
-                RangeOp::NotRight => t(!a.empty && !b.empty && hi_cmp(&a, &b) != Ordering::Greater),
-                RangeOp::NotLeft => t(!a.empty && !b.empty && lo_cmp(&a, &b) != Ordering::Less),
-                RangeOp::Adjacent => t(adjacent(&a, &b)),
-                _ => return Err(Error::runtime("not a range function")),
+            if vals[0].is_null() || vals[1].is_null() {
+                return Ok(Value::Null);
+            }
+            match apply(op, &vals[0], &vals[1])? {
+                Some(v) => v,
+                None => return Err(Error::type_err("this function takes ranges")),
             }
         }
     })
+}
+
+/// The function that casts to the range or multirange type called `tn`, if it is one.
+pub(crate) fn cast_function_for(tn: &str) -> Option<String> {
+    let up = tn.to_ascii_uppercase();
+    let known = KINDS.iter().any(|(n, _)| *n == up) || MULTI.iter().any(|(n, _)| *n == up);
+    let custom = crate::sql::usertypes::lookup(tn).is_some_and(|t| t.range.is_some());
+    (known || custom).then(|| format!("__RANGE_CAST_{up}"))
 }

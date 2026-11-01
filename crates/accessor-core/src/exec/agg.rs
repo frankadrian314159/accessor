@@ -43,6 +43,10 @@ pub enum AggFn {
     BitAnd,
     BitOr,
     BitXor,
+    /// `range_intersect_agg`
+    RangeIntersect,
+    /// `range_agg`: the multirange of the ranges.
+    RangeAgg,
 }
 
 impl AggFn {
@@ -68,6 +72,8 @@ impl AggFn {
             "BIT_AND" => AggFn::BitAnd,
             "BIT_OR" => AggFn::BitOr,
             "BIT_XOR" => AggFn::BitXor,
+            "RANGE_INTERSECT_AGG" => AggFn::RangeIntersect,
+            "RANGE_AGG" => AggFn::RangeAgg,
             _ => return None,
         })
     }
@@ -93,6 +99,8 @@ impl AggFn {
             AggFn::BitAnd => "BitAnd",
             AggFn::BitOr => "BitOr",
             AggFn::BitXor => "BitXor",
+            AggFn::RangeIntersect => "RangeIntersect",
+            AggFn::RangeAgg => "RangeAgg",
         }
     }
 }
@@ -226,6 +234,13 @@ impl AggState {
             }
             AggFn::Last => self.acc = Some(v.clone()),
             AggFn::StringAgg => self.parts.push(v.to_string()),
+            AggFn::RangeIntersect => {
+                self.acc = Some(match self.acc.take() {
+                    None => v.clone(),
+                    Some(a) => crate::expr::ranges::intersect_values(&a, v)?,
+                });
+            }
+            AggFn::RangeAgg => self.items.push(v.clone()),
             AggFn::JsonArrayAgg => self.parts.push(crate::json::to_text(&crate::json::from_value(v))),
             AggFn::ArrayAgg => unreachable!("ARRAY_AGG is fed before the NULL check"),
             AggFn::StddevPop | AggFn::StddevSamp | AggFn::VarPop | AggFn::VarSamp => {
@@ -292,6 +307,12 @@ impl AggState {
                     });
                 }
                 Value::Array(std::sync::Arc::new(at.into_iter().map(|i| self.items[i].clone()).collect()))
+            }
+            AggFn::RangeAgg => {
+                if self.items.is_empty() {
+                    return Value::Null;
+                }
+                crate::expr::ranges::multirange_of(&self.items).unwrap_or(Value::Null)
             }
             AggFn::StringAgg | AggFn::JsonArrayAgg if !self.keys.is_empty() => {
                 let mut at: Vec<usize> = (0..self.parts.len()).collect();
