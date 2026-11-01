@@ -5909,9 +5909,18 @@ impl<'a> Parser<'a> {
                 && (self.peek_kw_at(1, "LIKE")
                     || self.peek_kw_at(1, "BETWEEN")
                     || self.peek_kw_at(1, "IN")
+                    || self.peek_kw_at(1, "REGEXP")
+                    || self.peek_kw_at(1, "RLIKE")
                     || (self.peek_kw_at(1, "SIMILAR") && self.peek_kw_at(2, "TO")));
             if negated {
                 self.advance();
+            }
+            if self.eat_kw("REGEXP") || self.eat_kw("RLIKE") {
+                // MySQL: a REGEXP pattern
+                let pattern = self.concat()?;
+                let call = Expr::Function { name: "REGEXP_LIKE".into(), args: vec![left, pattern], distinct: false, star: false };
+                left = if negated { Expr::Not(Box::new(call)) } else { call };
+                continue;
             }
             if self.peek_kw("SIMILAR") && self.peek_kw_at(1, "TO") {
                 // `x SIMILAR TO pattern`: a regular-expression-like pattern matching the whole text.
@@ -6246,7 +6255,7 @@ impl<'a> Parser<'a> {
             Tok::Quoted(_) => self.column_ref(),
             Tok::Ident(name) => {
                 // _utf8mb4 'text', _binary 0x41: a character set introducer, which does nothing here
-                if name.starts_with('_') && name.len() > 1 && matches!(self.peek_at(1), Tok::Str(_) | Tok::Int(_) | Tok::Big(_)) {
+                if name.starts_with('_') && name.len() > 1 && matches!(self.peek_at(1), Tok::Str(_) | Tok::Int(_) | Tok::Big(_) | Tok::Bytes(_)) {
                     self.advance();
                     return self.primary();
                 }

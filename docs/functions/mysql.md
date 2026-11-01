@@ -65,6 +65,7 @@ Functions MySQL has that the other pages do not already give. NULL in, NULL out,
 | `EXTRACTVALUE(xml, xpath)`, `UPDATEXML(xml, xpath, new)` | the text of the nodes an XPath path selects (joined by spaces; `count(path)` counts), and the XML with the one element it selects replaced. The path may use `/`, `//`, `*`, `@attr`, `text()`, `.`, `..` and the predicates `[n]`, `[last()]`, `[@a='v']`, `[child='v']`, `[position()<n]`; XML that is not well formed gives NULL |
 | `TO_VECTOR(s)`, `FROM_VECTOR(v)`, `VECTOR_DIM(v)`, `DISTANCE(a, b, 'COSINE' \| 'DOT' \| 'EUCLIDEAN')` | a vector is its 32-bit floats (little-endian bytes), written `[1.00000e+00,2.00000e+00]`; the string forms are `STRING_TO_VECTOR` and `VECTOR_TO_STRING` |
 | `ROW_COUNT()` | the rows the last statement changed, -1 after a query |
+| `expr REGEXP pattern`, `expr RLIKE pattern`, `expr NOT REGEXP pattern` | the same as `REGEXP_LIKE(expr, pattern)` (see [regex.md](regex.md)); case is ignored |
 | `BINARY expr` | the text as bytes: compared and sorted byte for byte, so `BINARY 'a' = 'A'` is 0 |
 | `ST_*`, `MBR*`, `POINT(x, y)`, ... | spatial values and relations, see [spatial values](../sql/mysql.md#spatial-values) |
 | `a \| b`, `~a`, `a << b`, `a >> b` | bitwise OR, NOT, and shifts (`&` joins text and `^` is a power, so there is no AND or XOR operator) |

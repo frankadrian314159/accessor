@@ -6644,3 +6644,13 @@ fn regular_expressions_have_backreferences_and_lookaround() {
     assert_eq!(one(&mut db, r"SELECT REGEXP_REPLACE('aa bb cd', '(.)\\1', '<$1>')"), "<a> <b> cd");
     assert_eq!(one(&mut db, "SELECT REGEXP_SUBSTR('foobar', 'foo(?=bar)')"), "foo");
 }
+
+#[test]
+fn mysql_regexp_operator_and_binary_introducers() {
+    let mut db = Database::in_memory();
+    db.set_dialect(accessor_core::dialect::Dialect::Mysql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT 'Abc' REGEXP '^a.c$'"), "1");
+    assert_eq!(one(&mut db, "SELECT 'abc' NOT RLIKE 'x'"), "1");
+    assert_eq!(one(&mut db, "SELECT HEX(_utf16 x'0000ffff')"), "0000FFFF");
+}
