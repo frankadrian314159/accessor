@@ -309,6 +309,9 @@ impl ScalarFn {
     /// Functions that tolerate (and may transform) `Null` arguments; all
     /// others yield `Null` as soon as any argument is `Null`.
     fn handles_null(self) -> bool {
+        if matches!(self, ScalarFn::Greatest | ScalarFn::Least) && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+            return true;
+        }
         if let ScalarFn::Pg(p) = self {
             return p.handles_null();
         }
@@ -749,8 +752,14 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             }
         }
         Greatest | Least => {
-            let mut best = vals[0].clone().into_owned();
-            for v in &vals[1..] {
+            // PostgreSQL leaves NULLs out; the others give NULL if there is one
+            let mut live = vals.iter().filter(|v| !v.is_null());
+            if vals.iter().any(|v| v.is_null()) && crate::dialect::current() != crate::dialect::Dialect::Postgresql {
+                return Ok(Value::Null);
+            }
+            let Some(first) = live.next() else { return Ok(Value::Null) };
+            let mut best = first.clone().into_owned();
+            for v in live {
                 let ord = v.sql_cmp(&best).ok_or_else(|| Error::type_err("cannot compare these values"))?;
                 if (f == Greatest && ord.is_gt()) || (f == Least && ord.is_lt()) {
                     best = v.clone().into_owned();

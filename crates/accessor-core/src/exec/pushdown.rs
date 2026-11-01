@@ -24,7 +24,7 @@ fn plain(e: &Expr) -> bool {
     let _ = walk_expr(&mut e.clone(), &mut |x| {
         match x {
             Expr::Window { .. } | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSelect { .. } | Expr::Param(_) => ok = false,
-            Expr::Function { name, .. } if crate::exec::agg::AggFn::from_name(name).is_some() => ok = false,
+            Expr::Function { name, .. } if crate::exec::agg::is_aggregate_name(name) => ok = false,
             _ => {}
         }
         Ok(())

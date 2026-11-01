@@ -26,6 +26,7 @@ A session speaks one of three dialects. `asql` is the default and is what the re
 | `ON CONFLICT (lower(a), b)`, `ON CONFLICT ON CONSTRAINT c` | not read | an expression in the target (or a constraint name) makes any conflict count | not read |
 | `CREATE TRIGGER .. REFERENCING OLD \| NEW TABLE AS t` | not read | read and ignored: a trigger that reads the transition table fails when it fires | not read |
 | `ALTER TABLE p ATTACH PARTITION c` | the columns must match in order | a child with the same columns in another order is put in the parent's order | the same as `asql` |
+| `CREATE AGGREGATE name (type, ..) (SFUNC = f, STYPE = t [, FINALFUNC = g] [, INITCOND = 'v'])` | not read | the state starts as `INITCOND` (cast to `STYPE`), `f(state, args..)` runs for each row (after `DISTINCT` and `ORDER BY` inside the call), and `g(state)` gives the result; `f` and `g` are functions with an expression body, or a function of the server such as `int4pl` or `int8inc`; the old spelling (`BASETYPE`, `SFUNC1`, `STYPE1`, `INITCOND1`) and `(*)` are read, the other options are ignored; ordered-set and `VARIADIC` aggregates are refused; `DROP AGGREGATE` | not read |
 
 ## Choosing one
 

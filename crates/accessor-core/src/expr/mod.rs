@@ -38,6 +38,9 @@ pub enum BExpr {
     InSet { expr: Box<BExpr>, set: HashSet<Value>, has_null: bool, negated: bool },
     Func(ScalarFn, Vec<BExpr>),
     Case { whens: Vec<(BExpr, BExpr)>, else_expr: Option<Box<BExpr>> },
+    /// A user-defined aggregate over the array `items` of its argument rows: `step` reads `[state, args..]` and gives the next
+    /// state, `fin` reads `[state]`.
+    Fold { items: Box<BExpr>, step: Box<BExpr>, init: Box<BExpr>, fin: Option<Box<BExpr>>, nargs: usize },
 }
 
 /// Three-valued truth of a value: `None` is SQL unknown.
@@ -221,6 +224,27 @@ impl BExpr {
                 Cow::Owned(from_tri(negate_tri(t, *negated)))
             }
             BExpr::Func(f, args) => Cow::Owned(func::call(*f, args, row)?),
+            BExpr::Fold { items, step, init, fin, nargs } => {
+                let list = items.eval(row)?;
+                let mut state = init.eval(&[])?.into_owned();
+                if let Value::Array(rows) = &*list {
+                    for item in rows.iter() {
+                        let mut at = Vec::with_capacity(1 + nargs);
+                        at.push(state);
+                        match (nargs, item) {
+                            (0, _) => {}
+                            (1, v) => at.push(v.clone()),
+                            (_, Value::Array(parts)) => at.extend(parts.iter().cloned()),
+                            (_, v) => at.push(v.clone()),
+                        }
+                        state = step.eval(&at)?.into_owned();
+                    }
+                }
+                match fin {
+                    Some(f) => Cow::Owned(f.eval(&[state])?.into_owned()),
+                    None => Cow::Owned(state),
+                }
+            }
             BExpr::Case { whens, else_expr } => {
                 for (cond, result) in whens {
                     if cond.eval_tri(row)? == Some(true) {
@@ -272,6 +296,7 @@ impl BExpr {
             }
             BExpr::InSet { expr, .. } => expr.visit_cols(f),
             BExpr::Func(_, args) => args.iter().for_each(|e| e.visit_cols(f)),
+            BExpr::Fold { items, .. } => items.visit_cols(f),
             BExpr::Case { whens, else_expr } => {
                 for (c, r) in whens {
                     c.visit_cols(f);
@@ -316,6 +341,9 @@ impl BExpr {
                 BExpr::InSet { expr: bx(expr), set: set.clone(), has_null: *has_null, negated: *negated }
             }
             BExpr::Func(func, args) => BExpr::Func(*func, args.iter().map(|e| e.map_cols(f)).collect()),
+            BExpr::Fold { items, step, init, fin, nargs } => {
+                BExpr::Fold { items: bx(items), step: step.clone(), init: init.clone(), fin: fin.clone(), nargs: *nargs }
+            }
             BExpr::Case { whens, else_expr } => BExpr::Case {
                 whens: whens.iter().map(|(c, r)| (c.map_cols(f), r.map_cols(f))).collect(),
                 else_expr: else_expr.as_ref().map(|e| bx(e)),
@@ -337,6 +365,7 @@ impl BExpr {
             BExpr::Func(f, args) => {
                 !f.is_volatile() && args.iter().all(BExpr::is_constant)
             }
+            BExpr::Fold { items, .. } => items.is_constant(),
             BExpr::Case { whens, else_expr } => {
                 whens.iter().all(|(c, r)| c.is_constant() && r.is_constant())
                     && else_expr.as_ref().is_none_or(|e| e.is_constant())

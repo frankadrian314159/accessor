@@ -28,7 +28,7 @@ const MAX_CALLS: u32 = 16;
 /// Loop iterations one `CALL` may make in all.
 const MAX_ITERATIONS: u64 = 1_000_000;
 
-fn cast_to(e: Expr, ty: DataType) -> Expr {
+pub(crate) fn cast_to(e: Expr, ty: DataType) -> Expr {
     match cast_function(ty) {
         Some(name) => Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false },
         None => e,
@@ -927,8 +927,19 @@ impl Database {
         }
     }
 
+    /// The aggregate made with `CREATE AGGREGATE` called `name`.
+    pub(crate) fn aggregate_def(&self, name: &str) -> Option<Arc<RoutineDef>> {
+        self.routines.get(&key(name)).filter(|r| r.aggregate.is_some()).cloned()
+    }
+
+    /// Tells the parser and binder (through a thread-local) which names are user-defined aggregates.
+    pub(crate) fn sync_aggregates(&self) {
+        let names = self.routines.iter().filter(|(_, r)| r.aggregate.is_some()).map(|(k, _)| k.to_ascii_lowercase()).collect();
+        crate::exec::agg::set_user_aggregates(names);
+    }
+
     /// The routine called `name`, if it is a function.
     pub(crate) fn function_def(&self, name: &str) -> Option<Arc<RoutineDef>> {
-        self.routines.get(&key(name)).filter(|r| r.function).cloned()
+        self.routines.get(&key(name)).filter(|r| r.function && r.aggregate.is_none()).cloned()
     }
 }

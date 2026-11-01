@@ -133,6 +133,11 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
     })
 }
 
+/// The SQL for a function of the server itself, such as `int4pl` or `int8inc`, with `args` for its arguments.
+pub(crate) fn internal_function_text(name: &str, args: &[String]) -> Option<String> {
+    pgfunc::internal_function(name, args)
+}
+
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
     let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
@@ -379,7 +384,7 @@ fn row_in_query(items: &[Expr], mut q: Select, negated: bool) -> Expr {
     for item in &mut q.items {
         if let SelectItem::Expr { expr, .. } = item {
             let _ = crate::sql::walk::walk_expr(expr, &mut |e| {
-                if matches!(e, Expr::Window { .. }) || matches!(e, Expr::Function { name, .. } if crate::exec::agg::AggFn::from_name(name).is_some()) {
+                if matches!(e, Expr::Window { .. }) || matches!(e, Expr::Function { name, .. } if crate::exec::agg::is_aggregate_name(name)) {
                     aggregates = true;
                 }
                 Ok(())
@@ -3448,7 +3453,7 @@ impl<'a> Parser<'a> {
             (RoutineBody::Block(b), self.toks[self.pos - 1].pos + "END".len())
         };
         let sql = self.src[start..end].trim().to_string();
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, set_columns: Vec::new(), sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, set_columns: Vec::new(), aggregate: None, sql })))
     }
 
     /// A data type written as a name (`INTEGER`, `VARCHAR(20)`, `DOUBLE PRECISION`, ...).
@@ -3841,6 +3846,10 @@ impl<'a> Parser<'a> {
                 return self.pg_routine(function, create_pos);
             }
             return self.routine(function, create_pos);
+        }
+        if !unique && self.eat_kw("AGGREGATE") {
+            self.if_exists_clause(true, guarded)?;
+            return self.pg_aggregate(create_pos);
         }
         if !unique && self.eat_kw("SEQUENCE") {
             self.if_exists_clause(true, guarded)?;
@@ -5110,6 +5119,13 @@ impl<'a> Parser<'a> {
         } else if self.eat_kw("REPORT") {
             self.if_exists_clause(false, guarded)?;
             Ok(Statement::DropReport(self.ident()?))
+        } else if self.eat_kw("AGGREGATE") {
+            self.if_exists_clause(false, guarded)?;
+            let name = self.table_ident()?;
+            self.skip_argument_types()?;
+            self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            Ok(Statement::DropRoutine { name, function: true })
         } else if self.peek_kw("FUNCTION") || self.peek_kw("PROCEDURE") {
             let function = self.peek_kw("FUNCTION");
             self.advance();

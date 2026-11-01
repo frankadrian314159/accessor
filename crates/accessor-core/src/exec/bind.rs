@@ -339,7 +339,7 @@ impl Correlator<'_> {
 
 pub fn contains_agg(e: &Expr) -> bool {
     match e {
-        Expr::Function { name, args, .. } => AggFn::from_name(name).is_some() || args.iter().any(contains_agg),
+        Expr::Function { name, args, .. } => super::agg::is_aggregate_name(name) || args.iter().any(contains_agg),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) | Expr::Subquery(_) | Expr::Exists { .. } => false,
         // The window function itself is not an aggregate, but aggregates may sit inside its arguments.
         Expr::Window { func, spec } => {
@@ -450,6 +450,9 @@ impl<'a> Binder<'a> {
                 if let Some(func) = AggFn::from_name(name) {
                     return self.bind_agg(func, args, *distinct, *star);
                 }
+                if let Some(def) = self.db.aggregate_def(name) {
+                    return self.bind_user_agg(&def, args, *distinct, *star);
+                }
             }
             // An expression identical to a GROUP BY expression is read from
             // the group key instead of being recomputed.
@@ -472,7 +475,7 @@ impl<'a> Binder<'a> {
                 }
             }
         } else if let Expr::Function { name, .. } = e {
-            if AggFn::from_name(name).is_some() {
+            if super::agg::is_aggregate_name(name) {
                 return Err(Error::runtime(format!("aggregate function {name} is not allowed here")));
             }
         }
@@ -800,6 +803,71 @@ impl<'a> Binder<'a> {
         self.allow_win = saved;
         self.wins.push(result?);
         Ok(BExpr::Col(WIN_BASE + self.wins.len() - 1))
+    }
+
+    /// A call of an aggregate made with `CREATE AGGREGATE`: the argument rows are collected (as `ARRAY_AGG` does, with
+    /// its `DISTINCT` and `ORDER BY`), and the state function is run over them from the initial value, then the final
+    /// function.
+    fn bind_user_agg(&mut self, def: &crate::sql::ast::RoutineDef, args: &[Expr], distinct: bool, star: bool) -> Result<BExpr> {
+        let agg = def.aggregate.as_ref().expect("an aggregate");
+        let (order_args, plain): (Vec<&Expr>, Vec<&Expr>) = args.iter().partition(|a| matches!(a, Expr::Function { name, .. } if name == "__AGG_ORDER"));
+        let given = if star { 0 } else { plain.len() };
+        if given != agg.nargs {
+            return Err(Error::runtime(format!("{} takes {} argument(s), not {given}", def.name, agg.nargs)));
+        }
+        let item = match plain.len() {
+            0 => Expr::Literal(Value::Int(1)),
+            1 => plain[0].clone(),
+            _ => Expr::Function { name: "__ARRAY".into(), args: plain.iter().map(|a| (*a).clone()).collect(), distinct: false, star: false },
+        };
+        let mut collect = vec![item];
+        collect.extend(order_args.into_iter().cloned());
+        let items = self.bind_agg(AggFn::ArrayAgg, &collect, distinct, false)?;
+
+        let mut cols = vec![ScopeCol { table: String::new(), name: "__state".into(), hidden: false }];
+        let mut step_args = vec![Expr::Column { table: None, name: "__state".into() }];
+        for i in 0..agg.nargs {
+            cols.push(ScopeCol { table: String::new(), name: format!("__a{i}"), hidden: false });
+            step_args.push(Expr::Column { table: None, name: format!("__a{i}") });
+        }
+        let scope = Scope { cols, invisible: Vec::new() };
+        let call = |db: &Database, scope: &Scope, name: &str, args: Vec<Expr>| -> Result<BExpr> {
+            let known = db.function_def(name).is_some() || ScalarFn::lookup(name).is_some();
+            let e = if known {
+                Expr::Function { name: name.to_string(), args, distinct: false, star: false }
+            } else {
+                // a function of the server itself (int4pl, int8inc, ...)
+                let texts: Vec<String> = args.iter().map(|a| match a {
+                    Expr::Column { name, .. } => name.clone(),
+                    _ => String::new(),
+                }).collect();
+                match crate::sql::parser::internal_function_text(name, &texts) {
+                    Some(sql) => crate::sql::parser::parse_expression(&sql)?,
+                    None => return Err(Error::catalog(format!("the function '{name}' does not exist"))),
+                }
+            };
+            Binder::new(db, scope, 0).bind(&e)
+        };
+        let step = call(self.db, &scope, &agg.sfunc, step_args)?;
+        let fin = match &agg.finalfunc {
+            Some(f) => {
+                let scope = Scope { cols: vec![scope.cols[0].clone()], invisible: Vec::new() };
+                Some(Box::new(call(self.db, &scope, f, vec![Expr::Column { table: None, name: "__state".into() }])?))
+            }
+            None => None,
+        };
+        let init = match &agg.initcond {
+            Some(text) => {
+                let lit = Expr::Literal(Value::text(text));
+                let e = match agg.stype {
+                    Some(t) => super::routine::cast_to(lit, t),
+                    None => lit,
+                };
+                Binder::new(self.db, &Scope::default(), 0).bind(&e)?
+            }
+            None => BExpr::Lit(Value::Null),
+        };
+        Ok(BExpr::Fold { items: Box::new(items), step: Box::new(step), init: Box::new(init), fin, nargs: agg.nargs })
     }
 
     fn bind_agg(&mut self, func: AggFn, all_args: &[Expr], distinct: bool, star: bool) -> Result<BExpr> {

@@ -6758,3 +6758,34 @@ fn postgresql_copy_writes_and_reads_files() {
     assert_eq!(db.execute("SELECT b FROM t2 WHERE a = 3").unwrap().rows[0][0].to_string(), "q,\"z");
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn postgresql_create_aggregate_folds_a_state_function_over_the_rows() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TABLE t (g int, a int, b int)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 3, 10), (1, 5, 20), (2, 7, 30)").unwrap();
+    db.execute("CREATE AGGREGATE newsum (sfunc1 = int4pl, basetype = int4, stype1 = int4, initcond1 = '0')").unwrap();
+    db.execute("CREATE AGGREGATE newcnt (*) (sfunc = int8inc, stype = int8, initcond = '0')").unwrap();
+    db.execute("CREATE FUNCTION least_accum(int8, int8) RETURNS int8 LANGUAGE sql AS 'select least($1, $2)'").unwrap();
+    db.execute("CREATE AGGREGATE least_agg(int8) (stype = int8, sfunc = least_accum)").unwrap();
+    db.execute("CREATE FUNCTION sum3(int8, int8, int8) RETURNS int8 LANGUAGE sql AS 'select $1 + $2 + $3'").unwrap();
+    db.execute("CREATE AGGREGATE sum2(int8, int8) (sfunc = sum3_2, stype = int8, initcond = '0')").ok();
+    db.execute("CREATE FUNCTION add2(int8, int8, int8) RETURNS int8 LANGUAGE sql AS 'select $1 + $2 * $3'").unwrap();
+    db.execute("CREATE AGGREGATE dot(int8, int8) (sfunc = add2, stype = int8, initcond = '0')").unwrap();
+    db.execute("CREATE FUNCTION half(int8) RETURNS int8 LANGUAGE sql AS 'select $1 / 2'").unwrap();
+    db.execute("CREATE AGGREGATE halfsum(int8) (sfunc = int8pl, stype = int8, finalfunc = half, initcond = '0')").unwrap();
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT newsum(a) FROM t"), "15");
+    assert_eq!(one(&mut db, "SELECT newcnt(*) FROM t"), "3");
+    assert_eq!(one(&mut db, "SELECT least_agg(a) FROM t"), "3");
+    assert_eq!(one(&mut db, "SELECT dot(a, b) FROM t"), "340");
+    assert_eq!(one(&mut db, "SELECT halfsum(a) FROM t"), "7");
+    assert_eq!(one(&mut db, "SELECT newsum(a) FROM t WHERE a > 100"), "0");
+    let r = db.execute("SELECT g, newsum(a) FROM t GROUP BY g ORDER BY g").unwrap();
+    assert_eq!(r.rows[0][1].to_string(), "8");
+    assert_eq!(r.rows[1][1].to_string(), "7");
+    db.execute("DROP AGGREGATE newsum(int4)").unwrap();
+    assert!(db.execute("SELECT newsum(a) FROM t").is_err());
+}

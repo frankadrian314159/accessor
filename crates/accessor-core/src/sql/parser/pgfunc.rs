@@ -124,6 +124,108 @@ impl<'a> Parser<'a> {
         self.data_type_name()
     }
 
+    /// Moves to the `,` or `)` that ends the value being skipped (brackets inside it are skipped whole).
+    fn skip_option_value(&mut self) {
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                Tok::Eof => return,
+                Tok::Sym(",") | Tok::Sym(")") if depth == 0 => return,
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth -= 1,
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
+    /// `CREATE AGGREGATE name ([*] | type, ...) (SFUNC = f, STYPE = t [, FINALFUNC = g] [, INITCOND = 'v'] ...)`, and the
+    /// old spelling `CREATE AGGREGATE name (BASETYPE = t, SFUNC = f, ...)`. The other options (parallel, moving
+    /// aggregates, combine functions) are read and ignored.
+    pub(super) fn pg_aggregate(&mut self, start: usize) -> Result<Statement> {
+        let name = self.table_ident()?;
+        self.expect_sym("(")?;
+        let old_style = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Sym("="));
+        let mut nargs = 1usize;
+        if !old_style {
+            if self.eat_sym("*") {
+                nargs = 0;
+            } else if self.peek_sym(")") {
+                nargs = 0;
+            } else {
+                nargs = 1;
+                let mut depth = 0usize;
+                loop {
+                    match self.peek() {
+                        Tok::Eof => return Err(self.unexpected(")")),
+                        Tok::Sym(")") if depth == 0 => break,
+                        Tok::Sym("(") => depth += 1,
+                        Tok::Sym(")") => depth -= 1,
+                        Tok::Sym(",") if depth == 0 => nargs += 1,
+                        Tok::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("ORDER") => {
+                            return Err(Error::syntax("ordered-set aggregates are not supported"));
+                        }
+                        Tok::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("VARIADIC") => {
+                            return Err(Error::syntax("VARIADIC aggregates are not supported"));
+                        }
+                        _ => {}
+                    }
+                    self.advance();
+                }
+            }
+            self.expect_sym(")")?;
+            self.expect_sym("(")?;
+        }
+        let (mut sfunc, mut stype, mut finalfunc, mut initcond) = (None::<String>, None::<DataType>, None::<String>, None::<String>);
+        loop {
+            let option = self.ident()?.to_ascii_lowercase();
+            self.expect_sym("=")?;
+            match option.as_str() {
+                "sfunc" | "sfunc1" => sfunc = Some(self.table_ident()?),
+                "finalfunc" => finalfunc = Some(self.table_ident()?),
+                "initcond" | "initcond1" => match self.advance() {
+                    Tok::Str(s) => initcond = Some(s),
+                    _ => {
+                        self.pos -= 1;
+                        return Err(self.unexpected("the initial value in quotes"));
+                    }
+                },
+                "stype" | "stype1" => {
+                    let at = self.pos;
+                    match self.pg_type() {
+                        Ok(t) if matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")) => stype = Some(t),
+                        _ => self.pos = at,
+                    }
+                }
+                _ => {}
+            }
+            self.skip_option_value();
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        let sfunc = sfunc.ok_or_else(|| Error::syntax("an aggregate needs SFUNC"))?;
+        if stype.is_none() && initcond.is_none() && finalfunc.is_none() && old_style {
+            // nothing to say about the state beyond the function
+        }
+        let end = self.toks[self.pos].pos;
+        let sql = self.src[start..end].trim().to_string();
+        let params = (0..nargs).map(|i| RoutineParam { name: format!("${}", i + 1), data_type: None, default: None, out: false }).collect();
+        let aggregate = Some(Box::new(AggregateDef { sfunc, stype, finalfunc, initcond, nargs }));
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef {
+            name,
+            function: true,
+            params,
+            returns: None,
+            body: RoutineBody::Block(Vec::new()),
+            trigger: false,
+            set_columns: Vec::new(),
+            aggregate,
+            sql,
+        })))
+    }
+
     pub(super) fn pg_routine(&mut self, function: bool, start: usize) -> Result<Statement> {
         let name = self.table_ident()?;
         self.expect_sym("(")?;
@@ -300,7 +402,7 @@ impl<'a> Parser<'a> {
             }
             other => return Err(Error::syntax(format!("the language '{other}' is not available (use sql or plpgsql)"))),
         };
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, trigger: is_trigger, set_columns, sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, trigger: is_trigger, set_columns, aggregate: None, sql })))
     }
 
     /// `DROP FUNCTION name (argument types)`: the types are read and ignored (functions are known by name).
@@ -994,7 +1096,7 @@ impl<'a> Parser<'a> {
             [ProcStmt::Return(Some(e))] if function => RoutineBody::Expr(e.clone()),
             _ => RoutineBody::Block(stmts),
         };
-        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, set_columns: Vec::new(), sql })))
+        Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body, trigger: false, set_columns: Vec::new(), aggregate: None, sql })))
     }
 
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
@@ -1372,7 +1474,7 @@ impl<'a> Parser<'a> {
 }
 
 /// The expression a server function (`int4eq`, `int8pl`, `int4in`, ..) stands for, over the arguments `a`.
-fn internal_function(name: &str, a: &[String]) -> Option<String> {
+pub(crate) fn internal_function(name: &str, a: &[String]) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     const TYPES: [(&str, &str); 14] = [
         ("int2", "smallint"),
@@ -1413,6 +1515,10 @@ fn internal_function(name: &str, a: &[String]) -> Option<String> {
             "in" | "recv" if a.len() == 1 => return Some(format!("CAST({} AS {sql_type})", a[0])),
             "out" | "send" if a.len() == 1 => return Some(format!("CAST({} AS text)", a[0])),
             "um" if a.len() == 1 => return Some(format!("(-{})", a[0])),
+            "inc" if a.len() == 1 => return Some(format!("({} + 1)", a[0])),
+            "inc_any" if a.len() == 2 => return Some(format!("({} + 1)", a[0])),
+            "larger" if a.len() == 2 => return Some(format!("GREATEST({}, {})", a[0], a[1])),
+            "smaller" if a.len() == 2 => return Some(format!("LEAST({}, {})", a[0], a[1])),
             "abs" if a.len() == 1 => return Some(format!("ABS({})", a[0])),
             _ => {}
         }

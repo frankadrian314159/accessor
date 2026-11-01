@@ -7,6 +7,20 @@ use crate::expr::{arith, tri, BExpr};
 use crate::sql::ast::BinOp;
 use crate::value::Value;
 
+thread_local! {
+    static USER_AGGREGATES: std::cell::RefCell<HashSet<String>> = std::cell::RefCell::new(HashSet::new());
+}
+
+/// Makes `names` (lower case) the user-defined aggregates that calls are read against on this thread.
+pub(crate) fn set_user_aggregates(names: HashSet<String>) {
+    USER_AGGREGATES.with(|u| *u.borrow_mut() = names);
+}
+
+/// Is `name` a built-in aggregate or one made with `CREATE AGGREGATE`?
+pub fn is_aggregate_name(name: &str) -> bool {
+    AggFn::from_name(name).is_some() || USER_AGGREGATES.with(|u| !u.borrow().is_empty() && u.borrow().contains(&name.to_ascii_lowercase()))
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AggFn {
     Count,

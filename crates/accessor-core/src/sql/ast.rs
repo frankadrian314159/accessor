@@ -479,7 +479,20 @@ pub struct RoutineDef {
     pub trigger: bool,
     /// `RETURNS TABLE (...)` / `RETURNS SETOF type`: the names of the columns of the rows it returns (it is called in FROM).
     pub set_columns: Vec<String>,
+    /// `CREATE AGGREGATE`: the parts of the aggregate (the routine then has no body).
+    pub aggregate: Option<Box<AggregateDef>>,
     pub sql: String,
+}
+
+/// A user-defined aggregate: the state starts as `initcond`, `sfunc(state, args..)` makes the next state for each row, and
+/// `finalfunc(state)` (if any) gives the result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggregateDef {
+    pub sfunc: String,
+    pub stype: Option<DataType>,
+    pub finalfunc: Option<String>,
+    pub initcond: Option<String>,
+    pub nargs: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]

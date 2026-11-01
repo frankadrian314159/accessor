@@ -551,12 +551,14 @@ impl Database {
                     return Err(Error::catalog(format!("the function or procedure '{name}' already exists")));
                 }
                 self.routines.insert(k, Arc::new(def));
+                self.sync_aggregates();
                 Ok(None)
             }
             Op::DropRoutine(name) => {
                 self.routines
                     .remove(&key(name))
                     .ok_or_else(|| Error::catalog(format!("the function or procedure '{name}' does not exist")))?;
+                self.sync_aggregates();
                 Ok(None)
             }
             Op::CreateTrigger { name, sql } => {
@@ -1089,6 +1091,7 @@ impl Database {
     pub(crate) fn enter_session(&self) {
         crate::tz::set_session(self.time_zone);
         crate::dialect::set_session(self.dialect());
+        self.sync_aggregates();
         crate::sequence::set_current(&self.seqs);
         // A connection reading for a transaction that is not the one the database has open says so.
         mvcc::set_view(mvcc::override_view().unwrap_or_else(|| self.view_of()));
