@@ -288,6 +288,16 @@ impl<'a> Parser<'a> {
                 plpgsql_body(&body, names, false)?
             }
             "plpgsql" => plpgsql_body(&body, names, returns.is_some())?,
+            "internal" => {
+                // a function of the server that is given a new name: AS 'int4eq' stands for the operator it implements
+                let inner = body.trim();
+                let args: Vec<String> = (1..=params.len()).map(|i| format!("${i}")).collect();
+                let text = match internal_function(inner, &args) {
+                    Some(t) => t,
+                    None => format!("{inner}({})", args.join(", ")),
+                };
+                sql_body(&format!("SELECT {text}"), &names, returns.is_some())?
+            }
             other => return Err(Error::syntax(format!("the language '{other}' is not available (use sql or plpgsql)"))),
         };
         Ok(Statement::CreateRoutine(Box::new(RoutineDef { name, function, params, returns, body: routine_body, trigger: is_trigger, set_columns, sql })))
@@ -1359,4 +1369,53 @@ impl<'a> Parser<'a> {
         out.push(ProcStmt::Sql(st));
         self.my_end()
     }
+}
+
+/// The expression a server function (`int4eq`, `int8pl`, `int4in`, ..) stands for, over the arguments `a`.
+fn internal_function(name: &str, a: &[String]) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    const TYPES: [(&str, &str); 14] = [
+        ("int2", "smallint"),
+        ("int4", "integer"),
+        ("int8", "bigint"),
+        ("float4", "real"),
+        ("float8", "double precision"),
+        ("numeric", "numeric"),
+        ("text", "text"),
+        ("bool", "boolean"),
+        ("date", "date"),
+        ("timestamp", "timestamp"),
+        ("timestamptz", "timestamptz"),
+        ("interval", "interval"),
+        ("oid", "bigint"),
+        ("varchar", "text"),
+    ];
+    for (prefix, sql_type) in TYPES {
+        let Some(op) = lower.strip_prefix(prefix) else { continue };
+        let symbol = match op {
+            "eq" => "=",
+            "ne" => "<>",
+            "lt" => "<",
+            "le" => "<=",
+            "gt" => ">",
+            "ge" => ">=",
+            "pl" => "+",
+            "mi" => "-",
+            "mul" => "*",
+            "div" => "/",
+            "mod" => "%",
+            _ => "",
+        };
+        if !symbol.is_empty() && a.len() == 2 {
+            return Some(format!("({} {symbol} {})", a[0], a[1]));
+        }
+        match op {
+            "in" | "recv" if a.len() == 1 => return Some(format!("CAST({} AS {sql_type})", a[0])),
+            "out" | "send" if a.len() == 1 => return Some(format!("CAST({} AS text)", a[0])),
+            "um" if a.len() == 1 => return Some(format!("(-{})", a[0])),
+            "abs" if a.len() == 1 => return Some(format!("ABS({})", a[0])),
+            _ => {}
+        }
+    }
+    None
 }

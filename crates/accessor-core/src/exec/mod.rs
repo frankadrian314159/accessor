@@ -4,6 +4,7 @@ pub use prepared::Prepared;
 pub mod agg;
 pub mod bind;
 mod budget;
+mod copy;
 mod multi;
 mod mysqlshow;
 mod catalog;
@@ -168,6 +169,18 @@ impl Database {
             }
             Statement::SetTimeZone(name) => self.set_time_zone(name).map(|_| QueryResult::default()),
             Statement::Select(s) if s.lock.is_some() => self.exec_locking_select(s),
+            Statement::Select(s) if s.with.as_ref().is_some_and(|w| w.ctes.iter().any(|c| c.modifying.is_some())) => {
+                // WITH x AS (INSERT .. RETURNING ..) SELECT ..: the statements run first, and the query reads what they returned
+                let mut s = s.clone();
+                for cte in s.with.iter_mut().flat_map(|w| w.ctes.iter_mut()) {
+                    let Some(stmt) = cte.modifying.take() else { continue };
+                    let done = self.execute_statement(&stmt)?;
+                    cte.query = rows_as_select(&done, &cte.columns);
+                }
+                let r = self.run_select(&s)?;
+                crate::expr::myfuncs::set_found_rows(r.rows.len());
+                Ok(r)
+            }
             Statement::Select(s) => {
                 let r = self.run_select(s)?;
                 crate::expr::myfuncs::set_found_rows(r.rows.len());
@@ -353,6 +366,7 @@ impl Database {
             Statement::DropView(name) => self.exec_drop_view(name),
             Statement::Parameters(_) => Ok(QueryResult::default()),
             Statement::Exec { name, args } => self.exec_exec(name, args),
+            Statement::Copy(def) => self.exec_copy(def),
             Statement::Raise(_) => Err(Error::runtime("RAISE can only be used inside a trigger")),
             Statement::InsertSelectExtend { table, select } => self.exec_insert_select_extend(table, select),
             Statement::Signal { resignal, state, items } => {
@@ -412,6 +426,28 @@ impl Database {
 }
 
 /// What `EXPLAIN` says of a statement that is not a query: which kind it is, and that it was not run.
+/// The rows of `done` as a query of literals (named `names`, or by the statement's own columns).
+fn rows_as_select(done: &QueryResult, names: &[String]) -> crate::sql::ast::Select {
+    use crate::sql::ast::{Expr, Select, SelectItem, SetOp, SetPart};
+    use crate::value::Value;
+    let name_of = |i: usize| names.get(i).cloned().or_else(|| done.columns.get(i).cloned()).unwrap_or_else(|| format!("column{}", i + 1));
+    let width = done.columns.len().max(names.len());
+    let row_select = |row: &[Value]| Select {
+        items: (0..width)
+            .map(|i| SelectItem::Expr { expr: Expr::Literal(row.get(i).cloned().unwrap_or(Value::Null)), alias: Some(name_of(i)) })
+            .collect(),
+        ..Select::default()
+    };
+    let Some((first, rest)) = done.rows.split_first() else {
+        let mut empty = row_select(&[]);
+        empty.filter = Some(Expr::Literal(Value::Bool(false)));
+        return empty;
+    };
+    let mut sel = row_select(first);
+    sel.unions = rest.iter().map(|r| SetPart { op: SetOp::Union, all: true, select: row_select(r) }).collect();
+    sel
+}
+
 fn explain_other(st: &Statement) -> QueryResult {
     let what = match st {
         Statement::Insert { table, .. } => format!("insert into {table}"),

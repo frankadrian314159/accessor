@@ -233,6 +233,14 @@ impl Database {
                     (0..schema.columns.len()).filter(|&i| !schema.columns[i].is_calculated() && !hidden.iter().any(|h| h.eq_ignore_ascii_case(&schema.columns[i].name))).collect()
                 }
             };
+            // PostgreSQL: with no column list, fewer values than columns leave the last columns to their defaults
+            if let (None, InsertSource::Values(rows), crate::dialect::Dialect::Postgresql) = (columns, source, crate::dialect::current()) {
+                if let Some(width) = rows.first().map(Vec::len) {
+                    if width < positions.len() && rows.iter().all(|r| r.len() == width) {
+                        positions.truncate(width);
+                    }
+                }
+            }
             let value_rows: Vec<Vec<Value>> = match source {
                 InsertSource::Values(rows) => {
                     let scope = Scope::default();

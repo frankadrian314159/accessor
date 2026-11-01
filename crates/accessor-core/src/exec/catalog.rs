@@ -87,7 +87,7 @@ impl Database {
                     if self.catalog_has(c.kind, name) && !c.replace {
                         return Err(Error::catalog(format!("{what} \"{name}\" already exists")));
                     }
-                    if c.kind == "type" && self.catalog_has("type", name) {
+                    if c.kind == "type" && !c.replace && self.catalog_has("type", name) {
                         return Err(Error::catalog(format!("type \"{name}\" already exists")));
                     }
                     self.catalog_set(c.kind, name, Some(value.clone()))?;

@@ -404,7 +404,7 @@ impl DataType {
             | "REGDICTIONARY" | "REGCOLLATION" | "BYTEA" | "TSVECTOR" | "TSQUERY" | "JSONPATH" | "INET" | "CIDR" | "MACADDR" | "MACADDR8"
             | "UUID" | "BOX" | "POINT" | "POLYGON" | "PATH" | "CIRCLE" | "LINE" | "LSEG" | "XML" | "PG_LSN" | "TID" | "CID" | "VARBIT"
             | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE" | "INT4MULTIRANGE" | "INT8MULTIRANGE"
-            | "NUMMULTIRANGE" | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "REFCURSOR" => (DataType::Text, false),
+            | "NUMMULTIRANGE" | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "REFCURSOR" | "CSTRING" | "INTERNAL" => (DataType::Text, false),
             "XID" | "XID8" | "OID8" | "MEDIUMINT" | "INT1" | "INT3" | "YEAR" => (DataType::Integer, false),
             // MySQL's text and binary families are all text here
             "TINYTEXT" | "MEDIUMTEXT" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BLOB" | "VARBINARY" | "BINARY" | "GEOMETRY" | "GEOMETRYCOLLECTION"

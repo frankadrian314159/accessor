@@ -6689,3 +6689,72 @@ fn a_view_over_information_schema_columns_can_read_itself_and_set_var_limits_the
     }
     assert!(db.execute("SELECT /*+ SET_VAR(max_execution_time=1) */ * FROM t1 a, t1 b").is_err());
 }
+
+#[test]
+fn postgresql_operators_escape_strings_and_alter_forms() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT |/ 64.0"), "8");
+    assert_eq!(one(&mut db, "SELECT ||/ 27.0"), "3");
+    assert_eq!(one(&mut db, "SELECT 6 & 3"), "2");
+    assert_eq!(one(&mut db, "SELECT 6 # 3"), "5");
+    assert_eq!(one(&mut db, "SELECT 'a' || 'b' || 1"), "ab1");
+    assert_eq!(one(&mut db, r"SELECT length(E'a\nb\x41é\\')"), "6");
+    assert_eq!(one(&mut db, "SELECT 'it''s', E'it''s'"), "it's");
+    assert_eq!(one(&mut db, "SELECT 'a%' SIMILAR TO 'a|%' ESCAPE '|'"), "true");
+    db.execute("CREATE TABLE t (a int, b int, c text DEFAULT 'x')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    assert_eq!(one(&mut db, "SELECT c FROM t"), "x");
+    db.execute("CREATE TABLE u (id int, arr int[])").unwrap();
+    db.execute("INSERT INTO u VALUES (1, '{1,2,3}')").unwrap();
+    db.execute("UPDATE u SET arr[1] = 42, arr[2] = 77").unwrap();
+    assert_eq!(one(&mut db, "SELECT arr FROM u"), "{42,77,3}");
+    db.execute("UPDATE t SET b = u.id + 10 FROM u WHERE t.a = u.id").unwrap();
+    assert_eq!(one(&mut db, "SELECT b FROM t"), "11");
+    db.execute("UPDATE t SET (a, b) = (SELECT 5, 6)").unwrap();
+    assert_eq!(one(&mut db, "SELECT a * 10 + b FROM t"), "56");
+    db.execute("DELETE FROM t x USING u WHERE x.a = 5 AND u.id = 1").unwrap();
+    assert_eq!(one(&mut db, "SELECT count(*) FROM t"), "0");
+    db.execute("INSERT INTO t VALUES (1, 2, 'q')").unwrap();
+    db.execute("ALTER TABLE t ALTER COLUMN c DROP DEFAULT").unwrap();
+    db.execute("ALTER TABLE t ALTER COLUMN c TYPE int USING length(c)").unwrap();
+    assert_eq!(one(&mut db, "SELECT c FROM t"), "1");
+    assert_eq!(one(&mut db, "WITH ins AS (INSERT INTO t VALUES (7, 8, 9) RETURNING a) SELECT a FROM ins"), "7");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM t"), "2");
+    db.execute("CREATE TYPE mood AS ENUM ('sad', 'ok')").unwrap();
+    db.execute("ALTER TYPE mood ADD VALUE 'happy' AFTER 'sad'").unwrap();
+    db.execute("CREATE TABLE m (x mood)").unwrap();
+    db.execute("INSERT INTO m VALUES ('happy')").unwrap();
+    db.execute("REINDEX TABLE m").unwrap();
+    db.execute("CREATE TABLE k (fruit text, key int UNIQUE)").unwrap();
+    db.execute("INSERT INTO k VALUES ('a', 1) ON CONFLICT (lower(fruit), key) DO NOTHING").unwrap();
+    db.execute("INSERT INTO k VALUES ('b', 1) ON CONFLICT (lower(fruit), key) DO NOTHING").unwrap();
+    assert_eq!(one(&mut db, "SELECT count(*) FROM k"), "1");
+    db.execute("CREATE FUNCTION ri_int4eq(int4, int4) RETURNS bool AS 'int4eq' LANGUAGE internal IMMUTABLE STRICT").unwrap();
+    assert_eq!(one(&mut db, "SELECT ri_int4eq(1, 1)"), "true");
+}
+
+#[test]
+fn postgresql_copy_writes_and_reads_files() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TABLE t (a int, b text, c bool)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'x y', true), (2, NULL, false), (3, 'q,\"z', NULL)").unwrap();
+    let r = db.execute("COPY t TO STDOUT").unwrap();
+    assert_eq!(r.rows[1][0].to_string(), "2\t\\N\tf");
+    let r = db.execute("COPY t TO STDOUT CSV HEADER").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "a,b,c");
+    assert_eq!(r.rows[3][0].to_string(), "3,\"q,\"\"z\",");
+    let r = db.execute("COPY (SELECT 1 AS foo UNION ALL SELECT 2) TO STDOUT WITH (FORMAT json)").unwrap();
+    assert_eq!(r.rows[1][0].to_string(), "{\"foo\":2}");
+    let path = std::env::temp_dir().join("accessor_copy_test.csv");
+    let path = path.display().to_string().replace('\\', "/");
+    db.execute(&format!("COPY t TO '{path}' CSV")).unwrap();
+    db.execute("CREATE TABLE t2 (a int, b text, c bool)").unwrap();
+    db.execute(&format!("COPY t2 FROM '{path}' CSV")).unwrap();
+    assert_eq!(db.execute("SELECT b FROM t2 WHERE a = 3").unwrap().rows[0][0].to_string(), "q,\"z");
+    let _ = std::fs::remove_file(&path);
+}

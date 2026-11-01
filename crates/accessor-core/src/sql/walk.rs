@@ -134,6 +134,9 @@ pub fn walk_select(s: &mut Select, f: &mut Visitor) -> Result<()> {
     if let Some(with) = &mut s.with {
         for cte in &mut with.ctes {
             walk_select(&mut cte.query, f)?;
+            if let Some(stmt) = &mut cte.modifying {
+                walk_statement(stmt, f)?;
+            }
         }
     }
     for (_, spec) in &mut s.windows {

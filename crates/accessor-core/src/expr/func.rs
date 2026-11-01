@@ -39,6 +39,7 @@ pub enum ScalarFn {
     Int,
     Fix,
     Sqr,
+    Cbrt,
     Sgn,
     Exp,
     Log,
@@ -195,6 +196,7 @@ impl ScalarFn {
             "INT" | "FLOOR" => (Int, 1, 1),
             "FIX" => (Fix, 1, 1),
             "SQR" | "SQRT" => (Sqr, 1, 1),
+            "CBRT" => (Cbrt, 1, 1),
             "SGN" | "SIGN" => (Sgn, 1, 1),
             "EXP" => (Exp, 1, 1),
             "LOG" | "LN" => (Log, 1, 1),
@@ -273,7 +275,7 @@ impl ScalarFn {
             "REGEXP_REPLACE" => (RegexpReplace, 3, 4),
             "REGEXP_SUBSTR" => (RegexpSubstr, 2, 4),
             "REGEXP_COUNT" => (RegexpCount, 2, 3),
-            "SIMILAR_TO" => (SimilarTo, 2, 2),
+            "SIMILAR_TO" => (SimilarTo, 2, 3),
             "ATAN2" => (Atan2, 2, 2),
             "DEGREES" => (Degrees, 1, 1),
             "RADIANS" => (Radians, 1, 1),
@@ -610,6 +612,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             }
             float_result(f64_of(v0.unwrap())?.sqrt(), v0.unwrap(), "Sqr")?
         }
+        Cbrt => float_result(f64_of(v0.unwrap())?.cbrt(), v0.unwrap(), "Cbrt")?,
         Sgn => Value::Int(match sign_of(v0.unwrap())? {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
@@ -1016,7 +1019,11 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             }
         }
         SimilarTo => {
-            let re = extra::pattern(&extra::similar_to_regex(&text_of(&vals[1])), "")?;
+            let escape = match vals.get(2) {
+                Some(e) => text_of(e).chars().next(),
+                None => Some('\\'),
+            };
+            let re = extra::pattern(&extra::similar_to_regex_escaped(&text_of(&vals[1]), escape), "")?;
             Value::Bool(re.is_match(&text_of(&vals[0])))
         }
         RegexpReplace => {

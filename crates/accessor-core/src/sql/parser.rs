@@ -267,6 +267,26 @@ pub fn rename_table_in_sql(text: &str, old: &str, new: &str) -> String {
 }
 
 /// Rewrites `alias.col` to `table.col` in an UPDATE or DELETE that named its target with an alias.
+/// `current` with the element at `subscripts` replaced by `value`: `__ARRAY_SET(arr, i, __ARRAY_SET(arr[i], j, value))`.
+fn array_set(current: Expr, subscripts: Vec<Expr>, value: Expr) -> Expr {
+    let Some((first, rest)) = subscripts.split_first() else { return value };
+    let inner = if rest.is_empty() {
+        value
+    } else {
+        let element = Expr::Function { name: "__SUBSCRIPT".into(), args: vec![current.clone(), first.clone()], distinct: false, star: false };
+        array_set(element, rest.to_vec(), value)
+    };
+    Expr::Function { name: "__ARRAY_SET".into(), args: vec![current, first.clone(), inner], distinct: false, star: false }
+}
+
+/// `UPDATE t SET .. FROM u` and `DELETE FROM t USING u`: the list of tables with the target put first.
+fn with_target(from: From, table: &str, alias: Option<String>) -> From {
+    let target = TableFactor::Named { name: table.to_string(), alias, only: false };
+    let mut joins = vec![Join { kind: JoinKind::Cross, factor: from.first, on: None, using: Vec::new(), natural: false }];
+    joins.extend(from.joins);
+    From { first: target, joins }
+}
+
 fn requalify(st: &mut Statement, alias: &str, table: &str) -> Result<()> {
     crate::sql::walk::walk_statement(st, &mut |e| {
         if let Expr::Column { table: Some(t), .. } = e {
@@ -1087,6 +1107,194 @@ impl<'a> Parser<'a> {
             || (self.peek_kw("ACCESS") && self.peek_kw_at(1, "METHOD"))
             || (self.peek_kw("DEFAULT") && self.peek_kw_at(1, "PRIVILEGES"))
             || (self.peek_kw("LARGE") && self.peek_kw_at(1, "OBJECT"))
+    }
+
+    /// `COPY table [(cols)] | (query) TO | FROM 'file' | STDOUT | STDIN [[WITH] (options) | legacy options]`.
+    fn copy_statement(&mut self) -> Result<Statement> {
+        self.advance();
+        let (mut table, mut columns, mut query) = (String::new(), Vec::new(), None);
+        if self.eat_sym("(") {
+            query = Some(Box::new(self.statement()?));
+            self.expect_sym(")")?;
+        } else {
+            table = self.table_ident()?;
+            if self.eat_sym("(") {
+                columns = self.ident_list()?;
+                self.expect_sym(")")?;
+            }
+        }
+        let to = if self.eat_kw("TO") {
+            true
+        } else {
+            self.expect_kw("FROM")?;
+            false
+        };
+        let mut file = None;
+        if self.eat_kw("PROGRAM") {
+            return Err(Error::syntax("COPY .. PROGRAM is not available"));
+        } else if self.eat_kw("STDIN") || self.eat_kw("STDOUT") {
+        } else if let Tok::Str(path) = self.peek().clone() {
+            self.advance();
+            file = Some(path);
+        } else {
+            return Err(self.unexpected("a file name, STDIN or STDOUT"));
+        }
+        let mut options: Vec<(String, String)> = Vec::new();
+        let value_of = |p: &mut Self| -> Result<String> {
+            Ok(match p.peek().clone() {
+                Tok::Str(s) => {
+                    p.advance();
+                    s
+                }
+                Tok::Int(n) => {
+                    p.advance();
+                    n.to_string()
+                }
+                Tok::Sym("*") => {
+                    p.advance();
+                    "*".to_string()
+                }
+                Tok::Sym("(") => {
+                    p.advance();
+                    let list = p.ident_list()?.join(",");
+                    p.expect_sym(")")?;
+                    list
+                }
+                Tok::Ident(w) => {
+                    p.advance();
+                    w
+                }
+                _ => String::new(),
+            })
+        };
+        if self.eat_kw("WITH") || self.peek_sym("(") {
+            if self.eat_sym("(") {
+                loop {
+                    let name = self.ident_or_keyword()?.to_ascii_lowercase();
+                    let v = if self.peek_sym(",") || self.peek_sym(")") { String::new() } else { value_of(self)? };
+                    options.push((name, v));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            }
+        }
+        // the older spelling: BINARY, CSV, HEADER, DELIMITER [AS] 'x', NULL [AS] 'x', QUOTE [AS] 'x', ESCAPE [AS] 'x', FORCE QUOTE cols
+        loop {
+            if self.at_eof() || self.peek_sym(";") || self.peek_kw("WHERE") {
+                break;
+            }
+            let name = self.ident_or_keyword()?.to_ascii_lowercase();
+            match name.as_str() {
+                "binary" | "csv" => options.push(("format".into(), name)),
+                "header" | "freeze" => options.push((name, "true".into())),
+                "delimiter" | "null" | "quote" | "escape" | "encoding" => {
+                    self.eat_kw("AS");
+                    let v = value_of(self)?;
+                    options.push((name, v));
+                }
+                "force" => {
+                    let kind = self.ident_or_keyword()?.to_ascii_lowercase();
+                    if self.eat_kw("NOT") {
+                        self.expect_kw("NULL")?;
+                    }
+                    let v = if self.eat_sym("*") { "*".to_string() } else { self.ident_list()?.join(",") };
+                    options.push((format!("force_{kind}"), v));
+                }
+                other => return Err(Error::syntax(format!("option \"{other}\" not recognized"))),
+            }
+        }
+        if self.eat_kw("WHERE") {
+            self.expr()?;
+        }
+        Ok(Statement::Copy(Box::new(CopyDef { table, columns, query, to, file, options })))
+    }
+
+    /// After `SET (a, b) =`: `n` expressions, from `(x, y)`, `ROW(x, y)` or a sub-query with `n` columns.
+    fn row_source(&mut self, n: usize) -> Result<Vec<Expr>> {
+        let row = self.eat_kw("ROW");
+        self.expect_sym("(")?;
+        if !row && (self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES")) {
+            let q = self.select()?;
+            self.expect_sym(")")?;
+            if q.items.len() != n || !q.unions.is_empty() || q.items.iter().any(|i| !matches!(i, SelectItem::Expr { .. })) {
+                return Err(Error::syntax(format!("source for a multiple-column UPDATE item must be a sub-SELECT with {n} columns")));
+            }
+            // each column is the scalar sub-query of that one item
+            return Ok((0..n)
+                .map(|k| {
+                    let mut one = q.clone();
+                    one.items = vec![q.items[k].clone()];
+                    Expr::Subquery(Box::new(one))
+                })
+                .collect());
+        }
+        let mut items = vec![self.expr()?];
+        while self.eat_sym(",") {
+            items.push(self.expr()?);
+        }
+        self.expect_sym(")")?;
+        if items.len() != n {
+            return Err(Error::syntax(format!("number of columns ({n}) does not match number of values ({})", items.len())));
+        }
+        Ok(items)
+    }
+
+    /// `ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'other']`, `RENAME VALUE 'a' TO 'b'`; the other
+    /// forms (`RENAME TO`, `OWNER TO`, `SET SCHEMA`) are read and ignored. A table made earlier keeps the labels it was made with.
+    fn alter_type(&mut self) -> Result<Statement> {
+        self.advance();
+        self.advance();
+        let name = self.ident()?;
+        let label = |p: &mut Self| match p.advance() {
+            Tok::Str(s) => Ok(s),
+            _ => {
+                p.pos -= 1;
+                Err(p.unexpected("a label in quotes"))
+            }
+        };
+        let add = self.peek_kw("ADD") && self.peek_kw_at(1, "VALUE");
+        let rename = self.peek_kw("RENAME") && self.peek_kw_at(1, "VALUE");
+        if !add && !rename {
+            return Ok(self.ignore_rest("ALTER TYPE"));
+        }
+        self.advance();
+        self.advance();
+        let Some(mut t) = crate::sql::usertypes::lookup(&name).filter(|t| !t.labels.is_empty()) else {
+            return Err(Error::catalog(format!("\"{name}\" is not an enum type")));
+        };
+        if add {
+            let if_not_exists = self.eat_kw("IF") && {
+                self.expect_kw("NOT")?;
+                self.expect_kw("EXISTS")?;
+                true
+            };
+            let new = label(self)?;
+            if t.labels.contains(&new) {
+                if if_not_exists {
+                    return Ok(Statement::Batch(Vec::new()));
+                }
+                return Err(Error::catalog(format!("enum label \"{new}\" already exists")));
+            }
+            if self.eat_kw("BEFORE") || self.peek_kw("AFTER") {
+                let after = self.eat_kw("AFTER");
+                let other = label(self)?;
+                let at = t.labels.iter().position(|l| *l == other).ok_or_else(|| Error::catalog(format!("\"{other}\" is not an existing enum label")))?;
+                t.labels.insert(at + usize::from(after), new);
+            } else {
+                t.labels.push(new);
+            }
+        } else {
+            let from = label(self)?;
+            self.expect_kw("TO")?;
+            let to = label(self)?;
+            let at = t.labels.iter().position(|l| *l == from).ok_or_else(|| Error::catalog(format!("\"{from}\" is not an existing enum label")))?;
+            t.labels[at] = to;
+        }
+        crate::sql::usertypes::register(&name, t.clone());
+        let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
+        Ok(Statement::Catalog(Box::new(CatalogChange { kind: "type", names: vec![name], value: Some(value), replace: true, cascade: false })))
     }
 
     fn ignore_rest(&mut self, what: &str) -> Statement {
@@ -2023,8 +2231,37 @@ impl<'a> Parser<'a> {
             self.advance();
             let mut target = Vec::new();
             if self.eat_sym("(") {
-                target = self.ident_list()?;
+                // columns, or expressions (of an expression index), each perhaps with COLLATE and an operator class;
+                // with an expression in the list any conflict counts
+                let mut plain = true;
+                loop {
+                    let single = matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && matches!(self.peek_at(1), Tok::Sym(",") | Tok::Sym(")")) || (matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && (self.peek_kw_at(1, "COLLATE") || matches!(self.peek_at(1), Tok::Ident(_))));
+                    if single {
+                        target.push(self.ident()?);
+                    } else {
+                        plain = false;
+                        self.expr()?;
+                    }
+                    if self.eat_kw("COLLATE") {
+                        self.ident()?;
+                    }
+                    if matches!(self.peek(), Tok::Ident(_)) && !self.peek_kw("DO") {
+                        self.advance();
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
                 self.expect_sym(")")?;
+                if !plain {
+                    target.clear();
+                }
+                if self.eat_kw("WHERE") {
+                    self.expr()?;
+                }
+            } else if self.eat_kw("ON") {
+                self.expect_kw("CONSTRAINT")?;
+                self.ident()?;
             }
             self.expect_kw("DO")?;
             let action = if self.eat_kw("NOTHING") {
@@ -2226,6 +2463,21 @@ impl<'a> Parser<'a> {
         if self.peek_kw("GET") && (self.peek_kw_at(1, "DIAGNOSTICS") || ((self.peek_kw_at(1, "CURRENT") || self.peek_kw_at(1, "STACKED")) && self.peek_kw_at(2, "DIAGNOSTICS"))) {
             self.advance();
             return self.get_diagnostics();
+        }
+        let pg = crate::dialect::current() == crate::dialect::Dialect::Postgresql;
+        if pg && self.peek_kw("COPY") {
+            return self.copy_statement();
+        }
+        if pg && self.peek_kw("REINDEX") {
+            // indexes are kept up to date, so there is nothing to rebuild
+            return Ok(self.ignore_rest("REINDEX"));
+        }
+        if pg && self.peek_kw("ALTER") && self.peek_kw_at(1, "INDEX") {
+            // ATTACH PARTITION, SET (..), ALTER COLUMN .. SET STATISTICS, RENAME and the like: the engine has one kind of index
+            return Ok(self.ignore_rest("ALTER INDEX"));
+        }
+        if pg && self.peek_kw("ALTER") && self.peek_kw_at(1, "TYPE") {
+            return self.alter_type();
         }
         // PostgreSQL's text search objects (configurations, dictionaries, parsers, templates): the search uses its built-in ones
         if self.peek_kw("ALTER") && ["FUNCTION", "PROCEDURE", "EVENT", "INSTANCE", "TABLESPACE", "SERVER", "LOGFILE", "RESOURCE"].iter().any(|k| self.peek_kw_at(1, k)) && crate::dialect::current() == crate::dialect::Dialect::Mysql {
@@ -2771,12 +3023,50 @@ impl<'a> Parser<'a> {
         self.expect_kw("SET")?;
         let mut assignments = Vec::new();
         loop {
+            if self.peek_sym("(") && crate::dialect::current() != crate::dialect::Dialect::Mysql {
+                // PostgreSQL: SET (a, b) = (x, y) | ROW(x, y) | (SELECT x, y ..)
+                self.advance();
+                let cols = self.ident_list()?;
+                self.expect_sym(")")?;
+                self.expect_sym("=")?;
+                let row = self.row_source(cols.len())?;
+                assignments.extend(cols.into_iter().zip(row));
+                if !self.eat_sym(",") {
+                    break;
+                }
+                continue;
+            }
             let col = self.column_name()?;
-            self.expect_sym("=")?;
-            assignments.push((col, self.expr()?));
+            if self.peek_sym("[") {
+                // PostgreSQL: SET arr[i] = v (and arr[i][j]): the array with that element replaced
+                let mut subscripts = Vec::new();
+                while self.eat_sym("[") {
+                    subscripts.push(self.expr()?);
+                    self.expect_sym("]")?;
+                }
+                self.expect_sym("=")?;
+                let value = self.expr()?;
+                let current = match assignments.iter().position(|(c, _): &(String, Expr)| c.eq_ignore_ascii_case(&col)) {
+                    Some(at) => assignments.remove(at).1,
+                    None => Expr::Column { table: None, name: col.clone() },
+                };
+                assignments.push((col, array_set(current, subscripts, value)));
+            } else {
+                self.expect_sym("=")?;
+                assignments.push((col, self.expr()?));
+            }
             if !self.eat_sym(",") {
                 break;
             }
+        }
+        // PostgreSQL: UPDATE t SET .. FROM u, v WHERE ..
+        if self.peek_kw("FROM") {
+            self.advance();
+            let from = with_target(self.from_clause()?, &table, alias.clone());
+            let shown = alias.unwrap_or_else(|| table.clone());
+            let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+            let assignments = assignments.into_iter().map(|(c, e)| (Some(shown.clone()), c, e)).collect();
+            return Ok(Statement::UpdateMulti { from, assignments, filter });
         }
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let mut tail = Select::default();
@@ -2902,9 +3192,16 @@ impl<'a> Parser<'a> {
             while self.eat_sym(",") {
                 targets.push(self.ident()?);
             }
+            // PostgreSQL: DELETE FROM t [AS x] USING u, v WHERE ...: the target is not in the list
+            let pg_alias = if crate::dialect::current() == crate::dialect::Dialect::Postgresql && targets.len() == 1 && !self.peek_kw("USING") { self.target_alias()? } else { None };
             if self.peek_kw("USING") {
                 self.advance();
-                let from = self.from_clause()?;
+                let mut from = self.from_clause()?;
+                if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                    let shown = pg_alias.clone().unwrap_or_else(|| targets[0].clone());
+                    from = with_target(from, &targets[0], pg_alias);
+                    targets = vec![shown];
+                }
                 let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
                 return Ok(Statement::DeleteMulti { targets, from, filter });
             }
@@ -3326,7 +3623,13 @@ impl<'a> Parser<'a> {
         self.expect_kw("ON")?;
         let table = self.table_ident()?;
         if self.eat_kw("REFERENCING") {
-            return Err(Error::syntax("REFERENCING (transition tables) is not supported"));
+            // transition tables (REFERENCING OLD | NEW TABLE AS name): read and ignored, so a trigger that reads one fails when it fires
+            while self.peek_kw("OLD") || self.peek_kw("NEW") {
+                self.advance();
+                self.expect_kw("TABLE")?;
+                self.eat_kw("AS");
+                self.ident()?;
+            }
         }
         let mut each_statement = false;
         if self.eat_kw("FOR") {
@@ -4727,6 +5030,13 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_sym(")")?;
             }
+            if self.eat_kw("USING") {
+                // PostgreSQL: the new value of each row comes from the expression over the old ones; the values are
+                // rewritten first, then the column gets its type
+                let e = self.expr()?;
+                let rewrite = Statement::Update { table: table.clone(), assignments: vec![(name.clone(), e)], filter: None };
+                return Ok(Statement::Batch(vec![rewrite, Statement::AlterTable { table, action: AlterAction::AlterColumn { name, data_type } }]));
+            }
             AlterAction::AlterColumn { name, data_type }
         } else {
             return Err(self.unexpected("ADD, DROP, RENAME or ALTER"));
@@ -4932,9 +5242,13 @@ impl<'a> Parser<'a> {
             };
             self.expect_kw("AS")?;
             self.expect_sym("(")?;
-            let query = self.select()?;
+            let (query, modifying) = if self.peek_kw("INSERT") || self.peek_kw("UPDATE") || self.peek_kw("DELETE") {
+                (Select::default(), Some(Box::new(self.statement()?)))
+            } else {
+                (self.select()?, None)
+            };
             self.expect_sym(")")?;
-            ctes.push(Cte { name, columns, query });
+            ctes.push(Cte { name, columns, query, modifying });
             if !self.eat_sym(",") {
                 break;
             }
@@ -5259,6 +5573,9 @@ impl<'a> Parser<'a> {
             if let Tok::Str(s) = self.peek().clone() {
                 self.advance();
                 Some(s)
+            } else if matches!(self.peek(), Tok::Ident(_)) {
+                // any word is an alias after AS (`AS mod`, `AS user`)
+                Some(self.ident_or_keyword()?)
             } else {
                 Some(self.ident()?)
             }
@@ -5927,7 +6244,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 self.advance();
                 let pattern = self.concat()?;
-                let call = Expr::Function { name: "SIMILAR_TO".into(), args: vec![left, pattern], distinct: false, star: false };
+                let mut args = vec![left, pattern];
+                if self.eat_kw("ESCAPE") {
+                    args.push(self.concat()?);
+                }
+                let call = Expr::Function { name: "SIMILAR_TO".into(), args, distinct: false, star: false };
                 left = if negated { Expr::Not(Box::new(call)) } else { call };
             } else if self.eat_kw("LIKE") {
                 let mut pattern = self.concat()?;
@@ -6016,9 +6337,27 @@ impl<'a> Parser<'a> {
 
     fn join_text(&mut self) -> Result<Expr> {
         let mut left = self.additive()?;
-        while self.eat_sym("&") {
-            let right = self.additive()?;
-            left = Expr::Binary { op: BinOp::Concat, left: Box::new(left), right: Box::new(right) };
+        loop {
+            let asql = crate::dialect::current() == crate::dialect::Dialect::Asql;
+            if self.peek_sym("||") && !matches!(self.peek_at(1), Tok::Sym("/")) {
+                self.advance();
+                let right = self.additive()?;
+                left = Expr::Binary { op: BinOp::Concat, left: Box::new(left), right: Box::new(right) };
+            } else if self.eat_sym("&") {
+                let right = self.additive()?;
+                left = if asql {
+                    Expr::Binary { op: BinOp::Concat, left: Box::new(left), right: Box::new(right) }
+                } else {
+                    // PostgreSQL and MySQL: bitwise AND
+                    Expr::Function { name: "__BITAND".into(), args: vec![left, right], distinct: false, star: false }
+                };
+            } else if self.eat_sym("#") {
+                // PostgreSQL's bitwise XOR
+                let right = self.additive()?;
+                left = Expr::Function { name: "__BITXOR".into(), args: vec![left, right], distinct: false, star: false };
+            } else {
+                break;
+            }
         }
         Ok(left)
     }
@@ -6079,6 +6418,15 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr> {
+        let cube = self.peek_sym("||") && matches!(self.peek_at(1), Tok::Sym("/"));
+        if cube || (self.peek_sym("|") && matches!(self.peek_at(1), Tok::Sym("/"))) {
+            // PostgreSQL's prefix square root (|/ x) and cube root (||/ x)
+            let name = if cube { "CBRT" } else { "SQRT" };
+            self.advance();
+            self.advance();
+            let inner = self.unary()?;
+            return Ok(Expr::Function { name: name.into(), args: vec![inner], distinct: false, star: false });
+        }
         if self.eat_sym("@") {
             // PostgreSQL's prefix absolute value: @ -5
             let inner = self.unary()?;

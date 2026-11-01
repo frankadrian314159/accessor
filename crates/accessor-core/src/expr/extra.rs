@@ -101,9 +101,22 @@ pub(crate) fn pattern(pattern: &str, flags: &str) -> Result<Rc<Re>> {
 /// The regular expression a `SIMILAR TO` pattern stands for: `%` and `_` as in `LIKE`, with `|`, `*`,
 /// `+`, `?`, `{m,n}`, `( )` and `[ ]` as in a regular expression, matching the whole text.
 pub(crate) fn similar_to_regex(p: &str) -> String {
+    similar_to_regex_escaped(p, Some('\\'))
+}
+
+/// Like [`similar_to_regex`], with `escape` (or none) making the next character an ordinary one.
+pub(crate) fn similar_to_regex_escaped(p: &str, escape: Option<char>) -> String {
     let mut out = String::from("(?s)^(?:");
     let mut in_class = false;
-    for c in p.chars() {
+    let mut chars = p.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next) => out.push_str(&regex::escape(&next.to_string())),
+                None => out.push_str(&regex::escape(&c.to_string())),
+            }
+            continue;
+        }
         match c {
             '[' => {
                 in_class = true;

@@ -36,8 +36,8 @@ pub struct Token {
     pub pos: usize,
 }
 
-const SYMBOLS: [&str; 37] = [
-    "<=>", "@?", "@@", "<<", ">>", "!~*", "~*", "!~", "~", "@", "->>", "->", "::", ":=", ":", "..", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "|", "=", "<", ">", "%",
+const SYMBOLS: [&str; 38] = [
+    "#", "<=>", "@?", "@@", "<<", ">>", "!~*", "~*", "!~", "~", "@", "->>", "->", "::", ":=", ":", "..", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "|", "=", "<", ">", "%",
 ];
 
 fn is_ident_start(c: char) -> bool {
@@ -194,6 +194,76 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             let to = chars[close].0;
             out.push(Token { tok: Tok::Str(src[if body_start >= chars.len() { src.len() } else { from }..to].to_string()), pos });
             i = close + open_len;
+        } else if matches!(c, 'e' | 'E' | 'b' | 'B') && at(i + 1) == Some('\'') && dialect::current() != Dialect::Mysql && !(i > 0 && is_ident_part(chars[i - 1].1)) {
+            // E'..' (backslash escapes) and B'0101' (a bit string, kept as its digits)
+            let escapes = matches!(c, 'e' | 'E');
+            let mut s = String::new();
+            i += 2;
+            loop {
+                match at(i) {
+                    None => return Err(Error::syntax("unterminated string literal")),
+                    Some('\'') if at(i + 1) == Some('\'') => {
+                        s.push('\'');
+                        i += 2;
+                    }
+                    Some('\'') => break,
+                    Some('\\') if escapes && at(i + 1).is_some() => {
+                        let e = at(i + 1).expect("checked");
+                        i += 2;
+                        let digits = |max: usize, radix: u32, i: &mut usize| {
+                            let mut v = 0u32;
+                            let mut n = 0;
+                            while n < max {
+                                match at(*i).and_then(|d| d.to_digit(radix)) {
+                                    Some(d) => {
+                                        v = v * radix + d;
+                                        *i += 1;
+                                        n += 1;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            (v, n)
+                        };
+                        match e {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            'r' => s.push('\r'),
+                            'b' => s.push('\u{8}'),
+                            'f' => s.push('\u{c}'),
+                            'x' => {
+                                let (v, n) = digits(2, 16, &mut i);
+                                if n == 0 {
+                                    s.push('x');
+                                } else if let Some(ch) = char::from_u32(v) {
+                                    s.push(ch);
+                                }
+                            }
+                            'u' | 'U' => {
+                                let (v, n) = digits(if e == 'u' { 4 } else { 8 }, 16, &mut i);
+                                match char::from_u32(v) {
+                                    Some(ch) if n > 0 => s.push(ch),
+                                    _ => return Err(Error::syntax("invalid Unicode escape")),
+                                }
+                            }
+                            '0'..='7' => {
+                                i -= 1;
+                                let (v, _) = digits(3, 8, &mut i);
+                                if let Some(ch) = char::from_u32(v) {
+                                    s.push(ch);
+                                }
+                            }
+                            other => s.push(other),
+                        }
+                    }
+                    Some(ch) => {
+                        s.push(ch);
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+            out.push(Token { tok: Tok::Str(s), pos });
         } else if is_ident_start(c) {
             let start = i;
             while at(i).is_some_and(is_ident_part) {
@@ -202,7 +272,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             let end = chars.get(i).map_or(src.len(), |&(p, _)| p);
             let _ = start;
             out.push(Token { tok: Tok::Ident(src[pos..end].to_string()), pos });
-        } else if c == '@' && at(i + 1).is_some_and(|d| is_ident_start(d) || (d.is_ascii_digit() && crate::dialect::current() == crate::dialect::Dialect::Mysql)) {
+        } else if c == '@' && dialect::current() != Dialect::Postgresql && at(i + 1).is_some_and(|d| is_ident_start(d) || (d.is_ascii_digit() && crate::dialect::current() == crate::dialect::Dialect::Mysql)) {
             i += 1;
             let start = i;
             while at(i).is_some_and(is_ident_part) {
@@ -347,7 +417,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             // `||` (standard SQL) is accepted as a spelling of the concatenation operator &.
             if rest.starts_with("||") {
                 i += 2;
-                out.push(Token { tok: Tok::Sym("&"), pos });
+                out.push(Token { tok: Tok::Sym("||"), pos });
                 continue;
             }
             let array_op = match dialect::current() {

@@ -224,10 +224,26 @@ pub struct With {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct CopyDef {
+    pub table: String,
+    pub columns: Vec<String>,
+    /// `COPY (query) TO ..`
+    pub query: Option<Box<Statement>>,
+    pub to: bool,
+    /// The file; `None` is STDIN or STDOUT.
+    pub file: Option<String>,
+    /// `(name, value)` of the options, names in lower case.
+    pub options: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Cte {
     pub name: String,
     pub columns: Vec<String>,
     pub query: Select,
+    /// PostgreSQL: `name AS (INSERT | UPDATE | DELETE .. RETURNING ..)`; the statement runs once, and `query` is then
+    /// replaced by the rows it returned.
+    pub modifying: Option<Box<Statement>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -525,6 +541,8 @@ pub struct TriggerDef {
 pub enum Statement {
     Select(Select),
     Insert { table: String, columns: Option<Vec<String>>, source: InsertSource },
+    /// PostgreSQL's `COPY table [(cols)] | (query) TO | FROM 'file' | STDOUT | STDIN [WITH (options)]`.
+    Copy(Box<CopyDef>),
     Update { table: String, assignments: Vec<(String, Expr)>, filter: Option<Expr> },
     Delete { table: String, filter: Option<Expr> },
     CreateTable {

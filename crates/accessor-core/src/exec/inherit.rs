@@ -363,6 +363,22 @@ impl Database {
                 let pcols: Vec<String> = self.table_checked(&parent_name)?.schema().columns.iter().map(|c| c.name.to_ascii_lowercase()).collect();
                 let ccols: Vec<String> = self.table_checked(&child_name)?.schema().columns.iter().map(|c| c.name.to_ascii_lowercase()).collect();
                 if pcols != ccols {
+                    // the same columns in another order: the child is put in the parent's order (rows are stored by position)
+                    let (mut a, mut b) = (pcols.clone(), ccols.clone());
+                    a.sort();
+                    b.sort();
+                    if a == b {
+                        for (i, name) in pcols.iter().enumerate() {
+                            let now = self.table_checked(&child_name)?.schema().columns.iter().position(|c| c.name.eq_ignore_ascii_case(name));
+                            if now != Some(i) {
+                                let after = if i == 0 { None } else { Some(pcols[i - 1].clone()) };
+                                self.exec_alter_table(&child_name, &crate::sql::ast::AlterAction::MoveColumn { name: name.clone(), after })?;
+                            }
+                        }
+                    }
+                }
+                let ccols: Vec<String> = self.table_checked(&child_name)?.schema().columns.iter().map(|c| c.name.to_ascii_lowercase()).collect();
+                if pcols != ccols {
                     return Err(Error::catalog(format!("table \"{child_name}\" does not have the columns of \"{parent_name}\" (same names, same order)")));
                 }
                 self.apply_all(vec![Op::Catalog { kind: "inherit".into(), name: link, value: Some(b.to_string()) }])?;

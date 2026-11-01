@@ -23,6 +23,8 @@ pub enum ArrFn {
     Subscript,
     /// `a[lo:hi]`, either bound NULL for open
     Slice,
+    /// `__ARRAY_SET(arr, i, v)`: the array with element `i` replaced (what `UPDATE .. SET arr[i] = v` means)
+    Set,
     Length,
     Cardinality,
     Upper,
@@ -64,6 +66,7 @@ pub fn lookup(name: &str) -> Option<(ArrFn, usize, usize)> {
         "__ROWTEXT" => (RowText, 1, usize::MAX),
         "__SUBSCRIPT" => (Subscript, 2, 2),
         "__SLICE" => (Slice, 3, 3),
+        "__ARRAY_SET" => (Set, 3, 3),
         "ARRAY_LENGTH" => (Length, 2, 2),
         "CARDINALITY" => (Cardinality, 1, 1),
         "ARRAY_UPPER" => (Upper, 2, 2),
@@ -134,7 +137,7 @@ impl ArrFn {
     /// Functions that get their NULL arguments instead of answering NULL themselves.
     pub fn handles_null(self) -> bool {
         use ArrFn::*;
-        matches!(self, Ctor | RowText | Append | Prepend | Cat | Remove | Replace | Position | Positions | Fill | ToString | Quant(_) | JsonArrayAppend | JsonArrayInsert | JsonInsert | JsonReplace)
+        matches!(self, Ctor | RowText | Set | Append | Prepend | Cat | Remove | Replace | Position | Positions | Fill | ToString | Quant(_) | JsonArrayAppend | JsonArrayInsert | JsonInsert | JsonReplace)
     }
 }
 
@@ -275,6 +278,19 @@ pub fn call(f: ArrFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let a = items(v(0))?;
             let i = int(v(1))?;
             usize::try_from(i - 1).ok().and_then(|k| a.get(k)).cloned().unwrap_or(Value::Null)
+        }
+        Set => {
+            let mut a = if v(0).is_null() { Vec::new() } else { items(v(0))?.into_owned() };
+            let i = int(v(1))?;
+            let at = usize::try_from(i - 1).map_err(|_| Error::runtime("array subscript out of range"))?;
+            if at > 1_000_000 {
+                return Err(Error::runtime("array subscript out of range"));
+            }
+            if a.len() <= at {
+                a.resize(at + 1, Value::Null);
+            }
+            a[at] = v(2).clone();
+            array(a)
         }
         Slice => {
             let a = items(v(0))?;
