@@ -7337,6 +7337,14 @@ impl<'a> Parser<'a> {
                 return Ok(interval_add(date, Expr::Function { name: "__INTERVAL".into(), args: vec![days, Expr::Literal(Value::text("DAY"))], distinct: false, star: false }, up == "SUBDATE"));
             }
         }
+        if up == "PG_TYPEOF" && args.len() == 1 {
+            // what the value alone cannot tell: a bare string literal is of type unknown, and pg_typeof gives a regtype
+            match &args[0] {
+                Expr::Literal(Value::Text(_)) => return Ok(Expr::Literal(Value::text("unknown"))),
+                Expr::Function { name, .. } if name == "PG_TYPEOF" => return Ok(Expr::Literal(Value::text("regtype"))),
+                _ => {}
+            }
+        }
         Ok(Expr::Function { name: up, args, distinct, star })
     }
 

@@ -321,6 +321,8 @@ impl<'a> Parser<'a> {
         match outs.len() {
             0 => {}
             1 if returns.is_none() => returns = Some(outs[0].1),
+            // one OUT parameter with RETURNS of its type: the value is the result
+            1 if returns.is_some() => {}
             // several OUT parameters are the columns of the one row the function returns
             _ if returns.is_none() && set_columns.is_empty() => {
                 set_columns = outs.iter().enumerate().map(|(i, (n, _))| n.clone().unwrap_or_else(|| format!("column{}", i + 1))).collect();

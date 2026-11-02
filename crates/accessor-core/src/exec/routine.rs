@@ -270,7 +270,8 @@ impl Database {
             return Err(Error::catalog(format!("the function or procedure '{}' already exists", def.name)));
         }
         self.routine_slot(def)?;
-        if def.function && ScalarFn::lookup(&def.name).is_some() || crate::exec::agg::AggFn::from_name(&def.name).is_some() {
+        let pg = crate::dialect::current() == crate::dialect::Dialect::Postgresql;
+        if def.function && !pg && ScalarFn::lookup(&def.name).is_some() || crate::exec::agg::AggFn::from_name(&def.name).is_some() {
             return Err(Error::catalog(format!("'{}' is the name of a built-in function", def.name)));
         }
         if self.view_sql(&def.name).is_some() && !def.function {

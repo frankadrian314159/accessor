@@ -4283,7 +4283,7 @@ fn postgresql_functions() {
     assert_eq!(one("SELECT pg_input_is_valid('12', 'int4')"), "Yes");
     assert_eq!(one("SELECT pg_input_is_valid('x12', 'int4')"), "No");
     assert!(db.query("SELECT pg_input_is_valid('1', 'nosuchtype')").is_err());
-    assert_eq!(one("SELECT pg_typeof('x')"), "text");
+    assert_eq!(one("SELECT pg_typeof('x')"), "unknown");
     assert_eq!(one("SELECT pg_typeof(1.5)"), "numeric");
     assert_eq!(one("SELECT pg_typeof(1.5e0)"), "double precision");
     assert_eq!(one("SELECT scale(12.345)"), "3");
@@ -7079,4 +7079,51 @@ fn postgresql_overloads_are_picked_by_the_type_of_an_expression() {
     assert_eq!(one(&mut db, "SELECT g(1 < 2)"), "bool");
     assert_eq!(one(&mut db, "SELECT g(n())"), "int");
     assert_eq!(one(&mut db, "SELECT g(CASE WHEN true THEN 'x'::text ELSE 'y'::text END)"), "text");
+}
+
+#[test]
+fn postgresql_pg_typeof_knows_unknown_regtype_and_arrays() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT pg_typeof('x')"), "unknown");
+    assert_eq!(one(&mut db, "SELECT pg_typeof('' || '')"), "text");
+    assert_eq!(one(&mut db, "SELECT pg_typeof(pg_typeof(0))"), "regtype");
+    assert_eq!(one(&mut db, "SELECT pg_typeof(array[1.2,55.5])"), "numeric[]");
+    assert_eq!(one(&mut db, "SELECT pg_typeof(array[1,2])"), "integer[]");
+}
+
+#[test]
+fn postgresql_a_user_function_can_take_the_name_of_a_builtin_and_variadic_any_array() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    db.execute("CREATE FUNCTION concat(text, variadic anyarray) RETURNS text AS $$ select array_to_string($2, $1); $$ language sql immutable strict").unwrap();
+    assert_eq!(one(&mut db, "select concat('%', 1, 2, 3, 4, 5)"), "1%2%3%4%5");
+    assert_eq!(one(&mut db, "select concat('|', 'a'::text, 'b', 'c')"), "a|b|c");
+    assert_eq!(one(&mut db, "select concat('|', variadic array[1,2,33])"), "1|2|33");
+    assert_eq!(one(&mut db, "select concat('|', variadic array[]::int[])"), "");
+}
+
+#[test]
+fn postgresql_an_aggregate_over_anyarray_starts_from_an_array() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE FUNCTION tfp(anyarray, anyelement) RETURNS anyarray AS $$ select $1 || $2 $$ language sql").unwrap();
+    db.execute("CREATE AGGREGATE myagg(BASETYPE = anyelement, SFUNC = tfp, STYPE = anyarray, INITCOND = '{}')").unwrap();
+    db.execute("CREATE TABLE t(f1 int)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+    assert_eq!(db.execute("SELECT myagg(f1) FROM t").unwrap().rows[0][0].to_string(), "{1,2,3}");
+}
+
+#[test]
+fn postgresql_an_out_parameter_may_share_the_name_of_an_in_parameter() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("create function testpolym(a int, out a int) returns int as $$ select $1;$$ language sql").unwrap();
+    assert_eq!(db.execute("select testpolym(37)").unwrap().rows[0][0].to_string(), "37");
 }

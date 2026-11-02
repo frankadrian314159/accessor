@@ -186,7 +186,10 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let (ty, _) = DataType::from_sql_name(&name).ok_or_else(|| Error::catalog(format!("type \"{name}\" does not exist")))?;
             Value::Bool(Value::text(&text(v(0))).coerce_to(ty).is_ok())
         }
-        TypeOf => Value::text(type_label(v(0))),
+        TypeOf => match v(0) {
+            Value::Array(a) => Value::text(&format!("{}[]", a.iter().find(|x| !x.is_null()).map_or("text", |x| type_label(x)))),
+            x => Value::text(type_label(x)),
+        },
         SplitPart => {
             let (s, d, n) = (text(v(0)), text(v(1)), int(v(2))?);
             if n == 0 {

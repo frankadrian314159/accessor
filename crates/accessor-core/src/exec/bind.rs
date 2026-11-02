@@ -666,7 +666,9 @@ impl<'a> Binder<'a> {
                     let ordered = self.positional(name, args)?;
                     return self.bind(&Expr::Function { name: name.clone(), args: ordered, distinct: false, star: false });
                 }
-                let Some((f, min, max)) = ScalarFn::lookup(name) else {
+                // in PostgreSQL a function of one's own may take the name of a built-in and then wins
+                let own = crate::dialect::current() == crate::dialect::Dialect::Postgresql && ScalarFn::lookup(name).is_some() && self.db.function_def_for(name, args).is_some();
+                let Some((f, min, max)) = ScalarFn::lookup(name).filter(|_| !own) else {
                     // A stored function: its body, with the arguments in place of the parameters.
                     let Some(def) = self.db.function_def_for(name, args) else {
                         // `float8(x)`, `int4(x)`, `name(x)`: a type name used as a function is a cast
@@ -933,6 +935,10 @@ impl<'a> Binder<'a> {
                 let lit = Expr::Literal(Value::text(text));
                 let e = match agg.stype {
                     Some(t) => super::routine::cast_to(lit, t),
+                    // a polymorphic state type (anyarray) with an array literal for its start
+                    None if text.starts_with('{') && text.ends_with('}') => {
+                        Expr::Literal(Value::text(text).coerce_to(crate::value::DataType::Array(crate::value::ArrayOf::Any)).unwrap_or_else(|_| Value::text(text)))
+                    }
                     None => lit,
                 };
                 Binder::new(self.db, &Scope::default(), 0).bind(&e)?
