@@ -38,6 +38,8 @@ struct Names {
     records: Vec<String>,
     /// A function that returns a set of rows: `RETURN` takes no value.
     set: bool,
+    /// The function has OUT parameters: `RETURN` takes no value.
+    has_out: bool,
     /// The handlers declared in the block being read.
     handlers: Vec<Handler>,
     /// `DECLARE name CONDITION FOR ...`
@@ -403,6 +405,7 @@ impl<'a> Parser<'a> {
             trigger: is_trigger,
             records: Vec::new(),
             set: !set_columns.is_empty(),
+            has_out: !outs.is_empty(),
             handlers: Vec::new(),
             conditions: Vec::new(),
         };
@@ -687,6 +690,9 @@ impl<'a> Parser<'a> {
             let value = if self.peek_sym(";") || self.at_eof() { None } else { Some(self.pl_expr(names)?) };
             if names.set && value.is_some() {
                 return Err(Error::syntax("RETURN cannot have a parameter in a function returning a set; use RETURN NEXT"));
+            }
+            if names.has_out && value.is_some() {
+                return Err(Error::syntax("RETURN cannot have a parameter in function with OUT parameters"));
             }
             out.push(ProcStmt::Return(value));
             return self.end_stmt();
@@ -1182,7 +1188,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, handlers: Vec::new(), conditions: Vec::new() };
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new() };
         let stmts = self.my_body(&mut names)?;
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
@@ -1196,7 +1202,7 @@ impl<'a> Parser<'a> {
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
     /// are variables.
     pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
-        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, handlers: Vec::new(), conditions: Vec::new() };
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new() };
         let body = self.my_body(&mut names)?;
         fn check(list: &[ProcStmt]) -> Result<()> {
             for s in list {
