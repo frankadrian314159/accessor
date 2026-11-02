@@ -1331,7 +1331,7 @@ impl fmt::Display for Value {
                     }
                     match x {
                         Value::Null => f.write_str("NULL")?,
-                        Value::Text(s) if array_needs_quotes(s) => {
+                        Value::Text(s) | Value::Multirange(s) if array_needs_quotes(s) => {
                             f.write_str("\"")?;
                             for c in s.chars() {
                                 if c == '"' || c == '\\' {
