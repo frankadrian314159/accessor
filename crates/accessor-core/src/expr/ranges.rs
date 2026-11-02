@@ -608,9 +608,15 @@ fn split_array_elements(inner: &str) -> Vec<String> {
     out
 }
 
+/// A text that is a multirange (`{[1,3),[5,7)}`, `{}`), in canonical form.
+pub(crate) fn as_multirange(s: &str) -> Option<String> {
+    let (list, multi) = read_ranges(s)?;
+    multi.then(|| format!("{{{}}}", list.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(",")))
+}
+
 fn write_ranges(v: &[Range], multi: bool) -> Value {
     if multi {
-        Value::text(&format!("{{{}}}", v.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(",")))
+        Value::Multirange(format!("{{{}}}", v.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(",")).as_str().into())
     } else {
         Value::text(&v.first().map_or("empty".to_string(), |r| r.to_string()))
     }
@@ -618,7 +624,7 @@ fn write_ranges(v: &[Range], multi: bool) -> Value {
 
 fn shape(v: &Value) -> Option<(Vec<Range>, bool)> {
     match v {
-        Value::Text(s) => read_ranges(s),
+        Value::Text(s) | Value::Multirange(s) => read_ranges(s),
         _ => None,
     }
 }

@@ -9,7 +9,7 @@ use crate::ui::{bracket, Event};
 /// The drop-down scrolls: there are the thirteen types and an array of each.
 const TYPE_LIST_HEIGHT: f32 = 340.0;
 
-const TYPES: [DataType; 27] = [
+const TYPES: [DataType; 28] = [
     DataType::Integer,
     DataType::Bignum,
     DataType::Float,
@@ -23,6 +23,7 @@ const TYPES: [DataType; 27] = [
     DataType::TimestampTz,
     DataType::Interval,
     DataType::Json,
+    DataType::Multirange,
     DataType::Array(ArrayOf::Any),
     DataType::Array(ArrayOf::Integer),
     DataType::Array(ArrayOf::Bignum),
@@ -42,7 +43,7 @@ const TYPES: [DataType; 27] = [
 /// Types offered for a new field, Calculated after the thirteen plain ones (so it is in view without scrolling) and the
 /// arrays after it. An existing field can only be converted to the ordinary types (`TYPES`); a field becomes
 /// calculated by being created that way.
-const NEW_TYPES: [DataType; 28] = [
+const NEW_TYPES: [DataType; 29] = [
     DataType::Integer,
     DataType::Bignum,
     DataType::Float,
@@ -56,6 +57,7 @@ const NEW_TYPES: [DataType; 28] = [
     DataType::TimestampTz,
     DataType::Interval,
     DataType::Json,
+    DataType::Multirange,
     DataType::Calculated,
     DataType::Array(ArrayOf::Any),
     DataType::Array(ArrayOf::Integer),

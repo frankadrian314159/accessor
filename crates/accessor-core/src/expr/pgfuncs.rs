@@ -168,6 +168,7 @@ fn type_label(v: &Value) -> &'static str {
         "INTERVAL" => "interval",
         "JSON" => "jsonb",
         "RATIONAL" => "rational",
+        "MULTIRANGE" => "multirange",
         _ => "unknown",
     }
 }

@@ -69,6 +69,7 @@ Each type has a canonical name and aliases; the aliases are what the standard an
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | a moment in time, shown in a time zone ([types/timestamptz.md](../types/timestamptz.md)) |
 | `INTERVAL` | | a length of time in months, days and seconds ([types/interval.md](../types/interval.md)) |
 | `JSON` | `JSONB` | a JSON document ([types/json.md](../types/json.md)) |
+| `MULTIRANGE` | `INT4MULTIRANGE`, `NUMMULTIRANGE`, the multirange of a `CREATE TYPE .. AS RANGE`, and the like | a set of ranges such as `{[1,3),[5,7)}`; `{}` is the empty one ([types/multirange.md](../types/multirange.md)) |
 | `COUNTER` | `AUTOINCREMENT`, `AUTONUMBER`, `SERIAL` | an `INTEGER` filled in automatically |
 | `CALCULATED` | | a value computed from the other columns |
 

@@ -65,6 +65,9 @@ pub enum Value {
     Json(Arc<str>),
     /// `ARRAY`: a list of values (PostgreSQL's arrays; a nested array is a further dimension).
     Array(Arc<Vec<Value>>),
+    /// A multirange (`{[1,3),[5,7)}`, `{}` when empty): PostgreSQL's form, kept as text but a type of its own, so the
+    /// empty multirange is not an empty array.
+    Multirange(Arc<str>),
     /// Raw bytes that are not valid UTF-8 (MySQL's binary strings, `X'AB12'`); bytes that are valid UTF-8 are `Text`.
     /// A TEXT column may hold one. Use `Value::bytes` to make one.
     Bytes(Arc<Vec<u8>>),
@@ -96,6 +99,7 @@ enum Wire {
     Json(Arc<str>),
     Array(Vec<Value>),
     Bytes(Vec<u8>),
+    Multirange(Arc<str>),
 }
 
 #[derive(Serialize)]
@@ -118,6 +122,7 @@ enum WireRef<'a> {
     Json(&'a str),
     Array(&'a [Value]),
     Bytes(&'a [u8]),
+    Multirange(&'a str),
 }
 
 impl From<Wire> for Value {
@@ -141,6 +146,7 @@ impl From<Wire> for Value {
             Wire::Json(s) => Value::Json(s),
             Wire::Array(a) => Value::Array(Arc::new(a)),
             Wire::Bytes(b) => Value::Bytes(Arc::new(b)),
+            Wire::Multirange(s) => Value::Multirange(s),
         }
     }
 }
@@ -164,6 +170,7 @@ impl Serialize for Value {
             Value::Json(s) => WireRef::Json(s),
             Value::Array(a) => WireRef::Array(a),
             Value::Bytes(b) => WireRef::Bytes(b),
+            Value::Multirange(t) => WireRef::Multirange(t),
         }
         .serialize(s)
     }
@@ -199,6 +206,8 @@ pub enum DataType {
     Json,
     /// A list of values of one type (`INTEGER[]`, `TEXT[]`).
     Array(ArrayOf),
+    /// A multirange: text in PostgreSQL's form (`{[1,3),[5,7)}`).
+    Multirange,
     /// A field whose value is an expression over the other fields of the same
     /// record. The expression is kept in the column's `default`; see
     /// [`crate::schema::Column::expression`].
@@ -242,7 +251,7 @@ impl ArrayOf {
             DataType::TimestampTz => ArrayOf::TimestampTz,
             DataType::Interval => ArrayOf::Interval,
             DataType::Json => ArrayOf::Json,
-            DataType::Array(_) | DataType::Calculated => ArrayOf::Any,
+            DataType::Array(_) | DataType::Multirange | DataType::Calculated => ArrayOf::Any,
         }
     }
 
@@ -287,6 +296,7 @@ enum TypeWire {
     Interval,
     Json,
     Array(ArrayOf),
+    Multirange,
 }
 
 impl From<TypeWire> for DataType {
@@ -307,6 +317,7 @@ impl From<TypeWire> for DataType {
             TypeWire::Interval => DataType::Interval,
             TypeWire::Json => DataType::Json,
             TypeWire::Array(a) => DataType::Array(a),
+            TypeWire::Multirange => DataType::Multirange,
         }
     }
 }
@@ -329,6 +340,7 @@ impl From<DataType> for TypeWire {
             DataType::Interval => TypeWire::Interval,
             DataType::Json => TypeWire::Json,
             DataType::Array(a) => TypeWire::Array(a),
+            DataType::Multirange => TypeWire::Multirange,
         }
     }
 }
@@ -365,6 +377,7 @@ impl DataType {
                 ArrayOf::Interval => "INTERVAL[]",
                 ArrayOf::Json => "JSON[]",
             },
+            DataType::Multirange => "MULTIRANGE",
             DataType::Calculated => "CALCULATED",
         }
     }
@@ -403,8 +416,8 @@ impl DataType {
             "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR" | "REGROLE" | "REGNAMESPACE" | "REGCONFIG"
             | "REGDICTIONARY" | "REGCOLLATION" | "BYTEA" | "TSVECTOR" | "TSQUERY" | "JSONPATH" | "INET" | "CIDR" | "MACADDR" | "MACADDR8"
             | "UUID" | "BOX" | "POINT" | "POLYGON" | "PATH" | "CIRCLE" | "LINE" | "LSEG" | "XML" | "PG_LSN" | "TID" | "CID" | "VARBIT"
-            | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE" | "INT4MULTIRANGE" | "INT8MULTIRANGE"
-            | "NUMMULTIRANGE" | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "REFCURSOR" | "CSTRING" | "INTERNAL" => (DataType::Text, false),
+            | "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE" | "REFCURSOR" | "CSTRING" | "INTERNAL" => (DataType::Text, false),
+            "INT4MULTIRANGE" | "INT8MULTIRANGE" | "NUMMULTIRANGE" | "TSMULTIRANGE" | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "ANYMULTIRANGE" | "MULTIRANGE" => (DataType::Multirange, false),
             "XID" | "XID8" | "OID8" | "MEDIUMINT" | "INT1" | "INT3" | "YEAR" => (DataType::Integer, false),
             // MySQL's text and binary families are all text here
             "TINYTEXT" | "MEDIUMTEXT" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BLOB" | "VARBINARY" | "BINARY" | "GEOMETRY" | "GEOMETRYCOLLECTION"
@@ -626,7 +639,7 @@ impl Value {
 
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::Text(s) => Some(s),
+            Value::Text(s) | Value::Multirange(s) => Some(s),
             _ => None,
         }
     }
@@ -669,6 +682,7 @@ impl Value {
             Value::TimestampTz(_) => DataType::TimestampTz,
             Value::Interval(_) => DataType::Interval,
             Value::Json(_) => DataType::Json,
+            Value::Multirange(_) => DataType::Multirange,
             Value::Array(a) => DataType::Array(a.iter().find_map(Value::data_type).map_or(ArrayOf::Any, ArrayOf::of)),
             Value::Text(_) | Value::Bytes(_) => DataType::Text,
         })
@@ -683,7 +697,7 @@ impl Value {
             Value::Null => 0,
             Value::Bool(_) => 1,
             Value::DateTime(_) | Value::TimestampTz(_) => 3,
-            Value::Text(_) | Value::Bytes(_) => 4,
+            Value::Text(_) | Value::Bytes(_) | Value::Multirange(_) => 4,
             Value::Interval(_) => 5,
             Value::Json(_) => 6,
             Value::Array(_) => 7,
@@ -839,6 +853,7 @@ impl Value {
             // false < true; asql keeps Access's, where Yes is -1 and so Yes < No
             (Value::Bool(a), Value::Bool(b)) if crate::dialect::current() != Dialect::Asql => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
+            (Value::Multirange(a) | Value::Text(a), Value::Multirange(b)) | (Value::Multirange(a), Value::Text(b)) => text_cmp(a, b),
             (Value::Bytes(a), Value::Bytes(b)) => a.as_slice().cmp(b.as_slice()),
             (Value::Bytes(a), Value::Text(t)) => a.as_slice().cmp(t.as_bytes()),
             (Value::Text(t), Value::Bytes(b)) => t.as_bytes().cmp(b.as_slice()),
@@ -958,6 +973,11 @@ impl Value {
                     _ => Err(bad()),
                 },
                 // a single value is not an array
+                _ => Err(bad()),
+            },
+            DataType::Multirange => match self {
+                Multirange(_) => Ok(self.clone()),
+                Text(s) => crate::expr::ranges::as_multirange(s).map(|t| Multirange(t.as_str().into())).ok_or_else(|| Error::type_err(format!("malformed multirange literal: \"{s}\""))),
                 _ => Err(bad()),
             },
             DataType::Json => match self {
@@ -1168,6 +1188,7 @@ impl Ord for Value {
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Array(a), Value::Array(b)) => a.iter().cmp(b.iter()),
             (Value::Text(a), Value::Text(b)) => text_cmp(a, b),
+            (Value::Multirange(a) | Value::Text(a), Value::Multirange(b)) | (Value::Multirange(a), Value::Text(b)) => text_cmp(a, b),
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
             (Value::Bytes(a), Value::Text(t)) => a.as_slice().cmp(t.as_bytes()),
             (Value::Text(t), Value::Bytes(b)) => t.as_bytes().cmp(b.as_slice()),
@@ -1252,7 +1273,7 @@ impl Hash for Value {
                     x.hash(state);
                 }
             }
-            Value::Text(s) => {
+            Value::Text(s) | Value::Multirange(s) => {
                 4u8.hash(state);
                 for b in s.bytes() {
                     b.to_ascii_lowercase().hash(state);
@@ -1300,6 +1321,7 @@ impl fmt::Display for Value {
             Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
             Value::Interval(i) => write!(f, "{i}"),
             Value::Json(s) => f.write_str(s),
+            Value::Multirange(s) => f.write_str(s),
             Value::Bytes(b) => f.write_str(&String::from_utf8_lossy(b)),
             Value::Array(a) => {
                 f.write_str("{")?;

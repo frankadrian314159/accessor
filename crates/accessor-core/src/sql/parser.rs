@@ -129,6 +129,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
         DataType::Interval => "CINTERVAL",
         DataType::Json => "JSON_PARSE",
         DataType::Array(of) => crate::expr::arrays::cast_name(of),
+        DataType::Multirange => "MULTIRANGE",
         DataType::Calculated => return None,
     })
 }

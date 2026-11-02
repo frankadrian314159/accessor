@@ -82,6 +82,9 @@ pub(crate) fn lenient() -> bool {
 
 /// The data type for a type name: a built-in one, or (when lenient) text.
 pub(crate) fn resolve(name: &str) -> Option<(crate::value::DataType, bool)> {
+    if is_multirange_name(name) {
+        return Some((crate::value::DataType::Multirange, false));
+    }
     crate::value::DataType::from_sql_name(name).or_else(|| lenient().then_some((crate::value::DataType::Text, false)))
 }
 

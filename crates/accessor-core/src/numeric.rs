@@ -439,7 +439,7 @@ fn arith_checked(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
         return Ok(Value::Null);
     }
     // ranges: union, difference and intersection
-    if let (Value::Text(_), Value::Text(_)) = (a, b) {
+    if let (Value::Text(_) | Value::Multirange(_), Value::Text(_) | Value::Multirange(_)) = (a, b) {
         use crate::expr::ranges::{try_op, RangeOp};
         let range_op = match op {
             BinOp::Add => Some(RangeOp::Union),

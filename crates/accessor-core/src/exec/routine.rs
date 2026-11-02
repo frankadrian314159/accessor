@@ -253,7 +253,7 @@ impl Database {
             Some((n, t)) => (n, Some(t)),
             None => (name, None),
         };
-        let types: Option<Vec<Option<DataType>>> = types.map(|t| t.split('\u{3}').filter(|x| !x.is_empty()).map(|x| DataType::from_sql_name(x).map(|(t, _)| t)).collect());
+        let types: Option<Vec<(Option<DataType>, String)>> = types.map(|t| t.split('\u{3}').filter(|x| !x.is_empty()).map(|x| (DataType::from_sql_name(x).map(|(t, _)| t), x.to_string())).collect());
         let found = self
             .routine_slot_of(name, types.as_deref().unwrap_or(&[]), types.is_some())
             .filter(|k| self.routines.get(k).is_some_and(|r| r.function == function))
@@ -344,14 +344,14 @@ impl Database {
     }
 
     /// The version of `name` called by `DROP FUNCTION name(types)`; without types, the first.
-    pub(crate) fn routine_slot_of(&self, name: &str, types: &[Option<DataType>], listed: bool) -> Option<String> {
+    pub(crate) fn routine_slot_of(&self, name: &str, types: &[(Option<DataType>, String)], listed: bool) -> Option<String> {
         let k = key(name);
         let overload = format!("{k}\u{1}");
         self.routines
             .range(k.clone()..)
             .take_while(|(x, _)| **x == k || x.starts_with(&overload))
             .find(|(_, r)| {
-                !listed || (r.params.len() == types.len() && r.params.iter().zip(types).all(|(p, t)| t.is_none() || p.data_type.is_none() || p.data_type == *t))
+                !listed || (r.params.len() == types.len() && r.params.iter().zip(types).all(|(p, (t, raw))| if raw.starts_with("any") { p.poly == *raw } else { t.is_none() || p.data_type.is_none() || p.data_type == *t }))
             })
             .map(|(x, _)| x.clone())
     }

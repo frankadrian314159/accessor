@@ -267,7 +267,7 @@ impl TableSchema {
             )));
         }
         for (v, c) in row.iter_mut().zip(&self.columns) {
-            if let Value::Text(_) = &*v {
+            if let Value::Text(_) | Value::Multirange(_) = &*v {
                 if let Some(tn) = crate::expr::ranges::column_type(&self.name, &c.name) {
                     *v = crate::expr::ranges::normalize(&tn, v)?;
                 }

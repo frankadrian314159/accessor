@@ -48,6 +48,7 @@ pub(crate) fn mysql_type(t: DataType) -> &'static str {
         DataType::Interval => "time",
         DataType::Json => "json",
         DataType::Array(_) => "json",
+        DataType::Multirange => "text",
         DataType::Calculated => "text",
     }
 }

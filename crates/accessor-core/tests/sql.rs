@@ -7044,3 +7044,20 @@ fn postgresql_functions_can_be_overloaded_and_take_polymorphic_types() {
     assert_eq!(one(&mut db, "SELECT pick('a', 'b')"), "b");
     assert_eq!(one(&mut db, "SELECT pick(1.5, 2.5)"), "2.5");
 }
+
+#[test]
+fn postgresql_multirange_is_a_type_and_the_empty_one_is_not_an_array() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    db.execute("CREATE TABLE m (id int, r int4multirange)").unwrap();
+    db.execute("INSERT INTO m VALUES (1, '{}'), (2, '{[1,3]}'), (3, '{[5,7)}')").unwrap();
+    assert_eq!(one(&mut db, "SELECT r FROM m WHERE id = 2"), "{[1,4)}");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM m WHERE isempty(r)"), "1");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM m WHERE r @> '{}'"), "3");
+    assert_eq!(one(&mut db, "SELECT count(*) FROM m WHERE r = '{}'"), "1");
+    assert_eq!(one(&mut db, "SELECT pg_typeof(r) FROM m WHERE id = 1"), "multirange");
+    assert_eq!(one(&mut db, "SELECT '{}'::int4multirange && int4multirange(int4range(1, 2))"), "false");
+    assert_eq!(one(&mut db, "SELECT ARRAY[1,2] @> '{}'"), "true");
+}
