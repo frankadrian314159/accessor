@@ -6278,6 +6278,21 @@ impl<'a> Parser<'a> {
     // ----- expressions ------------------------------------------------------
 
     pub(crate) fn expr(&mut self) -> Result<Expr> {
+        // an expression nested without end (IF(IF(IF(...))) would use up the stack
+        thread_local! {
+            static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        struct Level;
+        impl Drop for Level {
+            fn drop(&mut self) {
+                DEPTH.with(|d| d.set(d.get() - 1));
+            }
+        }
+        if DEPTH.with(|d| d.replace(d.get() + 1)) >= 64 {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            return Err(Error::syntax("Thread stack overrun: the expression is nested too deeply"));
+        }
+        let _level = Level;
         self.or_expr()
     }
 

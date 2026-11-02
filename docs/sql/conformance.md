@@ -114,3 +114,5 @@ Statements about objects that only a server has are read and **ignored**: `CREAT
 ## Differences found by the PostgreSQL regression suite
 
 See [testing](../extern/testing.md#the-postgresql-regression-suite).
+
+An expression nested more than 64 levels deep (`IF(IF(IF(...)))`) is refused with "Thread stack overrun" instead of using up the stack.

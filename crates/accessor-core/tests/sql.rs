@@ -7200,3 +7200,12 @@ fn postgresql_create_aggregate_with_lenient_types_reads_polymorphic_state_types(
     db.execute("CREATE FUNCTION tfp(anyarray,anyelement) RETURNS anyarray AS 'select $1 || $2' LANGUAGE SQL").unwrap();
     db.execute("CREATE AGGREGATE agg(BASETYPE = anyelement, SFUNC = tfp, STYPE = anyarray, INITCOND = '{}')").unwrap();
 }
+
+#[test]
+fn an_expression_nested_without_end_is_refused_instead_of_overflowing_the_stack() {
+    let mut db = Database::in_memory();
+    let deep = format!("SELECT {}1{}", "abs(".repeat(5000), ")".repeat(5000));
+    assert!(db.execute(&deep).is_err());
+    let ok = format!("SELECT {}1{}", "abs(".repeat(30), ")".repeat(30));
+    assert_eq!(db.execute(&ok).unwrap().rows[0][0].to_string(), "1");
+}

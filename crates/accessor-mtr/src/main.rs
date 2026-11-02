@@ -705,7 +705,10 @@ impl Runner<'_> {
                             }
                         } else {
                             let mut n = 0;
-                            while self.truthy(rest) && n < 2000 {
+                            // helper scripts that mysqltest writes with perl are not run here, so a loop that waits for
+                            // them would never end: a loop gets a few seconds
+                            let began = std::time::Instant::now();
+                            while self.truthy(rest) && n < 2000 && began.elapsed().as_secs() < 3 {
                                 self.run(body);
                                 n += 1;
                             }
