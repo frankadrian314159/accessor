@@ -1012,6 +1012,16 @@ impl Value {
                 if let (DataType::Rational, Text(s)) = (numeric, self) {
                     return crate::rational::Rational::parse(s).map(Value::Rational).ok_or_else(bad);
                 }
+                // PostgreSQL reads whole numbers only: not "34.5", "1e3" or blanks
+                if let (DataType::Integer | DataType::Bignum, Text(s)) = (numeric, self) {
+                    if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                        let t = s.trim();
+                        let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+                        if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit() || c == b'_') {
+                            return Err(Error::type_err(format!("invalid input syntax for type {}: \"{s}\"", if numeric == DataType::Integer { "integer" } else { "bigint" })));
+                        }
+                    }
+                }
                 let n = self.num_lenient().ok_or_else(bad)?;
                 let n: &Value = &n;
                 match numeric {

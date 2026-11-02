@@ -264,7 +264,56 @@ impl Frame {
 }
 
 impl Database {
+    /// Whether a function parameter can take a declared type: a polymorphic parameter takes a plain type (an array for
+    /// `anyarray`) or the same pseudo-type; a plain parameter takes only its own type.
+    fn param_takes(p: &RoutineParam, want: &(Option<DataType>, String)) -> bool {
+        match (&want.0, want.1.as_str()) {
+            (Some(t), _) if !p.poly.is_empty() => !p.poly.ends_with("array") || matches!(t, DataType::Array(_)),
+            (Some(t), _) => p.data_type == Some(*t),
+            (None, _) => !p.poly.is_empty(),
+        }
+    }
+
+    /// The checks `CREATE AGGREGATE` makes of its functions: the state type must be settled by the inputs, and the
+    /// transition and final functions must exist for the declared types.
+    fn check_aggregate(&self, agg: &AggregateDef) -> Result<()> {
+        let Some(base) = &agg.base else { return Ok(()) };
+        let state: (Option<DataType>, String) = (agg.stype, agg.stype_poly.clone());
+        if state.0.is_none() && state.1.is_empty() {
+            return Ok(());
+        }
+        if !state.1.is_empty() && !base.iter().any(|b| !b.1.is_empty()) {
+            return Err(Error::catalog("cannot determine transition data type"));
+        }
+        let show = |t: &(Option<DataType>, String)| if t.1.is_empty() { t.0.map_or("unknown".to_string(), |d| d.sql_name().to_ascii_lowercase()) } else { t.1.clone() };
+        let wanted = |types: &[(Option<DataType>, String)]| types.iter().map(show).collect::<Vec<_>>().join(", ");
+        let find = |name: &str, types: Vec<(Option<DataType>, String)>| -> Result<()> {
+            let all = self.routines_named(name);
+            if all.is_empty() {
+                return Ok(());
+            }
+            let fits = |d: &RoutineDef| d.params.len() == types.len() && d.params.iter().zip(&types).all(|(p, w)| Self::param_takes(p, w));
+            if all.iter().any(|d| fits(d)) {
+                Ok(())
+            } else {
+                Err(Error::catalog(format!("function {name}({}) does not exist", wanted(&types))))
+            }
+        };
+        let mut sfunc_types = vec![state.clone()];
+        sfunc_types.extend(base.iter().cloned());
+        find(&agg.sfunc, sfunc_types)?;
+        if let Some(f) = &agg.finalfunc {
+            find(f, vec![state])?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn exec_create_routine(&mut self, def: &RoutineDef) -> Result<QueryResult> {
+        if let Some(agg) = &def.aggregate {
+            if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                self.check_aggregate(agg)?;
+            }
+        }
         // only PostgreSQL has several functions of a name
         if crate::dialect::current() != crate::dialect::Dialect::Postgresql && !self.routines_named(&def.name).is_empty() {
             return Err(Error::catalog(format!("the function or procedure '{}' already exists", def.name)));

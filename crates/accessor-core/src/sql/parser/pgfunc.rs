@@ -149,6 +149,37 @@ impl<'a> Parser<'a> {
         self.expect_sym("(")?;
         let old_style = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Sym("="));
         let mut nargs = 1usize;
+        let mut base: Option<Vec<(Option<DataType>, String)>> = None;
+        if !old_style {
+            // the declared types, when they are plain `type, type`
+            let at = self.pos;
+            let mut types = Vec::new();
+            let mut ok = true;
+            if self.peek_sym("*") || self.peek_sym(")") {
+                if self.peek_sym("*") {
+                    self.advance();
+                }
+            } else {
+                loop {
+                    if let Some(p) = self.polymorphic_type() {
+                        types.push((None, p));
+                    } else if let Ok(t) = self.pg_type() {
+                        types.push((Some(t), String::new()));
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                ok = ok && self.peek_sym(")");
+            }
+            if ok && self.peek_sym(")") {
+                base = Some(types);
+            }
+            self.pos = at;
+        }
         if !old_style {
             if self.eat_sym("*") {
                 nargs = 0;
@@ -179,12 +210,22 @@ impl<'a> Parser<'a> {
             self.expect_sym("(")?;
         }
         let (mut sfunc, mut stype, mut finalfunc, mut initcond) = (None::<String>, None::<DataType>, None::<String>, None::<String>);
+        let mut stype_poly = String::new();
         loop {
             let option = self.ident()?.to_ascii_lowercase();
             self.expect_sym("=")?;
             match option.as_str() {
                 "sfunc" | "sfunc1" => sfunc = Some(self.table_ident()?),
                 "finalfunc" => finalfunc = Some(self.table_ident()?),
+                "basetype" => {
+                    let at = self.pos;
+                    base = if let Some(p) = self.polymorphic_type() {
+                        Some(vec![(None, p)])
+                    } else {
+                        self.pg_type().ok().map(|t| vec![(Some(t), String::new())])
+                    };
+                    self.pos = at;
+                }
                 "initcond" | "initcond1" => match self.advance() {
                     Tok::Str(s) => initcond = Some(s),
                     _ => {
@@ -194,6 +235,12 @@ impl<'a> Parser<'a> {
                 },
                 "stype" | "stype1" => {
                     let at = self.pos;
+                    if let Some(p) = self.polymorphic_type() {
+                        if matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")) {
+                            stype_poly = p;
+                        }
+                        self.pos = at;
+                    }
                     match self.pg_type() {
                         Ok(t) if matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")) => stype = Some(t),
                         _ => self.pos = at,
@@ -214,7 +261,7 @@ impl<'a> Parser<'a> {
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
         let params = (0..nargs).map(|i| RoutineParam { name: format!("${}", i + 1), data_type: None, default: None, out: false, variadic: false, poly: String::new() }).collect();
-        let aggregate = Some(Box::new(AggregateDef { sfunc, stype, finalfunc, initcond, nargs }));
+        let aggregate = Some(Box::new(AggregateDef { sfunc, stype, finalfunc, initcond, nargs, base, stype_poly }));
         Ok(Statement::CreateRoutine(Box::new(RoutineDef {
             name,
             function: true,

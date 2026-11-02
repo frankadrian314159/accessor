@@ -7127,3 +7127,66 @@ fn postgresql_an_out_parameter_may_share_the_name_of_an_in_parameter() {
     db.execute("create function testpolym(a int, out a int) returns int as $$ select $1;$$ language sql").unwrap();
     assert_eq!(db.execute("select testpolym(37)").unwrap().rows[0][0].to_string(), "37");
 }
+
+#[test]
+fn postgresql_create_aggregate_checks_the_state_and_transition_types() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    for q in [
+        "CREATE FUNCTION stfp(anyarray) RETURNS anyarray AS 'select $1' LANGUAGE SQL",
+        "CREATE FUNCTION stfnp(int[]) RETURNS int[] AS 'select $1' LANGUAGE SQL",
+        "CREATE FUNCTION tfp(anyarray,anyelement) RETURNS anyarray AS 'select $1 || $2' LANGUAGE SQL",
+        "CREATE FUNCTION tfnp(int[],int) RETURNS int[] AS 'select $1 || $2' LANGUAGE SQL",
+        "CREATE FUNCTION tf2p(int[],anyelement) RETURNS int[] AS 'select $1' LANGUAGE SQL",
+        "CREATE FUNCTION ffp(anyarray) RETURNS anyarray AS 'select $1' LANGUAGE SQL",
+        "CREATE FUNCTION ffnp(int[]) returns int[] as 'select $1' LANGUAGE SQL",
+    ] {
+        db.execute(q).unwrap();
+    }
+    for ok in [
+        "CREATE AGGREGATE a1(*) (SFUNC = stfnp, STYPE = int4[], FINALFUNC = ffp, INITCOND = '{}')",
+        "CREATE AGGREGATE a2(*) (SFUNC = stfp, STYPE = int4[], INITCOND = '{}')",
+        "CREATE AGGREGATE a3(BASETYPE = int, SFUNC = tf2p, STYPE = int[], FINALFUNC = ffp, INITCOND = '{}')",
+        "CREATE AGGREGATE a4(BASETYPE = int, SFUNC = tfp, STYPE = int[], INITCOND = '{}')",
+        "CREATE AGGREGATE a5(BASETYPE = anyelement, SFUNC = tfp, STYPE = anyarray, FINALFUNC = ffp, INITCOND = '{}')",
+        "CREATE AGGREGATE a6(anyelement) (SFUNC = tfp, STYPE = anyarray, INITCOND = '{}')",
+    ] {
+        db.execute(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for bad in [
+        "CREATE AGGREGATE b1(*) (SFUNC = stfnp, STYPE = anyarray, FINALFUNC = ffp, INITCOND = '{}')",
+        "CREATE AGGREGATE b2(*) (SFUNC = stfp, STYPE = anyarray, INITCOND = '{}')",
+        "CREATE AGGREGATE b3(BASETYPE = anyelement, SFUNC = tfnp, STYPE = int[], INITCOND = '{}')",
+        "CREATE AGGREGATE b4(BASETYPE = int, SFUNC = tfp, STYPE = anyarray, INITCOND = '{}')",
+        "CREATE AGGREGATE b5(BASETYPE = anyelement, SFUNC = tfp, STYPE = anyarray, FINALFUNC = ffnp, INITCOND = '{}')",
+    ] {
+        assert!(db.execute(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn postgresql_integer_columns_refuse_text_that_is_not_a_whole_number() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("CREATE TABLE n(f int)").unwrap();
+    for bad in ["'34.5'", "'asdf'", "'   '", "''", "'1e3'"] {
+        assert!(db.execute(&format!("INSERT INTO n VALUES ({bad})")).is_err(), "{bad}");
+    }
+    db.execute("INSERT INTO n VALUES (' 12 '), ('-7')").unwrap();
+    assert_eq!(db.execute("SELECT count(*) FROM n").unwrap().rows[0][0].to_string(), "2");
+}
+
+#[test]
+fn mysql_a_view_over_information_schema_views_can_be_read() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    db.execute("CREATE ALGORITHM=TEMPTABLE VIEW v1 AS SELECT VIEW_DEFINITION FROM INFORMATION_SCHEMA.VIEWS").unwrap();
+    assert_eq!(db.execute("SELECT * FROM v1 WHERE VIEW_DEFINITION LIKE 'x'").unwrap().rows.len(), 0);
+    db.execute("CREATE ALGORITHM=TEMPTABLE VIEW v2 AS SELECT * FROM v1").unwrap();
+    db.execute("CREATE ALGORITHM=TEMPTABLE VIEW v3 AS SELECT * FROM (SELECT * FROM v1 UNION SELECT * FROM v2) AS dt").unwrap();
+    assert_eq!(db.execute("SELECT * FROM v3 WHERE VIEW_DEFINITION LIKE 'x'").unwrap().rows.len(), 0);
+    assert_eq!(db.execute("SELECT count(*) FROM v1").unwrap().rows[0][0].to_string(), "3");
+}

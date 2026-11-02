@@ -12,6 +12,9 @@ use crate::value::{Row, Value};
 
 thread_local! {
     static PROBING_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while `information_schema.views` is being filled: a view over it would otherwise ask itself whether it can be
+    /// updated, which reads `information_schema.views` again.
+    static LISTING_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The views of the schema, for the error message.
@@ -201,15 +204,17 @@ impl Database {
                 names(&["table_name", "column_name", "ordinal_position", "data_type", "is_nullable", "column_default", "is_primary_key", "is_autonumber", "calculated_expression", "table_catalog", "table_schema", "column_type", "column_key", "extra", "character_set_name", "collation_name", "column_comment", "character_maximum_length", "numeric_precision", "numeric_scale", "datetime_precision", "generation_expression", "privileges"])
             }
             "views" => {
+                let nested = LISTING_VIEWS.with(|p| p.replace(true));
                 for (name, sql) in self.views.values() {
-                    let target = self.view_target(name);
+                    let updatable = !nested && self.view_target(name).is_ok();
                     rows.push(vec![
                         t(name),
                         t(sql.trim_start_matches("/*CHECK OPTION*/").trim()),
-                        yes_no(target.is_ok()),
+                        yes_no(updatable),
                         yes_no(sql.trim_start().starts_with("/*CHECK OPTION*/")),
                     ]);
                 }
+                LISTING_VIEWS.with(|p| p.set(nested));
                 names(&["table_name", "view_definition", "is_updatable", "check_option"])
             }
             "table_constraints" => {

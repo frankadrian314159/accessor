@@ -499,6 +499,10 @@ pub struct AggregateDef {
     pub finalfunc: Option<String>,
     pub initcond: Option<String>,
     pub nargs: usize,
+    /// The declared input types: a type, or the name of a polymorphic pseudo-type; `None` when they could not be read.
+    pub base: Option<Vec<(Option<DataType>, String)>>,
+    /// The polymorphic pseudo-type the state was declared with, empty for a plain type.
+    pub stype_poly: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
