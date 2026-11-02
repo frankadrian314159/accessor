@@ -59,3 +59,9 @@ DROP EXTENSION [IF EXISTS] name [CASCADE];
 ```
 
 The name is recorded (a second `CREATE EXTENSION` of it fails, a `DROP` of one never created fails) and nothing else happens: the functions an extension would bring are either built in already ([PostgreSQL functions](../functions/postgresql.md)) or absent.
+
+## System catalogs (PostgreSQL)
+
+In PostgreSQL mode `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`, `pg_proc`, `pg_aggregate`, `pg_constraint`, `pg_index`, `pg_authid`, `pg_roles`, `pg_trigger`, `pg_database`, `pg_tables`, `pg_views`, `pg_indexes` and `pg_settings` can be queried, built from the tables, views, routines, triggers, roles and types of the database. `pg_operator`, `pg_depend`, `pg_locks`, `pg_description`, `pg_inherits` and a dozen more have their columns and no rows. A table of the same name in the database takes precedence.
+
+There are no object identifiers: the `oid` of a table, type or function is its name, which is also what `'t'::regclass` and `::regtype` give. So `attrelid = 't'::regclass`, a join of `pg_attribute.attrelid` to `pg_class.oid`, and `conrelid::regclass` work; arithmetic or comparison of an `oid` with a number does not. CHECK constraints, inheritance (`pg_inherits`) and operators are not listed.

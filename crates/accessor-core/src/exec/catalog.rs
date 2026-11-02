@@ -31,6 +31,15 @@ fn describe(kind: &str) -> &str {
 }
 
 impl Database {
+    /// The query a materialized view was made from.
+    pub(crate) fn matview_query(&self, name: &str) -> Option<String> {
+        self.catalog.get(&("matview".to_string(), key(name))).cloned()
+    }
+
+    pub(crate) fn set_matview(&mut self, name: &str, query: Option<String>) -> Result<()> {
+        self.catalog_set("matview", name, query)
+    }
+
     /// The invisible columns of a table (MySQL's `INVISIBLE`), by lower-case name.
     pub(crate) fn invisible_columns(&self, table: &str) -> Vec<String> {
         let prefix = format!("{}.", key(table));
@@ -212,7 +221,7 @@ impl Database {
         }
     }
 
-    fn is_superuser(&self, role: &str) -> bool {
+    pub(crate) fn is_superuser(&self, role: &str) -> bool {
         self.role_options_of(role)
             .and_then(|m| m.get("superuser").and_then(|v| v.as_str().map(|s| s == "true")))
             .unwrap_or(false)

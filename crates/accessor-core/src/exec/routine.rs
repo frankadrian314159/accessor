@@ -887,6 +887,50 @@ impl Database {
                 let row = cols.iter().map(|c| frame.vars.get(&format!("{name}.{c}")).cloned().unwrap_or(Value::Null)).collect();
                 self.add_set_row(frame, row)?;
             }
+            ProcStmt::Execute { sql, using, targets, record, strict } => {
+                let r = self.dynamic_query(sql, using, frame)?;
+                if !targets.is_empty() {
+                    if *strict && r.rows.len() != 1 {
+                        return Err(Error::runtime(if r.rows.is_empty() { "query returned no rows" } else { "query returned more than one row" }));
+                    }
+                    let row = r.rows.into_iter().next();
+                    if *record {
+                        self.set_record(frame, &targets[0], &r.columns, row);
+                    } else {
+                        for (i, t) in targets.iter().enumerate() {
+                            let mut v = row.as_ref().and_then(|x| x.get(i).cloned()).unwrap_or(Value::Null);
+                            let k = t.to_ascii_lowercase();
+                            if let Some(ty) = frame.types.get(&k) {
+                                v = v.coerce_to(*ty)?;
+                            }
+                            frame.vars.insert(k, v);
+                        }
+                    }
+                } else {
+                    frame.last = Some(r);
+                }
+            }
+            ProcStmt::ForExecute { name, sql, using, body } => {
+                let r = self.dynamic_query(sql, using, frame)?;
+                for row in r.rows {
+                    frame.iterations += 1;
+                    if frame.iterations > MAX_ITERATIONS {
+                        return Err(Error::runtime("a procedure made more than a million loop iterations (is a loop endless?)"));
+                    }
+                    self.set_record(frame, name, &r.columns, Some(row));
+                    match self.run_block(body, frame)? {
+                        Flow::Normal => {}
+                        Flow::Leave => break,
+                        other => return Ok(other),
+                    }
+                }
+            }
+            ProcStmt::ReturnQueryExecute { sql, using } => {
+                let r = self.dynamic_query(sql, using, frame)?;
+                for row in r.rows {
+                    self.add_set_row(frame, row)?;
+                }
+            }
             ProcStmt::ReturnQuery(select) => {
                 let (_, rows) = self.record_query(select, frame)?;
                 for row in rows {
@@ -1084,6 +1128,44 @@ impl Database {
     }
 
     /// Runs the query of a record variable's `SELECT ... INTO` / `FOR ... IN`, with the variables filled in.
+    /// Runs the statement `sql` evaluates to, with `$1`, `$2`, ... put in as the `USING` values.
+    fn dynamic_query(&mut self, sql: &Expr, using: &[Expr], frame: &Frame) -> Result<QueryResult> {
+        let text = self.eval_in(sql, frame)?;
+        if text.is_null() {
+            return Err(Error::runtime("query string argument of EXECUTE is null"));
+        }
+        let mut values = Vec::new();
+        for e in using {
+            values.push(self.eval_in(e, frame)?);
+        }
+        let src = text.to_string();
+        let mut out = String::with_capacity(src.len());
+        let (mut quote, mut chars) = (None::<char>, src.chars().peekable());
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '$') if chars.peek().is_some_and(char::is_ascii_digit) => {
+                    let mut n = String::new();
+                    while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                        n.push(*d);
+                        chars.next();
+                    }
+                    let v = n.parse::<usize>().ok().and_then(|k| values.get(k.wrapping_sub(1))).ok_or_else(|| Error::runtime(format!("there is no parameter ${n}")))?;
+                    out.push_str(&match v {
+                        Value::Null => "NULL".to_string(),
+                        Value::Int(_) | Value::Big(_) | Value::Dec(_) | Value::Bool(_) => v.to_string(),
+                        other => format!("'{}'", other.to_string().replace('\'', "''")),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
+            out.push(c);
+        }
+        self.execute(&out)
+    }
+
     fn record_query(&mut self, select: &crate::sql::ast::Select, frame: &Frame) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
         let mut stmt = Statement::Select(select.clone());
         bind_params(&mut stmt, &frame.vars)?;

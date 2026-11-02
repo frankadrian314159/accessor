@@ -7236,3 +7236,74 @@ fn a_grouped_join_gives_the_same_groups_as_it_does_without_streaming() {
     let k = db.execute("SELECT count(*), sum(y2) FROM (SELECT t2.y AS y2 FROM t t1 JOIN t t2 ON t1.x = t2.x WHERE t1.y > 3) q").unwrap();
     assert_eq!(g.rows[0], k.rows[0]);
 }
+
+fn pg() -> Database {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db
+}
+
+fn pg_one(db: &mut Database, sql: &str) -> String {
+    db.execute(sql).unwrap().rows[0][0].to_string()
+}
+
+#[test]
+fn postgresql_string_json_and_array_built_ins() {
+    let mut db = pg();
+    assert_eq!(pg_one(&mut db, "SELECT strpos('abc', 'c')"), "3");
+    assert_eq!(pg_one(&mut db, "SELECT to_hex(255)"), "ff");
+    assert_eq!(pg_one(&mut db, "SELECT btrim('xxaxx', 'x')"), "a");
+    assert_eq!(pg_one(&mut db, "SELECT chr(65) || starts_with('abc', 'a')"), "Atrue");
+    assert_eq!(pg_one(&mut db, "SELECT num_nulls(1, NULL, NULL)"), "2");
+    assert_eq!(pg_one(&mut db, "SELECT quote_nullable(NULL)"), "NULL");
+    assert_eq!(pg_one(&mut db, "SELECT regexp_match('abc123', '([a-z]+)([0-9]+)')"), "{abc,123}");
+    assert_eq!(pg_one(&mut db, "SELECT regexp_split_to_array('a b  c', ' +')"), "{a,b,c}");
+    assert_eq!(pg_one(&mut db, "SELECT json_build_object('a', 1, 'b', array[1,2])"), "{\"a\":1,\"b\":[1,2]}");
+    assert_eq!(pg_one(&mut db, "SELECT json_extract_path_text('{\"a\":{\"b\":5}}', 'a', 'b')"), "5");
+    assert_eq!(pg_one(&mut db, "SELECT jsonb_exists('{\"a\":1}'::jsonb, 'a')"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT array_sort(array[3,1,2], true)"), "{3,2,1}");
+    assert_eq!(pg_one(&mut db, "SELECT pg_size_pretty(1234567890)"), "1177 MB");
+}
+
+#[test]
+fn postgresql_table_functions_for_text_json_and_arrays() {
+    let mut db = pg();
+    assert_eq!(db.execute("SELECT * FROM string_to_table('a,b,c', ',')").unwrap().rows.len(), 3);
+    assert_eq!(db.execute("SELECT * FROM regexp_split_to_table('a1b22c', '[0-9]+')").unwrap().rows.len(), 3);
+    assert_eq!(db.execute("SELECT regexp_matches('foobarbaz', '(b.)', 'g')").unwrap().rows.len(), 2);
+    assert_eq!(db.execute("SELECT * FROM jsonb_array_elements('[1,2,3]'::jsonb)").unwrap().rows.len(), 3);
+    assert_eq!(db.execute("SELECT jsonb_object_keys('{\"a\":1,\"b\":2}')").unwrap().rows.len(), 2);
+    assert_eq!(db.execute("SELECT * FROM generate_subscripts(array[10,20,30], 1)").unwrap().rows.len(), 3);
+}
+
+#[test]
+fn postgresql_system_catalogs_describe_tables_columns_and_constraints() {
+    let mut db = pg();
+    db.execute("CREATE TABLE a (id int PRIMARY KEY, x text NOT NULL, y int REFERENCES a(id))").unwrap();
+    db.execute("CREATE INDEX a_x ON a(x)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT relkind FROM pg_class WHERE relname = 'a'"), "r");
+    assert_eq!(pg_one(&mut db, "SELECT relkind FROM pg_class WHERE relname = 'a_x'"), "i");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM pg_attribute WHERE attrelid = 'a'::regclass"), "3");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM pg_constraint WHERE conrelid = 'a'::regclass"), "2");
+    assert_eq!(pg_one(&mut db, "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'a'"), "public");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM pg_type WHERE typname = 'text'"), "1");
+}
+
+#[test]
+fn postgresql_plpgsql_execute_do_blocks_and_materialized_view_refresh() {
+    let mut db = pg();
+    db.execute("CREATE TABLE tt (a int)").unwrap();
+    db.execute("INSERT INTO tt VALUES (1), (2), (3)").unwrap();
+    db.execute("CREATE FUNCTION cnt(tbl text) RETURNS int AS $$ DECLARE n int; BEGIN EXECUTE 'SELECT count(*) FROM ' || tbl INTO n; RETURN n; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT cnt('tt')"), "3");
+    db.execute("CREATE FUNCTION ex(x int) RETURNS int AS $$ DECLARE r int; BEGIN EXECUTE 'select $1 + 10' INTO r USING x; RETURN r; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT ex(5)"), "15");
+    db.execute("DO $$ BEGIN INSERT INTO tt VALUES (10); END $$").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM tt"), "4");
+    db.execute("CREATE MATERIALIZED VIEW mv AS SELECT a * 2 AS y FROM tt WITH DATA").unwrap();
+    db.execute("INSERT INTO tt VALUES (20)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM mv"), "4");
+    db.execute("REFRESH MATERIALIZED VIEW mv").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM mv"), "5");
+}

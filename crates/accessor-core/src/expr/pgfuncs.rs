@@ -48,6 +48,8 @@ pub enum PgFn {
     /// One of the range functions ([`super::ranges`]).
     Range(super::ranges::RangeFn),
     Composite(super::composite::CompFn),
+    /// One of the functions of [`super::pgmore`].
+    More(super::pgmore::MoreFn),
     /// A function that always gives the same text (`DATABASE()`, `VERSION()`, `CURRENT_USER()`).
     Text(&'static str),
     JsonPathArray,
@@ -110,6 +112,7 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
                 .or_else(|| super::arrays::lookup(name).map(|(m, a, b)| (Arr(m), a, b)))
                 .or_else(|| super::ranges::lookup(name).map(|(m, a, b)| (Range(m), a, b)))
                 .or_else(|| super::composite::lookup(name).map(|(m, a, b)| (Composite(m), a, b)))
+                .or_else(|| super::pgmore::lookup(name).map(|(m, a, b)| (More(m), a, b)))
                 .or_else(|| super::myfuncs::lookup(name).map(|(m, a, b)| (My(m), a, b)))
         }
     })
@@ -123,6 +126,7 @@ impl PgFn {
             PgFn::Arr(a) => a.handles_null(),
             PgFn::Range(r) => r.handles_null(),
             PgFn::Composite(c) => c.handles_null(),
+            PgFn::More(m) => m.handles_null(),
             _ => matches!(self, PgFn::ConcatWs | PgFn::TypeOf | PgFn::Nothing),
         }
     }
@@ -351,6 +355,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         Arr(a) => return super::arrays::call(a, vals),
         Range(r) => return super::ranges::call(r, vals),
         Composite(c) => return super::composite::call(c, vals),
+        More(m) => return super::pgmore::call(m, vals),
         Text(s) => Value::text(s),
         Zero => Value::Int(0),
         Same => v(0).clone(),

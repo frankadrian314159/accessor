@@ -450,6 +450,12 @@ pub enum ProcStmt {
     ReturnNextRecord(String),
     /// `RETURN QUERY select`: the rows of the query are rows of the result.
     ReturnQuery(Box<Select>),
+    /// `EXECUTE text [INTO [STRICT] targets] [USING args]`: a statement built at run time. `record` says the one target is a record.
+    Execute { sql: Expr, using: Vec<Expr>, targets: Vec<String>, record: bool, strict: bool },
+    /// `FOR rec IN EXECUTE text [USING args] LOOP body END LOOP`
+    ForExecute { name: String, sql: Expr, using: Vec<Expr>, body: Vec<ProcStmt> },
+    /// `RETURN QUERY EXECUTE text [USING args]`
+    ReturnQueryExecute { sql: Expr, using: Vec<Expr> },
     /// `BEGIN ... END` with handlers or a label; a plain block is just its statements.
     Block { label: Option<String>, body: Vec<ProcStmt>, handlers: Vec<Handler> },
     /// `label: WHILE | LOOP | REPEAT ...`
@@ -674,6 +680,12 @@ pub enum Statement {
     },
     /// `CREATE TABLE name AS query [WITH [NO] DATA]`.
     CreateTableAs { name: String, query: Box<Select>, with_data: bool },
+    /// `CREATE MATERIALIZED VIEW`: a table filled from the query, which is kept (as text) for `REFRESH`.
+    CreateMatView { name: String, query: Box<Select>, sql: String, with_data: bool },
+    /// `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]`
+    RefreshMatView { name: String, with_data: bool },
+    /// PostgreSQL's `DO $$ ... $$`: an anonymous block of PL/pgSQL.
+    DoBlock(String),
     /// MySQL's `HANDLER t OPEN [AS a]`, `HANDLER a READ FIRST | NEXT | PREV | LAST [WHERE c] [LIMIT n]`, `HANDLER a CLOSE`.
     Handler(Box<HandlerStmt>),
     /// A command that is read and does nothing (`VACUUM`, `ANALYZE`, `COMMENT ON`, `LOCK`, ...).

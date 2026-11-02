@@ -205,6 +205,12 @@ impl Database {
         self.inherit_links().filter(|(_, p, _)| *p == t).map(|(c, _, _)| c.to_string()).collect()
     }
 
+    /// The table this one is a partition or child of.
+    pub(crate) fn parent_of(&self, table: &str) -> Option<String> {
+        let t = key(table);
+        self.inherit_links().find(|(c, _, _)| *c == t).map(|(_, p, _)| p.to_string())
+    }
+
     pub(crate) fn has_children(&self, table: &str) -> bool {
         let t = key(table);
         self.inherit_links().any(|(_, p, _)| p == t)

@@ -2330,7 +2330,7 @@ impl<'a> Parser<'a> {
             // `FROM t WINDOW w AS (...)`: WINDOW starts a clause here, not an alias.
             Tok::Ident(s) if s.eq_ignore_ascii_case("WINDOW") && matches!(self.peek_at(1), Tok::Ident(_)) && self.peek_kw_at(2, "AS") => false,
             // `CREATE TABLE t AS SELECT ... FROM s WITH NO DATA`
-            Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && (self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "CHECK") || self.peek_kw_at(1, "LOCAL") || self.peek_kw_at(1, "CASCADED")) => false,
+            Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && (self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "DATA") || self.peek_kw_at(1, "CHECK") || self.peek_kw_at(1, "LOCAL") || self.peek_kw_at(1, "CASCADED")) => false,
             Tok::Ident(s) if s.eq_ignore_ascii_case("STRAIGHT_JOIN") => false,
             // `FROM t FOR UPDATE`, `FROM t LOCK IN SHARE MODE`: locking clauses
             Tok::Ident(s) if s.eq_ignore_ascii_case("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) => false,
@@ -2643,6 +2643,30 @@ impl<'a> Parser<'a> {
                 }
                 return Ok(Statement::Ignored(word.to_string()));
             }
+        }
+        if self.peek_kw("REFRESH") && self.peek_kw_at(1, "MATERIALIZED") && self.peek_kw_at(2, "VIEW") {
+            self.advance();
+            self.advance();
+            self.advance();
+            self.eat_kw("CONCURRENTLY");
+            let name = self.table_ident()?;
+            let mut with_data = true;
+            if self.eat_kw("WITH") {
+                with_data = !self.eat_kw("NO");
+                self.expect_kw("DATA")?;
+            }
+            return Ok(Statement::RefreshMatView { name, with_data });
+        }
+        if self.peek_kw("DO") && (matches!(self.peek_at(1), Tok::Str(_)) || self.peek_kw_at(1, "LANGUAGE")) {
+            self.advance();
+            if self.eat_kw("LANGUAGE") {
+                self.ident()?;
+            }
+            let Tok::Str(body) = self.advance() else { return Err(self.unexpected("the code of the block")) };
+            if self.eat_kw("LANGUAGE") {
+                self.ident()?;
+            }
+            return Ok(Statement::DoBlock(body));
         }
         if self.peek_kw("DO") && !matches!(self.peek_at(1), Tok::Str(_) | Tok::Eof | Tok::Sym(";")) && !self.peek_kw_at(1, "LANGUAGE") {
             // MySQL: DO expr, ...
@@ -3936,14 +3960,30 @@ impl<'a> Parser<'a> {
             self.advance();
             self.if_exists_clause(true, guarded)?;
             let name = self.table_ident()?;
+            if self.peek_sym("(") {
+                self.skip_parens()?; // column names
+            }
+            // USING method, WITH (storage options), TABLESPACE t
+            loop {
+                if self.eat_kw("USING") || self.eat_kw("TABLESPACE") {
+                    self.ident()?;
+                } else if self.peek_kw("WITH") && self.peek_sym_at(1, "(") {
+                    self.advance();
+                    self.skip_parens()?;
+                } else {
+                    break;
+                }
+            }
             self.expect_kw("AS")?;
+            let from = self.toks[self.pos].pos;
             let query = Box::new(self.select()?);
+            let sql = self.src[from..self.toks[self.pos].pos.min(self.src.len())].to_string();
             let mut with_data = true;
             if self.eat_kw("WITH") {
                 with_data = !self.eat_kw("NO");
                 self.expect_kw("DATA")?;
             }
-            return Ok(Statement::CreateTableAs { name, query, with_data });
+            return Ok(Statement::CreateMatView { name, query, sql: sql.trim().trim_end_matches(';').trim().to_string(), with_data });
         }
         // temporary and unlogged tables are ordinary tables here
         while (self.peek_kw("TEMP") || self.peek_kw("TEMPORARY") || self.peek_kw("UNLOGGED") || self.peek_kw("GLOBAL") || self.peek_kw("LOCAL"))
@@ -5378,8 +5418,20 @@ impl<'a> Parser<'a> {
         if sel.from.is_none() && sel.items.len() == 1 {
             if let SelectItem::Expr { expr: Expr::Function { name, args, .. }, alias } = &sel.items[0] {
                 let up = name.to_ascii_uppercase();
-                if matches!(up.as_str(), "GENERATE_SERIES" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" | "UNNEST" | "RANGE_MINUS_MULTI" | "MULTIRANGE_MINUS_MULTI") {
+                if matches!(
+                    up.as_str(),
+                    "GENERATE_SERIES" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" | "UNNEST" | "RANGE_MINUS_MULTI" | "MULTIRANGE_MINUS_MULTI"
+                        | "STRING_TO_TABLE" | "REGEXP_SPLIT_TO_TABLE" | "REGEXP_MATCHES" | "GENERATE_SUBSCRIPTS" | "JSON_OBJECT_KEYS" | "JSONB_OBJECT_KEYS"
+                        | "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT"
+                ) {
                     let col = match up.as_str() {
+                        "STRING_TO_TABLE" => "string_to_table",
+                        "REGEXP_SPLIT_TO_TABLE" => "regexp_split_to_table",
+                        "REGEXP_MATCHES" => "regexp_matches",
+                        "GENERATE_SUBSCRIPTS" => "generate_subscripts",
+                        "JSON_OBJECT_KEYS" => "json_object_keys",
+                        "JSONB_OBJECT_KEYS" => "jsonb_object_keys",
+                        "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT" => "value",
                         "GENERATE_SERIES" => "generate_series",
                         "UNNEST" => "unnest",
                         "RANGE_MINUS_MULTI" => "range_minus_multi",

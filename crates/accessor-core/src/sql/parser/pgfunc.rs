@@ -571,7 +571,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn peek_sym_at(&self, n: usize, s: &str) -> bool {
+    pub(super) fn peek_sym_at(&self, n: usize, s: &str) -> bool {
         matches!(self.peek_at(n), Tok::Sym(x) if *x == s)
     }
 
@@ -689,6 +689,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `[USING expr, ...]` after a dynamic statement.
+    fn pl_using(&mut self, names: &mut Names) -> Result<Vec<Expr>> {
+        let mut out = Vec::new();
+        if self.eat_kw("USING") {
+            loop {
+                out.push(self.pl_expr(names)?);
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn end_stmt(&mut self) -> Result<()> {
         if self.eat_sym(";") || self.peek_kw("END") || self.at_eof() {
             Ok(())
@@ -724,8 +738,11 @@ impl<'a> Parser<'a> {
                 return self.end_stmt();
             }
             if self.eat_kw("QUERY") {
-                if self.peek_kw("EXECUTE") {
-                    return Err(Error::syntax("RETURN QUERY EXECUTE is not supported"));
+                if self.eat_kw("EXECUTE") {
+                    let sql = self.pl_expr(names)?;
+                    let using = self.pl_using(names)?;
+                    out.push(ProcStmt::ReturnQueryExecute { sql, using });
+                    return self.end_stmt();
                 }
                 let mut st = self.statement()?;
                 names.statement(&mut st)?;
@@ -812,6 +829,17 @@ impl<'a> Parser<'a> {
         if self.eat_kw("FOR") {
             let var = self.ident()?;
             self.expect_kw("IN")?;
+            if self.eat_kw("EXECUTE") {
+                let sql = self.pl_expr(names)?;
+                let using = self.pl_using(names)?;
+                self.expect_kw("LOOP")?;
+                names.records.push(var.clone());
+                let body = self.pl_stmts(names, &["END"])?;
+                self.expect_kw("END")?;
+                self.expect_kw("LOOP")?;
+                out.push(ProcStmt::ForExecute { name: var, sql, using, body });
+                return self.end_stmt();
+            }
             if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
                 let start = self.toks[self.pos].pos;
                 let mut depth = 0usize;
@@ -888,7 +916,24 @@ impl<'a> Parser<'a> {
             out.push(ProcStmt::Sql(st));
             return self.end_stmt();
         }
-        if self.peek_kw("EXECUTE") || self.peek_kw("OPEN") || self.peek_kw("FETCH") || self.peek_kw("CLOSE") || self.peek_kw("GET") {
+        if self.eat_kw("EXECUTE") {
+            let sql = self.pl_expr(names)?;
+            let (mut targets, mut strict) = (Vec::new(), false);
+            if self.eat_kw("INTO") {
+                strict = self.eat_kw("STRICT");
+                loop {
+                    targets.push(self.ident()?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+            }
+            let using = self.pl_using(names)?;
+            let record = targets.len() == 1 && names.records.contains(&targets[0]);
+            out.push(ProcStmt::Execute { sql, using, targets, record, strict });
+            return self.end_stmt();
+        }
+        if self.peek_kw("OPEN") || self.peek_kw("FETCH") || self.peek_kw("CLOSE") || self.peek_kw("GET") {
             return Err(Error::syntax("EXECUTE, cursors and GET DIAGNOSTICS are not supported"));
         }
         // NEW.col := expr (a trigger function changing the row)

@@ -14,6 +14,7 @@ pub mod tsearch;
 pub mod xmlfuncs;
 pub mod myfuncs;
 pub mod pgfuncs;
+pub mod pgmore;
 
 use std::borrow::Cow;
 use std::collections::HashSet;

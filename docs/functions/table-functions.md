@@ -81,3 +81,7 @@ SELECT value, ordinal FROM SPLIT_STRING('red,green,blue', ',');
 SELECT A.Title, T.value AS tag
 FROM Article A CROSS JOIN LATERAL SPLIT_STRING(A.Tags, ';') AS T;
 ```
+
+## PostgreSQL's text, JSON and array table functions
+
+In PostgreSQL mode these also return rows (and, alone in a select list, behave as if selected from): `STRING_TO_TABLE(text, delimiter [, null_string])`, `REGEXP_SPLIT_TO_TABLE(text, pattern [, flags])`, `REGEXP_MATCHES(text, pattern [, flags])` (one array per match with the `g` flag, otherwise the first), `GENERATE_SUBSCRIPTS(array, dim [, reverse])`, `JSON[B]_ARRAY_ELEMENTS[_TEXT](doc)`, `JSON[B]_OBJECT_KEYS(doc)`, `JSONB_EACH(doc)`, `JSON[B]_EACH_TEXT(doc)`, `PG_PARTITION_TREE(table)` (`relid`, `parentrelid`, `isleaf`, `level`) and `PG_PARTITION_ANCESTORS(table)`. Not available: `JSON[B]_POPULATE_RECORD[SET]`, `TS_DEBUG`, `XMLTABLE`.

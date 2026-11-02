@@ -179,3 +179,11 @@ A function that `RETURNS trigger` is run by `CREATE TRIGGER ... EXECUTE FUNCTION
 Not available: `INSTEAD OF` triggers that call a function, `REFERENCING` (transition tables), trigger arguments (`TG_ARGV`), `TG_TABLE_SCHEMA` other than `'public'`, and `CREATE CONSTRAINT TRIGGER`. A trigger function is looked up when the trigger fires, so it can be created after the trigger. Statements inside the function run as statements of their own: if a later statement of the outer command fails, what they did is undone only when the whole command ran in a transaction.
 
 In the PostgreSQL dialect `CREATE AGGREGATE` checks its functions as PostgreSQL does: a state type of `anyarray`/`anyelement` needs a polymorphic input to settle it ("cannot determine transition data type"), and the transition and final functions must exist for the declared types (a polymorphic declaration matches only a polymorphic parameter; a plain type matches a plain or a polymorphic parameter). Also in PostgreSQL, an integer column refuses text that is not a whole number (`'34.5'`, `'1e3'`, blanks).
+
+### Dynamic SQL, `DO` and materialized views (PostgreSQL)
+
+In a PL/pgSQL body, `EXECUTE text [INTO [STRICT] targets] [USING args]` runs a statement built at run time: `$1`, `$2`, ... in the text are replaced by the `USING` values (as literals), and `INTO` takes the first row into variables or a record. `FOR rec IN EXECUTE text [USING ...] LOOP` and `RETURN QUERY EXECUTE text [USING ...]` work too. The text cannot read the variables of the routine, as in PostgreSQL. Cursors (`OPEN`, `FETCH`, `CLOSE`) and `GET DIAGNOSTICS` are still not supported.
+
+`DO [LANGUAGE plpgsql] $$ ... $$` runs an anonymous PL/pgSQL block; it is made as the function `pg_do_block()`, called, and dropped.
+
+`CREATE MATERIALIZED VIEW name [(cols)] [USING m] [WITH (..)] AS query [WITH [NO] DATA]` makes a table filled from the query and keeps the query; `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` empties the table and fills it again from that query.

@@ -196,6 +196,11 @@ impl Database {
                     let res = self.without_privileges(|| self.run_select_depth(&q, depth + 1))?;
                     return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
                 }
+                if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                    if let Some((names, rows)) = self.pg_catalog(name) {
+                        return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
+                    }
+                }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }
             TableFactor::Pivot { source, agg, pivot, values, alias } => {
@@ -440,6 +445,16 @@ impl Database {
             "SPLIT_STRING" => vec!["value".into(), "ordinal".into()],
             "JSON_EACH" => vec!["key".into(), "value".into()],
             "UNNEST" => vec!["unnest".into()],
+            "STRING_TO_TABLE" => vec!["string_to_table".into()],
+            "REGEXP_SPLIT_TO_TABLE" => vec!["regexp_split_to_table".into()],
+            "REGEXP_MATCHES" => vec!["regexp_matches".into()],
+            "GENERATE_SUBSCRIPTS" => vec!["generate_subscripts".into()],
+            "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT" => vec!["value".into()],
+            "JSON_OBJECT_KEYS" => vec!["json_object_keys".into()],
+            "JSONB_OBJECT_KEYS" => vec!["jsonb_object_keys".into()],
+            "JSONB_EACH" | "JSON_EACH_TEXT" | "JSONB_EACH_TEXT" => vec!["key".into(), "value".into()],
+            "PG_PARTITION_TREE" => vec!["relid".into(), "parentrelid".into(), "isleaf".into(), "level".into()],
+            "PG_PARTITION_ANCESTORS" => vec!["relid".into()],
             "RANGE_MINUS_MULTI" => vec!["range_minus_multi".into()],
             "MULTIRANGE_MINUS_MULTI" => vec!["multirange_minus_multi".into()],
             "PG_INPUT_ERROR_INFO" => vec!["message".into(), "detail".into(), "hint".into(), "sql_error_code".into()],
@@ -618,6 +633,190 @@ impl Database {
                 let (doc, path, vars, silent) = crate::expr::pgfuncs::json_path_args(&cows)?;
                 let items = crate::jsonpath::query(&doc, &path, vars.as_ref(), silent)?;
                 Ok((cols, items.iter().map(|j| vec![crate::expr::pgfuncs::json_value(j)]).collect()))
+            }
+            "STRING_TO_TABLE" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(wrong("STRING_TO_TABLE"));
+                }
+                if args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                let text = args[0].to_string();
+                let null_str = args.get(2).filter(|v| !v.is_null()).map(Value::to_string);
+                let parts: Vec<String> = if args[1].is_null() {
+                    text.chars().map(String::from).collect()
+                } else {
+                    let sep = args[1].to_string();
+                    if sep.is_empty() { vec![text.clone()] } else { text.split(&sep).map(str::to_string).collect() }
+                };
+                let rows = parts.into_iter().map(|p| vec![if null_str.as_deref() == Some(p.as_str()) { Value::Null } else { Value::text(&p) }]).collect();
+                Ok((cols, rows))
+            }
+            "REGEXP_SPLIT_TO_TABLE" => {
+                if args.len() < 2 || args.len() > 3 || args.iter().any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let (s, p) = (args[0].to_string(), args[1].to_string());
+                let flags = args.get(2).map(Value::to_string).unwrap_or_default();
+                let flags = if flags.contains('i') { flags } else { format!("c{flags}") };
+                let re = crate::expr::extra::pattern(&p, &flags)?;
+                let (mut rows, mut last) = (Vec::new(), 0);
+                for (a, b) in re.find_all(&s) {
+                    if b == a {
+                        continue;
+                    }
+                    rows.push(vec![Value::text(&s[last..a])]);
+                    last = b;
+                }
+                rows.push(vec![Value::text(&s[last..])]);
+                Ok((cols, rows))
+            }
+            "REGEXP_MATCHES" => {
+                if args.len() < 2 || args.len() > 3 || args.iter().take(2).any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let (s, p) = (args[0].to_string(), args[1].to_string());
+                let flags = args.get(2).map(Value::to_string).unwrap_or_default();
+                let global = flags.contains('g');
+                let flags: String = flags.chars().filter(|c| *c != 'g').collect();
+                let flags = if flags.contains('i') { flags } else { format!("c{flags}") };
+                let re = crate::expr::extra::pattern(&p, &flags)?;
+                let n = re.group_count();
+                let mut rows = Vec::new();
+                for (a, b) in re.find_all(&s) {
+                    let m = &s[a..b];
+                    let item = if n <= 1 {
+                        vec![Value::text(m)]
+                    } else {
+                        (1..n).map(|k| re.group(m, k).map_or(Value::Null, |g| Value::text(&g))).collect()
+                    };
+                    rows.push(vec![Value::Array(Arc::new(item))]);
+                    if !global {
+                        break;
+                    }
+                }
+                Ok((cols, rows))
+            }
+            "GENERATE_SUBSCRIPTS" => {
+                if args.len() < 2 || args.iter().take(2).any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let len = match &args[0] {
+                    Value::Array(a) => a.len() as i64,
+                    other => match other.coerce_to(crate::value::DataType::Array(crate::value::ArrayOf::Any))? {
+                        Value::Array(a) => a.len() as i64,
+                        _ => 0,
+                    },
+                };
+                let reverse = matches!(args.get(2), Some(Value::Bool(true)));
+                let mut rows: Vec<Row> = (1..=len).map(|i| vec![Value::Int(i)]).collect();
+                if reverse {
+                    rows.reverse();
+                }
+                Ok((cols, rows))
+            }
+            "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT" => {
+                if args.len() != 1 {
+                    return Err(wrong("JSON_ARRAY_ELEMENTS"));
+                }
+                if args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                let text = name.to_ascii_uppercase().ends_with("_TEXT");
+                let rows = match crate::json::document(&args[0])? {
+                    serde_json::Value::Array(a) => a
+                        .iter()
+                        .map(|v| {
+                            vec![if text {
+                                match v {
+                                    serde_json::Value::Null => Value::Null,
+                                    serde_json::Value::String(s) => Value::text(s),
+                                    other => Value::text(&other.to_string()),
+                                }
+                            } else {
+                                crate::json::json_value(v)
+                            }]
+                        })
+                        .collect(),
+                    _ => return Err(Error::runtime("cannot extract elements from a scalar or an object")),
+                };
+                Ok((cols, rows))
+            }
+            "JSON_OBJECT_KEYS" | "JSONB_OBJECT_KEYS" => {
+                if args.len() != 1 {
+                    return Err(wrong("JSON_OBJECT_KEYS"));
+                }
+                if args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                match crate::json::document(&args[0])? {
+                    serde_json::Value::Object(m) => Ok((cols, m.keys().map(|k| vec![Value::text(k)]).collect())),
+                    _ => Err(Error::runtime("cannot call json_object_keys on a scalar or an array")),
+                }
+            }
+            "JSONB_EACH" | "JSON_EACH_TEXT" | "JSONB_EACH_TEXT" => {
+                if args.len() != 1 {
+                    return Err(wrong("JSONB_EACH"));
+                }
+                if args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                let text = name.to_ascii_uppercase().ends_with("_TEXT");
+                let rows = match crate::json::document(&args[0])? {
+                    serde_json::Value::Object(m) => m
+                        .iter()
+                        .map(|(k, v)| {
+                            vec![
+                                Value::text(k),
+                                if text {
+                                    match v {
+                                        serde_json::Value::Null => Value::Null,
+                                        serde_json::Value::String(s) => Value::text(s),
+                                        other => Value::text(&other.to_string()),
+                                    }
+                                } else {
+                                    crate::json::json_value(v)
+                                },
+                            ]
+                        })
+                        .collect(),
+                    _ => return Err(Error::runtime("cannot call jsonb_each on a non-object")),
+                };
+                Ok((cols, rows))
+            }
+            "PG_PARTITION_TREE" => {
+                if args.len() != 1 || args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                let root = args[0].to_string();
+                let Some(t) = self.table(&root) else { return Ok((cols, Vec::new())) };
+                let mut rows: Vec<Row> = Vec::new();
+                let mut stack = vec![(t.name().to_string(), None::<String>, 0i64)];
+                while let Some((name, parent, level)) = stack.pop() {
+                    let kids = self.children_of(&name);
+                    rows.push(vec![Value::text(&name), parent.as_deref().map_or(Value::Null, Value::text), Value::Bool(kids.is_empty()), Value::Int(level)]);
+                    for k in kids.into_iter().rev() {
+                        let shown = self.table(&k).map_or(k, |t| t.name().to_string());
+                        stack.push((shown, Some(name.clone()), level + 1));
+                    }
+                }
+                Ok((cols, rows))
+            }
+            "PG_PARTITION_ANCESTORS" => {
+                if args.len() != 1 || args[0].is_null() {
+                    return Ok((cols, Vec::new()));
+                }
+                let mut rows: Vec<Row> = Vec::new();
+                let mut cur = args[0].to_string();
+                loop {
+                    let shown = self.table(&cur).map_or(cur.clone(), |t| t.name().to_string());
+                    rows.push(vec![Value::text(&shown)]);
+                    match self.parent_of(&cur) {
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+                Ok((cols, rows))
             }
             "JSON_EACH" => {
                 if args.len() != 1 {

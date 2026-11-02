@@ -18,6 +18,7 @@ pub(crate) mod settings;
 mod routine;
 mod reports;
 mod infoschema;
+mod pgcatalog;
 mod perfschema;
 mod returning;
 mod prepared;
@@ -418,6 +419,27 @@ impl Database {
                 Ok(QueryResult::default())
             }
             Statement::Do(exprs) => self.run_do(exprs),
+            Statement::DoBlock(body) => {
+                self.execute(&format!("CREATE OR REPLACE FUNCTION pg_do_block() RETURNS void AS $do_blk$ {body} $do_blk$ LANGUAGE plpgsql"))?;
+                let r = self.execute("SELECT pg_do_block()");
+                self.execute("DROP FUNCTION pg_do_block()")?;
+                r.map(|_| QueryResult::default())
+            }
+            Statement::CreateMatView { name, query, sql, with_data } => {
+                let r = self.exec_create_table_as(name, query, *with_data)?;
+                self.set_matview(name, Some(sql.clone()))?;
+                Ok(r)
+            }
+            Statement::RefreshMatView { name, with_data } => {
+                let Some(sql) = self.matview_query(name) else {
+                    return Err(Error::catalog(format!("\"{name}\" is not a materialized view")));
+                };
+                self.execute(&format!("DELETE FROM {name}"))?;
+                if *with_data {
+                    self.execute(&format!("INSERT INTO {name} {sql}"))?;
+                }
+                Ok(QueryResult::default())
+            }
             Statement::SelectOutfile { select, spec } => self.select_outfile(select, spec),
             Statement::DeclareCursor { name, query, hold } => self.declare_cursor(name, query, *hold),
             Statement::Fetch { name, direction, move_only } => self.fetch_cursor(name, *direction, *move_only),

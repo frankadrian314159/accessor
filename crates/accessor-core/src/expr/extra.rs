@@ -34,6 +34,11 @@ impl Re {
         self.0.find_iter(text).map_while(|m| m.ok()).map(|m| (m.start(), m.end())).collect()
     }
 
+    /// The number of groups, the whole match counted.
+    pub(crate) fn group_count(&self) -> usize {
+        self.0.captures_len()
+    }
+
     /// The text of group `n` (0 is the whole match) of the first match.
     pub(crate) fn group(&self, text: &str, n: usize) -> Option<String> {
         let caps = self.0.captures(text).ok().flatten()?;
