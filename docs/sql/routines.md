@@ -140,7 +140,7 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 
 **A name in the body that is a parameter or variable means that parameter or variable**, even where a column of the same name exists (PostgreSQL prefers the column). Write `t.col` to reach the column.
 
-**Functions are known by name.** A second function with the same name and different argument types is refused ("already exists"); `CREATE OR REPLACE` replaces it. There is no overloading.
+**Functions are known by name**, except in the PostgreSQL dialect, where several functions may share a name and differ in their parameter types or count (`DROP FUNCTION f(int)` names one). A call takes the version whose parameter count fits, and then the one whose types fit best. An argument's type is known for a literal, a cast, arithmetic and comparisons over those, `CASE`, `||`, common built-ins (`LENGTH`, `UPPER`, `ABS`, ...) and a stored function with a declared result type; a column's type is not known, so such an argument fits any parameter equally. In other dialects a second function of the same name is refused ("already exists"); `CREATE OR REPLACE` replaces it.
 
 ### PL/pgSQL
 

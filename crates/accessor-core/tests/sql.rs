@@ -7061,3 +7061,22 @@ fn postgresql_multirange_is_a_type_and_the_empty_one_is_not_an_array() {
     assert_eq!(one(&mut db, "SELECT '{}'::int4multirange && int4multirange(int4range(1, 2))"), "false");
     assert_eq!(one(&mut db, "SELECT ARRAY[1,2] @> '{}'"), "true");
 }
+
+#[test]
+fn postgresql_overloads_are_picked_by_the_type_of_an_expression() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    let one = |db: &mut Database, q: &str| db.execute(q).unwrap().rows[0][0].to_string();
+    db.execute("CREATE FUNCTION g(a int) RETURNS text AS $$ SELECT 'int' $$ LANGUAGE sql").unwrap();
+    db.execute("CREATE FUNCTION g(a text) RETURNS text AS $$ SELECT 'text' $$ LANGUAGE sql").unwrap();
+    db.execute("CREATE FUNCTION g(a boolean) RETURNS text AS $$ SELECT 'bool' $$ LANGUAGE sql").unwrap();
+    db.execute("CREATE FUNCTION n() RETURNS int AS $$ SELECT 7 $$ LANGUAGE sql").unwrap();
+    assert_eq!(one(&mut db, "SELECT g(1 + 2)"), "int");
+    assert_eq!(one(&mut db, "SELECT g(length('abc'))"), "int");
+    assert_eq!(one(&mut db, "SELECT g(upper('abc'))"), "text");
+    assert_eq!(one(&mut db, "SELECT g('a' || 'b')"), "text");
+    assert_eq!(one(&mut db, "SELECT g(1 < 2)"), "bool");
+    assert_eq!(one(&mut db, "SELECT g(n())"), "int");
+    assert_eq!(one(&mut db, "SELECT g(CASE WHEN true THEN 'x'::text ELSE 'y'::text END)"), "text");
+}

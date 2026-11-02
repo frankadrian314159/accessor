@@ -83,18 +83,62 @@ fn is_number(t: DataType) -> bool {
 }
 
 /// The type of an argument when it is plain to see: a literal, or a cast.
-fn static_type(e: &Expr) -> Option<DataType> {
+fn static_type(db: &Database, e: &Expr) -> Option<DataType> {
+    let rank = |t: DataType| match t {
+        DataType::Integer => Some(0),
+        DataType::Bignum => Some(1),
+        DataType::Decimal => Some(2),
+        DataType::Float => Some(3),
+        DataType::Double => Some(4),
+        _ => None,
+    };
     match e {
         Expr::Literal(v) => v.data_type(),
-        Expr::Function { name, .. } => {
+        Expr::Neg(x) => static_type(db, x).filter(|t| rank(*t).is_some()),
+        Expr::Not(_) | Expr::IsNull { .. } | Expr::Like { .. } | Expr::Between { .. } | Expr::InList { .. } | Expr::InSelect { .. } | Expr::Exists { .. } => Some(DataType::YesNo),
+        Expr::Binary { op, left, right } => match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::And | BinOp::Or => Some(DataType::YesNo),
+            BinOp::Concat => Some(DataType::Text),
+            BinOp::Div | BinOp::Pow => None,
+            _ => {
+                let (l, r) = (static_type(db, left)?, static_type(db, right)?);
+                let (rl, rr) = (rank(l)?, rank(r)?);
+                Some(if rl >= rr { l } else { r })
+            }
+        },
+        Expr::Case { whens, else_expr } => {
+            let t = whens.first().and_then(|(_, v)| static_type(db, v))?;
+            let rest_agree = whens.iter().skip(1).map(|(_, v)| v).chain(else_expr.as_deref()).all(|v| static_type(db, v).is_none_or(|u| u == t));
+            rest_agree.then_some(t)
+        }
+        Expr::Function { name, args, .. } => {
             let up = name.to_ascii_uppercase();
-            [DataType::Integer, DataType::Bignum, DataType::Decimal, DataType::Float, DataType::Double, DataType::Text, DataType::YesNo, DataType::DateTime, DataType::Json]
+            if let Some(t) = [DataType::Integer, DataType::Bignum, DataType::Decimal, DataType::Float, DataType::Double, DataType::Text, DataType::YesNo, DataType::DateTime, DataType::Json]
                 .into_iter()
                 .find(|t| match t {
                     DataType::Integer => up == "CAST_INTEGER",
                     DataType::Bignum => up == "CAST_BIGNUM",
                     t => cast_function(*t).is_some_and(|c| c.eq_ignore_ascii_case(&up)),
                 })
+            {
+                return Some(t);
+            }
+            match up.as_str() {
+                "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "OCTET_LENGTH" | "STRPOS" | "POSITION" | "ASCII" => return Some(DataType::Integer),
+                "COUNT" => return Some(DataType::Bignum),
+                "UPPER" | "LOWER" | "TRIM" | "LTRIM" | "RTRIM" | "CONCAT" | "SUBSTR" | "SUBSTRING" | "REPLACE" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "INITCAP" | "LEFT" | "RIGHT" | "MD5" => return Some(DataType::Text),
+                "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNC" | "SIGN" | "MIN" | "MAX" | "SUM" | "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" => {
+                    let types: Vec<DataType> = args.iter().filter_map(|a| static_type(db, a)).collect();
+                    return match types.split_first() {
+                        Some((t, rest)) if rest.iter().all(|u| u == t) && types.len() == args.len().min(if up == "ROUND" || up == "TRUNC" { 1 } else { args.len() }) => Some(*t),
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
+            // a stored function: the type it is declared to return
+            let def = db.routine_def_for(name, args)?;
+            if def.function && def.aggregate.is_none() { def.returns } else { None }
         }
         _ => None,
     }
@@ -303,7 +347,7 @@ impl Database {
                     };
                     continue;
                 }
-                let (Some(want), Some(have)) = (p.data_type, static_type(a)) else {
+                let (Some(want), Some(have)) = (p.data_type, static_type(self, a)) else {
                     s += if p.data_type.is_none() { 0 } else { 1 };
                     continue;
                 };

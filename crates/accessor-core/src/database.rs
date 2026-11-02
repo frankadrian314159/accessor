@@ -547,7 +547,7 @@ impl Database {
                     .ok_or_else(|| Error::catalog(format!("the report '{name}' does not exist")))?;
                 Ok(None)
             }
-            Op::CreateRoutine { name, sql } => {
+            Op::CreateRoutine { name: _, sql } => {
                 let def = parse_routine(sql)?;
                 let k = self.routine_slot(&def)?;
                 self.routines.insert(k, Arc::new(def));
