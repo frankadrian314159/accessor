@@ -7190,3 +7190,13 @@ fn mysql_a_view_over_information_schema_views_can_be_read() {
     assert_eq!(db.execute("SELECT * FROM v3 WHERE VIEW_DEFINITION LIKE 'x'").unwrap().rows.len(), 0);
     assert_eq!(db.execute("SELECT count(*) FROM v1").unwrap().rows[0][0].to_string(), "3");
 }
+
+#[test]
+fn postgresql_create_aggregate_with_lenient_types_reads_polymorphic_state_types() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Postgresql);
+    db.execute("SET lenient_types = on").unwrap();
+    db.execute("CREATE FUNCTION tfp(anyarray,anyelement) RETURNS anyarray AS 'select $1 || $2' LANGUAGE SQL").unwrap();
+    db.execute("CREATE AGGREGATE agg(BASETYPE = anyelement, SFUNC = tfp, STYPE = anyarray, INITCOND = '{}')").unwrap();
+}

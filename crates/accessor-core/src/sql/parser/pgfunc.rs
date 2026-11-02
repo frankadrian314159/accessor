@@ -235,13 +235,12 @@ impl<'a> Parser<'a> {
                 },
                 "stype" | "stype1" => {
                     let at = self.pos;
-                    if let Some(p) = self.polymorphic_type() {
-                        if matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")) {
-                            stype_poly = p;
-                        }
-                        self.pos = at;
+                    let poly = self.polymorphic_type().filter(|_| matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")));
+                    if let Some(p) = &poly {
+                        stype_poly = p.clone();
                     }
-                    match self.pg_type() {
+                    self.pos = at;
+                    match self.pg_type().ok().filter(|_| poly.is_none()).ok_or(()) {
                         Ok(t) if matches!(self.peek(), Tok::Sym(",") | Tok::Sym(")")) => stype = Some(t),
                         _ => self.pos = at,
                     }
