@@ -101,6 +101,10 @@ join L: hash join, built on the right table (2000 slots); 8 rows in, ...
 The first line gives the order and says whether it differs from the written one; each `join` line gives the method, the rows in and out and the estimate. See [explain.md](explain.md).
 
 
+## Grouping as the last join runs
+
+A query with a plain `GROUP BY` (or a global aggregate, `SELECT sum(..) FROM a JOIN b ...`), no grouping sets and no correlated sub-query in the select list, does not wait for the joined rows to be built. The last join, when it is inner, cross or left, takes the rows before it 2,048 at a time, joins each slice and feeds the result straight into the groups; the joined rows of a slice are dropped before the next is made. A three-way join of 4.5 million rows that took 1.8 GB now takes memory for its groups and a slice. The answer is the same; only the order in which rows reach an aggregate such as `STRING_AGG` without `ORDER BY` may differ, which SQL leaves open. `EXPLAIN` shows the join as "grouped as they came".
+
 ## Cross products come last
 
 At each step the source linked to the rows already joined (by an equality) is preferred to one that would make a cross product, even when the cross product is smaller right now. Two copies of a small table (TPC-H query 8 uses `nation` twice) would otherwise be multiplied first (5 × 25 rows) and every later step would carry that factor, when the big table that links each copy to the rest comes a step later. A cross product is chosen only when nothing left is linked.

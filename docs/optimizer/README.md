@@ -55,6 +55,7 @@ join L: index nested-loop via ix_line_ord (1 key column(s)); 8 rows in, 40 out .
 11. **Shared conditions of an OR.** Conditions that every branch of an `OR` repeats, join conditions especially, are moved out of it. See [pushdown.md](pushdown.md#conditions-every-branch-of-an-or-shares).
 12. **Narrow rows.** In a join, a plain table is read with only the columns the statement mentions, so the rows built are as narrow as the query needs. See [join-order.md](join-order.md#narrow-rows).
 13. **Row counts for free.** A bare `SELECT COUNT(*) FROM t` is the table's row count. See [access-paths.md](access-paths.md#count).
+14. **Grouped as joined.** A plain `GROUP BY` (or global aggregate) over a join does not build the joined rows first: the last inner, cross or left join hands its rows to the grouping 2,048 left rows at a time, so a join of millions of rows needs memory only for the groups. See [join-order.md](join-order.md#grouping-as-the-last-join-runs).
 
 And what it deliberately does not do, so that you are not surprised:
 

@@ -7209,3 +7209,30 @@ fn an_expression_nested_without_end_is_refused_instead_of_overflowing_the_stack(
     let ok = format!("SELECT {}1{}", "abs(".repeat(30), ")".repeat(30));
     assert_eq!(db.execute(&ok).unwrap().rows[0][0].to_string(), "1");
 }
+
+#[test]
+fn mysql_a_prefix_key_on_a_number_is_refused_and_one_on_text_is_kept() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Mysql);
+    let e = db.execute("CREATE TABLE t2 (a INT, KEY (a(20)))").unwrap_err().to_string();
+    assert!(e.contains("Incorrect prefix key"), "{e}");
+    assert!(db.execute("SELECT * FROM t2").is_err());
+    db.execute("CREATE TABLE t3 (a VARCHAR(40), b TEXT, KEY (a(20)), KEY (b(5)))").unwrap();
+}
+
+#[test]
+fn a_grouped_join_gives_the_same_groups_as_it_does_without_streaming() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (x INT, y INT)").unwrap();
+    for i in 0..300 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i % 5, i % 7)).unwrap();
+    }
+    // 60 rows per x: 60 * 60 * 60 joined rows for each, more than the slice the last join hands over at a time
+    let r = db.execute("SELECT t1.x, sum(t2.y + t3.y), count(*) FROM t t1 JOIN t t2 ON t1.x = t2.x JOIN t t3 ON t2.x = t3.x GROUP BY t1.x ORDER BY t1.x").unwrap();
+    assert_eq!(r.rows.len(), 5);
+    assert_eq!(r.rows[0][2].to_string(), "216000");
+    let g = db.execute("SELECT count(*), sum(t2.y) FROM t t1 JOIN t t2 ON t1.x = t2.x WHERE t1.y > 3").unwrap();
+    let k = db.execute("SELECT count(*), sum(y2) FROM (SELECT t2.y AS y2 FROM t t1 JOIN t t2 ON t1.x = t2.x WHERE t1.y > 3) q").unwrap();
+    assert_eq!(g.rows[0], k.rows[0]);
+}

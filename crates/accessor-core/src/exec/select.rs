@@ -993,6 +993,9 @@ impl Database {
         } else {
             None
         };
+        // a plain GROUP BY over joined tables groups the rows as the last join makes them
+        let mut folded = group.as_ref().filter(|_| corr.is_empty() && sel.group_sets.is_empty() && sel.from.as_ref().is_some_and(|f| !f.joins.is_empty()))
+            .map(|g| AggAcc::new(&g.exprs, &g.aggs, None, has_mask.then_some(0)));
         let mut rows: Vec<Row> = match ordered {
             Some(r) => {
                 presorted = true;
@@ -1010,7 +1013,7 @@ impl Database {
             }
             Some(from) => {
                 let conj: Vec<&BExpr> = filter.as_ref().map(split_and).unwrap_or_default();
-                self.produce_rows(&sources, from, &scope, &join_ons, filter.as_ref(), &conj, scan_limit, depth)?
+                self.produce_rows(&sources, from, &scope, &join_ons, filter.as_ref(), &conj, scan_limit, folded.as_mut(), depth)?
             }
         } };
         if !corr.is_empty() {
@@ -1027,9 +1030,12 @@ impl Database {
         }
 
         // 5. Grouping.
-        if let Some(g) = group {
+        if let Some(g) = &group {
             self.note(depth, || format!("group {} rows{}", rows.len(), if sel.group_sets.is_empty() { String::new() } else { format!(" into {} grouping set(s)", sel.group_sets.len()) }));
-            rows = aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets, has_mask)?;
+            rows = match folded.take() {
+                Some(acc) if acc.streamed => acc.finish(),
+                _ => aggregate(rows, &g.exprs, &g.aggs, &sel.group_sets, has_mask)?,
+            };
             if !gcorr.is_empty() {
                 rows = self.add_corr_columns(rows, &gcorr, depth)?;
             }
@@ -1291,6 +1297,7 @@ impl Database {
         filter: Option<&BExpr>,
         conj: &[&BExpr],
         limit: Option<usize>,
+        mut sink: Option<&mut AggAcc<'_>>,
         depth: u32,
     ) -> Result<Vec<Row>> {
         let single = from.joins.is_empty();
@@ -1543,6 +1550,44 @@ impl Database {
             // Filtering the joined table first is safe unless it is preserved by the join.
             let right_pre = if matches!(kind, JoinKind::Right | JoinKind::Full) { None } else { and(pre[s].clone()) };
             let before = rows.len();
+            if step + 1 == order.len() && matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) && !matches!(right.data, SourceData::Lateral(_)) {
+                if let Some(acc) = sink.as_deref_mut() {
+                    // the last join is folded into the grouping a slice of its left rows at a time, so the joined rows are never all held
+                    acc.streamed = true;
+                    let (mut out, mut how) = (0usize, String::new());
+                    let mut rest = rows;
+                    while !rest.is_empty() {
+                        let take = rest.len().min(2048);
+                        let slice: Vec<Row> = rest.drain(..take).collect();
+                        let (joined, h) = join_step(slice, width, right, kind, on.as_ref(), right_pre.as_ref(), self.optimizer_on)?;
+                        if how.is_empty() {
+                            how = h;
+                        }
+                        out += joined.len();
+                        for r in joined {
+                            let row = if (reorder || hoist) && reordered {
+                                let mut row = Vec::with_capacity(total);
+                                for s in 0..m {
+                                    row.extend_from_slice(&r[eoff[s]..eoff[s] + sources[s].ncols()]);
+                                }
+                                row
+                            } else {
+                                r
+                            };
+                            if !reorder {
+                                if let Some(f) = filter {
+                                    if !f.eval_bool(&row)? {
+                                        continue;
+                                    }
+                                }
+                            }
+                            acc.feed(&row)?;
+                        }
+                    }
+                    self.note(depth, || format!("join {}: {how}; {before} rows in, {out} out, grouped as they came", right.alias));
+                    return Ok(Vec::new());
+                }
+            }
             let (joined, how) = match &right.data {
                 SourceData::Lateral(lat) => {
                     // the outer columns, where they are in the rows built in this join order
@@ -2666,45 +2711,64 @@ fn aggregate(rows: Vec<Row>, group_exprs: &[BExpr], aggs: &[AggSpec], sets: &[Ve
     Ok(out)
 }
 
-/// One grouping. With `active`, only those group expressions form the key; the
-/// others are NULL in the output, and `mask` is appended to every row.
-fn aggregate_set(
-    rows: &[Row],
-    group_exprs: &[BExpr],
-    aggs: &[AggSpec],
-    active: Option<&[usize]>,
+/// A grouping being filled one row at a time, so a join can hand its rows over without building them all first.
+struct AggAcc<'a> {
+    group_exprs: &'a [BExpr],
+    aggs: &'a [AggSpec],
+    active: Option<&'a [usize]>,
     mask: Option<i64>,
-) -> Result<Vec<Row>> {
-    let new_states = || aggs.iter().map(AggState::new).collect::<Vec<_>>();
-    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
-    let mut groups: Vec<(Vec<Value>, Vec<AggState>)> = Vec::new();
-    let global = active.map_or(group_exprs.is_empty(), |s| s.is_empty());
-    let null_key = || vec![Value::Null; group_exprs.len()];
-    if global {
-        // A global aggregate yields one row even over empty input.
-        groups.push((null_key(), new_states()));
+    global: bool,
+    /// Set once a join has fed its rows in; until then the rows are still to be grouped the usual way.
+    streamed: bool,
+    index: HashMap<Vec<Value>, usize>,
+    groups: Vec<(Vec<Value>, Vec<AggState>)>,
+}
+
+impl<'a> AggAcc<'a> {
+    /// With `active`, only those group expressions form the key; the others are NULL in the output, and `mask` is
+    /// appended to every row.
+    fn new(group_exprs: &'a [BExpr], aggs: &'a [AggSpec], active: Option<&'a [usize]>, mask: Option<i64>) -> Self {
+        let global = active.map_or(group_exprs.is_empty(), |s| s.is_empty());
+        let mut acc = AggAcc { group_exprs, aggs, active, mask, global, streamed: false, index: HashMap::new(), groups: Vec::new() };
+        if global {
+            // A global aggregate yields one row even over empty input.
+            let key = acc.null_key();
+            let states = acc.new_states();
+            acc.groups.push((key, states));
+        }
+        acc
     }
-    for row in rows {
-        let gi = if global {
+
+    fn null_key(&self) -> Vec<Value> {
+        vec![Value::Null; self.group_exprs.len()]
+    }
+
+    fn new_states(&self) -> Vec<AggState> {
+        self.aggs.iter().map(AggState::new).collect()
+    }
+
+    fn feed(&mut self, row: &Row) -> Result<()> {
+        let gi = if self.global {
             0
         } else {
-            let mut key = null_key();
-            for (i, e) in group_exprs.iter().enumerate() {
-                if active.is_none_or(|s| s.contains(&i)) {
+            let mut key = self.null_key();
+            for (i, e) in self.group_exprs.iter().enumerate() {
+                if self.active.is_none_or(|s| s.contains(&i)) {
                     key[i] = e.eval(row)?.into_owned();
                 }
             }
-            match index.get(&key) {
+            match self.index.get(&key) {
                 Some(&i) => i,
                 None => {
-                    let i = groups.len();
-                    index.insert(key.clone(), i);
-                    groups.push((key, new_states()));
+                    let i = self.groups.len();
+                    self.index.insert(key.clone(), i);
+                    let states = self.new_states();
+                    self.groups.push((key, states));
                     i
                 }
             }
         };
-        for (state, spec) in groups[gi].1.iter_mut().zip(aggs) {
+        for (state, spec) in self.groups[gi].1.iter_mut().zip(self.aggs) {
             match &spec.arg {
                 None => state.update(None)?,
                 Some(e) => {
@@ -2718,17 +2782,37 @@ fn aggregate_set(
                 }
             }
         }
+        Ok(())
     }
-    Ok(groups
-        .into_iter()
-        .map(|(mut key, states)| {
-            key.extend(states.into_iter().map(AggState::finish));
-            if let Some(m) = mask {
-                key.push(Value::Int(m));
-            }
-            key
-        })
-        .collect())
+
+    fn finish(self) -> Vec<Row> {
+        let mask = self.mask;
+        self.groups
+            .into_iter()
+            .map(|(mut key, states)| {
+                key.extend(states.into_iter().map(AggState::finish));
+                if let Some(m) = mask {
+                    key.push(Value::Int(m));
+                }
+                key
+            })
+            .collect()
+    }
+}
+
+/// One grouping.
+fn aggregate_set(
+    rows: &[Row],
+    group_exprs: &[BExpr],
+    aggs: &[AggSpec],
+    active: Option<&[usize]>,
+    mask: Option<i64>,
+) -> Result<Vec<Row>> {
+    let mut acc = AggAcc::new(group_exprs, aggs, active, mask);
+    for row in rows {
+        acc.feed(row)?;
+    }
+    Ok(acc.finish())
 }
 
 /// Compares two sort values, with NULLs placed by `nulls_first` (by default first when

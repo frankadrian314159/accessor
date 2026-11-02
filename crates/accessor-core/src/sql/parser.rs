@@ -56,7 +56,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
 }
 
 fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
+    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -141,7 +141,7 @@ pub(crate) fn internal_function_text(name: &str, args: &[String]) -> Option<Stri
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0 };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -537,6 +537,8 @@ struct Parser<'a> {
     /// overflowing the stack.
     depth: usize,
     selects: usize,
+    /// The key columns given a prefix length (`KEY (a(20))`) since the last check.
+    prefixed: Vec<String>,
 }
 
 /// As deep as parentheses and operators may nest, and as sub-queries (MySQL's own limit on nested selects is 61).
@@ -2047,6 +2049,7 @@ impl<'a> Parser<'a> {
             }
             if self.peek_sym("(") {
                 self.skip_parens()?; // a prefix length
+                self.prefixed.push(cols.last().cloned().unwrap_or_default());
             }
             desc.push(self.index_direction());
             if !self.eat_sym(",") {
@@ -4533,6 +4536,14 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_sym(")")?;
+        for n in std::mem::take(&mut self.prefixed) {
+            let numeric = columns.iter().find(|c| c.name.eq_ignore_ascii_case(&n)).is_some_and(|c| {
+                matches!(c.data_type, DataType::Integer | DataType::Bignum | DataType::Float | DataType::Double | DataType::Decimal | DataType::YesNo | DataType::DateTime)
+            });
+            if numeric && crate::dialect::current() == crate::dialect::Dialect::Mysql {
+                return Err(Error::syntax("Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys"));
+            }
+        }
         for n in &not_null_columns {
             if let Some(col) = columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(n)) {
                 col.not_null = true;
