@@ -699,6 +699,18 @@ impl<'a> Binder<'a> {
                     let root = if table_call { table.as_str() } else { "table" };
                     return Ok(BExpr::Lit(Value::text(&crate::expr::xmlfuncs::rows_to_xml(&result.columns, &result.rows, nulls, forest, &ns, root, row_name))));
                 }
+                // cursor_to_xml(cursor, count, nulls, tableforest, targetns): the next rows of a cursor (which stays where it is)
+                if name.eq_ignore_ascii_case("CURSOR_TO_XML") && args.len() == 5 {
+                    let mut consts = Vec::new();
+                    for a in args {
+                        consts.push(self.bind(a)?.eval(&[])?.into_owned());
+                    }
+                    let count = usize::try_from(consts[1].to_string().parse::<i64>().unwrap_or(0)).unwrap_or(0);
+                    let cursor = consts[0].to_string();
+                    let (columns, rows) = self.db.peek_cursor(&cursor, count).ok_or_else(|| Error::runtime(format!("cursor \"{cursor}\" does not exist")))?;
+                    let (nulls, forest) = (matches!(consts[2], Value::Bool(true)), matches!(consts[3], Value::Bool(true)));
+                    return Ok(BExpr::Lit(Value::text(&crate::expr::xmlfuncs::rows_to_xml(&columns, &rows, nulls, forest, &consts[4].to_string(), "table", "row"))));
+                }
                 // set_config(name, value, is_local): the setting changes when the statement is done
                 if name.eq_ignore_ascii_case("SET_CONFIG") && args.len() == 3 {
                     let (Some(Expr::Literal(Value::Text(n))), Some(Expr::Literal(v))) = (args.first(), args.get(1)) else {

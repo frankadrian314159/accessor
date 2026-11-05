@@ -7499,3 +7499,42 @@ fn postgresql_set_config_large_object_descriptors_query_to_xml_and_xmltable() {
     assert_eq!(pg_one(&mut db, "SELECT sum(x.a) FROM (VALUES ('<r><row><a>1</a></row><row><a>2</a></row></r>')) AS d(doc), xmltable('//row' PASSING d.doc COLUMNS a int) AS x"), "3");
     assert!(db.execute("SELECT * FROM xmltable('//row' PASSING '<r><row><a>1</a></row><row/></r>'::xml COLUMNS a int NOT NULL)").is_err());
 }
+
+#[test]
+fn postgresql_cursors_by_name_loops_over_cursors_and_xml_constructors() {
+    let mut db = pg();
+    db.execute("CREATE TABLE t (a int, b text)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')").unwrap();
+    db.execute("CREATE FUNCTION s() RETURNS text AS $$ DECLARE c CURSOR (m int) FOR SELECT a, b FROM t WHERE a >= m ORDER BY a; r record; acc text := ''; BEGIN FOR r IN c(2) LOOP CONTINUE WHEN r.a = 3; acc := acc || r.a::text || r.b; END LOOP; RETURN acc; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT s()"), "2y");
+    // a cursor the function opened is left in the session under the name it returns
+    db.execute("CREATE FUNCTION getc(ref refcursor) RETURNS refcursor AS $$ BEGIN OPEN ref FOR SELECT a, b FROM t ORDER BY a; RETURN ref; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("CREATE FUNCTION getu() RETURNS refcursor AS $$ DECLARE cc refcursor; BEGIN OPEN cc FOR SELECT b FROM t ORDER BY a DESC; RETURN cc; END $$ LANGUAGE plpgsql").unwrap();
+    db.execute("BEGIN").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT getc('mycur')"), "mycur");
+    assert_eq!(db.execute("FETCH 2 IN mycur").unwrap().rows.len(), 2);
+    assert_eq!(db.execute("FETCH ALL IN mycur").unwrap().rows.len(), 1);
+    let name = pg_one(&mut db, "SELECT getu()");
+    assert!(name.starts_with("<unnamed portal"));
+    db.execute("COMMIT").unwrap();
+    db.execute("CREATE TABLE emp (id int, name text, dept text)").unwrap();
+    db.execute("INSERT INTO emp VALUES (1,'Ann','a&b'),(2,'Bob',NULL)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT xmlelement(name emp, xmlattributes(id, name AS n), dept) FROM emp WHERE id = 1"), "<emp id=\"1\" n=\"Ann\">a&amp;b</emp>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlelement(name emp, xmlattributes(id)) FROM emp WHERE id = 2"), "<emp id=\"2\"/>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlforest(id, name, dept) FROM emp WHERE id = 2"), "<id>2</id><name>Bob</name>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlagg(xmlelement(name r, id) ORDER BY id) FROM emp"), "<r>1</r><r>2</r>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlelement(name outer, xmlelement(name inner, 'x<y'), 'a<b')"), "<outer><inner>x&lt;y</inner>a&lt;b</outer>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlpi(name php, 'echo 1;')"), "<?php echo 1;?>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlcomment('hi')"), "<!--hi-->");
+    assert_eq!(pg_one(&mut db, "SELECT xmlconcat('<a/>', '<b/>')"), "<a/><b/>");
+    assert_eq!(pg_one(&mut db, "SELECT xmlroot('<?xml version=\"1.1\"?><a/>'::xml, version '1.0', standalone yes)"), "<?xml version=\"1.0\" standalone=\"yes\"?><a/>");
+    assert_eq!(pg_one(&mut db, "SELECT xml_is_well_formed('<a>')"), "false");
+    assert_eq!(pg_one(&mut db, "SELECT xmlexists('//b' PASSING BY REF '<a><b/></a>')"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT xmlserialize(document '<a><b>1</b><c/></a>' as text indent)"), "<a>\n  <b>1</b>\n  <c/>\n</a>");
+    assert!(db.execute("SELECT xmlparse(document '<a>')").is_err());
+    assert!(db.execute("SELECT xmlcomment('a--b')").is_err());
+    db.execute("BEGIN").unwrap();
+    db.execute("DECLARE cx CURSOR FOR SELECT id, name FROM emp ORDER BY id").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT cursor_to_xml('cx', 1, false, true, '')"), "<row xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n  <id>1</id>\n  <name>Ann</name>\n</row>\n\n");
+    db.execute("COMMIT").unwrap();
+}

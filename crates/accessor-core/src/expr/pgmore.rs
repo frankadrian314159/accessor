@@ -93,6 +93,17 @@ pub enum MoreFn {
     ConvertFrom,
     ConvertTo,
     XmlNotNull,
+    XmlElement,
+    XmlForest,
+    XmlPi,
+    XmlParse,
+    XmlSerialize,
+    XmlRoot,
+    XmlConcat,
+    XmlComment,
+    XmlWellFormed,
+    XmlWellFormedDocument,
+    XmlWellFormedContent,
     XpathExists,
     RestoreStats,
     ClearStats,
@@ -179,6 +190,17 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "CONVERT_FROM" => (ConvertFrom, 2, 2),
         "CONVERT_TO" => (ConvertTo, 2, 2),
         "__XML_NOTNULL" => (XmlNotNull, 2, 2),
+        "__XMLELEMENT" => (XmlElement, 2, 255),
+        "__XMLFOREST" => (XmlForest, 0, 255),
+        "__XMLPI" => (XmlPi, 1, 2),
+        "__XMLPARSE" => (XmlParse, 2, 2),
+        "__XMLSERIALIZE" => (XmlSerialize, 2, 2),
+        "__XMLROOT" => (XmlRoot, 3, 3),
+        "XMLCONCAT" => (XmlConcat, 1, 255),
+        "XMLCOMMENT" => (XmlComment, 1, 1),
+        "XML_IS_WELL_FORMED" => (XmlWellFormed, 1, 1),
+        "XML_IS_WELL_FORMED_DOCUMENT" => (XmlWellFormedDocument, 1, 1),
+        "XML_IS_WELL_FORMED_CONTENT" => (XmlWellFormedContent, 1, 1),
         "XPATH_EXISTS" => (XpathExists, 2, 3),
         "PG_RESTORE_RELATION_STATS" | "PG_RESTORE_ATTRIBUTE_STATS" => (RestoreStats, 0, usize::MAX),
         "PG_CLEAR_RELATION_STATS" | "PG_CLEAR_ATTRIBUTE_STATS" => (ClearStats, 2, 3),
@@ -203,6 +225,11 @@ impl MoreFn {
                 | MoreFn::Populate
                 | MoreFn::RestoreStats
                 | MoreFn::XmlNotNull
+                | MoreFn::XmlElement
+                | MoreFn::XmlForest
+                | MoreFn::XmlPi
+                | MoreFn::XmlRoot
+                | MoreFn::XmlConcat
         )
     }
 }
@@ -324,6 +351,24 @@ fn set_position(fd: i64, at: usize) {
 
 fn lo_data(id: i64) -> Result<Vec<u8>> {
     LARGE_OBJECTS.with(|m| m.borrow().get(&id).cloned()).ok_or_else(|| Error::runtime(format!("large object {id} does not exist")))
+}
+
+/// A value as the text of an XML attribute or element.
+fn xml_text(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        other => text(other).into_owned(),
+    }
+}
+
+/// A value as XML element content: markup that is well formed (a value of type xml) stays as it is, any other text is escaped.
+fn xml_content(v: &Value) -> String {
+    let s = xml_text(v);
+    if s.trim_start().starts_with('<') && super::xmlfuncs::well_formed(&s, true) {
+        s
+    } else {
+        super::xmlfuncs::escape_content(&s)
+    }
 }
 
 fn raw(v: &Value) -> Vec<u8> {
@@ -876,6 +921,97 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             })?;
             Value::Null
         }
+        XmlElement => {
+            let name = super::xmlfuncs::element_name(&text(v(0)));
+            let nattr = int(v(1))? as usize;
+            let mut attrs = String::new();
+            for i in 0..nattr {
+                let (an, av) = (text(v(2 + 2 * i)), v(3 + 2 * i));
+                if !av.is_null() {
+                    attrs.push_str(&format!(" {}=\"{}\"", super::xmlfuncs::element_name(&an), super::xmlfuncs::escape_attribute(&xml_text(av))));
+                }
+            }
+            let mut body = String::new();
+            let mut any = false;
+            for c in &vals[2 + 2 * nattr..] {
+                if !c.is_null() {
+                    any = true;
+                    body.push_str(&xml_content(c));
+                }
+            }
+            Value::text(&if any { format!("<{name}{attrs}>{body}</{name}>") } else { format!("<{name}{attrs}/>") })
+        }
+        XmlForest => {
+            let mut out = String::new();
+            for pair in vals.chunks(2) {
+                if !pair[1].is_null() {
+                    let n = super::xmlfuncs::element_name(&text(&pair[0]));
+                    out.push_str(&format!("<{n}>{}</{n}>", xml_content(&pair[1])));
+                }
+            }
+            if out.is_empty() { Value::Null } else { Value::text(&out) }
+        }
+        XmlPi => {
+            let name = text(v(0)).into_owned();
+            if name.eq_ignore_ascii_case("xml") {
+                return Err(Error::runtime("invalid XML processing instruction"));
+            }
+            match vals.get(1).filter(|c| !c.is_null()) {
+                None => Value::text(&format!("<?{name}?>")),
+                Some(c) => {
+                    let c = text(c).into_owned();
+                    if c.contains("?>") {
+                        return Err(Error::runtime("invalid XML processing instruction"));
+                    }
+                    Value::text(&format!("<?{name} {}?>", c.trim_start()))
+                }
+            }
+        }
+        XmlParse => {
+            let content = text(v(0)).eq_ignore_ascii_case("content");
+            let s = text(v(1)).into_owned();
+            if !super::xmlfuncs::well_formed(&s, content) {
+                return Err(Error::runtime(if content { "invalid XML content" } else { "invalid XML document" }));
+            }
+            Value::text(&s)
+        }
+        XmlSerialize => {
+            let s = text(v(0)).into_owned();
+            Value::text(&if matches!(v(1), Value::Bool(true)) { super::xmlfuncs::indent(&s) } else { s })
+        }
+        XmlRoot => {
+            if v(0).is_null() {
+                return Ok(Value::Null);
+            }
+            let s = text(v(0)).into_owned();
+            let rest = match s.trim_start().strip_prefix("<?xml") {
+                Some(r) if r.starts_with(char::is_whitespace) || r.starts_with("?>") => r.find("?>").map_or(r, |i| &r[i + 2..]).to_string(),
+                _ => s.trim_start().to_string(),
+            };
+            let version = if v(1).is_null() { "1.0".to_string() } else { text(v(1)).into_owned() };
+            let mut decl = format!("<?xml version=\"{version}\"");
+            if !v(2).is_null() {
+                decl.push_str(&format!(" standalone=\"{}\"", text(v(2)).to_ascii_lowercase()));
+            }
+            Value::text(&format!("{decl}?>{rest}"))
+        }
+        XmlConcat => {
+            let parts: Vec<String> = vals.iter().filter(|x| !x.is_null()).map(|x| text(x).into_owned()).collect();
+            if parts.is_empty() { Value::Null } else { Value::text(&parts.concat()) }
+        }
+        XmlComment => {
+            let s = text(v(0)).into_owned();
+            if s.contains("--") || s.ends_with('-') {
+                return Err(Error::runtime("invalid XML comment"));
+            }
+            Value::text(&format!("<!--{s}-->"))
+        }
+        XmlWellFormed => {
+            let s = text(v(0));
+            Value::Bool(super::xmlfuncs::well_formed(&s, false) || super::xmlfuncs::well_formed(&s, true))
+        }
+        XmlWellFormedDocument => Value::Bool(super::xmlfuncs::well_formed(&text(v(0)), false)),
+        XmlWellFormedContent => Value::Bool(super::xmlfuncs::well_formed(&text(v(0)), true)),
         XmlNotNull => {
             if v(0).is_null() {
                 return Err(Error::runtime(format!("null is not allowed in column \"{}\"", text(v(1)))));

@@ -514,3 +514,94 @@ pub fn rows_to_xml(columns: &[String], rows: &[Vec<crate::value::Value>], nulls:
     }
     out
 }
+
+/// Is the text a well-formed XML document (`content` false: one root element, with an optional declaration, comments and
+/// processing instructions around it) or a well-formed piece of content (any run of elements and text)?
+pub fn well_formed(src: &str, content: bool) -> bool {
+    let mut s = src.trim_start();
+    if content {
+        return parse_xml(&format!("<x>{src}</x>")).is_some();
+    }
+    loop {
+        let rest = if s.starts_with("<?") {
+            s.find("?>").map(|i| &s[i + 2..])
+        } else if s.starts_with("<!--") {
+            s.find("-->").map(|i| &s[i + 3..])
+        } else if s.starts_with("<!DOCTYPE") {
+            s.find('>').map(|i| &s[i + 1..])
+        } else {
+            break;
+        };
+        match rest {
+            Some(r) => s = r.trim_start(),
+            None => return false,
+        }
+    }
+    // trailing comments are allowed after the root
+    let mut body = s.trim_end();
+    while body.ends_with("-->") {
+        match body.rfind("<!--") {
+            Some(i) => body = body[..i].trim_end(),
+            None => return false,
+        }
+    }
+    body.starts_with('<') && parse_xml(body).is_some()
+}
+
+/// Escapes text for element content.
+pub fn escape_content(s: &str) -> String {
+    xml_escape(s)
+}
+
+/// Escapes text for an attribute value in double quotes.
+pub fn escape_attribute(s: &str) -> String {
+    xml_escape(s).replace('"', "&quot;")
+}
+
+/// An element name as `XMLELEMENT(NAME ...)` writes it (characters a name cannot hold are escaped).
+pub fn element_name(name: &str) -> String {
+    xml_name(name)
+}
+
+/// `XMLSERIALIZE(... INDENT)`: each element, text and comment on a line of its own, two spaces per level (an element with
+/// only text stays on one line).
+pub fn indent(xml: &str) -> String {
+    let mut toks: Vec<(bool, &str)> = Vec::new();
+    let mut at = 0;
+    while at < xml.len() {
+        if xml[at..].starts_with('<') {
+            let end = xml[at..].find('>').map_or(xml.len(), |i| at + i + 1);
+            toks.push((true, &xml[at..end]));
+            at = end;
+        } else {
+            let end = xml[at..].find('<').map_or(xml.len(), |i| at + i);
+            toks.push((false, &xml[at..end]));
+            at = end;
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < toks.len() {
+        let (is_tag, t) = toks[i];
+        let pad = "  ".repeat(depth);
+        if !is_tag {
+            if !t.trim().is_empty() {
+                lines.push(format!("{pad}{}", t.trim()));
+            }
+        } else if t.starts_with("</") {
+            depth = depth.saturating_sub(1);
+            lines.push(format!("{}{t}", "  ".repeat(depth)));
+        } else if t.starts_with("<?") || t.starts_with("<!") || t.ends_with("/>") {
+            lines.push(format!("{pad}{t}"));
+        } else if i + 2 < toks.len() && !toks[i + 1].0 && !toks[i + 1].1.trim().is_empty() && toks[i + 2].0 && toks[i + 2].1.starts_with("</") {
+            lines.push(format!("{pad}{t}{}{}", toks[i + 1].1, toks[i + 2].1));
+            i += 2;
+        } else {
+            lines.push(format!("{pad}{t}"));
+            depth += 1;
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}

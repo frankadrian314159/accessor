@@ -7316,6 +7316,149 @@ impl<'a> Parser<'a> {
         self.expr()
     }
 
+    /// `XMLELEMENT(NAME n [, XMLATTRIBUTES(..)] [, content ...])`, `XMLFOREST`, `XMLPI`, `XMLPARSE`, `XMLSERIALIZE`, `XMLROOT` and
+    /// `XMLEXISTS`, whose arguments are written with keywords (after the opening parenthesis).
+    fn xml_form(&mut self, name: &str) -> Result<Option<Expr>> {
+        let up = name.to_ascii_uppercase();
+        let call = |n: &str, args: Vec<Expr>| Expr::Function { name: n.into(), args, distinct: false, star: false };
+        let text = |s: &str| Expr::Literal(Value::text(s));
+        // `expr [AS name]`, the name from the column when there is no AS
+        let named = |p: &mut Self| -> Result<(String, Expr)> {
+            let e = p.expr()?;
+            let n = if p.eat_kw("AS") {
+                p.ident_or_keyword()?
+            } else if let Expr::Column { name, .. } = &e {
+                name.clone()
+            } else {
+                return Err(Error::syntax("unnamed XML attribute value must be a column reference"));
+            };
+            Ok((n, e))
+        };
+        Ok(Some(match up.as_str() {
+            "XMLELEMENT" => {
+                self.expect_kw("NAME")?;
+                let n = self.ident_or_keyword()?;
+                let mut attrs: Vec<(String, Expr)> = Vec::new();
+                let mut content = Vec::new();
+                while self.eat_sym(",") {
+                    if self.peek_kw("XMLATTRIBUTES") && self.peek_sym_at(1, "(") {
+                        self.advance();
+                        self.advance();
+                        loop {
+                            attrs.push(named(self)?);
+                            if !self.eat_sym(",") {
+                                break;
+                            }
+                        }
+                        self.expect_sym(")")?;
+                    } else {
+                        content.push(self.expr()?);
+                    }
+                }
+                self.expect_sym(")")?;
+                let mut args = vec![text(&n), Expr::Literal(Value::Int(attrs.len() as i64))];
+                for (an, e) in attrs {
+                    args.push(text(&an));
+                    args.push(e);
+                }
+                args.extend(content);
+                call("__XMLELEMENT", args)
+            }
+            "XMLFOREST" => {
+                let mut args = Vec::new();
+                loop {
+                    let (n, e) = named(self)?;
+                    args.push(text(&n));
+                    args.push(e);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                call("__XMLFOREST", args)
+            }
+            "XMLPI" => {
+                self.expect_kw("NAME")?;
+                let n = self.ident_or_keyword()?;
+                let mut args = vec![text(&n)];
+                if self.eat_sym(",") {
+                    args.push(self.expr()?);
+                }
+                self.expect_sym(")")?;
+                call("__XMLPI", args)
+            }
+            "XMLPARSE" => {
+                let kind = self.ident_or_keyword()?;
+                let e = self.expr()?;
+                if self.eat_kw("PRESERVE") || self.eat_kw("STRIP") {
+                    self.expect_kw("WHITESPACE")?;
+                }
+                self.expect_sym(")")?;
+                call("__XMLPARSE", vec![text(&kind), e])
+            }
+            "XMLSERIALIZE" => {
+                let _kind = self.ident_or_keyword()?;
+                let e = self.expr()?;
+                self.expect_kw("AS")?;
+                self.type_name()?;
+                if self.eat_sym("(") {
+                    while !self.peek_sym(")") && !self.at_eof() {
+                        self.advance();
+                    }
+                    self.expect_sym(")")?;
+                }
+                let mut indent = false;
+                if self.eat_kw("NO") {
+                    self.expect_kw("INDENT")?;
+                } else if self.eat_kw("INDENT") {
+                    indent = true;
+                }
+                self.expect_sym(")")?;
+                call("__XMLSERIALIZE", vec![e, Expr::Literal(Value::Bool(indent))])
+            }
+            "XMLROOT" => {
+                let e = self.expr()?;
+                self.expect_sym(",")?;
+                self.expect_kw("VERSION")?;
+                let version = if self.eat_kw("NO") {
+                    self.expect_kw("VALUE")?;
+                    Expr::Literal(Value::Null)
+                } else {
+                    self.expr()?
+                };
+                let mut standalone = Expr::Literal(Value::Null);
+                if self.eat_sym(",") {
+                    self.expect_kw("STANDALONE")?;
+                    if self.eat_kw("YES") {
+                        standalone = text("yes");
+                    } else if self.eat_kw("NO") {
+                        if !self.eat_kw("VALUE") {
+                            standalone = text("no");
+                        }
+                    } else {
+                        return Err(self.unexpected("YES, NO or NO VALUE"));
+                    }
+                }
+                self.expect_sym(")")?;
+                call("__XMLROOT", vec![e, version, standalone])
+            }
+            "XMLEXISTS" => {
+                let path = self.expr()?;
+                self.expect_kw("PASSING")?;
+                if self.eat_kw("BY") {
+                    self.advance();
+                }
+                let doc = self.expr()?;
+                if self.eat_kw("BY") {
+                    self.advance();
+                }
+                self.expect_sym(")")?;
+                call("XPATH_EXISTS", vec![path, doc])
+            }
+            _ => return Ok(None),
+        }))
+    }
+
     fn function_call(&mut self, name: String) -> Result<Expr> {
         if name.eq_ignore_ascii_case("CONVERT") {
             // CONVERT(x, type) is CAST(x AS type); CONVERT(x USING charset) is x
@@ -7332,6 +7475,9 @@ impl<'a> Parser<'a> {
             }
             self.expect_sym(")")?;
             return Ok(first);
+        }
+        if let Some(e) = self.xml_form(&name)? {
+            return Ok(e);
         }
         if matches!(name.to_ascii_uppercase().as_str(), "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST") {
             LAST_ENUM_CAST.with(|c| *c.borrow_mut() = None);
@@ -7394,6 +7540,11 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(")")?;
         let up = name.to_ascii_uppercase();
+        if up == "XMLAGG" && !args.is_empty() {
+            // the pieces are joined with nothing between them
+            args.insert(1, Expr::Literal(Value::text("")));
+            return Ok(Expr::Function { name: "STRING_AGG".into(), args, distinct, star });
+        }
         if matches!(up.as_str(), "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST") {
             // the type the argument was cast to is not in its value: it goes in front as text
             let ty = LAST_ENUM_CAST.with(|c| c.borrow_mut().take()).map_or(Expr::Literal(Value::Null), |t| Expr::Literal(Value::text(&t)));

@@ -49,6 +49,8 @@ struct Names {
     /// plpgsql: the loops being read, innermost last.
     loops: Vec<LoopCtx>,
     loop_seq: usize,
+    /// plpgsql: the cursors declared.
+    cursors: Vec<String>,
 }
 
 /// A plpgsql loop being read: its label, the label `CONTINUE` leaves to, and whether a `CONTINUE` did.
@@ -469,6 +471,7 @@ impl<'a> Parser<'a> {
             label: None,
             loops: Vec::new(),
             loop_seq: 0,
+            cursors: Vec::new(),
         };
         if language == "plpgsql" {
             names.all.push("found".to_string());
@@ -662,6 +665,7 @@ impl<'a> Parser<'a> {
                 if self.eat_kw("REFCURSOR") {
                     self.expect_sym(";")?;
                     names.all.push(name.clone());
+                    names.cursors.push(name.clone());
                     out.push(ProcStmt::DeclarePgCursor { name, params: Vec::new(), select: None });
                     continue;
                 }
@@ -687,6 +691,7 @@ impl<'a> Parser<'a> {
                     names.statement(&mut st)?;
                     let Statement::Select(select) = st else { return Err(Error::syntax("a cursor is declared for a SELECT")) };
                     self.expect_sym(";")?;
+                    names.cursors.push(name.clone());
                     out.push(ProcStmt::DeclarePgCursor { name, params, select: Some(Box::new(select)) });
                     continue;
                 }
@@ -987,6 +992,35 @@ impl<'a> Parser<'a> {
                 let body = Self::loop_exit(names, body);
                 self.end_loop()?;
                 out.push(ProcStmt::ForExecute { name: var, sql, using, body });
+                return self.end_stmt();
+            }
+            // FOR rec IN cursor [(args)] LOOP: open it, fetch until there is no row, close it
+            if matches!(self.peek(), Tok::Ident(c) if names.cursors.iter().any(|n| n.eq_ignore_ascii_case(c))) {
+                let cursor = self.ident()?;
+                let mut args = Vec::new();
+                if self.eat_sym("(") {
+                    loop {
+                        args.push(self.pl_expr(names)?);
+                        if !self.eat_sym(",") {
+                            break;
+                        }
+                    }
+                    self.expect_sym(")")?;
+                }
+                self.expect_kw("LOOP")?;
+                names.records.push(var.clone());
+                Self::loop_enter(names);
+                let inner = self.pl_stmts(names, &["END"])?;
+                let inner = Self::loop_exit(names, inner);
+                self.end_loop()?;
+                let mut body = vec![
+                    ProcStmt::FetchPg { cursor: cursor.clone(), direction: crate::sql::ast::FetchDirection::Next, move_only: false, targets: vec![var.clone()], record: true },
+                    ProcStmt::If { branches: vec![(Expr::Not(Box::new(Expr::Param("found".into()))), vec![ProcStmt::Leave])], otherwise: Vec::new() },
+                ];
+                body.extend(inner);
+                out.push(ProcStmt::OpenPg { name: cursor.clone(), args, query: None, dynamic: None });
+                out.push(ProcStmt::While { cond: lit_true(), body });
+                out.push(ProcStmt::CloseCursor(cursor));
                 return self.end_stmt();
             }
             if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") {
@@ -1542,7 +1576,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new(), label: None, loops: Vec::new(), loop_seq: 0 };
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new(), label: None, loops: Vec::new(), loop_seq: 0, cursors: Vec::new() };
         let stmts = self.my_body(&mut names)?;
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
@@ -1556,7 +1590,7 @@ impl<'a> Parser<'a> {
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
     /// are variables.
     pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
-        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new(), label: None, loops: Vec::new(), loop_seq: 0 };
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new(), label: None, loops: Vec::new(), loop_seq: 0, cursors: Vec::new() };
         let body = self.my_body(&mut names)?;
         fn check(list: &[ProcStmt]) -> Result<()> {
             for s in list {

@@ -149,6 +149,8 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `t.col%TYPE` is a variable of no fixed type; `record` and `t%ROWTYPE` are record variables (see above); `name [SCROLL] CURSOR [(param type, ...)] FOR select` declares a cursor and `name refcursor` a cursor variable to be opened with `OPEN name FOR ...` |
 | `OPEN c [(args)];`, `OPEN c FOR select;`, `OPEN c FOR EXECUTE text [USING ...];` | opens the cursor: its rows are those of the query when it is opened (a cursor does not see later changes). The arguments of a bound cursor take the place of its parameters |
 | `FETCH [direction] [FROM \| IN] c INTO targets;`, `MOVE [direction] c;`, `CLOSE c;` | `direction` is `NEXT` (the default), `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `FORWARD [n]` or `BACKWARD [n]`; one row is fetched, into variables or a record, and `FOUND` says whether there was one (no row sets the targets to NULL). A cursor is local to the call that declared it |
+| `FOR rec IN cursor [(args)] LOOP ... END LOOP;` | opens the declared cursor, runs the body for each row (in `rec`), and closes it |
+| `OPEN c FOR ...; RETURN c;` with `c refcursor` (a variable or a parameter) | the cursor stays open in the session under the name the variable holds (the argument given for a parameter, else `<unnamed portal N>`), and the caller reads it with `FETCH ... IN name` (in a transaction block, as in PostgreSQL; here it also survives without one) |
 | `GET [CURRENT] DIAGNOSTICS var = ROW_COUNT [, RESULT_OID, PG_CONTEXT];` | the rows the last statement changed (or a query gave) |
 | `GET STACKED DIAGNOSTICS var = MESSAGE_TEXT \| RETURNED_SQLSTATE \| PG_EXCEPTION_DETAIL \| PG_EXCEPTION_HINT \| PG_EXCEPTION_CONTEXT \| ...;` | in an `EXCEPTION` handler: the error being handled. Outside one it is an error |
 | `BEGIN ... EXCEPTION WHEN cond [OR cond ...] THEN ... [WHEN ...] END;` | an error in the block's statements undoes what the block did (a savepoint) and goes to the first `WHEN` that answers to it, whose statements then run in place of the rest of the block. A condition is a name (`division_by_zero`, `unique_violation`, `not_null_violation`, `foreign_key_violation`, `check_violation`, `raise_exception`, `no_data_found`, `too_many_rows`, `undefined_table`, `syntax_error`, ...; the class names such as `data_exception` answer to the whole class), `SQLSTATE 'xxxxx'`, or `OTHERS`. In a handler `SQLSTATE` and `SQLERRM` are variables. The SQLSTATE of an error is worked out from what went wrong, as the MySQL one is, so an unusual error may be `XX000` and answered only by `OTHERS` |
@@ -165,7 +167,7 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: arrays, assigning a whole record (`r := new`), cursors returned to the caller by name (`RETURN c` with `FETCH ALL IN "c"` afterwards), `FOR rec IN cursor LOOP`, event triggers, and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: arrays, assigning a whole record (`r := new`), event triggers, and every language except `sql` and `plpgsql`.
 
 ### Trigger functions
 

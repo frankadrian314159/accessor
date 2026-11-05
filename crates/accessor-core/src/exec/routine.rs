@@ -274,6 +274,8 @@ struct PgCursor {
     rows: Vec<Vec<Value>>,
     pos: usize,
     open: bool,
+    /// A `refcursor` variable: the variable holds the name the cursor is known by, and it outlives the call.
+    by_name: bool,
 }
 
 impl Frame {
@@ -681,7 +683,7 @@ impl Database {
             frame.vars.insert(k, v);
         }
         self.call_depth.fetch_add(1, Ordering::Relaxed);
-        let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| ()));
+        let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| db.export_pg_cursors(&frame)));
         self.call_depth.fetch_sub(1, Ordering::Relaxed);
         outcome?;
         // the OUT and INOUT parameters go back to the variables the caller named
@@ -716,6 +718,19 @@ impl Database {
 
     /// A block with handlers: an error in one of its statements goes to the first handler that answers to it; a `CONTINUE`
     /// handler lets the block go on with the next statement, an `EXIT` handler ends the block.
+    /// The cursors a call opened on `refcursor` variables are left in the session under the names the variables hold, so
+    /// the caller can `FETCH` from them.
+    fn export_pg_cursors(&mut self, frame: &Frame) {
+        for (k, c) in &frame.pg_cursors {
+            if !(c.by_name && c.open) {
+                continue;
+            }
+            if let Some(Value::Text(name)) = frame.vars.get(k) {
+                self.export_cursor(name, c.columns.clone(), c.rows.clone(), c.pos);
+            }
+        }
+    }
+
     fn run_block_handled(&mut self, body: &[ProcStmt], handlers: &[Handler], frame: &mut Frame) -> Result<Flow> {
         let depth = frame.handlers.len();
         frame.handlers.extend(handlers.iter().cloned());
@@ -870,12 +885,24 @@ impl Database {
             ProcStmt::DeclarePgCursor { name, params, select } => {
                 frame.pg_cursors.insert(
                     name.to_ascii_lowercase(),
-                    PgCursor { select: select.as_deref().cloned(), params: params.clone(), columns: Vec::new(), rows: Vec::new(), pos: 0, open: false },
+                    PgCursor { select: select.as_deref().cloned(), params: params.clone(), columns: Vec::new(), rows: Vec::new(), pos: 0, open: false, by_name: select.is_none() },
                 );
+                if select.is_none() {
+                    frame.vars.entry(name.to_ascii_lowercase()).or_insert(Value::Null);
+                }
             }
             ProcStmt::OpenPg { name, args, query, dynamic } => {
                 let k = name.to_ascii_lowercase();
+                // a refcursor parameter or variable that was not declared as a cursor
+                if !frame.pg_cursors.contains_key(&k) && frame.vars.contains_key(&k) {
+                    frame.pg_cursors.insert(k.clone(), PgCursor { select: None, params: Vec::new(), columns: Vec::new(), rows: Vec::new(), pos: 0, open: false, by_name: true });
+                }
                 let cur = frame.pg_cursors.get(&k).cloned().ok_or_else(|| Error::runtime(format!("cursor \"{name}\" does not exist")))?;
+                if cur.by_name && frame.vars.get(&k).is_none_or(Value::is_null) {
+                    static PORTALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let n = PORTALS.fetch_add(1, Ordering::Relaxed) + 1;
+                    frame.vars.insert(k.clone(), Value::text(&format!("<unnamed portal {n}>")));
+                }
                 if cur.open {
                     return Err(Error::runtime(format!("cursor \"{name}\" already in use")));
                 }
@@ -1393,7 +1420,7 @@ impl Database {
             return Err(Error::runtime("functions are nested too deeply"));
         }
         self.call_depth.fetch_add(1, Ordering::Relaxed);
-        let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| ()));
+        let outcome = self.atomically(|db| db.run_block(body, &mut frame).map(|_| db.export_pg_cursors(&frame)));
         self.call_depth.fetch_sub(1, Ordering::Relaxed);
         outcome?;
         Ok((names, frame.rows))

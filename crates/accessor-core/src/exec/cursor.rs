@@ -19,6 +19,17 @@ pub(crate) struct Cursor {
 }
 
 impl Database {
+    /// The next `count` rows of a cursor, without moving it (what `cursor_to_xml` reads).
+    pub(crate) fn peek_cursor(&self, name: &str, count: usize) -> Option<(Vec<String>, Vec<Row>)> {
+        let c = self.cursors.get(&name.to_ascii_lowercase())?;
+        Some((c.columns.clone(), c.rows.iter().skip(c.pos).take(count).cloned().collect()))
+    }
+
+    /// A cursor a plpgsql function opened, left in the session under `name`.
+    pub(crate) fn export_cursor(&mut self, name: &str, columns: Vec<String>, rows: Vec<Row>, pos: usize) {
+        self.cursors.insert(name.to_ascii_lowercase(), Cursor { columns, rows, pos, hold: true });
+    }
+
     pub(crate) fn declare_cursor(&mut self, name: &str, query: &Select, hold: bool) -> Result<QueryResult> {
         let key = name.to_ascii_lowercase();
         if self.cursors.contains_key(&key) {
