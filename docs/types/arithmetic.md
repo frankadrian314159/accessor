@@ -57,7 +57,7 @@ There are three kinds of division, so that each of the results people expect is 
 
 **`x \ y`** is whole-number division after rounding both operands to whole numbers, and `x MOD y` (or `x % y`) is the remainder; both give an `INTEGER` or `BIGNUM`.
 
-**Dividing by zero is NULL**, for all of these (and for dividing an interval, and for `0 ^ -1`). It is not an error, so a column computed as `a / b` is NULL for the rows where `b` is 0, and a condition on it simply does not hold. This is what SQLite and MySQL do; the SQL standard says error. A `FLOAT` or `DOUBLE` result still never becomes infinite or NaN: overflow is an error.
+**Dividing by zero is NULL** (in [PostgreSQL mode](../sql/dialects.md) it is the error `division by zero`, SQLSTATE `22012`, as in PostgreSQL), for all of these (and for dividing an interval, and for `0 ^ -1`). It is not an error, so a column computed as `a / b` is NULL for the rows where `b` is 0, and a condition on it simply does not hold. This is what SQLite and MySQL do; the SQL standard says error. A `FLOAT` or `DOUBLE` result still never becomes infinite or NaN: overflow is an error.
 
 Which one to use: `/` for counts and indexes (`n / 2`) and for approximate measurements; `DIV` for money, percentages and anything where a result such as 0.1 must be exactly 0.1. `Avg` and `Sum` of exact numbers stay exact whatever `/` does.
 

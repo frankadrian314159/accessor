@@ -86,7 +86,7 @@ The parser sees a word as letters and digits (`3.14` is one word); e-mail addres
 
 ## Not available
 
-The text search objects (`CREATE TEXT SEARCH CONFIGURATION`, dictionaries, parsers: read and ignored), `ts_stat`, `tsvector || tsvector` (the two texts are joined; use `tsvector_concat`), most XML functions (`xmltable`, `table_to_xml`, `query_to_xml`, `xmlelement`, ...), the file-based large-object functions (`lo_import`, `lo_export`) and the descriptor ones (`lo_open`, `loread`, `lowrite`), and `set_config`.
+The text search objects (`CREATE TEXT SEARCH CONFIGURATION`, dictionaries, parsers: read and ignored), `ts_stat`, `tsvector || tsvector` (the two texts are joined; use `tsvector_concat`), and the XML constructors and converters other than the ones listed above (`xmlelement`, `xmlforest`, `xmlagg`, `cursor_to_xml`, `schema_to_xml`, `xmlserialize`, ...). `XMLTABLE` has no `XMLNAMESPACES`.
 
 ## More built-in functions
 
@@ -104,6 +104,12 @@ The text search objects (`CREATE TEXT SEARCH CONFIGURATION`, dictionaries, parse
 | `satisfies_hash_partition(table, modulus, remainder, values...)` | whether a row with those key values belongs in that hash partition |
 | `to_regcollation(name)` | the name if it is one of `default`, `C`, `POSIX`, `ucs_basic`, `en_US` or the ICU names `und-x-icu`, `en-x-icu`, else NULL |
 | `lo_create(oid)`, `lo_from_bytea(oid, bytes)`, `lo_get(oid [, offset, length])`, `lo_put(oid, offset, bytes)`, `lo_unlink(oid)` | large objects, kept in memory for the session (an oid of 0 takes the next free number, from 16384). They are not part of the database file and are not undone by `ROLLBACK` |
+| `lo_open(oid, mode)`, `loread(fd, n)`, `lowrite(fd, bytes)`, `lo_lseek(fd, offset, whence)`, `lo_tell(fd)`, `lo_truncate(fd, len)`, `lo_close(fd)` | read and write a large object through a descriptor (`mode` 262144 reads, 131072 writes, 393216 both; `whence` 0, 1 or 2 for start, current position or end). Descriptors, like the objects, last for the session |
+| `lo_import(path [, oid])`, `lo_export(oid, path)` | a large object made from a file of the machine the engine runs on, and written to one |
+| `convert_from(bytes, encoding)`, `convert_to(text, encoding)` | bytes read as UTF-8 text, and text as its UTF-8 bytes (the encoding is not looked at) |
+| `set_config(name, value, is_local)` | sets a [run-time parameter](../sql/session.md) (as `SET name = value`) and gives the new value. The name and value must be written as constants; the setting takes effect for the statement that follows (a `current_setting` in the same statement sees it), and `is_local` is not honoured: the setting lasts for the session |
+| `query_to_xml(query, nulls, tableforest, targetns)`, `table_to_xml(table, nulls, tableforest, targetns)` | the rows of a query (a constant text) or table as XML text, in PostgreSQL's layout: `<table>` with a `<row>` element per row (or, with `tableforest`, one element per row), each column an element with the name escaped as PostgreSQL does (`my col` is `my_x0020_col`). A NULL is left out, or `xsi:nil="true"` with `nulls`. The table must be a constant name |
+| `XMLTABLE(rowpath PASSING doc COLUMNS ...)` | in `FROM`: one row per element the row path selects (see [table functions](table-functions.md)) |
 | `xpath(path, xml)`, `xpath_exists(path, xml)` | the nodes the path selects as an array of XML text, or whether it selects any. The XPath is the small subset of [EXTRACTVALUE](mysql.md): absolute and relative paths, `//`, `*`, `@attribute`, `text()` and the common predicates; no namespaces |
 | `ts_lexize(dictionary, word)` | the lexemes a dictionary makes of a word: `english_stem` (a stop word gives `{}`) or `simple` |
 | `pg_restore_relation_stats(...)`, `pg_restore_attribute_stats(...)` | check that the name/value pairs are paired and `relname` is given, and return true; the statistics themselves are not kept. `pg_clear_relation_stats` and `pg_clear_attribute_stats` return NULL |

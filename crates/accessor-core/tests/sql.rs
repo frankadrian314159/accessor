@@ -4529,7 +4529,8 @@ fn plpgsql_functions_and_procedures() {
     assert_eq!(one(&mut db, "SELECT biggest()"), "9");
     db.execute("CALL note('hello')").unwrap();
     assert_eq!(one(&mut db, "SELECT msg FROM log"), "hello");
-    assert!(db.execute("CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; EXCEPTION WHEN others THEN RETURN 2; END $$ LANGUAGE plpgsql").is_err());
+    db.execute("CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; EXCEPTION WHEN others THEN RETURN 2; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(one(&mut db, "SELECT f()"), "1");
     assert!(db.execute("CREATE FUNCTION g() RETURNS SETOF int AS $$ BEGIN RETURN 1; END $$ LANGUAGE plpgsql").is_err());
 }
 
@@ -7429,4 +7430,72 @@ fn postgresql_xpath_text_search_debug_and_stats_restore() {
     db.execute("CREATE TABLE s (a int)").unwrap();
     assert_eq!(pg_one(&mut db, "SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 's', 'relpages', 3::integer)"), "true");
     assert!(db.execute("SELECT pg_restore_relation_stats('relname')").is_err());
+}
+
+#[test]
+fn postgresql_plpgsql_exception_handlers_labels_and_continue() {
+    let mut db = pg();
+    db.execute("CREATE TABLE t (id int PRIMARY KEY, v text)").unwrap();
+    db.execute("CREATE FUNCTION safe_div(a int, b int) RETURNS text AS $$ BEGIN RETURN (a / b)::text; EXCEPTION WHEN division_by_zero THEN RETURN 'div0 ' || SQLSTATE; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT safe_div(6, 3)"), "2");
+    assert_eq!(pg_one(&mut db, "SELECT safe_div(1, 0)"), "div0 22012");
+    // what the block did is undone when a handler answers
+    db.execute("CREATE FUNCTION ins(i int) RETURNS text AS $$ BEGIN INSERT INTO t VALUES (i, 'a'); INSERT INTO t VALUES (i, 'b'); RETURN 'ok'; EXCEPTION WHEN unique_violation THEN RETURN 'dup ' || (SELECT count(*) FROM t)::text; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT ins(1)"), "dup 0");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM t"), "0");
+    // RAISE with options, GET STACKED DIAGNOSTICS, SQLERRM
+    db.execute(
+        "CREATE FUNCTION r() RETURNS text AS $$ DECLARE m text; s text; d text; BEGIN BEGIN RAISE EXCEPTION 'boom %', 42 USING ERRCODE = 'P0001', DETAIL = 'the detail'; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS m = MESSAGE_TEXT, s = RETURNED_SQLSTATE, d = PG_EXCEPTION_DETAIL; RETURN m || '/' || s || '/' || d || '/' || SQLERRM; END; END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT r()"), "boom 42/P0001/the detail/boom 42");
+    // a bare RAISE re-raises; an outer block answers by SQLSTATE or by name
+    db.execute("CREATE FUNCTION rethrow() RETURNS text AS $$ BEGIN BEGIN RAISE division_by_zero; EXCEPTION WHEN division_by_zero THEN RAISE; END; EXCEPTION WHEN SQLSTATE '22012' OR raise_exception THEN RETURN 'outer'; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT rethrow()"), "outer");
+    // a condition nobody answers goes on
+    db.execute("CREATE FUNCTION unanswered() RETURNS int AS $$ BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN division_by_zero THEN RETURN 1; END $$ LANGUAGE plpgsql").unwrap();
+    assert!(db.execute("SELECT unanswered()").is_err());
+    assert!(db.execute("SELECT 1 / 0").is_err(), "PostgreSQL raises division by zero");
+    // labels, EXIT label, CONTINUE [label] [WHEN]
+    db.execute(
+        "CREATE FUNCTION loops() RETURNS text AS $$ DECLARE s text := ''; i int; j int; BEGIN FOR i IN 1..4 LOOP CONTINUE WHEN i = 2; s := s || i::text; END LOOP; s := s || '|'; <<outer>> FOR i IN 1..3 LOOP FOR j IN 1..3 LOOP CONTINUE outer WHEN j = 2; EXIT outer WHEN i = 3; s := s || i::text || j::text || ','; END LOOP; END LOOP outer; i := 0; WHILE i < 5 LOOP i := i + 1; CONTINUE WHEN i % 2 = 0; s := s || i::text; END LOOP; RETURN s; END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT loops()"), "134|11,21,135");
+}
+
+#[test]
+fn postgresql_set_config_large_object_descriptors_query_to_xml_and_xmltable() {
+    let mut db = pg();
+    assert_eq!(pg_one(&mut db, "SELECT set_config('my.flag', 'on', false)"), "on");
+    assert_eq!(pg_one(&mut db, "SELECT current_setting('my.flag')"), "on");
+    assert_eq!(pg_one(&mut db, "SELECT set_config('my.flag', 'x', false) || current_setting('my.flag')"), "xx");
+    assert_eq!(pg_one(&mut db, "SELECT lo_from_bytea(0, 'hello world'::bytea)"), "16384");
+    assert_eq!(pg_one(&mut db, "SELECT lo_open(16384, 393216)"), "0");
+    assert_eq!(pg_one(&mut db, "SELECT convert_from(loread(0, 5), 'UTF8')"), "hello");
+    assert_eq!(pg_one(&mut db, "SELECT lo_lseek(0, 0, 2)"), "11");
+    assert_eq!(pg_one(&mut db, "SELECT lowrite(0, '!!!'::bytea)"), "3");
+    assert_eq!(pg_one(&mut db, "SELECT lo_tell(0)"), "14");
+    assert_eq!(pg_one(&mut db, "SELECT convert_from(lo_get(16384), 'UTF8')"), "hello world!!!");
+    assert_eq!(pg_one(&mut db, "SELECT lo_close(0)"), "0");
+    assert!(db.execute("SELECT loread(0, 1)").is_err());
+    db.execute("CREATE TABLE tx (a int, b text)").unwrap();
+    db.execute("INSERT INTO tx VALUES (1, 'x<y'), (2, NULL)").unwrap();
+    assert_eq!(
+        pg_one(&mut db, "SELECT query_to_xml('select a, b as \"my col\" from tx', true, false, '')"),
+        "<table xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n\n<row>\n  <a>1</a>\n  <my_x0020_col>x&lt;y</my_x0020_col>\n</row>\n\n<row>\n  <a>2</a>\n  <my_x0020_col xsi:nil=\"true\"/>\n</row>\n\n</table>\n"
+    );
+    assert_eq!(
+        pg_one(&mut db, "SELECT table_to_xml('tx', false, true, '')"),
+        "<tx xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n  <a>1</a>\n  <b>x&lt;y</b>\n</tx>\n\n<tx xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n  <a>2</a>\n</tx>\n\n"
+    );
+    let r = db
+        .execute("SELECT * FROM xmltable('/rows/row' PASSING '<rows><row id=\"1\"><a>5</a><b>x</b></row><row id=\"2\"><a>6</a></row></rows>'::xml COLUMNS n FOR ORDINALITY, id int PATH '@id', a int, b text DEFAULT 'none')")
+        .unwrap();
+    assert_eq!(r.columns, ["n", "id", "a", "b"]);
+    let rows: Vec<String> = r.rows.iter().map(|row| row.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")).collect();
+    assert_eq!(rows, ["1,1,5,x", "2,2,6,none"]);
+    // a lateral reference to a column of an earlier table
+    assert_eq!(pg_one(&mut db, "SELECT sum(x.a) FROM (VALUES ('<r><row><a>1</a></row><row><a>2</a></row></r>')) AS d(doc), xmltable('//row' PASSING d.doc COLUMNS a int) AS x"), "3");
+    assert!(db.execute("SELECT * FROM xmltable('//row' PASSING '<r><row><a>1</a></row><row/></r>'::xml COLUMNS a int NOT NULL)").is_err());
 }

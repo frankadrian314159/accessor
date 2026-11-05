@@ -204,6 +204,20 @@ impl Database {
         self.user_vars.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    /// Remembers a `set_config` call for the end of the statement (the binder cannot change the settings itself).
+    pub(crate) fn queue_setting(name: &str, value: Option<String>) {
+        PENDING_SETTINGS.with(|p| p.borrow_mut().push((name.to_string(), value)));
+    }
+
+    /// What a `set_config` call earlier in the statement set the parameter to, if one did.
+    pub(crate) fn pending_setting(name: &str) -> Option<Option<String>> {
+        PENDING_SETTINGS.with(|p| p.borrow().iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone()))
+    }
+
+    pub(crate) fn take_settings() -> Vec<(String, Option<String>)> {
+        PENDING_SETTINGS.with(|p| std::mem::take(&mut *p.borrow_mut()))
+    }
+
     /// The value of a run-time parameter as text (`current_setting`): `None` for a name that is not one.
     pub(crate) fn setting_text(&self, name: &str) -> Option<String> {
         let name = name.to_ascii_lowercase();
@@ -233,6 +247,10 @@ impl Database {
         out.sort();
         out
     }
+}
+
+thread_local! {
+    static PENDING_SETTINGS: std::cell::RefCell<Vec<(String, Option<String>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn boolean(value: &str) -> Option<&'static str> {

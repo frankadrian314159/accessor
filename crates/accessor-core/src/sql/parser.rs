@@ -6256,6 +6256,9 @@ impl<'a> Parser<'a> {
             if name == "JSON_TABLE" {
                 return self.json_table();
             }
+            if name == "XMLTABLE" {
+                return self.xml_table();
+            }
             let mut args = Vec::new();
             if !self.peek_sym(")") {
                 args.push(self.expr()?);
@@ -7564,6 +7567,82 @@ impl<'a> Parser<'a> {
         let query = self.json_table_columns(doc, path, tag)?;
         self.expect_sym(")")?;
         let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { "json_table".to_string() };
+        Ok(TableFactor::Derived { query: Box::new(query), alias, columns: Vec::new(), lateral: true })
+    }
+
+    /// `XMLTABLE(rowpath PASSING doc COLUMNS name type [PATH p] [DEFAULT d] [NOT NULL], name FOR ORDINALITY, ..)` after the
+    /// parenthesis: a lateral query over the elements the row path selects in the document.
+    fn xml_table(&mut self) -> Result<TableFactor> {
+        let call = |name: &str, args: Vec<Expr>| Expr::Function { name: name.into(), args, distinct: false, star: false };
+        if self.peek_kw("XMLNAMESPACES") {
+            return Err(Error::syntax("XMLNAMESPACES is not supported"));
+        }
+        let row = self.expr()?;
+        self.expect_kw("PASSING")?;
+        if self.eat_kw("BY") {
+            self.advance(); // REF or VALUE
+        }
+        let doc = self.expr()?;
+        if self.eat_kw("BY") {
+            self.advance();
+        }
+        self.expect_kw("COLUMNS")?;
+        let src = format!("__x{}", self.pos);
+        let value = Expr::Column { table: Some(src.clone()), name: "v".into() };
+        let mut items = Vec::new();
+        loop {
+            let name = self.ident()?;
+            if self.eat_kw("FOR") {
+                self.expect_kw("ORDINALITY")?;
+                if items.iter().any(|i| matches!(i, SelectItem::Expr { expr: Expr::Window { .. }, .. })) {
+                    return Err(Error::syntax("only one FOR ORDINALITY column is allowed"));
+                }
+                let number = Expr::Window { func: Box::new(call("row_number", Vec::new())), spec: WindowSpec::default() };
+                items.push(SelectItem::Expr { expr: number, alias: Some(name) });
+            } else {
+                let declared = self.type_name()?;
+                let tn = crate::sql::usertypes::lookup(&declared).map(|u| u.base).unwrap_or_else(|| declared.clone());
+                let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
+                let mut hints = Vec::new();
+                if self.eat_sym("(") {
+                    while !self.peek_sym(")") && !self.at_eof() {
+                        if let Tok::Int(i) = self.advance() {
+                            hints.push(i);
+                        }
+                    }
+                    self.expect_sym(")")?;
+                }
+                let (mut path, mut default, mut required) = (None, None, false);
+                loop {
+                    if self.eat_kw("PATH") {
+                        path = Some(self.expr()?);
+                    } else if self.eat_kw("DEFAULT") {
+                        default = Some(self.expr()?);
+                    } else if self.eat_kw("NOT") {
+                        self.expect_kw("NULL")?;
+                        required = true;
+                    } else if !self.eat_kw("NULL") {
+                        break;
+                    }
+                }
+                let path = path.unwrap_or_else(|| Expr::Literal(Value::text(&name)));
+                let mut got = call("__XML_VALUE", vec![value.clone(), path]);
+                if let Some(d) = default {
+                    got = call("COALESCE", vec![got, d]);
+                }
+                if required {
+                    got = call("__XML_NOTNULL", vec![got, Expr::Literal(Value::text(&name))]);
+                }
+                items.push(SelectItem::Expr { expr: make_cast(got, ty, &hints), alias: Some(name) });
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        let source = TableFactor::Function { name: "UNNEST".into(), args: vec![call("XPATH", vec![row, doc])], alias: src, columns: vec!["v".into()] };
+        let query = Select { items, from: Some(From { first: source, joins: Vec::new() }), ..Select::default() };
+        let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { "xmltable".to_string() };
         Ok(TableFactor::Derived { query: Box::new(query), alias, columns: Vec::new(), lateral: true })
     }
 

@@ -149,21 +149,23 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `t.col%TYPE` is a variable of no fixed type; `record` and `t%ROWTYPE` are record variables (see above); `name [SCROLL] CURSOR [(param type, ...)] FOR select` declares a cursor and `name refcursor` a cursor variable to be opened with `OPEN name FOR ...` |
 | `OPEN c [(args)];`, `OPEN c FOR select;`, `OPEN c FOR EXECUTE text [USING ...];` | opens the cursor: its rows are those of the query when it is opened (a cursor does not see later changes). The arguments of a bound cursor take the place of its parameters |
 | `FETCH [direction] [FROM \| IN] c INTO targets;`, `MOVE [direction] c;`, `CLOSE c;` | `direction` is `NEXT` (the default), `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `FORWARD [n]` or `BACKWARD [n]`; one row is fetched, into variables or a record, and `FOUND` says whether there was one (no row sets the targets to NULL). A cursor is local to the call that declared it |
-| `GET [CURRENT] DIAGNOSTICS var = ROW_COUNT [, RESULT_OID, PG_CONTEXT];` | the rows the last statement changed (or a query gave). `GET STACKED DIAGNOSTICS` is read but raises an error, as there are no `EXCEPTION` handlers |
+| `GET [CURRENT] DIAGNOSTICS var = ROW_COUNT [, RESULT_OID, PG_CONTEXT];` | the rows the last statement changed (or a query gave) |
+| `GET STACKED DIAGNOSTICS var = MESSAGE_TEXT \| RETURNED_SQLSTATE \| PG_EXCEPTION_DETAIL \| PG_EXCEPTION_HINT \| PG_EXCEPTION_CONTEXT \| ...;` | in an `EXCEPTION` handler: the error being handled. Outside one it is an error |
+| `BEGIN ... EXCEPTION WHEN cond [OR cond ...] THEN ... [WHEN ...] END;` | an error in the block's statements undoes what the block did (a savepoint) and goes to the first `WHEN` that answers to it, whose statements then run in place of the rest of the block. A condition is a name (`division_by_zero`, `unique_violation`, `not_null_violation`, `foreign_key_violation`, `check_violation`, `raise_exception`, `no_data_found`, `too_many_rows`, `undefined_table`, `syntax_error`, ...; the class names such as `data_exception` answer to the whole class), `SQLSTATE 'xxxxx'`, or `OTHERS`. In a handler `SQLSTATE` and `SQLERRM` are variables. The SQLSTATE of an error is worked out from what went wrong, as the MySQL one is, so an unusual error may be `XX000` and answered only by `OTHERS` |
 | `FOUND` | true when the last `SELECT INTO a record`, `UPDATE`, `INSERT`, `DELETE`, `FETCH` or `EXECUTE ... INTO` found or changed a row, or a `FOR` loop ran; false when the function starts. A plain `SELECT ... INTO a, b` does not set it |
 | `name := expr;` or `name = expr;` | assignment |
 | `IF c THEN ... ELSIF c THEN ... ELSE ... END IF;` | |
 | `CASE [expr] WHEN v [, v] THEN ... ELSE ... END CASE;` | the statement form |
-| `WHILE c LOOP ... END LOOP;`, `LOOP ... END LOOP;` | `EXIT [WHEN c];` leaves the innermost loop (a label is read and ignored) |
-| `FOR i IN [REVERSE] a..b [BY n] LOOP ... END LOOP;` | `i` is an integer; `FOR r IN query` is not available |
+| `WHILE c LOOP ... END LOOP;`, `LOOP ... END LOOP;` | `EXIT [label] [WHEN c];` leaves the innermost loop, or the loop or block called `label` (written `<<label>>` before it, and optionally after `END LOOP`); `CONTINUE [label] [WHEN c];` goes on with the next round of that loop |
+| `FOR i IN [REVERSE] a..b [BY n] LOOP ... END LOOP;` | `i` is an integer; `FOR r IN query LOOP` is described above |
 | `RETURN [expr];` | |
 | `RETURN NEXT expr;`, `RETURN NEXT;`, `RETURN NEXT rec;`, `RETURN QUERY select;` | in a function that `RETURNS TABLE (...)` or `RETURNS SETOF type | table`: adds a row to the result. `RETURN NEXT;` takes the output columns, which are variables of the body; `RETURN` alone ends it. The function is called in FROM (also through a view); it is run once, before the query, when its arguments are known then, so a call that reads a column of another table in FROM (`LATERAL`) is not supported |
-| `RAISE [level] 'format %', args;` | `EXCEPTION` (the default) stops with that message and undoes the call; the levels `NOTICE`, `INFO`, `WARNING`, `LOG`, `DEBUG` do nothing; `USING MESSAGE = ...` works, the other `USING` options are ignored |
+| `RAISE [level] 'format %', args [USING option = value, ...];` | `EXCEPTION` (the default) stops with that message (SQLSTATE `P0001`) and undoes the call unless a handler answers; the levels `NOTICE`, `INFO`, `WARNING`, `LOG`, `DEBUG` do nothing. `RAISE condition_name;` and `RAISE SQLSTATE 'xxxxx';` raise that condition; the options `MESSAGE`, `ERRCODE` (a name or a 5-character code), `DETAIL` and `HINT` are kept (the others are ignored). `RAISE;` in a handler raises the error again |
 | `PERFORM query;` | runs the query and discards it |
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, `CONTINUE`, arrays, assigning a whole record (`r := new`), cursors returned to the caller by name (`RETURN c` with `FETCH ALL IN "c"` afterwards), `FOR rec IN cursor LOOP`, event triggers, and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: arrays, assigning a whole record (`r := new`), cursors returned to the caller by name (`RETURN c` with `FETCH ALL IN "c"` afterwards), `FOR rec IN cursor LOOP`, event triggers, and every language except `sql` and `plpgsql`.
 
 ### Trigger functions
 

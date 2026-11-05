@@ -79,7 +79,20 @@ pub enum MoreFn {
     LoGet,
     LoPut,
     LoUnlink,
+    LoImport,
+    LoExport,
+    LoOpen,
+    LoClose,
+    LoRead,
+    LoWrite,
+    LoLseek,
+    LoTell,
+    LoTruncate,
     Xpath,
+    XmlValue,
+    ConvertFrom,
+    ConvertTo,
+    XmlNotNull,
     XpathExists,
     RestoreStats,
     ClearStats,
@@ -152,7 +165,20 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "LO_GET" => (LoGet, 1, 3),
         "LO_PUT" => (LoPut, 3, 3),
         "LO_UNLINK" => (LoUnlink, 1, 1),
+        "LO_IMPORT" => (LoImport, 1, 2),
+        "LO_EXPORT" => (LoExport, 2, 2),
+        "LO_OPEN" => (LoOpen, 2, 2),
+        "LO_CLOSE" => (LoClose, 1, 1),
+        "LOREAD" => (LoRead, 2, 2),
+        "LOWRITE" => (LoWrite, 2, 2),
+        "LO_LSEEK" | "LO_LSEEK64" => (LoLseek, 3, 3),
+        "LO_TELL" | "LO_TELL64" => (LoTell, 1, 1),
+        "LO_TRUNCATE" | "LO_TRUNCATE64" => (LoTruncate, 2, 2),
         "XPATH" => (Xpath, 2, 3),
+        "__XML_VALUE" => (XmlValue, 2, 2),
+        "CONVERT_FROM" => (ConvertFrom, 2, 2),
+        "CONVERT_TO" => (ConvertTo, 2, 2),
+        "__XML_NOTNULL" => (XmlNotNull, 2, 2),
         "XPATH_EXISTS" => (XpathExists, 2, 3),
         "PG_RESTORE_RELATION_STATS" | "PG_RESTORE_ATTRIBUTE_STATS" => (RestoreStats, 0, usize::MAX),
         "PG_CLEAR_RELATION_STATS" | "PG_CLEAR_ATTRIBUTE_STATS" => (ClearStats, 2, 3),
@@ -176,6 +202,7 @@ impl MoreFn {
                 | MoreFn::EnumLast
                 | MoreFn::Populate
                 | MoreFn::RestoreStats
+                | MoreFn::XmlNotNull
         )
     }
 }
@@ -276,6 +303,27 @@ fn enum_labels(type_name: &Value, probe: &[Cow<'_, Value>]) -> Result<Vec<String
 
 thread_local! {
     static LARGE_OBJECTS: std::cell::RefCell<std::collections::BTreeMap<i64, Vec<u8>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+thread_local! {
+    /// The large object descriptors that are open: the object, the position, and whether it may be written.
+    static LO_DESCRIPTORS: std::cell::RefCell<Vec<Option<(i64, usize, bool)>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn descriptor(fd: i64) -> Result<(i64, usize, bool)> {
+    LO_DESCRIPTORS.with(|d| usize::try_from(fd).ok().and_then(|i| d.borrow().get(i).copied().flatten())).ok_or_else(|| Error::runtime(format!("invalid large-object descriptor: {fd}")))
+}
+
+fn set_position(fd: i64, at: usize) {
+    LO_DESCRIPTORS.with(|d| {
+        if let Some(Some(e)) = d.borrow_mut().get_mut(fd as usize) {
+            e.1 = at;
+        }
+    });
+}
+
+fn lo_data(id: i64) -> Result<Vec<u8>> {
+    LARGE_OBJECTS.with(|m| m.borrow().get(&id).cloned()).ok_or_else(|| Error::runtime(format!("large object {id} does not exist")))
 }
 
 fn raw(v: &Value) -> Vec<u8> {
@@ -828,6 +876,26 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             })?;
             Value::Null
         }
+        XmlNotNull => {
+            if v(0).is_null() {
+                return Err(Error::runtime(format!("null is not allowed in column \"{}\"", text(v(1)))));
+            }
+            v(0).clone()
+        }
+        ConvertFrom => Value::text(&String::from_utf8_lossy(&raw(v(0)))),
+        ConvertTo => Value::bytes(raw(v(0))),
+        XmlValue => {
+            // a column of XMLTABLE: the path is relative to the row element, which is the root of the node's text
+            let node = text(v(0)).into_owned();
+            let path = text(v(1)).into_owned();
+            let root = node.trim_start().strip_prefix('<').map(|r| r.split(|c: char| c.is_whitespace() || c == '>' || c == '/').next().unwrap_or("").to_string()).unwrap_or_default();
+            let full = if path.starts_with('/') || root.is_empty() { path } else if path == "." { format!("/{root}") } else { format!("/{root}/{path}") };
+            if super::xmlfuncs::xpath_nodes(&node, &full)?.is_empty() {
+                Value::Null
+            } else {
+                super::xmlfuncs::extract_value(&node, &full)?.map_or(Value::Null, |t| Value::text(&t))
+            }
+        }
         Xpath | XpathExists => {
             let nodes = super::xmlfuncs::xpath_nodes(&text(v(1)), &text(v(0)))?;
             if f == XpathExists {
@@ -859,6 +927,99 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 return Err(Error::runtime(format!("large object {id} does not exist")));
             }
             Value::Int(1)
+        }
+        LoImport => {
+            let path = text(v(0)).into_owned();
+            let data = std::fs::read(&path).map_err(|e| Error::runtime(format!("could not open server file \"{path}\": {e}")))?;
+            Value::Int(lo_new(vals.get(1).map_or(Ok(0), |x| int(x))?, data)?)
+        }
+        LoExport => {
+            let (id, path) = (int(v(0))?, text(v(1)).into_owned());
+            std::fs::write(&path, lo_data(id)?).map_err(|e| Error::runtime(format!("could not create server file \"{path}\": {e}")))?;
+            Value::Int(1)
+        }
+        LoOpen => {
+            let (id, mode) = (int(v(0))?, int(v(1))?);
+            lo_data(id)?;
+            let fd = LO_DESCRIPTORS.with(|d| {
+                let mut d = d.borrow_mut();
+                let entry = Some((id, 0, mode & 0x20000 != 0));
+                match d.iter().position(Option::is_none) {
+                    Some(i) => {
+                        d[i] = entry;
+                        i
+                    }
+                    None => {
+                        d.push(entry);
+                        d.len() - 1
+                    }
+                }
+            });
+            Value::Int(fd as i64)
+        }
+        LoClose => {
+            let fd = int(v(0))?;
+            descriptor(fd)?;
+            LO_DESCRIPTORS.with(|d| d.borrow_mut()[fd as usize] = None);
+            Value::Int(0)
+        }
+        LoRead => {
+            let (fd, n) = (int(v(0))?, int(v(1))?);
+            let (id, at, _) = descriptor(fd)?;
+            let data = lo_data(id)?;
+            let from = at.min(data.len());
+            let to = (from + n.max(0) as usize).min(data.len());
+            set_position(fd, to);
+            Value::bytes(data[from..to].to_vec())
+        }
+        LoWrite => {
+            let fd = int(v(0))?;
+            let (id, at, writable) = descriptor(fd)?;
+            if !writable {
+                return Err(Error::runtime("large object descriptor was not opened for writing"));
+            }
+            let bytes = raw(v(1));
+            let end = at + bytes.len();
+            LARGE_OBJECTS.with(|m| {
+                if let Some(data) = m.borrow_mut().get_mut(&id) {
+                    if data.len() < end {
+                        data.resize(end, 0);
+                    }
+                    data[at..end].copy_from_slice(&bytes);
+                }
+            });
+            set_position(fd, end);
+            Value::Int(bytes.len() as i64)
+        }
+        LoLseek => {
+            let (fd, offset, whence) = (int(v(0))?, int(v(1))?, int(v(2))?);
+            let (id, at, _) = descriptor(fd)?;
+            let base = match whence {
+                0 => 0,
+                1 => at as i64,
+                2 => lo_data(id)?.len() as i64,
+                _ => return Err(Error::runtime(format!("invalid whence setting: {whence}"))),
+            };
+            let to = base + offset;
+            if to < 0 {
+                return Err(Error::runtime(format!("invalid large object seek target: {to}")));
+            }
+            set_position(fd, to as usize);
+            Value::Int(to)
+        }
+        LoTell => Value::Int(descriptor(int(v(0))?)?.1 as i64),
+        LoTruncate => {
+            let (fd, len) = (int(v(0))?, int(v(1))?);
+            let (id, _, writable) = descriptor(fd)?;
+            if !writable || len < 0 {
+                return Err(Error::runtime("large object descriptor was not opened for writing"));
+            }
+            LARGE_OBJECTS.with(|m| {
+                if let Some(data) = m.borrow_mut().get_mut(&id) {
+                    data.resize(len as usize, 0);
+                }
+            });
+            Value::Int(0)
         }
         Null => Value::Null,
     })

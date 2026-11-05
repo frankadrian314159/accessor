@@ -668,11 +668,45 @@ impl<'a> Binder<'a> {
                         return Err(Error::runtime("current_setting needs the name of a parameter in quotes"));
                     };
                     let missing_ok = matches!(args.get(1), Some(Expr::Literal(Value::Bool(true))));
-                    return match self.db.setting_text(n) {
+                    let current = match Database::pending_setting(n) {
+                        Some(set) => set,
+                        None => self.db.setting_text(n),
+                    };
+                    return match current {
                         Some(v) => Ok(BExpr::Lit(Value::text(&v))),
                         None if missing_ok => Ok(BExpr::Lit(Value::Null)),
                         None => Err(Error::runtime(format!("unrecognized configuration parameter \"{n}\""))),
                     };
+                }
+                // query_to_xml(query, nulls, tableforest, targetns), table_to_xml(table, ...): the query runs when the statement is read
+                if matches!(name.to_ascii_uppercase().as_str(), "QUERY_TO_XML" | "TABLE_TO_XML") && args.len() == 4 {
+                    let mut consts = Vec::new();
+                    for a in args {
+                        consts.push(self.bind(a)?.eval(&[])?.into_owned());
+                    }
+                    let (nulls, forest) = (matches!(consts[1], Value::Bool(true)), matches!(consts[2], Value::Bool(true)));
+                    let ns = consts[3].to_string();
+                    let given = consts[0].to_string();
+                    let table_call = name.eq_ignore_ascii_case("TABLE_TO_XML");
+                    let (sql, table) = if table_call {
+                        let t = given.rsplit('.').next().unwrap_or(&given).trim_matches('"').to_string();
+                        (format!("SELECT * FROM {given}"), t)
+                    } else {
+                        (given, "table".to_string())
+                    };
+                    let result = self.db.query(&sql)?;
+                    let row_name = if table_call && forest { table.as_str() } else { "row" };
+                    let root = if table_call { table.as_str() } else { "table" };
+                    return Ok(BExpr::Lit(Value::text(&crate::expr::xmlfuncs::rows_to_xml(&result.columns, &result.rows, nulls, forest, &ns, root, row_name))));
+                }
+                // set_config(name, value, is_local): the setting changes when the statement is done
+                if name.eq_ignore_ascii_case("SET_CONFIG") && args.len() == 3 {
+                    let (Some(Expr::Literal(Value::Text(n))), Some(Expr::Literal(v))) = (args.first(), args.get(1)) else {
+                        return Err(Error::runtime("set_config needs the name of the parameter and its new value as constants"));
+                    };
+                    let value = if v.is_null() { None } else { Some(v.to_string()) };
+                    Database::queue_setting(n, value.clone());
+                    return Ok(BExpr::Lit(value.map_or(Value::Null, |t| Value::text(&t))));
                 }
                 // row_to_json(t), to_json(t): a row as an object of its columns
                 if matches!(name.to_ascii_uppercase().as_str(), "ROW_TO_JSON" | "TO_JSON" | "TO_JSONB") && !args.is_empty() {

@@ -427,7 +427,10 @@ fn operand(v: &Value) -> Result<Cow<'_, Value>> {
 /// engine; the SQL standard would raise an error.
 pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     match arith_checked(op, a, b) {
-        Err(Error::Runtime(m)) if m == DIVISION_BY_ZERO => Ok(Value::Null),
+        Err(Error::Runtime(m)) if m == DIVISION_BY_ZERO => {
+            // PostgreSQL raises the error; the other dialects give NULL
+            if crate::dialect::current() == crate::dialect::Dialect::Postgresql { Err(Error::runtime("division by zero")) } else { Ok(Value::Null) }
+        }
         other => other,
     }
 }

@@ -147,6 +147,11 @@ impl Database {
         for (name, value) in crate::expr::myfuncs::take_assignments() {
             self.user_vars.insert(name, value);
         }
+        // set_config(name, value, is_local) calls read while the statement was bound
+        let result = match Self::take_settings().into_iter().try_for_each(|(name, value)| self.set_parameter(&name, value.as_deref())) {
+            Err(e) if result.is_ok() => Err(e),
+            _ => result,
+        };
         // Numbers handed out are logged even if the statement failed or its transaction is rolled back.
         self.flush_sequences()?;
         result

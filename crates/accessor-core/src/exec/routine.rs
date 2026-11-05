@@ -218,6 +218,11 @@ enum Flow {
     Return,
 }
 
+/// Does an `EXCEPTION WHEN` condition (a SQLSTATE, a class ending in `000`, or `OTHERS`) answer to the state?
+fn pg_condition_matches(cond: &str, state: &str) -> bool {
+    cond == "OTHERS" || cond == state || (cond.ends_with("000") && state.starts_with(&cond[..2]))
+}
+
 fn handler_matches(h: &Handler, e: &Error) -> bool {
     let state = e.sqlstate();
     let class = state.get(..2).unwrap_or("");
@@ -799,6 +804,47 @@ impl Database {
                     Flow::LeaveTo(l) if l.eq_ignore_ascii_case(label) => Flow::Normal,
                     other => other,
                 });
+            }
+            ProcStmt::PgTry { body, handlers } => {
+                const SAVEPOINT: &str = "__pgtry";
+                self.savepoint(SAVEPOINT)?;
+                match self.run_block(body, frame) {
+                    Ok(flow) => {
+                        self.release(SAVEPOINT)?;
+                        return Ok(flow);
+                    }
+                    Err(e) => {
+                        self.rollback_to(SAVEPOINT)?;
+                        self.release(SAVEPOINT)?;
+                        let state = e.pg_sqlstate();
+                        let Some((_, handler)) = handlers.iter().find(|(conds, _)| conds.iter().any(|c| pg_condition_matches(c, &state))) else { return Err(e) };
+                        let mut diag = e.diag();
+                        diag.state = state.clone();
+                        frame.vars.insert("sqlstate".to_string(), Value::text(&state));
+                        frame.vars.insert("sqlerrm".to_string(), Value::text(&diag.message));
+                        let outer = frame.diag.replace(diag);
+                        let flow = self.run_block(handler, frame);
+                        frame.diag = outer;
+                        return flow;
+                    }
+                }
+            }
+            ProcStmt::PgRaise { state, message, items } => {
+                if state.is_none() && message.is_none() {
+                    let Some(d) = frame.diag.clone() else {
+                        return Err(Error::runtime("RAISE without parameters cannot be used outside an exception handler"));
+                    };
+                    return Err(Error::signal(&d.state, d.errno, d.message, d.items));
+                }
+                let text = match message {
+                    Some(m) => self.eval_in(m, frame)?.to_string(),
+                    None => String::new(),
+                };
+                let mut extra = Vec::new();
+                for (k, e) in items {
+                    extra.push((k.clone(), self.eval_in(e, frame)?.to_string()));
+                }
+                return Err(Error::signal(state.as_deref().unwrap_or("P0001"), 1644, text, extra));
             }
             ProcStmt::Block { label, body, handlers } => {
                 let flow = self.run_block_handled(body, handlers, frame)?;

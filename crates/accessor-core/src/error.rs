@@ -66,6 +66,72 @@ impl Diag {
     }
 }
 
+/// The SQLSTATE of a plpgsql condition name (`division_by_zero`), if it is one this engine knows.
+pub fn pg_condition_state(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "successful_completion" => "00000",
+        "warning" => "01000",
+        "no_data" => "02000",
+        "sql_statement_not_yet_complete" => "03000",
+        "connection_exception" => "08000",
+        "feature_not_supported" => "0A000",
+        "invalid_transaction_initiation" => "0B000",
+        "data_exception" => "22000",
+        "string_data_right_truncation" => "22001",
+        "null_value_not_allowed" => "22004",
+        "numeric_value_out_of_range" => "22003",
+        "invalid_datetime_format" => "22007",
+        "datetime_field_overflow" => "22008",
+        "division_by_zero" => "22012",
+        "invalid_parameter_value" => "22023",
+        "invalid_text_representation" => "22P02",
+        "invalid_binary_representation" => "22P03",
+        "invalid_escape_sequence" => "22025",
+        "array_subscript_error" => "2202E",
+        "integrity_constraint_violation" => "23000",
+        "restrict_violation" => "23001",
+        "not_null_violation" => "23502",
+        "foreign_key_violation" => "23503",
+        "unique_violation" => "23505",
+        "check_violation" => "23514",
+        "exclusion_violation" => "23P01",
+        "invalid_cursor_state" => "24000",
+        "invalid_transaction_state" => "25000",
+        "invalid_sql_statement_name" => "26000",
+        "triggered_data_change_violation" => "27000",
+        "invalid_authorization_specification" => "28000",
+        "invalid_cursor_name" => "34000",
+        "syntax_error_or_access_rule_violation" => "42000",
+        "syntax_error" => "42601",
+        "insufficient_privilege" => "42501",
+        "undefined_column" => "42703",
+        "undefined_function" => "42883",
+        "undefined_table" => "42P01",
+        "undefined_object" => "42704",
+        "duplicate_column" => "42701",
+        "duplicate_function" => "42723",
+        "duplicate_table" => "42P07",
+        "duplicate_object" => "42710",
+        "datatype_mismatch" => "42804",
+        "ambiguous_column" => "42702",
+        "wrong_object_type" => "42809",
+        "cardinality_violation" => "21000",
+        "plpgsql_error" => "P0000",
+        "raise_exception" => "P0001",
+        "no_data_found" => "P0002",
+        "too_many_rows" => "P0003",
+        "assert_failure" => "P0004",
+        "internal_error" => "XX000",
+        "data_corrupted" => "XX001",
+        "lock_not_available" => "55P03",
+        "query_canceled" => "57014",
+        "serialization_failure" => "40001",
+        "deadlock_detected" => "40P01",
+        "transaction_rollback" => "40000",
+        _ => return None,
+    })
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
@@ -130,6 +196,53 @@ impl Error {
             "42000" => 1064,
             _ => 1105,
         }
+    }
+
+    /// The SQLSTATE PostgreSQL would give the error, as far as it can be told (what a plpgsql `EXCEPTION` handler matches).
+    pub fn pg_sqlstate(&self) -> String {
+        match self {
+            Error::Signal { state, .. } => return state.clone(),
+            Error::Syntax(_) => return "42601".into(),
+            _ => {}
+        }
+        let m = self.to_string().to_ascii_lowercase();
+        let has = |s: &str| m.contains(s);
+        if has("division by zero") {
+            "22012"
+        } else if has("duplicate value") || has("duplicate key") {
+            "23505"
+        } else if has("cannot contain a null") || has("null value in column") {
+            "23502"
+        } else if has("requires a matching record") || has("still refer to it") || has("foreign key") {
+            "23503"
+        } else if has("check constraint failed") || has("violates check") {
+            "23514"
+        } else if has("query returned more than one row") || has("more than one row") {
+            "P0003"
+        } else if has("query returned no rows") {
+            "P0002"
+        } else if has("invalid input syntax") {
+            "22P02"
+        } else if has("out of range") {
+            "22003"
+        } else if has("value too long") {
+            "22001"
+        } else if has("already exists") {
+            if has("column") { "42701" } else { "42P07" }
+        } else if has("does not exist") || has("was not found") {
+            if has("column") {
+                "42703"
+            } else if has("function") {
+                "42883"
+            } else {
+                "42P01"
+            }
+        } else if matches!(self, Error::Constraint(_)) {
+            "23000"
+        } else {
+            "XX000"
+        }
+        .to_string()
     }
 
     /// The diagnostics area this error leaves.

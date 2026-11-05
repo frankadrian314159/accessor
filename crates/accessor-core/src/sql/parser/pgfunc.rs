@@ -44,6 +44,18 @@ struct Names {
     handlers: Vec<Handler>,
     /// `DECLARE name CONDITION FOR ...`
     conditions: Vec<(String, HandlerCond)>,
+    /// plpgsql: the `<<label>>` just read, for the loop that follows.
+    label: Option<String>,
+    /// plpgsql: the loops being read, innermost last.
+    loops: Vec<LoopCtx>,
+    loop_seq: usize,
+}
+
+/// A plpgsql loop being read: its label, the label `CONTINUE` leaves to, and whether a `CONTINUE` did.
+struct LoopCtx {
+    label: Option<String>,
+    cont: String,
+    used: bool,
 }
 
 impl Names {
@@ -454,6 +466,9 @@ impl<'a> Parser<'a> {
             has_out: !outs.is_empty(),
             handlers: Vec::new(),
             conditions: Vec::new(),
+            label: None,
+            loops: Vec::new(),
+            loop_seq: 0,
         };
         if language == "plpgsql" {
             names.all.push("found".to_string());
@@ -564,14 +579,33 @@ impl<'a> Parser<'a> {
 
     // ---- PL/pgSQL ----
 
-    fn skip_label(&mut self) {
-        if self.peek_sym("<") && self.peek_sym_at(1, "<") {
-            while !self.at_eof() && !(self.peek_sym(">") && self.peek_sym_at(1, ">")) {
-                self.advance();
-            }
-            self.advance();
+    /// A label after `EXIT` or `CONTINUE` (a word that would otherwise be reserved, such as `outer`, can be one).
+    fn label_name(&mut self) -> String {
+        match self.advance() {
+            Tok::Ident(s) | Tok::Quoted(s) => s,
+            _ => String::new(),
+        }
+    }
+
+    /// `<<label>>`
+    fn read_label(&mut self) -> Option<String> {
+        if !self.peek_sym("<<") {
+            return None;
+        }
+        self.advance();
+        let name = match self.advance() {
+            Tok::Ident(s) | Tok::Quoted(s) => Some(s),
+            _ => None,
+        };
+        while !self.at_eof() && !self.peek_sym(">>") {
             self.advance();
         }
+        self.advance();
+        name
+    }
+
+    fn skip_label(&mut self) {
+        self.read_label();
     }
 
     pub(super) fn peek_sym_at(&self, n: usize, s: &str) -> bool {
@@ -700,15 +734,78 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_kw("BEGIN")?;
-        out.extend(self.pl_stmts(names, &["END", "EXCEPTION"])?);
-        if self.peek_kw("EXCEPTION") {
-            return Err(Error::syntax("EXCEPTION handlers are not supported; let the error stop the function"));
+        let body = self.pl_stmts(names, &["END", "EXCEPTION"])?;
+        if self.eat_kw("EXCEPTION") {
+            let mut handlers = Vec::new();
+            for v in ["sqlstate", "sqlerrm"] {
+                if !names.has(v) {
+                    names.all.push(v.to_string());
+                }
+            }
+            while self.eat_kw("WHEN") {
+                let mut conds = Vec::new();
+                loop {
+                    conds.push(self.pl_condition()?);
+                    if !self.eat_kw("OR") {
+                        break;
+                    }
+                }
+                self.expect_kw("THEN")?;
+                let handler = self.pl_stmts(names, &["WHEN", "END"])?;
+                handlers.push((conds, handler));
+            }
+            out.push(ProcStmt::PgTry { body, handlers });
+        } else {
+            out.extend(body);
         }
         self.expect_kw("END")?;
         if matches!(self.peek(), Tok::Ident(s) if !s.eq_ignore_ascii_case("IF") && !s.eq_ignore_ascii_case("LOOP")) {
             self.advance(); // END label
         }
         Ok(out)
+    }
+
+    /// A condition of an `EXCEPTION WHEN`: a name, `SQLSTATE 'xxxxx'` or `OTHERS`.
+    fn pl_condition(&mut self) -> Result<String> {
+        if self.eat_kw("OTHERS") {
+            return Ok("OTHERS".to_string());
+        }
+        if self.eat_kw("SQLSTATE") {
+            return match self.advance() {
+                Tok::Str(s) if s.len() == 5 => Ok(s.to_ascii_uppercase()),
+                _ => Err(Error::syntax("SQLSTATE needs a 5-character code")),
+            };
+        }
+        let name = self.ident()?;
+        crate::error::pg_condition_state(&name).map(str::to_string).ok_or_else(|| Error::syntax(format!("unrecognized exception condition \"{name}\"")))
+    }
+
+    /// Starts a loop: the label it had, and the label a `CONTINUE` in it leaves to.
+    fn loop_enter(names: &mut Names) {
+        names.loop_seq += 1;
+        let label = names.label.take();
+        let cont = format!("__cont{}", names.loop_seq);
+        names.loops.push(LoopCtx { label, cont, used: false });
+    }
+
+    /// Ends a loop: its body, set up so that a `CONTINUE` ends the round.
+    fn loop_exit(names: &mut Names, body: Vec<ProcStmt>) -> Vec<ProcStmt> {
+        let ctx = names.loops.pop().expect("a loop was started");
+        if ctx.used {
+            vec![ProcStmt::Block { label: Some(ctx.cont), body, handlers: Vec::new() }]
+        } else {
+            body
+        }
+    }
+
+    /// `END LOOP [label]`
+    fn end_loop(&mut self) -> Result<()> {
+        self.expect_kw("END")?;
+        self.expect_kw("LOOP")?;
+        if matches!(self.peek(), Tok::Ident(_)) {
+            self.advance();
+        }
+        Ok(())
     }
 
     fn pl_stmts(&mut self, names: &mut Names, stops: &[&str]) -> Result<Vec<ProcStmt>> {
@@ -748,6 +845,19 @@ impl<'a> Parser<'a> {
     }
 
     fn pl_stmt(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>) -> Result<()> {
+        let Some(label) = self.read_label() else { return self.pl_stmt_inner(names, out) };
+        if self.peek_kw("WHILE") || self.peek_kw("LOOP") || self.peek_kw("FOR") {
+            names.label = Some(label.clone());
+        }
+        let mut inner = Vec::new();
+        let done = self.pl_stmt_inner(names, &mut inner);
+        names.label = None;
+        done?;
+        out.push(ProcStmt::Block { label: Some(label), body: inner, handlers: Vec::new() });
+        Ok(())
+    }
+
+    fn pl_stmt_inner(&mut self, names: &mut Names, out: &mut Vec<ProcStmt>) -> Result<()> {
         self.skip_label();
         if self.peek_kw("DECLARE") || self.peek_kw("BEGIN") {
             let inner = self.pl_block(names)?;
@@ -849,16 +959,18 @@ impl<'a> Parser<'a> {
         if self.eat_kw("WHILE") {
             let cond = self.pl_expr(names)?;
             self.expect_kw("LOOP")?;
+            Self::loop_enter(names);
             let body = self.pl_stmts(names, &["END"])?;
-            self.expect_kw("END")?;
-            self.expect_kw("LOOP")?;
+            let body = Self::loop_exit(names, body);
+            self.end_loop()?;
             out.push(ProcStmt::While { cond, body });
             return self.end_stmt();
         }
         if self.eat_kw("LOOP") {
+            Self::loop_enter(names);
             let body = self.pl_stmts(names, &["END"])?;
-            self.expect_kw("END")?;
-            self.expect_kw("LOOP")?;
+            let body = Self::loop_exit(names, body);
+            self.end_loop()?;
             out.push(ProcStmt::While { cond: lit_true(), body });
             return self.end_stmt();
         }
@@ -870,9 +982,10 @@ impl<'a> Parser<'a> {
                 let using = self.pl_using(names)?;
                 self.expect_kw("LOOP")?;
                 names.records.push(var.clone());
+                Self::loop_enter(names);
                 let body = self.pl_stmts(names, &["END"])?;
-                self.expect_kw("END")?;
-                self.expect_kw("LOOP")?;
+                let body = Self::loop_exit(names, body);
+                self.end_loop()?;
                 out.push(ProcStmt::ForExecute { name: var, sql, using, body });
                 return self.end_stmt();
             }
@@ -893,9 +1006,10 @@ impl<'a> Parser<'a> {
                 let Some(mut st @ Statement::Select(_)) = statements.pop() else { return Err(Error::syntax("FOR ... IN needs a SELECT")) };
                 names.statement(&mut st)?;
                 let Statement::Select(sel) = st else { unreachable!("a SELECT stays one") };
+                Self::loop_enter(names);
                 let body = self.pl_stmts(names, &["END"])?;
-                self.expect_kw("END")?;
-                self.expect_kw("LOOP")?;
+                let body = Self::loop_exit(names, body);
+                self.end_loop()?;
                 out.push(ProcStmt::ForRecord { name: var, select: Box::new(sel), body });
                 return self.end_stmt();
             }
@@ -908,9 +1022,10 @@ impl<'a> Parser<'a> {
             let step = if self.eat_kw("BY") { self.pl_expr(names)? } else { Expr::Literal(Value::Int(1)) };
             self.expect_kw("LOOP")?;
             names.all.push(var.clone());
-            let mut body = self.pl_stmts(names, &["END"])?;
-            self.expect_kw("END")?;
-            self.expect_kw("LOOP")?;
+            Self::loop_enter(names);
+            let body = self.pl_stmts(names, &["END"])?;
+            let mut body = Self::loop_exit(names, body);
+            self.end_loop()?;
             let (from, to) = if reverse { (second, first) } else { (first, second) };
             let v = || Box::new(Expr::Param(var.clone()));
             out.push(ProcStmt::Declare { name: var.clone(), data_type: Some(DataType::Integer), init: Some(from) });
@@ -925,19 +1040,31 @@ impl<'a> Parser<'a> {
             return self.end_stmt();
         }
         if self.eat_kw("EXIT") {
-            if matches!(self.peek(), Tok::Ident(s) if !s.eq_ignore_ascii_case("WHEN")) {
-                self.advance(); // a label: only the innermost loop can be left
-            }
+            let leave = if matches!(self.peek(), Tok::Ident(s) if !s.eq_ignore_ascii_case("WHEN")) { ProcStmt::LeaveTo(self.label_name()) } else { ProcStmt::Leave };
             if self.eat_kw("WHEN") {
                 let cond = self.pl_expr(names)?;
-                out.push(ProcStmt::If { branches: vec![(cond, vec![ProcStmt::Leave])], otherwise: Vec::new() });
+                out.push(ProcStmt::If { branches: vec![(cond, vec![leave])], otherwise: Vec::new() });
             } else {
-                out.push(ProcStmt::Leave);
+                out.push(leave);
             }
             return self.end_stmt();
         }
-        if self.peek_kw("CONTINUE") {
-            return Err(Error::syntax("CONTINUE is not supported"));
+        if self.eat_kw("CONTINUE") {
+            let label = if matches!(self.peek(), Tok::Ident(s) if !s.eq_ignore_ascii_case("WHEN")) { Some(self.label_name()) } else { None };
+            let at = match &label {
+                None => names.loops.len().checked_sub(1),
+                Some(l) => names.loops.iter().rposition(|c| c.label.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(l))),
+            };
+            let Some(at) = at else { return Err(Error::syntax("CONTINUE cannot be used outside a loop")) };
+            names.loops[at].used = true;
+            let leave = ProcStmt::LeaveTo(names.loops[at].cont.clone());
+            if self.eat_kw("WHEN") {
+                let cond = self.pl_expr(names)?;
+                out.push(ProcStmt::If { branches: vec![(cond, vec![leave])], otherwise: Vec::new() });
+            } else {
+                out.push(leave);
+            }
+            return self.end_stmt();
         }
         if self.eat_kw("RAISE") {
             return self.pl_raise(names, out);
@@ -1168,6 +1295,19 @@ impl<'a> Parser<'a> {
             self.eat_kw("EXCEPTION");
         }
         let mut message: Option<Expr> = None;
+        let mut state: Option<String> = None;
+        let mut items: Vec<(String, Expr)> = Vec::new();
+        if exception && self.eat_kw("SQLSTATE") {
+            match self.advance() {
+                Tok::Str(s) if s.len() == 5 => state = Some(s.to_ascii_uppercase()),
+                _ => return Err(Error::syntax("SQLSTATE needs a 5-character code")),
+            }
+        } else if exception && matches!(self.peek(), Tok::Ident(s) if !s.eq_ignore_ascii_case("USING")) {
+            let name = self.ident()?;
+            let code = crate::error::pg_condition_state(&name).ok_or_else(|| Error::syntax(format!("unrecognized exception condition \"{name}\"")))?;
+            state = Some(code.to_string());
+            message = Some(Expr::Literal(Value::text(&name)));
+        }
         if let Tok::Str(fmt) = self.peek().clone() {
             self.advance();
             let mut converted = String::new();
@@ -1196,9 +1336,18 @@ impl<'a> Parser<'a> {
                 if !self.eat_sym("=") {
                     self.expect_kw("TO")?;
                 }
-                let v = self.pl_expr(names)?;
-                if option.eq_ignore_ascii_case("MESSAGE") && message.is_none() {
+                // ERRCODE = condition_name
+                let v = if option.eq_ignore_ascii_case("ERRCODE") && matches!(self.peek(), Tok::Ident(_)) { Expr::Literal(Value::text(&self.ident()?)) } else { self.pl_expr(names)? };
+                if option.eq_ignore_ascii_case("MESSAGE") {
                     message = Some(v);
+                } else if option.eq_ignore_ascii_case("ERRCODE") {
+                    let text = match &v {
+                        Expr::Literal(Value::Text(t)) => t.to_string(),
+                        _ => return Err(Error::syntax("ERRCODE needs a condition name or a 5-character code")),
+                    };
+                    state = Some(if text.len() == 5 && text.chars().all(|c| c.is_ascii_alphanumeric()) { text.to_ascii_uppercase() } else { crate::error::pg_condition_state(&text).ok_or_else(|| Error::syntax(format!("unrecognized exception condition \"{text}\"")))?.to_string() });
+                } else {
+                    items.push((option.to_ascii_uppercase(), v));
                 }
                 if !self.eat_sym(",") {
                     break;
@@ -1206,8 +1355,10 @@ impl<'a> Parser<'a> {
             }
         }
         if exception {
-            let message = message.ok_or_else(|| Error::syntax("RAISE needs a message (re-raising an error is not supported)"))?;
-            out.push(ProcStmt::Sql(Statement::Raise(message)));
+            if message.is_none() && state.is_some() {
+                message = Some(Expr::Literal(Value::text(state.as_deref().unwrap_or_default())));
+            }
+            out.push(ProcStmt::PgRaise { state, message, items });
         }
         self.end_stmt()
     }
@@ -1391,7 +1542,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new() };
+        let mut names = Names { all: params.iter().map(|p| p.name.clone()).collect(), params: params.iter().map(|p| p.name.clone()).collect(), trigger: false, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new(), label: None, loops: Vec::new(), loop_seq: 0 };
         let stmts = self.my_body(&mut names)?;
         let end = self.toks[self.pos].pos;
         let sql = self.src[start..end].trim().to_string();
@@ -1405,7 +1556,7 @@ impl<'a> Parser<'a> {
     /// The body of a MySQL trigger (a statement, or `BEGIN ... END` with `SET NEW.col = ...`): `NEW.col` and `OLD.col`
     /// are variables.
     pub(super) fn mysql_trigger_body(&mut self) -> Result<Vec<ProcStmt>> {
-        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new() };
+        let mut names = Names { all: Vec::new(), params: Vec::new(), trigger: true, records: Vec::new(), set: false, has_out: false, handlers: Vec::new(), conditions: Vec::new(), label: None, loops: Vec::new(), loop_seq: 0 };
         let body = self.my_body(&mut names)?;
         fn check(list: &[ProcStmt]) -> Result<()> {
             for s in list {

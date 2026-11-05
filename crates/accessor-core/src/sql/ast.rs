@@ -464,6 +464,12 @@ pub enum ProcStmt {
     FetchPg { cursor: String, direction: FetchDirection, move_only: bool, targets: Vec<String>, record: bool },
     /// plpgsql: `GET [CURRENT | STACKED] DIAGNOSTICS var = item, ...`
     PgDiagnostics { stacked: bool, items: Vec<(String, String)> },
+    /// plpgsql: `BEGIN ... EXCEPTION WHEN cond [OR cond] THEN ... END`. What the body did is undone when a handler answers
+    /// (a condition is a SQLSTATE, a 2-character class when it ends in `000`, or `OTHERS`).
+    PgTry { body: Vec<ProcStmt>, handlers: Vec<(Vec<String>, Vec<ProcStmt>)> },
+    /// plpgsql: `RAISE EXCEPTION ...`. `state` is the SQLSTATE (P0001 when none), `items` are DETAIL, HINT, and so on; with
+    /// no message and no state it re-raises the error a handler is dealing with.
+    PgRaise { state: Option<String>, message: Option<Expr>, items: Vec<(String, Expr)> },
     /// `BEGIN ... END` with handlers or a label; a plain block is just its statements.
     Block { label: Option<String>, body: Vec<ProcStmt>, handlers: Vec<Handler> },
     /// `label: WHILE | LOOP | REPEAT ...`

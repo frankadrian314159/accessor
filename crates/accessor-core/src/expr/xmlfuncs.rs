@@ -463,3 +463,54 @@ mod tests {
         assert!(extract_value("<a><b></a>", "/a").unwrap().is_none());
     }
 }
+
+/// An XML element name for a column name: characters a name cannot hold become `_xHHHH_`.
+fn xml_name(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        let ok = c.is_alphabetic() || c == '_' || (i > 0 && (c.is_ascii_digit() || c == '-' || c == '.'));
+        if ok {
+            out.push(c);
+        } else {
+            out.push_str(&format!("_x{:04X}_", c as u32));
+        }
+    }
+    out
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// PostgreSQL's `query_to_xml` / `table_to_xml`: the rows of a result as an XML document (or, with `forest`, a sequence of
+/// row elements named `row_name`); `table` is the name of the root element.
+pub fn rows_to_xml(columns: &[String], rows: &[Vec<crate::value::Value>], nulls: bool, forest: bool, ns: &str, table: &str, row_name: &str) -> String {
+    use crate::value::Value;
+    const XSI: &str = " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"";
+    let ns_attr = if ns.is_empty() { String::new() } else { format!(" xmlns=\"{}\"", xml_escape(ns)) };
+    let mut out = String::new();
+    if !forest {
+        out.push_str(&format!("<{table}{XSI}{ns_attr}>\n\n"));
+    }
+    for row in rows {
+        if forest {
+            out.push_str(&format!("<{row_name}{XSI}{ns_attr}>\n"));
+        } else {
+            out.push_str(&format!("<{row_name}>\n"));
+        }
+        for (c, v) in columns.iter().zip(row) {
+            let name = xml_name(c);
+            match v {
+                Value::Null if nulls => out.push_str(&format!("  <{name} xsi:nil=\"true\"/>\n")),
+                Value::Null => {}
+                Value::Bool(b) => out.push_str(&format!("  <{name}>{b}</{name}>\n")),
+                other => out.push_str(&format!("  <{name}>{}</{name}>\n", xml_escape(&other.to_string()))),
+            }
+        }
+        out.push_str(&format!("</{row_name}>\n\n"));
+    }
+    if !forest {
+        out.push_str(&format!("</{table}>\n"));
+    }
+    out
+}
