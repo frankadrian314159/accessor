@@ -100,7 +100,7 @@ const PARAMETERS: &[(&str, &str, char)] = &[
     ("transaction", "", 't'),
     ("characteristics", "", 't'),
     ("authorization", "", 't'),
-    ("role", "", 't'),
+    ("role", "none", 't'),
 ];
 
 pub(crate) fn known(name: &str) -> Option<(&'static str, char)> {
@@ -317,6 +317,9 @@ impl Database {
         if name == "optimizer" {
             self.set_optimizer(shown == "on");
         }
+        if name == "extra_float_digits" {
+            crate::value::set_extra_float_digits(shown.trim().parse().map_err(|_| Error::runtime(format!("invalid value for parameter \"{name}\": \"{value}\"")))?);
+        }
         if name == "sql_mode" {
             // MySQL: without a STRICT mode a value that does not fit becomes the nearest one that does
             crate::schema::set_lenient(!shown.to_ascii_uppercase().contains("STRICT"));
@@ -340,6 +343,9 @@ impl Database {
             Some((default, _)) => {
                 if name == "dialect" {
                     crate::dialect::set_session(crate::dialect::Dialect::Asql);
+                }
+                if name == "extra_float_digits" {
+                    crate::value::set_extra_float_digits(1);
                 }
                 if name == "timezone" {
                     self.set_time_zone("UTC")?;

@@ -514,6 +514,15 @@ impl<'a> Binder<'a> {
                         _ => Vec::new(),
                     };
                     if fields.is_empty() {
+                        // PostgreSQL: ctid is the place of a row in its table; rows here have no place, so every one has the first
+                        if name.eq_ignore_ascii_case("ctid") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                            let mut tables: Vec<&str> = self.scope.cols.iter().filter(|c| !c.hidden).map(|c| c.table.as_str()).collect();
+                            tables.dedup();
+                            if table.is_none() && tables.len() > 1 {
+                                return Err(Error::catalog("column reference \"ctid\" is ambiguous"));
+                            }
+                            return Ok(BExpr::Lit(Value::text("(0,1)")));
+                        }
                         return Err(err);
                     }
                     return self.bind(&Expr::Function { name: "__ROWTEXT".into(), args: fields, distinct: false, star: false });
@@ -661,6 +670,19 @@ impl<'a> Binder<'a> {
                         },
                         _ => Err(Error::runtime("pg_get_viewdef needs the name of a saved query in quotes")),
                     };
+                }
+                // fipshash(x): the first 32 hex digits of the SHA-256 of x (the regression tests use it for repeatable text)
+                if name.eq_ignore_ascii_case("FIPSHASH") && args.len() == 1 {
+                    let sha = Expr::Function { name: "SHA2".into(), args: vec![args[0].clone(), Expr::Literal(Value::Int(256))], distinct: false, star: false };
+                    let cut = Expr::Function { name: "SUBSTR".into(), args: vec![sha, Expr::Literal(Value::Int(1)), Expr::Literal(Value::Int(32))], distinct: false, star: false };
+                    return self.bind(&cut);
+                }
+                // current_user, session_user, current_role: the role of the session (SET ROLE changes only the current one)
+                if let Some(which) = name.strip_prefix("__PG_") {
+                    let login = "postgres".to_string();
+                    let role = self.db.setting_text("role").filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none"));
+                    let who = if which == "SESSION_USER" { login } else { role.unwrap_or(login) };
+                    return Ok(BExpr::Lit(Value::text(&who)));
                 }
                 // current_setting('name'[, missing_ok]): a run-time parameter, known when the statement is read
                 if name.eq_ignore_ascii_case("CURRENT_SETTING") && (1..=2).contains(&args.len()) {

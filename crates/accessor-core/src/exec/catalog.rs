@@ -9,7 +9,8 @@
 //! * **Extensions.** Recorded and shown; the functions an extension would bring are built in or absent.
 //! * **Roles and privileges.** `SET ROLE r` makes `r` the current role; a role that is not a superuser needs a
 //!   `GRANT` of `SELECT`, `INSERT`, `UPDATE` or `DELETE` on a table to use it. Nothing is checked while no role is set,
-//!   which is the case until a script runs `SET ROLE`. Tables have no owners.
+//!   which is the case until a script runs `SET ROLE`. A table or view made while a role is set is owned by that role,
+//!   which has every right on it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::Ordering;
@@ -116,6 +117,9 @@ impl Database {
 
     /// `CREATE` / `DROP` of a schema, type, extension or role.
     pub(crate) fn exec_catalog(&mut self, c: &CatalogChange) -> Result<QueryResult> {
+        if c.kind == "policy_alter" {
+            return self.alter_policy(&c.names[0], c.value.as_deref().unwrap_or("{}"));
+        }
         for name in &c.names {
             let what = describe(c.kind);
             match &c.value {
@@ -135,6 +139,40 @@ impl Database {
                     self.drop_catalog_object(c.kind, name, c.cascade)?;
                 }
             }
+        }
+        Ok(QueryResult::default())
+    }
+
+    /// `ALTER POLICY`: the parts of the change replace those of the policy; `rename` gives it a new name.
+    fn alter_policy(&mut self, name: &str, change: &str) -> Result<QueryResult> {
+        let Some(old) = self.catalog.get(&("policy".to_string(), key(name))).cloned() else {
+            let (table, policy) = name.split_once('|').unwrap_or(("", name));
+            return Err(Error::catalog(format!("policy \"{policy}\" for table \"{table}\" does not exist")));
+        };
+        let mut policy: serde_json::Value = serde_json::from_str(&old).map_err(|e| Error::runtime(e.to_string()))?;
+        let change: serde_json::Value = serde_json::from_str(change).map_err(|e| Error::runtime(e.to_string()))?;
+        let mut new_name = None;
+        if let (Some(p), Some(c)) = (policy.as_object_mut(), change.as_object()) {
+            for (k, v) in c {
+                if k == "rename" {
+                    new_name = v.as_str().map(str::to_string);
+                } else {
+                    p.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let text = policy.to_string();
+        match new_name {
+            Some(n) => {
+                let table = name.split_once('|').map_or("", |(t, _)| t);
+                let renamed = format!("{table}|{n}");
+                if self.catalog_has("policy", &renamed) {
+                    return Err(Error::catalog(format!("policy \"{n}\" for table \"{table}\" already exists")));
+                }
+                self.catalog_set("policy", name, None)?;
+                self.catalog_set("policy", &renamed, Some(text))?;
+            }
+            None => self.catalog_set("policy", name, Some(text))?,
         }
         Ok(QueryResult::default())
     }
@@ -399,6 +437,9 @@ impl Database {
         if role.is_empty() || self.is_superuser(role) || table.starts_with("information_schema.") || table.starts_with("performance_schema.") {
             return Ok(());
         }
+        if self.owns(role, table) {
+            return Ok(());
+        }
         for r in self.effective_roles(role) {
             if self.is_superuser(&r) {
                 return Ok(());
@@ -409,6 +450,23 @@ impl Database {
             }
         }
         Err(Error::runtime(format!("permission denied for table {table}")))
+    }
+
+    /// Notes who owns a table or view just made: the current role, if one is set (none otherwise).
+    pub(crate) fn record_owner(&mut self, name: &str) {
+        let role = self.settings.get("role").filter(|r| !r.is_empty()).cloned();
+        let had = self.catalog_has("owner", name);
+        if role.is_some() || had {
+            let _ = self.catalog_set("owner", name, role);
+        }
+    }
+
+    /// Does `role` own `table`, or belong to a role that does?
+    fn owns(&self, role: &str, table: &str) -> bool {
+        match self.catalog.get(&("owner".to_string(), key(table))) {
+            Some(owner) => self.effective_roles(role).contains(&key(owner)),
+            None => false,
+        }
     }
 
     /// Runs `f` without privilege checks (the body of a view runs with its owner's rights).

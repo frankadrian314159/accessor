@@ -15,7 +15,7 @@ The text is checked when it is stored: text that is not valid JSON is refused. I
 
 * two documents that mean the same thing are *equal* and store the same text, however they were written: `'{"b":1, "a":2}'` equals `'{"a":2,"b":1}'`;
 * the order of members is not kept (arrays keep their order);
-* a document shows as its canonical text.
+* a document shows as its canonical text. In the PostgreSQL dialect it is shown as `jsonb` is there instead: a space after each `:` and `,`, and the members of an object shorter names first, then in byte order (`{"a": 1, "bb": [1, 2]}`); the stored text and the comparisons are the same. (There is one `JSON` type here, so `json` values, such as the result of `row_to_json`, are spaced the same way.)
 
 ## Comparing and sorting
 

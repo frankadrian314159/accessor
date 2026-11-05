@@ -157,6 +157,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             i += 1;
+            if hex.len() % 2 != 0 && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                // PostgreSQL: a bit string; x'20000' is used as the number it spells
+                let v = i64::from_str_radix(&hex, 16).map_err(|_| Error::syntax("the X'...' literal is too large"))?;
+                out.push(Token { tok: Tok::Int(v), pos });
+                continue;
+            }
             if hex.len() % 2 != 0 {
                 return Err(Error::syntax("an X'...' literal needs an even number of hexadecimal digits"));
             }

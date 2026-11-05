@@ -1308,6 +1308,26 @@ fn format_currency(d: &Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(f, "{}${digits}", if d.is_negative() { "-" } else { "" })
 }
 
+thread_local! {
+    static EXTRA_FLOAT_DIGITS: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+/// `SET extra_float_digits`: with 1 or more a float is shown with the digits that tell it from its neighbours; with 0 or
+/// less, PostgreSQL's older way, rounded to 15 digits for a double (6 for a float) less the amount below zero.
+pub(crate) fn set_extra_float_digits(n: i32) {
+    EXTRA_FLOAT_DIGITS.with(|d| d.set(n.clamp(-15, 3)));
+}
+
+/// `x` rounded to `base` significant digits plus `extra_float_digits` when that is 0 or less; `None` to show it as it is.
+fn round_digits(x: f64, base: i32) -> Option<f64> {
+    let extra = EXTRA_FLOAT_DIGITS.with(|d| d.get());
+    if extra >= 1 || !x.is_finite() || x == 0.0 {
+        return None;
+    }
+    let digits = (base + extra).max(1) as usize;
+    format!("{:.*e}", digits - 1, x).parse().ok()
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1322,14 +1342,15 @@ impl fmt::Display for Value {
             }),
             Value::Int(i) => write!(f, "{i}"),
             Value::Big(b) => write!(f, "{b}"),
-            Value::Float(x) => write!(f, "{x}"),
-            Value::Double(x) => write!(f, "{x}"),
+            Value::Float(x) => write!(f, "{}", round_digits(*x as f64, 6).map_or_else(|| x.to_string(), |r| (r as f32).to_string())),
+            Value::Double(x) => write!(f, "{}", round_digits(*x, 15).map_or_else(|| x.to_string(), |r| r.to_string())),
             Value::Dec(d) => write!(f, "{d}"),
             Value::Currency(d) => format_currency(d, f),
             Value::Rational(r) => write!(f, "{r}"),
             Value::DateTime(t) => f.write_str(&datetime::format(*t)),
             Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
             Value::Interval(i) => write!(f, "{i}"),
+            Value::Json(s) if crate::dialect::current() == Dialect::Postgresql => f.write_str(&crate::json::pg_text(s)),
             Value::Json(s) => f.write_str(s),
             Value::Multirange(s) => f.write_str(s),
             Value::Bytes(b) => f.write_str(&String::from_utf8_lossy(b)),

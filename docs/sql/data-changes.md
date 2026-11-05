@@ -29,6 +29,7 @@ A row that has the same value as an existing one in a primary key or other uniqu
 ```sql
 INSERT INTO t (...) VALUES (...) ON CONFLICT [(column, ...)] DO NOTHING;
 INSERT INTO t (...) VALUES (...) ON CONFLICT [(column, ...)] DO UPDATE SET column = expr [, ...] [WHERE condition];
+INSERT INTO t (...) VALUES (...) ON CONFLICT [(column, ...)] DO SELECT [FOR UPDATE] [WHERE condition] RETURNING ...;   -- PostgreSQL 19: the existing row is only returned
 REPLACE INTO t (...) VALUES (...);              -- the same as INSERT OR REPLACE INTO
 INSERT OR IGNORE INTO t (...) VALUES (...);     -- the same as ON CONFLICT DO NOTHING
 ```

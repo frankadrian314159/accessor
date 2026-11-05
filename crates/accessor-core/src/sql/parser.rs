@@ -56,7 +56,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
 }
 
 fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -141,7 +141,7 @@ pub(crate) fn internal_function_text(name: &str, args: &[String]) -> Option<Stri
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -549,6 +549,8 @@ struct Parser<'a> {
     into_vars: Vec<String>,
     /// The file of a `SELECT ... INTO OUTFILE` just read.
     outfile: Option<OutfileSpec>,
+    /// The table of a PostgreSQL `SELECT ... INTO [TEMP] name` just read.
+    into_table: Option<String>,
     /// How deep the expressions being read are nested, and how deep the sub-queries: a limit keeps a hostile text from
     /// overflowing the stack.
     depth: usize,
@@ -874,13 +876,25 @@ impl<'a> Parser<'a> {
                         kind = up.to_ascii_lowercase();
                     } else if matches!(up.as_str(), "FOREIGN" | "LARGE") {
                         self.advance();
-                        self.advance();
+                        // FOREIGN DATA WRAPPER, FOREIGN SERVER, LARGE OBJECT
+                        if self.eat_kw("DATA") {
+                            self.expect_kw("WRAPPER")?;
+                        } else {
+                            self.advance();
+                        }
                         kind = "other".into();
                     }
                 }
-                let mut objects = vec![self.table_ident()?];
+                let object_name = |p: &mut Parser| -> Result<String> {
+                    if let Tok::Int(n) = p.peek().clone() {
+                        p.advance();
+                        return Ok(n.to_string());
+                    }
+                    p.table_ident()
+                };
+                let mut objects = vec![object_name(self)?];
                 while self.eat_sym(",") {
-                    objects.push(self.table_ident()?);
+                    objects.push(object_name(self)?);
                 }
                 // a function's argument types: `f(int, text)`
                 if self.peek_sym("(") {
@@ -1001,7 +1015,8 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("DOMAIN") {
             self.if_exists_clause(true, guarded)?;
-            let name = self.ident()?;
+            let name = self.table_ident()?;
+            let name = name.rsplit('.').next().unwrap_or(&name).to_string();
             self.eat_kw("AS");
             let mut type_name = self.type_name()?;
             let before = self.pos;
@@ -1174,7 +1189,18 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         self.if_exists_clause(false, guarded)?;
-        let names = if kind == "role" { self.role_list()? } else { self.ident_list()? };
+        let names = if kind == "role" {
+            self.role_list()?
+        } else if kind == "type" {
+            // a type in a schema (`s.t`) is kept under its own name
+            let mut names = vec![self.table_ident()?];
+            while self.eat_sym(",") {
+                names.push(self.table_ident()?);
+            }
+            names.into_iter().map(|n| n.rsplit('.').next().unwrap_or(&n).to_string()).collect()
+        } else {
+            self.ident_list()?
+        };
         let cascade = self.eat_kw("CASCADE");
         self.eat_kw("RESTRICT");
         if database {
@@ -1576,6 +1602,13 @@ impl<'a> Parser<'a> {
                 }
             }
             self.outfile = Some(spec);
+            return Ok(());
+        }
+        if self.peek_kw("INTO") && crate::dialect::current() == crate::dialect::Dialect::Postgresql && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
+            // SELECT ... INTO [TEMPORARY | TEMP | UNLOGGED] [TABLE] name: makes the table
+            self.advance();
+            while self.eat_kw("TEMPORARY") || self.eat_kw("TEMP") || self.eat_kw("UNLOGGED") || self.eat_kw("TABLE") {}
+            self.into_table = Some(self.table_ident()?);
             return Ok(());
         }
         if self.peek_kw("INTO") && matches!(self.peek_at(1), Tok::Param(_)) {
@@ -2348,6 +2381,8 @@ impl<'a> Parser<'a> {
             // `CREATE TABLE t AS SELECT ... FROM s WITH NO DATA`
             Tok::Ident(s) if s.eq_ignore_ascii_case("WITH") && (self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "DATA") || self.peek_kw_at(1, "CHECK") || self.peek_kw_at(1, "LOCAL") || self.peek_kw_at(1, "CASCADED")) => false,
             Tok::Ident(s) if s.eq_ignore_ascii_case("STRAIGHT_JOIN") => false,
+            // `DELETE FROM t RETURNING *`, `INSERT INTO t SELECT 1 RETURNING *`
+            Tok::Ident(s) if s.eq_ignore_ascii_case("RETURNING") && !matches!(self.peek_at(1), Tok::Sym(",") | Tok::Sym(")")) => false,
             // `FROM t FOR UPDATE`, `FROM t LOCK IN SHARE MODE`: locking clauses
             Tok::Ident(s) if s.eq_ignore_ascii_case("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) => false,
             Tok::Ident(s) if s.eq_ignore_ascii_case("LOCK") && self.peek_kw_at(1, "IN") && self.peek_kw_at(2, "SHARE") => false,
@@ -2430,6 +2465,15 @@ impl<'a> Parser<'a> {
             self.expect_kw("DO")?;
             let action = if self.eat_kw("NOTHING") {
                 ConflictAction::Nothing
+            } else if self.eat_kw("SELECT") {
+                // DO SELECT [FOR UPDATE | SHARE ...] [WHERE c]: the existing row is only returned, so an update that sets nothing
+                if self.eat_kw("FOR") {
+                    while !self.at_eof() && !self.peek_kw("WHERE") && !self.peek_kw("RETURNING") && !self.peek_sym(";") {
+                        self.advance();
+                    }
+                }
+                let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
+                ConflictAction::Update { sets: Vec::new(), filter }
             } else {
                 self.expect_kw("UPDATE")?;
                 self.expect_kw("SET")?;
@@ -2711,12 +2755,18 @@ impl<'a> Parser<'a> {
             self.advance();
             let name = self.table_ident()?;
             let from = From { first: TableFactor::Named { name, alias: None, only: false }, joins: Vec::new() };
-            return Ok(Statement::Select(Select { items: vec![SelectItem::Wildcard], from: Some(from), ..Select::default() }));
+            let mut sel = Select { items: vec![SelectItem::Wildcard], from: Some(from), ..Select::default() };
+            self.select_tail(&mut sel)?;
+            return Ok(Statement::Select(sel));
         }
         if self.peek_kw("SELECT") || self.peek_kw("WITH") || self.peek_kw("VALUES") || self.peek_kw("TRANSFORM") || self.peek_sym("(") {
             self.into_vars.clear();
+            self.into_table = None;
             let select = self.select()?;
             self.select_into_tail()?;
+            if let Some(name) = self.into_table.take() {
+                return Ok(Statement::CreateTableAs { name, query: Box::new(select), with_data: true });
+            }
             if let Some(spec) = self.outfile.take() {
                 return Ok(Statement::SelectOutfile { select: Box::new(select), spec });
             }
@@ -2933,6 +2983,10 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("PREPARE") {
             let name = self.ident()?;
+            if self.peek_sym("(") {
+                // PostgreSQL: the parameter types, `PREPARE p(int, text) AS ...`; the statement's $1, $2 take what they are given
+                self.skip_parens()?;
+            }
             self.expect_kw("AS")?;
             let statement = Box::new(self.statement()?);
             return Ok(Statement::Prepare { name, statement });
@@ -3098,6 +3152,32 @@ impl<'a> Parser<'a> {
         }
         let value = serde_json::json!({"permissive": permissive, "command": command, "roles": roles, "using": using, "check": check}).to_string();
         Ok(Statement::Catalog(Box::new(CatalogChange { kind: "policy", names: vec![format!("{table}|{name}")], value: Some(value), replace: false, cascade: false })))
+    }
+
+    /// `ALTER POLICY name ON table [RENAME TO new] [TO roles] [USING (expr)] [WITH CHECK (expr)]` (after `POLICY`): the parts
+    /// that are given replace those of the policy.
+    fn alter_policy(&mut self) -> Result<Statement> {
+        let name = self.ident()?;
+        self.expect_kw("ON")?;
+        let table = self.table_ident()?;
+        let mut change = serde_json::Map::new();
+        loop {
+            if self.eat_kw("RENAME") {
+                self.expect_kw("TO")?;
+                change.insert("rename".into(), serde_json::json!(self.ident()?));
+            } else if self.eat_kw("TO") {
+                let roles: Vec<String> = self.role_list()?.into_iter().map(|r| r.to_ascii_lowercase()).collect();
+                change.insert("roles".into(), serde_json::json!(roles));
+            } else if self.eat_kw("USING") {
+                change.insert("using".into(), serde_json::json!(self.paren_expr_text()?));
+            } else if self.eat_kw("WITH") {
+                self.expect_kw("CHECK")?;
+                change.insert("check".into(), serde_json::json!(self.paren_expr_text()?));
+            } else {
+                break;
+            }
+        }
+        Ok(Statement::Catalog(Box::new(CatalogChange { kind: "policy_alter", names: vec![format!("{table}|{name}")], value: Some(serde_json::Value::Object(change).to_string()), replace: true, cascade: false })))
     }
 
     /// An item of a `VALUES` row: an expression, or `DEFAULT` (the column's default).
@@ -5082,6 +5162,27 @@ impl<'a> Parser<'a> {
         if self.peek_kw("SCHEMA") || self.peek_kw("DATABASE") || ((self.peek_kw("USER") || self.peek_kw("ROLE")) && self.mysql_account_ahead()) {
             return Ok(self.ignore_rest("ALTER"));
         }
+        if self.peek_kw("USER") && self.peek_kw_at(1, "MAPPING") {
+            return Ok(self.ignore_rest("ALTER"));
+        }
+        if self.eat_kw("POLICY") {
+            return self.alter_policy();
+        }
+        if self.peek_kw("GROUP") && (self.peek_kw_at(2, "ADD") || self.peek_kw_at(2, "DROP")) && self.peek_kw_at(3, "USER") {
+            // ALTER GROUP g ADD USER u: u becomes a member of g
+            self.advance();
+            let group = self.role_name()?;
+            let revoke = self.eat_kw("DROP");
+            if !revoke {
+                self.expect_kw("ADD")?;
+            }
+            self.expect_kw("USER")?;
+            let mut users = vec![self.role_name()?];
+            while self.eat_sym(",") {
+                users.push(self.role_name()?);
+            }
+            return Ok(Statement::Grant(Box::new(GrantDef { revoke, privileges: Vec::new(), object_kind: String::new(), objects: vec![group], grantees: users, cascade: false })));
+        }
         if self.peek_kw("ROLE") || self.peek_kw("USER") || self.peek_kw("GROUP") {
             return self.alter_role();
         }
@@ -5096,7 +5197,23 @@ impl<'a> Parser<'a> {
         if self.ignorable_object() {
             return Ok(self.ignore_rest("ALTER"));
         }
-        self.expect_kw("TABLE")?;
+        if self.peek_kw("VIEW") {
+            // ALTER VIEW v RENAME TO n renames; its other forms (column defaults, owner, options) change nothing kept here
+            let save = self.pos;
+            self.advance();
+            if self.eat_kw("IF") {
+                self.expect_kw("EXISTS")?;
+            }
+            let _ = self.table_ident()?;
+            let rename = self.peek_kw("RENAME") && self.peek_kw_at(1, "TO");
+            self.pos = save;
+            if !rename {
+                return Ok(self.ignore_rest("ALTER VIEW"));
+            }
+            self.advance();
+        } else {
+            self.expect_kw("TABLE")?;
+        }
         let mut if_exists = false;
         if self.eat_kw("IF") {
             self.expect_kw("EXISTS")?;
@@ -7096,6 +7213,12 @@ impl<'a> Parser<'a> {
                         let Tok::Str(text) = self.advance() else { unreachable!("checked") };
                         let name = cast_function(ty).expect("not CALCULATED");
                         return Ok(Expr::Function { name: name.into(), args: vec![Expr::Literal(Value::text(&text))], distinct: false, star: false });
+                    }
+                    "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
+                        if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(self.peek_at(1), Tok::Sym("(" | ".")) =>
+                    {
+                        self.advance();
+                        return Ok(Expr::Function { name: format!("__PG_{up}"), args: vec![], distinct: false, star: false });
                     }
                     "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
                         if !matches!(self.peek_at(1), Tok::Sym("(")) =>

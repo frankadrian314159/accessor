@@ -536,6 +536,7 @@ fn run_test(ctx: &mut Ctx, name: &str) {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.db.execute(&sql)));
                 let (verdict, class, detail) = match (outcome, &expected.error) {
                     (Err(_), _) => ("panic".to_string(), "the engine panicked".to_string(), short(&sql, 200)),
+                    (Ok(Ok(_)), None) if is_plan_output(&sql) => ("plan".into(), String::new(), "ran; the output is a query plan or a planner estimate".into()),
                     (Ok(Ok(r)), None) => match &expected.table {
                         Some(want) => compare_rows(&sql, want, &r),
                         None => ("ok".into(), String::new(), String::new()),
@@ -556,6 +557,13 @@ fn run_test(ctx: &mut Ctx, name: &str) {
 /// Settings the run starts with: PostgreSQL's casts of a float to an integer round, where Accessor's drop the fraction, and
 /// its types that Accessor lacks (and arrays) are kept as text, so that the tables that use them can be made.
 const POSTGRES_SETTINGS: &[&str] = &["SET cast_truncates = off", "SET lenient_types = on", "SET strict_types = on"];
+
+/// Whether the statement's result is a query plan or a planner's row estimate (`EXPLAIN`, `check_estimated_rows`,
+/// `explain_filter`): text that depends on PostgreSQL's own planner, so it is not compared.
+fn is_plan_output(sql: &str) -> bool {
+    let s = sql.trim_start().to_ascii_lowercase();
+    s.starts_with("explain") || s.contains("check_estimated_rows(") || s.contains("explain_filter(") || s.contains("explain_parallel_") || s.contains("explain_analyze_")
+}
 
 fn compare_rows(sql: &str, want: &[Vec<String>], got: &accessor_core::QueryResult) -> (String, String, String) {
     let ordered = sql.to_ascii_lowercase().contains("order by");
@@ -763,7 +771,7 @@ fn main() {
     let _ = writeln!(md, "# PostgreSQL regression tests against Accessor\n");
     let _ = writeln!(md, "{} tests, {statements} statements (plus {} psql commands), run in {:.0}s.\n", per_test.len(), verdicts.get("meta").copied().unwrap_or(0), started.elapsed().as_secs_f64());
     let _ = writeln!(md, "| Outcome | Statements | Share |\n| --- | ---: | ---: |");
-    for (v, label) in [("ok", "both accepted (rows agree where shown)"), ("error", "both refused"), ("missing", "PostgreSQL accepted, Accessor refused"), ("lenient", "PostgreSQL refused, Accessor accepted"), ("value", "both accepted, different rows"), ("unaligned", "could not match the expected output; Accessor refused"), ("panic", "the engine panicked"), ("killer", "killed the process (skipped)")] {
+    for (v, label) in [("ok", "both accepted (rows agree where shown)"), ("error", "both refused"), ("missing", "PostgreSQL accepted, Accessor refused"), ("lenient", "PostgreSQL refused, Accessor accepted"), ("value", "both accepted, different rows"), ("plan", "both accepted; a query plan or planner estimate, not compared"), ("unaligned", "could not match the expected output; Accessor refused"), ("panic", "the engine panicked"), ("killer", "killed the process (skipped)")] {
         if let Some(n) = verdicts.get(v) {
             let _ = writeln!(md, "| {label} | {n} | {:.1}% |", 100.0 * *n as f64 / statements.max(1) as f64);
         }
@@ -773,7 +781,7 @@ fn main() {
     let cascade = rows.iter().filter(|r| r.verdict == "missing" && (r.class.contains("does not exist") || r.class.contains("already exists") || r.class.contains("was not found"))).count();
     let _ = writeln!(md, "
 Result tables compared: {} ({} equal, {wrong} different). Of the refused statements, {cascade} were refused because an earlier statement that creates the object had failed (\"does not exist\", \"already exists\", \"was not found\").", compared + wrong, compared);
-    let agree = verdicts.get("ok").copied().unwrap_or(0) + verdicts.get("error").copied().unwrap_or(0);
+    let agree = verdicts.get("ok").copied().unwrap_or(0) + verdicts.get("error").copied().unwrap_or(0) + verdicts.get("plan").copied().unwrap_or(0);
     let _ = writeln!(md, "\nAgreement on whether a statement is accepted: **{:.1}%** ({agree} of {statements}).\n", 100.0 * agree as f64 / statements.max(1) as f64);
     if !killers.is_empty() {
         let _ = writeln!(md, "## Statements that killed the process\n");
@@ -840,7 +848,7 @@ Result tables compared: {} ({} equal, {wrong} different). Of the refused stateme
             continue;
         }
         let g = |k: &str| v.get(k).copied().unwrap_or(0);
-        let _ = writeln!(md, "| {t} | {n} | {} | {} | {} | {} | {} |", g("ok"), g("error"), g("missing") + g("unaligned"), g("lenient"), g("value"));
+        let _ = writeln!(md, "| {t} | {n} | {} | {} | {} | {} | {} |", g("ok") + g("plan"), g("error"), g("missing") + g("unaligned"), g("lenient"), g("value"));
     }
     std::fs::write(&report, &md).expect("the report can be written");
     let _ = std::fs::write(report.with_extension("tsv"), &data);

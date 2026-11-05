@@ -144,6 +144,11 @@ impl Database {
 
     pub fn execute_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         let result = self.run_statement(st);
+        if result.is_ok() {
+            if let Statement::CreateTable { name, .. } | Statement::CreateTableAs { name, .. } | Statement::CreateView { name, .. } = st {
+                self.record_owner(name);
+            }
+        }
         for (name, value) in crate::expr::myfuncs::take_assignments() {
             self.user_vars.insert(name, value);
         }

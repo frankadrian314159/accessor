@@ -21,6 +21,48 @@ pub(crate) fn to_text(j: &J) -> String {
     serde_json::to_string(j).expect("a JSON value always serialises")
 }
 
+/// `text` as PostgreSQL shows a `jsonb`: a space after each `:` and `,`, and an object's keys shorter first, then in byte order.
+/// Text that is not JSON is returned as it is.
+pub(crate) fn pg_text(text: &str) -> String {
+    fn write(j: &J, out: &mut String) {
+        match j {
+            J::Array(a) => {
+                out.push('[');
+                for (i, x) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    write(x, out);
+                }
+                out.push(']');
+            }
+            J::Object(o) => {
+                let mut entries: Vec<(&String, &J)> = o.iter().collect();
+                entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(b.0)));
+                out.push('{');
+                for (i, (k, x)) in entries.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                    out.push_str(": ");
+                    write(x, out);
+                }
+                out.push('}');
+            }
+            other => out.push_str(&to_text(other)),
+        }
+    }
+    match serde_json::from_str::<J>(text) {
+        Ok(j) => {
+            let mut out = String::with_capacity(text.len() + 8);
+            write(&j, &mut out);
+            out
+        }
+        Err(_) => text.to_string(),
+    }
+}
+
 /// The canonical text of `text`, or `None` if it is not JSON.
 pub(crate) fn canonical(text: &str) -> Option<String> {
     serde_json::from_str::<J>(text).ok().map(|j| to_text(&j))

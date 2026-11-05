@@ -75,6 +75,7 @@ pub enum MoreFn {
     EnumLast,
     Populate,
     LoCreate,
+    LoCreat,
     LoFromBytea,
     LoGet,
     LoPut,
@@ -172,6 +173,7 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "__ENUM_LAST" => (EnumLast, 2, 2),
         "__POPULATE" => (Populate, 3, 3),
         "LO_CREATE" => (LoCreate, 1, 1),
+        "LO_CREAT" => (LoCreat, 1, 1),
         "LO_FROM_BYTEA" => (LoFromBytea, 2, 2),
         "LO_GET" => (LoGet, 1, 3),
         "LO_PUT" => (LoPut, 3, 3),
@@ -379,6 +381,11 @@ fn raw(v: &Value) -> Vec<u8> {
 }
 
 /// A new large object number: the one asked for, or the next free one.
+/// The large objects, as `(oid, contents)`.
+pub(crate) fn large_objects() -> Vec<(i64, Vec<u8>)> {
+    LARGE_OBJECTS.with(|m| m.borrow().iter().map(|(k, v)| (*k, v.clone())).collect())
+}
+
 fn lo_new(wanted: i64, data: Vec<u8>) -> Result<i64> {
     LARGE_OBJECTS.with(|m| {
         let mut m = m.borrow_mut();
@@ -882,6 +889,7 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Value::text(&super::composite::cast_text(&text(v(0)), &super::composite::join(&fields))?)
         }
         LoCreate => Value::Int(lo_new(int(v(0))?, Vec::new())?),
+        LoCreat => Value::Int(lo_new(0, Vec::new())?),
         LoFromBytea => Value::Int(lo_new(int(v(0))?, raw(v(1)))?),
         LoGet => {
             let id = int(v(0))?;

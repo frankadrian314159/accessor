@@ -263,6 +263,37 @@ impl Database {
             "pg_am" => names(&["oid", "amname", "amtype"]),
             "pg_extension" => names(&["oid", "extname", "extowner", "extnamespace", "extversion"]),
             "pg_sequence" => names(&["seqrelid", "seqtypid", "seqstart", "seqincrement", "seqmax", "seqmin", "seqcache", "seqcycle"]),
+            "pg_policies" => {
+                for ((k, n), v) in self.catalog.iter().filter(|((k, _), _)| k == "policy") {
+                    let _ = k;
+                    let (table, policy) = n.split_once('|').unwrap_or(("", n));
+                    let (schema, rel) = split(table);
+                    let p: serde_json::Value = serde_json::from_str(v).unwrap_or_default();
+                    let text = |key: &str| p.get(key).and_then(|x| x.as_str()).map_or(Value::Null, t);
+                    let roles: Vec<Value> = match p.get("roles").and_then(|r| r.as_array()) {
+                        Some(r) if !r.is_empty() => r.iter().filter_map(|x| x.as_str()).map(t).collect(),
+                        _ => vec![t("public")],
+                    };
+                    let permissive = p.get("permissive").and_then(|x| x.as_bool()).unwrap_or(true);
+                    let cmd = p.get("command").and_then(|x| x.as_str()).unwrap_or("all").to_ascii_uppercase();
+                    rows.push(vec![t(schema), t(rel), t(policy), t(if permissive { "PERMISSIVE" } else { "RESTRICTIVE" }), Value::Array(std::sync::Arc::new(roles)), t(&cmd), text("using"), text("check")]);
+                }
+                names(&["schemaname", "tablename", "policyname", "permissive", "roles", "cmd", "qual", "with_check"])
+            }
+            "pg_largeobject_metadata" => {
+                for (id, _) in crate::expr::pgmore::large_objects() {
+                    rows.push(vec![Value::Int(id), t("postgres"), Value::Null]);
+                }
+                names(&["oid", "lomowner", "lomacl"])
+            }
+            "pg_largeobject" => {
+                for (id, data) in crate::expr::pgmore::large_objects() {
+                    for (page, chunk) in data.chunks(2048).enumerate() {
+                        rows.push(vec![Value::Int(id), Value::Int(page as i64), Value::Bytes(chunk.to_vec().into())]);
+                    }
+                }
+                names(&["loid", "pageno", "data"])
+            }
             "pg_policy" => names(&["oid", "polname", "polrelid", "polcmd", "polpermissive", "polroles", "polqual", "polwithcheck"]),
             "pg_auth_members" => names(&["roleid", "member", "grantor", "admin_option"]),
             "pg_statistic_ext" => names(&["oid", "stxrelid", "stxname", "stxnamespace", "stxowner", "stxkeys", "stxkind"]),

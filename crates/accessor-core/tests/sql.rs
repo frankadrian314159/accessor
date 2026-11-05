@@ -7260,7 +7260,7 @@ fn postgresql_string_json_and_array_built_ins() {
     assert_eq!(pg_one(&mut db, "SELECT quote_nullable(NULL)"), "NULL");
     assert_eq!(pg_one(&mut db, "SELECT regexp_match('abc123', '([a-z]+)([0-9]+)')"), "{abc,123}");
     assert_eq!(pg_one(&mut db, "SELECT regexp_split_to_array('a b  c', ' +')"), "{a,b,c}");
-    assert_eq!(pg_one(&mut db, "SELECT json_build_object('a', 1, 'b', array[1,2])"), "{\"a\":1,\"b\":[1,2]}");
+    assert_eq!(pg_one(&mut db, "SELECT json_build_object('a', 1, 'b', array[1,2])"), "{\"a\": 1, \"b\": [1, 2]}");
     assert_eq!(pg_one(&mut db, "SELECT json_extract_path_text('{\"a\":{\"b\":5}}', 'a', 'b')"), "5");
     assert_eq!(pg_one(&mut db, "SELECT jsonb_exists('{\"a\":1}'::jsonb, 'a')"), "true");
     assert_eq!(pg_one(&mut db, "SELECT array_sort(array[3,1,2], true)"), "{3,2,1}");
@@ -7382,8 +7382,8 @@ fn postgresql_settings_row_json_and_large_objects() {
     assert!(db.execute("SELECT current_setting('nope')").is_err());
     db.execute("CREATE TABLE rt (id int, name text)").unwrap();
     db.execute("INSERT INTO rt VALUES (1, 'a')").unwrap();
-    assert_eq!(pg_one(&mut db, "SELECT row_to_json(rt) FROM rt"), "{\"id\":1,\"name\":\"a\"}");
-    assert_eq!(pg_one(&mut db, "SELECT row_to_json(ROW(1, 'x'))"), "{\"f1\":1,\"f2\":\"x\"}");
+    assert_eq!(pg_one(&mut db, "SELECT row_to_json(rt) FROM rt"), "{\"id\": 1, \"name\": \"a\"}");
+    assert_eq!(pg_one(&mut db, "SELECT row_to_json(ROW(1, 'x'))"), "{\"f1\": 1, \"f2\": \"x\"}");
     db.execute("SELECT lo_from_bytea(7000, 'hello'::bytea)").unwrap();
     assert_eq!(pg_one(&mut db, "SELECT lo_get(7000)"), "hello");
     assert_eq!(pg_one(&mut db, "SELECT lo_get(7000, 1, 3)"), "ell");
@@ -7560,4 +7560,56 @@ fn postgresql_xml_schema_mapping_and_xmltable_namespaces() {
         pg_one(&mut db, "SELECT a FROM xmltable(XMLNAMESPACES('urn:x' AS p), '/p:r/p:row' PASSING '<p:r xmlns:p=\"urn:x\"><p:row><p:a>1</p:a></p:row></p:r>'::xml COLUMNS a int PATH 'p:a')"),
         "1"
     );
+}
+
+#[test]
+fn postgresql_session_user_policies_ownership_select_into_and_json_spacing() {
+    let mut db = pg();
+    assert_eq!(pg_one(&mut db, "SELECT current_user"), "postgres");
+    assert_eq!(pg_one(&mut db, "SELECT current_setting('role')"), "none");
+    db.execute("CREATE ROLE r1").unwrap();
+    db.execute("CREATE ROLE r2").unwrap();
+    db.execute("SET ROLE r1").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT current_user"), "r1");
+    assert_eq!(pg_one(&mut db, "SELECT session_user"), "postgres");
+    // a table made by a role is owned by it; another role has no rights on it
+    db.execute("CREATE TABLE mine (x int)").unwrap();
+    db.execute("INSERT INTO mine VALUES (1)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT x FROM mine"), "1");
+    db.execute("SET ROLE r2").unwrap();
+    assert!(db.execute("SELECT x FROM mine").is_err());
+    db.execute("RESET ROLE").unwrap();
+
+    // RETURNING after a table name and after a constant; ALTER GROUP; PREPARE with types
+    db.execute("CREATE TABLE t (a int primary key, b text)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    assert_eq!(db.execute("DELETE FROM mine RETURNING *").unwrap().rows.len(), 1);
+    assert_eq!(db.execute("INSERT INTO mine SELECT 5 RETURNING *").unwrap().rows.len(), 1);
+    db.execute("ALTER GROUP r1 ADD USER r2").unwrap();
+    db.execute("PREPARE q(int) AS SELECT b FROM t WHERE a = $1").unwrap();
+    assert_eq!(pg_one(&mut db, "EXECUTE q(1)"), "x");
+
+    // policies: ALTER POLICY and pg_policies
+    db.execute("CREATE POLICY p1 ON t USING (a > 1)").unwrap();
+    db.execute("ALTER POLICY p1 ON t USING (a > 2)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT qual FROM pg_policies WHERE policyname = 'p1'"), "a > 2");
+    db.execute("ALTER POLICY p1 ON t RENAME TO p2").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT policyname FROM pg_policies"), "p2");
+
+    // SELECT INTO, TABLE with ORDER BY, ON CONFLICT DO SELECT, odd-length hex numbers, ctid
+    db.execute("SELECT * INTO t2 FROM t").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT b FROM t2"), "x");
+    assert_eq!(db.execute("TABLE t2 ORDER BY a DESC").unwrap().rows.len(), 1);
+    assert_eq!(db.execute("INSERT INTO t VALUES (1, 'y') ON CONFLICT (a) DO SELECT RETURNING b").unwrap().rows[0][0].to_string(), "x");
+    assert_eq!(pg_one(&mut db, "SELECT x'20000'::int"), "131072");
+    assert_eq!(pg_one(&mut db, "SELECT ctid FROM t"), "(0,1)");
+    assert_eq!(pg_one(&mut db, "SELECT fipshash('abc')"), "ba7816bf8f01cfea414140de5dae2223");
+
+    // jsonb is shown the way PostgreSQL shows it; floats are rounded with extra_float_digits = 0
+    assert_eq!(pg_one(&mut db, "SELECT '{\"bb\":[1,2],\"a\":1}'::jsonb"), "{\"a\": 1, \"bb\": [1, 2]}");
+    assert_eq!(pg_one(&mut db, "SELECT sinh(1::float8)"), "1.1752011936438014");
+    db.execute("SET extra_float_digits = 0").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT sinh(1::float8)"), "1.1752011936438");
+    db.execute("RESET extra_float_digits").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT sinh(1::float8)"), "1.1752011936438014");
 }

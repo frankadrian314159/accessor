@@ -30,6 +30,8 @@ A database starts with **no restrictions**: nothing is checked until `SET ROLE n
 
 The refusal is "permission denied for table t". A role has the rights granted to it, to any role it is a **member** of (directly or through other groups), and to `PUBLIC`. A `SUPERUSER` role has all rights. `GRANT ALL` means all of the table privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`).
 
+A table or view made while a role is set (`SET ROLE`) is **owned** by that role, which has every right on it, as do the roles it is a member of; a table made with no role set has no owner. `ALTER TABLE ... OWNER TO` is read and ignored. `ALTER GROUP g ADD USER u` and `DROP USER u` are `GRANT g TO u` and `REVOKE g FROM u`. `current_user` is the role chosen with `SET ROLE` (`postgres` when none is); `session_user` is always `postgres`; `current_setting('role')` is `none` when no role is chosen.
+
 A **view** is checked by its own name only: a role that may select from a view may read the tables under it without any right on them, as in PostgreSQL where the view's owner's rights are used. A trigger or a stored function runs with the rights of the role that fired it.
 
 ## Row-level security
@@ -38,10 +40,11 @@ A **view** is checked by its own name only: a role that may select from a view m
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;     -- also DISABLE, FORCE, NO FORCE
 CREATE POLICY mine ON docs [AS PERMISSIVE | RESTRICTIVE] [FOR ALL | SELECT | INSERT | UPDATE | DELETE]
     [TO role, ...] [USING (condition)] [WITH CHECK (condition)];
+ALTER POLICY mine ON docs [RENAME TO new] [TO role, ...] [USING (condition)] [WITH CHECK (condition)];
 DROP POLICY mine ON docs;
 ```
 
-With security enabled on a table, a role chosen with `SET ROLE` sees and changes only the rows its policies allow. `USING` says which existing rows a `SELECT`, `UPDATE` or `DELETE` can reach; `WITH CHECK` (the `USING` condition when left out) must hold for each row an `INSERT` or `UPDATE` writes, or the statement fails with "new row violates row-level security policy". The permissive policies that apply to the role (its own, its groups', `PUBLIC`) are OR-ed, the restrictive ones AND-ed; with no permissive policy that applies, **no row** is allowed. `CURRENT_USER` in a condition is the chosen role. Security does not apply to a superuser role or to the session before any `SET ROLE` (there are no table owners, so `FORCE` changes nothing). Not available: `ALTER POLICY` (drop and create again), and `current_setting()` in a policy.
+With security enabled on a table, a role chosen with `SET ROLE` sees and changes only the rows its policies allow. `USING` says which existing rows a `SELECT`, `UPDATE` or `DELETE` can reach; `WITH CHECK` (the `USING` condition when left out) must hold for each row an `INSERT` or `UPDATE` writes, or the statement fails with "new row violates row-level security policy". The permissive policies that apply to the role (its own, its groups', `PUBLIC`) are OR-ed, the restrictive ones AND-ed; with no permissive policy that applies, **no row** is allowed. `CURRENT_USER` in a condition is the chosen role. Security does not apply to a superuser role or to the session before any `SET ROLE` (table owners are not exempt here, so `FORCE` changes nothing). `ALTER POLICY` replaces the parts it names. The policies can be read from the `pg_policies` view. Not available: `current_setting()` in a policy.
 
 ## What is only recorded
 
