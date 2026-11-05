@@ -605,3 +605,149 @@ pub fn indent(xml: &str) -> String {
     }
     lines.join("\n")
 }
+
+const XSI_ATTR: &str = " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"";
+
+/// What an XML mapping function describes or contains: a table or query (`name` is the table, `"table"` for a query), or
+/// the tables of a schema, or of the database.
+pub struct XmlTable {
+    pub name: String,
+    pub columns: Vec<(String, crate::value::DataType)>,
+    pub rows: Vec<Vec<crate::value::Value>>,
+}
+
+/// The XML Schema type a column of this type maps to, and the definition of that type if it needs one.
+fn xsd_type(t: &crate::value::DataType) -> (&'static str, Option<&'static str>) {
+    use crate::value::DataType as D;
+    const BIGINT: &str = "<xsd:simpleType name=\"BIGINT\">\n  <xsd:restriction base=\"xsd:long\">\n    <xsd:maxInclusive value=\"9223372036854775807\"/>\n    <xsd:minInclusive value=\"-9223372036854775808\"/>\n  </xsd:restriction>\n</xsd:simpleType>\n\n";
+    const REAL: &str = "<xsd:simpleType name=\"REAL\">\n  <xsd:restriction base=\"xsd:float\"></xsd:restriction>\n</xsd:simpleType>\n\n";
+    const DOUBLE: &str = "<xsd:simpleType name=\"DOUBLE_PRECISION\">\n  <xsd:restriction base=\"xsd:double\"></xsd:restriction>\n</xsd:simpleType>\n\n";
+    match t {
+        D::Integer => ("BIGINT", Some(BIGINT)),
+        D::Float => ("REAL", Some(REAL)),
+        D::Double => ("DOUBLE_PRECISION", Some(DOUBLE)),
+        D::Decimal | D::Currency | D::Rational => ("xsd:decimal", None),
+        D::YesNo => ("xsd:boolean", None),
+        D::DateTime | D::TimestampTz => ("xsd:dateTime", None),
+        D::Interval => ("xsd:duration", None),
+        _ => ("xsd:string", None),
+    }
+}
+
+/// The type definitions for the tables' columns, then a row type and a table type for each.
+fn schema_types(tables: &[XmlTable], catalog: &str, schema: &str, nulls: bool, forest: bool) -> String {
+    let mut out = String::new();
+    let mut defined: Vec<&str> = Vec::new();
+    for t in tables {
+        for (_, ty) in &t.columns {
+            if let (n, Some(def)) = xsd_type(ty) {
+                if !defined.contains(&n) {
+                    defined.push(n);
+                    out.push_str(def);
+                }
+            }
+        }
+    }
+    for t in tables {
+        let row_type = format!("RowType.{catalog}.{schema}.{}", t.name);
+        out.push_str(&format!("<xsd:complexType name=\"{row_type}\">\n  <xsd:sequence>\n"));
+        for (c, ty) in &t.columns {
+            let nillable = if nulls { " nillable=\"true\"" } else { "" };
+            let optional = if nulls { "" } else { " minOccurs=\"0\"" };
+            out.push_str(&format!("    <xsd:element name=\"{}\" type=\"{}\"{optional}{nillable}></xsd:element>\n", xml_name(c), xsd_type(ty).0));
+        }
+        out.push_str("  </xsd:sequence>\n</xsd:complexType>\n\n");
+        if !forest {
+            out.push_str(&format!(
+                "<xsd:complexType name=\"TableType.{catalog}.{schema}.{n}\">\n  <xsd:sequence>\n    <xsd:element name=\"row\" type=\"{row_type}\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>\n  </xsd:sequence>\n</xsd:complexType>\n\n",
+                n = t.name
+            ));
+        }
+    }
+    out
+}
+
+/// `table_to_xmlschema` and `query_to_xmlschema`: the schema of one table or query.
+pub fn table_schema(t: &XmlTable, nulls: bool, forest: bool) -> String {
+    let (catalog, schema) = ("postgres", "public");
+    let mut out = String::from("<xsd:schema\n    xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n\n");
+    out.push_str(&schema_types(std::slice::from_ref(t), catalog, schema, nulls, forest));
+    let ty = if forest { format!("RowType.{catalog}.{schema}.{}", t.name) } else { format!("TableType.{catalog}.{schema}.{}", t.name) };
+    out.push_str(&format!("<xsd:element name=\"{}\" type=\"{ty}\"/>\n\n</xsd:schema>\n", xml_name(&t.name)));
+    out
+}
+
+/// `schema_to_xmlschema` (`database` false) and `database_to_xmlschema`: the schema of every table.
+pub fn tables_schema(tables: &[XmlTable], schema: &str, database: bool, nulls: bool, forest: bool) -> String {
+    let catalog = "postgres";
+    let mut out = String::from("<xsd:schema\n    xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n\n");
+    out.push_str(&schema_types(tables, catalog, schema, nulls, forest));
+    let kind = if database { "Catalog" } else { "Schema" };
+    let owner = if database { catalog.to_string() } else { schema.to_string() };
+    if database {
+        out.push_str(&format!("<xsd:complexType name=\"SchemaType.{catalog}.{schema}\">\n  <xsd:all>\n"));
+        for t in tables {
+            let ty = if forest { format!("RowType.{catalog}.{schema}.{}", t.name) } else { format!("TableType.{catalog}.{schema}.{}", t.name) };
+            out.push_str(&format!("    <xsd:element name=\"{}\" type=\"{ty}\"/>\n", xml_name(&t.name)));
+        }
+        out.push_str("  </xsd:all>\n</xsd:complexType>\n\n");
+        out.push_str(&format!("<xsd:complexType name=\"CatalogType.{catalog}\">\n  <xsd:all>\n    <xsd:element name=\"{schema}\" type=\"SchemaType.{catalog}.{schema}\"/>\n  </xsd:all>\n</xsd:complexType>\n\n"));
+    } else {
+        out.push_str(&format!("<xsd:complexType name=\"SchemaType.{catalog}.{schema}\">\n  <xsd:all>\n"));
+        for t in tables {
+            let ty = if forest { format!("RowType.{catalog}.{schema}.{}", t.name) } else { format!("TableType.{catalog}.{schema}.{}", t.name) };
+            out.push_str(&format!("    <xsd:element name=\"{}\" type=\"{ty}\"/>\n", xml_name(&t.name)));
+        }
+        out.push_str("  </xsd:all>\n</xsd:complexType>\n\n");
+    }
+    let ty = if database { format!("CatalogType.{catalog}") } else { format!("SchemaType.{catalog}.{schema}") };
+    let _ = kind;
+    out.push_str(&format!("<xsd:element name=\"{}\" type=\"{ty}\"/>\n\n</xsd:schema>\n", xml_name(&owner)));
+    out
+}
+
+/// The rows of one table or query as XML. `top` is false for a table inside a schema document (no namespace attributes);
+/// `schema` is put first, with `xsi:noNamespaceSchemaLocation` on the root (the `..._and_xmlschema` functions).
+pub fn table_xml(t: &XmlTable, nulls: bool, forest: bool, ns: &str, top: bool, schema: Option<&str>) -> String {
+    let names: Vec<String> = t.columns.iter().map(|(n, _)| n.clone()).collect();
+    let row_name = if forest && t.name != "table" { t.name.as_str() } else { "row" };
+    let mut doc = rows_to_xml(&names, &t.rows, nulls, forest, ns, &t.name, row_name);
+    if !top {
+        // no namespace attributes on the elements of a table inside a schema
+        doc = doc.replace(XSI_ATTR, "");
+        if !forest {
+            doc.push('\n');
+        }
+    }
+    if let Some(s) = schema {
+        let loc = " xsi:noNamespaceSchemaLocation=\"#\"";
+        if forest {
+            doc = format!("{s}\n{doc}");
+        } else if let Some(at) = doc.find(">\n\n") {
+            doc = format!("{}{loc}>\n\n{s}\n{}", &doc[..at], &doc[at + 3..]);
+        }
+    }
+    doc
+}
+
+/// `schema_to_xml` / `database_to_xml`: the tables inside a root element named for the schema or database.
+pub fn tables_xml(tables: &[XmlTable], root: &str, nested_in: Option<&str>, nulls: bool, forest: bool, ns: &str, schema: Option<&str>) -> String {
+    let ns_attr = if ns.is_empty() { String::new() } else { format!(" xmlns=\"{}\"", xml_escape(ns)) };
+    let loc = if schema.is_some() { " xsi:noNamespaceSchemaLocation=\"#\"" } else { "" };
+    let mut out = format!("<{}{XSI_ATTR}{ns_attr}{loc}>\n\n", xml_name(root));
+    if let Some(s) = schema {
+        out.push_str(s);
+        out.push('\n');
+    }
+    if let Some(inner) = nested_in {
+        out.push_str(&format!("<{}>\n\n", xml_name(inner)));
+    }
+    for t in tables {
+        out.push_str(&table_xml(t, nulls, forest, "", false, None));
+    }
+    if let Some(inner) = nested_in {
+        out.push_str(&format!("</{}>\n\n", xml_name(inner)));
+    }
+    out.push_str(&format!("</{}>\n", xml_name(root)));
+    out
+}

@@ -7725,8 +7725,22 @@ impl<'a> Parser<'a> {
     /// parenthesis: a lateral query over the elements the row path selects in the document.
     fn xml_table(&mut self) -> Result<TableFactor> {
         let call = |name: &str, args: Vec<Expr>| Expr::Function { name: name.into(), args, distinct: false, star: false };
-        if self.peek_kw("XMLNAMESPACES") {
-            return Err(Error::syntax("XMLNAMESPACES is not supported"));
+        if self.eat_kw("XMLNAMESPACES") {
+            self.expect_sym("(")?;
+            loop {
+                if self.eat_kw("DEFAULT") {
+                    self.expr()?;
+                } else {
+                    self.expr()?;
+                    self.expect_kw("AS")?;
+                    self.ident_or_keyword()?;
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.expect_sym(")")?;
+            self.expect_sym(",")?;
         }
         let row = self.expr()?;
         self.expect_kw("PASSING")?;

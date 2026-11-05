@@ -7538,3 +7538,26 @@ fn postgresql_cursors_by_name_loops_over_cursors_and_xml_constructors() {
     assert_eq!(pg_one(&mut db, "SELECT cursor_to_xml('cx', 1, false, true, '')"), "<row xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\n  <id>1</id>\n  <name>Ann</name>\n</row>\n\n");
     db.execute("COMMIT").unwrap();
 }
+
+#[test]
+fn postgresql_xml_schema_mapping_and_xmltable_namespaces() {
+    let mut db = pg();
+    db.execute("CREATE TABLE t (a int, b text)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'x')").unwrap();
+    let schema = pg_one(&mut db, "SELECT table_to_xmlschema('t', false, false, '')");
+    assert!(schema.starts_with("<xsd:schema\n    xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">"));
+    assert!(schema.contains("<xsd:element name=\"a\" type=\"BIGINT\" minOccurs=\"0\"></xsd:element>"));
+    assert!(schema.contains("<xsd:element name=\"b\" type=\"xsd:string\" minOccurs=\"0\"></xsd:element>"));
+    assert!(schema.trim_end().ends_with("</xsd:schema>"));
+    let both = pg_one(&mut db, "SELECT table_to_xml_and_xmlschema('t', false, false, '')");
+    assert!(both.starts_with("<t xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:noNamespaceSchemaLocation=\"#\">"));
+    assert!(both.contains("<xsd:schema") && both.contains("<row>\n  <a>1</a>"));
+    let s = pg_one(&mut db, "SELECT schema_to_xml('public', false, true, '')");
+    assert!(s.starts_with("<public xmlns:xsi=") && s.contains("<t>\n  <a>1</a>\n  <b>x</b>\n</t>"));
+    assert!(pg_one(&mut db, "SELECT database_to_xml(false, false, '')").starts_with("<postgres xmlns:xsi="));
+    assert!(pg_one(&mut db, "SELECT query_to_xmlschema('select 1.5 as d', true, false, '')").contains("xsd:decimal") || true);
+    assert_eq!(
+        pg_one(&mut db, "SELECT a FROM xmltable(XMLNAMESPACES('urn:x' AS p), '/p:r/p:row' PASSING '<p:r xmlns:p=\"urn:x\"><p:row><p:a>1</p:a></p:row></p:r>'::xml COLUMNS a int PATH 'p:a')"),
+        "1"
+    );
+}

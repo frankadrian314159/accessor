@@ -699,6 +699,10 @@ impl<'a> Binder<'a> {
                     let root = if table_call { table.as_str() } else { "table" };
                     return Ok(BExpr::Lit(Value::text(&crate::expr::xmlfuncs::rows_to_xml(&result.columns, &result.rows, nulls, forest, &ns, root, row_name))));
                 }
+                // schema_to_xml, database_to_xml and the ..._to_xmlschema / ..._and_xmlschema forms
+                if let Some(e) = self.xml_mapping(name, args)? {
+                    return Ok(e);
+                }
                 // cursor_to_xml(cursor, count, nulls, tableforest, targetns): the next rows of a cursor (which stays where it is)
                 if name.eq_ignore_ascii_case("CURSOR_TO_XML") && args.len() == 5 {
                     let mut consts = Vec::new();
@@ -1045,6 +1049,89 @@ impl<'a> Binder<'a> {
             None => BExpr::Lit(Value::Null),
         };
         Ok(BExpr::Fold { items: Box::new(items), step: Box::new(step), init: Box::new(init), fin, nargs: agg.nargs })
+    }
+
+    /// `query_to_xmlschema`, `table_to_xml_and_xmlschema`, `schema_to_xml`, `database_to_xml`, ...: XML made from the rows and
+    /// column types of a query, table, cursor, schema or the database, when the statement is read. `None` for any other
+    /// function (and for the plain `query_to_xml` / `table_to_xml` / `cursor_to_xml`, which are handled separately).
+    fn xml_mapping(&mut self, name: &str, args: &[Expr]) -> Result<Option<BExpr>> {
+        use crate::expr::xmlfuncs::{table_schema, table_xml, tables_schema, tables_xml, XmlTable};
+        let up = name.to_ascii_uppercase();
+        let Some((kind, rest)) = ["QUERY", "TABLE", "CURSOR", "SCHEMA", "DATABASE"].iter().find_map(|k| up.strip_prefix(&format!("{k}_TO_XML")).map(|r| (*k, r))) else { return Ok(None) };
+        let mode = match rest {
+            "" if matches!(kind, "SCHEMA" | "DATABASE") => 0,
+            "SCHEMA" => 1,
+            "_AND_XMLSCHEMA" => 2,
+            _ => return Ok(None),
+        };
+        let want = if kind == "DATABASE" { 3 } else { 4 };
+        if args.len() != want {
+            return Ok(None);
+        }
+        let mut consts = Vec::new();
+        for a in args {
+            consts.push(self.bind(a)?.eval(&[])?.into_owned());
+        }
+        let flags = consts.len() - 3;
+        let (nulls, forest) = (matches!(consts[flags], Value::Bool(true)), matches!(consts[flags + 1], Value::Bool(true)));
+        let ns = consts[flags + 2].to_string();
+        let given = if kind == "DATABASE" { String::new() } else { consts[0].to_string() };
+        let infer = |rows: &[Vec<Value>], i: usize| -> crate::value::DataType {
+            use crate::value::DataType as D;
+            match rows.iter().map(|r| &r[i]).find(|v| !v.is_null()) {
+                Some(Value::Int(_)) => D::Integer,
+                Some(Value::Double(_)) => D::Double,
+                Some(Value::Bool(_)) => D::YesNo,
+                _ => D::Text,
+            }
+        };
+        let from_query = |db: &Database, sql: &str, label: &str| -> Result<XmlTable> {
+            let r = db.query(sql)?;
+            let columns = r.columns.iter().enumerate().map(|(i, c)| (c.clone(), infer(&r.rows, i))).collect();
+            Ok(XmlTable { name: label.to_string(), columns, rows: r.rows })
+        };
+        let from_table = |db: &Database, t: &str| -> Result<XmlTable> {
+            let table = db.table_checked(t)?;
+            let columns = table.schema().columns.iter().map(|c| (c.name.clone(), c.data_type)).collect();
+            let rows = db.query(&format!("SELECT * FROM {t}"))?.rows;
+            Ok(XmlTable { name: table.name().to_string(), columns, rows })
+        };
+        let text = match kind {
+            "QUERY" | "TABLE" | "CURSOR" => {
+                let t = match kind {
+                    "QUERY" => from_query(self.db, &given, "table")?,
+                    "TABLE" => from_table(self.db, given.rsplit('.').next().unwrap_or(&given).trim_matches('"'))?,
+                    _ => {
+                        let (columns, rows) = self.db.peek_cursor(&given, usize::MAX).ok_or_else(|| Error::runtime(format!("cursor \"{given}\" does not exist")))?;
+                        let cols = columns.iter().enumerate().map(|(i, c)| (c.clone(), infer(&rows, i))).collect();
+                        XmlTable { name: "table".to_string(), columns: cols, rows }
+                    }
+                };
+                match mode {
+                    1 => table_schema(&t, nulls, forest),
+                    _ => table_xml(&t, nulls, forest, &ns, true, (mode == 2).then(|| table_schema(&t, nulls, forest)).as_deref()),
+                }
+            }
+            _ => {
+                let schema = if kind == "SCHEMA" { given.clone() } else { "public".to_string() };
+                let mut tables = Vec::new();
+                if schema.eq_ignore_ascii_case("public") {
+                    let mut names: Vec<String> = self.db.table_names().iter().map(|n| n.to_string()).collect();
+                    names.sort();
+                    for n in names {
+                        tables.push(from_table(self.db, &n)?);
+                    }
+                }
+                let database = kind == "DATABASE";
+                let sch = tables_schema(&tables, &schema, database, nulls, forest);
+                match mode {
+                    1 => sch,
+                    _ if database => tables_xml(&tables, "postgres", Some(&schema), nulls, forest, &ns, (mode == 2).then_some(sch.as_str())),
+                    _ => tables_xml(&tables, &schema, None, nulls, forest, &ns, (mode == 2).then_some(sch.as_str())),
+                }
+            }
+        };
+        Ok(Some(BExpr::Lit(Value::text(&text))))
     }
 
     fn bind_agg(&mut self, func: AggFn, all_args: &[Expr], distinct: bool, star: bool) -> Result<BExpr> {
