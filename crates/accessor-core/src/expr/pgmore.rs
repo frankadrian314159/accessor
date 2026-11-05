@@ -58,6 +58,31 @@ pub enum MoreFn {
     ArrayShuffle,
     ArraySample,
     UuidVersion,
+    UuidTimestamp,
+    UuidV7,
+    UuidV4,
+    JustifyDays,
+    JustifyHours,
+    JustifyInterval,
+    HashText,
+    HashTextExtended,
+    HashInt,
+    HashIntExtended,
+    SatisfiesHashPartition,
+    ToRegcollation,
+    EnumRange,
+    EnumFirst,
+    EnumLast,
+    Populate,
+    LoCreate,
+    LoFromBytea,
+    LoGet,
+    LoPut,
+    LoUnlink,
+    Xpath,
+    XpathExists,
+    RestoreStats,
+    ClearStats,
     Null,
 }
 
@@ -106,6 +131,31 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "ARRAY_SHUFFLE" => (ArrayShuffle, 1, 1),
         "ARRAY_SAMPLE" => (ArraySample, 2, 2),
         "UUID_EXTRACT_VERSION" => (UuidVersion, 1, 1),
+        "UUID_EXTRACT_TIMESTAMP" => (UuidTimestamp, 1, 1),
+        "UUIDV7" => (UuidV7, 0, 1),
+        "UUIDV4" | "GEN_RANDOM_UUID" => (UuidV4, 0, 0),
+        "JUSTIFY_DAYS" => (JustifyDays, 1, 1),
+        "JUSTIFY_HOURS" => (JustifyHours, 1, 1),
+        "JUSTIFY_INTERVAL" => (JustifyInterval, 1, 1),
+        "HASHTEXT" | "HASHNAME" | "HASHBPCHAR" => (HashText, 1, 1),
+        "HASHTEXTEXTENDED" | "HASHNAMEEXTENDED" | "HASHBPCHAREXTENDED" => (HashTextExtended, 2, 2),
+        "HASHINT2" | "HASHINT4" | "HASHINT8" | "HASHCHAR" => (HashInt, 1, 1),
+        "HASHINT2EXTENDED" | "HASHINT4EXTENDED" | "HASHINT8EXTENDED" | "HASHCHAREXTENDED" => (HashIntExtended, 2, 2),
+        "SATISFIES_HASH_PARTITION" => (SatisfiesHashPartition, 3, usize::MAX),
+        "TO_REGCOLLATION" => (ToRegcollation, 1, 1),
+        "__ENUM_RANGE" => (EnumRange, 2, 3),
+        "__ENUM_FIRST" => (EnumFirst, 2, 2),
+        "__ENUM_LAST" => (EnumLast, 2, 2),
+        "__POPULATE" => (Populate, 3, 3),
+        "LO_CREATE" => (LoCreate, 1, 1),
+        "LO_FROM_BYTEA" => (LoFromBytea, 2, 2),
+        "LO_GET" => (LoGet, 1, 3),
+        "LO_PUT" => (LoPut, 3, 3),
+        "LO_UNLINK" => (LoUnlink, 1, 1),
+        "XPATH" => (Xpath, 2, 3),
+        "XPATH_EXISTS" => (XpathExists, 2, 3),
+        "PG_RESTORE_RELATION_STATS" | "PG_RESTORE_ATTRIBUTE_STATS" => (RestoreStats, 0, usize::MAX),
+        "PG_CLEAR_RELATION_STATS" | "PG_CLEAR_ATTRIBUTE_STATS" => (ClearStats, 2, 3),
         "PG_COLUMN_COMPRESSION" => (Null, 1, 1),
         _ => return None,
     })
@@ -113,7 +163,20 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
 
 impl MoreFn {
     pub fn handles_null(self) -> bool {
-        matches!(self, MoreFn::NumNulls | MoreFn::NumNonnulls | MoreFn::QuoteNullable | MoreFn::JsonBuildObject | MoreFn::JsonBuildArray)
+        matches!(
+            self,
+            MoreFn::NumNulls
+                | MoreFn::NumNonnulls
+                | MoreFn::QuoteNullable
+                | MoreFn::JsonBuildObject
+                | MoreFn::JsonBuildArray
+                | MoreFn::SatisfiesHashPartition
+                | MoreFn::EnumRange
+                | MoreFn::EnumFirst
+                | MoreFn::EnumLast
+                | MoreFn::Populate
+                | MoreFn::RestoreStats
+        )
     }
 }
 
@@ -145,6 +208,111 @@ fn items(v: &Value) -> Result<Vec<Value>> {
 
 fn array(v: Vec<Value>) -> Value {
     Value::Array(Arc::new(v))
+}
+
+const DAY: i64 = 86_400;
+
+fn justify_hours(mut i: crate::interval::Interval) -> crate::interval::Interval {
+    i.days += i.secs / DAY;
+    i.secs %= DAY;
+    if i.days > 0 && i.secs < 0 {
+        i.days -= 1;
+        i.secs += DAY;
+    } else if i.days < 0 && i.secs > 0 {
+        i.days += 1;
+        i.secs -= DAY;
+    }
+    i
+}
+
+fn justify_days(mut i: crate::interval::Interval) -> crate::interval::Interval {
+    i.months += i.days / 30;
+    i.days %= 30;
+    if i.months > 0 && i.days < 0 {
+        i.months -= 1;
+        i.days += 30;
+    } else if i.months < 0 && i.days > 0 {
+        i.months += 1;
+        i.days -= 30;
+    }
+    i
+}
+
+fn interval_of(v: &Value) -> Result<crate::interval::Interval> {
+    match v {
+        Value::Interval(i) => Ok(*i),
+        Value::Text(t) => crate::interval::Interval::parse(t, None).map_err(Error::type_err),
+        other => Err(Error::type_err(format!("'{other}' is not an interval"))),
+    }
+}
+
+fn uuid_text(bytes: [u8; 16]) -> String {
+    let h: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
+fn random_bytes() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for b in &mut out {
+        *b = (super::extra::random() * 256.0) as u8;
+    }
+    out
+}
+
+/// The labels of the enum type with this name, or of the one that has `probe` as a label.
+fn enum_labels(type_name: &Value, probe: &[Cow<'_, Value>]) -> Result<Vec<String>> {
+    if !type_name.is_null() {
+        if let Some(t) = crate::sql::usertypes::lookup(&text(type_name)).filter(|t| !t.labels.is_empty()) {
+            return Ok(t.labels);
+        }
+    }
+    let wanted: Vec<String> = probe.iter().filter(|p| !p.is_null()).map(|p| text(p).into_owned()).collect();
+    let mut found: Vec<Vec<String>> = crate::sql::usertypes::snapshot().into_values().map(|t| t.labels).filter(|l| !l.is_empty() && wanted.iter().all(|w| l.contains(w))).collect();
+    match (found.pop(), wanted.is_empty()) {
+        (Some(l), false) if found.is_empty() => Ok(l),
+        _ => Err(Error::runtime("could not determine polymorphic type because input has type unknown")),
+    }
+}
+
+thread_local! {
+    static LARGE_OBJECTS: std::cell::RefCell<std::collections::BTreeMap<i64, Vec<u8>>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+fn raw(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Bytes(b) => b.as_ref().clone(),
+        other => text(other).as_bytes().to_vec(),
+    }
+}
+
+/// A new large object number: the one asked for, or the next free one.
+fn lo_new(wanted: i64, data: Vec<u8>) -> Result<i64> {
+    LARGE_OBJECTS.with(|m| {
+        let mut m = m.borrow_mut();
+        let id = if wanted != 0 { wanted } else { m.keys().next_back().map_or(16384, |k| k + 1) };
+        if m.contains_key(&id) {
+            return Err(Error::runtime(format!("large object {id} already exists")));
+        }
+        m.insert(id, data);
+        Ok(id)
+    })
+}
+
+/// The fields of a composite type filled from a JSON object, over the fields of `base` (record text) where the object has no key.
+pub(crate) fn populate_fields(type_name: &str, base: Option<&str>, doc: &J) -> Result<Vec<Option<String>>> {
+    let fields = super::composite::fields_of(type_name).ok_or_else(|| Error::catalog(format!("type \"{type_name}\" does not exist")))?;
+    let J::Object(map) = doc else { return Err(Error::runtime("cannot call populate_record on a non-object")) };
+    let old = base.and_then(super::composite::split).unwrap_or_default();
+    Ok(fields
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| match map.get(name) {
+            Some(J::Null) => None,
+            Some(J::String(s)) => Some(s.clone()),
+            Some(j) => Some(json::to_text(j)),
+            None => old.get(i).cloned().flatten(),
+        })
+        .collect())
 }
 
 /// Regular-expression flags the way PostgreSQL reads them: case-sensitive unless `i` is given.
@@ -515,6 +683,182 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 (Some(ver), Some(var)) if (8..=11).contains(&var) => Value::Int(i64::from(ver)),
                 _ => Value::Null,
             }
+        }
+        UuidTimestamp => {
+            let b = match super::bytefuncs::uuid_bytes(&text(v(0))) {
+                Some(b) => b,
+                None => return Ok(Value::Null),
+            };
+            let var = b[8] >> 6;
+            match (b[6] >> 4, var) {
+                (7, 2) => {
+                    let ms = b[..6].iter().fold(0u64, |a, x| (a << 8) | u64::from(*x));
+                    Value::TimestampTz((ms / 1000) as i64)
+                }
+                (1, 2) => {
+                    let low = u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+                    let mid = u64::from(u16::from_be_bytes([b[4], b[5]]));
+                    let hi = u64::from(u16::from_be_bytes([b[6], b[7]]) & 0x0fff);
+                    let ticks = (hi << 48) | (mid << 32) | low;
+                    Value::TimestampTz((ticks / 10_000_000) as i64 - 12_219_292_800)
+                }
+                _ => Value::Null,
+            }
+        }
+        UuidV7 | UuidV4 => {
+            let mut b = random_bytes();
+            if f == UuidV7 {
+                let shift = match vals.first() {
+                    Some(i) if !i.is_null() => interval_of(i)?.total_secs() as i64,
+                    _ => 0,
+                };
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) + shift * 1000;
+                let ms = now.max(0) as u64;
+                b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+                b[6] = (b[6] & 0x0f) | 0x70;
+            } else {
+                b[6] = (b[6] & 0x0f) | 0x40;
+            }
+            b[8] = (b[8] & 0x3f) | 0x80;
+            Value::text(&uuid_text(b))
+        }
+        JustifyDays => Value::Interval(justify_days(interval_of(v(0))?)),
+        JustifyHours => Value::Interval(justify_hours(interval_of(v(0))?)),
+        JustifyInterval => {
+            let mut i = justify_days(justify_hours(interval_of(v(0))?));
+            // a month and a day or time of opposite signs are brought to the same sign
+            if i.months > 0 && (i.days < 0 || i.secs < 0) {
+                i.months -= 1;
+                i.days += 30;
+            } else if i.months < 0 && (i.days > 0 || i.secs > 0) {
+                i.months += 1;
+                i.days -= 30;
+            }
+            Value::Interval(justify_hours(i))
+        }
+        HashText => Value::Int(i64::from(super::pghash::hash_bytes(text(v(0)).trim_end_matches(' ').as_bytes()) as i32)),
+        HashTextExtended => Value::Int(super::pghash::hash_bytes_extended(text(v(0)).as_bytes(), int(v(1))? as u64) as i64),
+        HashInt => Value::Int(i64::from(super::pghash::hash_i64(int(v(0))?) as i32)),
+        HashIntExtended => Value::Int(super::pghash::hash_i64_extended(int(v(0))?, int(v(1))? as u64) as i64),
+        SatisfiesHashPartition => {
+            let (modulus, remainder) = (int(v(1))?, int(v(2))?);
+            if modulus <= 0 {
+                return Err(Error::runtime("modulus for hash partition must be an integer value greater than zero"));
+            }
+            if remainder < 0 || remainder >= modulus {
+                return Err(Error::runtime("remainder for hash partition must be an integer value greater than or equal to zero and less than modulus"));
+            }
+            let keys: Vec<Value> = vals[3..].iter().map(|x| x.as_ref().clone()).collect();
+            Value::Bool(super::pghash::partition_hash(&keys) % modulus as u64 == remainder as u64)
+        }
+        ToRegcollation => {
+            let name = text(v(0));
+            let bare = name.trim().trim_start_matches("pg_catalog.").trim_matches('"');
+            if ["default", "C", "POSIX", "ucs_basic", "und-x-icu", "en-x-icu", "en_US", "en_US.utf8"].iter().any(|c| c.eq_ignore_ascii_case(bare)) {
+                Value::text(bare)
+            } else {
+                Value::Null
+            }
+        }
+        EnumRange => {
+            let labels = enum_labels(v(0), &vals[1..])?;
+            let at = |bound: Option<&Cow<'_, Value>>, default: usize| -> Result<usize> {
+                match bound {
+                    Some(b) if !b.is_null() => labels
+                        .iter()
+                        .position(|l| *l == *text(b))
+                        .ok_or_else(|| Error::runtime(format!("invalid input value for enum: \"{}\"", text(b)))),
+                    _ => Ok(default),
+                }
+            };
+            let (lo, hi) = if vals.len() == 3 { (at(vals.get(1), 0)?, at(vals.get(2), labels.len().saturating_sub(1))?) } else { (0, labels.len().saturating_sub(1)) };
+            array(if lo <= hi && !labels.is_empty() { labels[lo..=hi].iter().map(|l| Value::text(l)).collect() } else { Vec::new() })
+        }
+        EnumFirst | EnumLast => {
+            let labels = enum_labels(v(0), &vals[1..])?;
+            let l = if f == EnumFirst { labels.first() } else { labels.last() };
+            l.map_or(Value::Null, |l| Value::text(l))
+        }
+        Populate => {
+            if v(2).is_null() {
+                return Ok(v(1).clone());
+            }
+            let doc = json::document(v(2))?;
+            let base = (!v(1).is_null()).then(|| text(v(1)).into_owned());
+            let fields = populate_fields(&text(v(0)), base.as_deref(), &doc)?;
+            Value::text(&super::composite::cast_text(&text(v(0)), &super::composite::join(&fields))?)
+        }
+        LoCreate => Value::Int(lo_new(int(v(0))?, Vec::new())?),
+        LoFromBytea => Value::Int(lo_new(int(v(0))?, raw(v(1)))?),
+        LoGet => {
+            let id = int(v(0))?;
+            let data = LARGE_OBJECTS.with(|m| m.borrow().get(&id).cloned()).ok_or_else(|| Error::runtime(format!("large object {id} does not exist")))?;
+            let from = vals.get(1).map_or(Ok(0), |x| int(x))?;
+            if from < 0 {
+                return Err(Error::runtime("requested offset out of range"));
+            }
+            let from = (from as usize).min(data.len());
+            let to = match vals.get(2) {
+                Some(n) => {
+                    let n = int(n)?;
+                    if n < 0 {
+                        return Err(Error::runtime("requested length cannot be negative"));
+                    }
+                    (from + n as usize).min(data.len())
+                }
+                None => data.len(),
+            };
+            Value::bytes(data[from..to].to_vec())
+        }
+        LoPut => {
+            let id = int(v(0))?;
+            let (at, bytes) = (int(v(1))?, raw(v(2)));
+            if at < 0 {
+                return Err(Error::runtime("requested offset out of range"));
+            }
+            LARGE_OBJECTS.with(|m| -> Result<()> {
+                let mut m = m.borrow_mut();
+                let data = m.get_mut(&id).ok_or_else(|| Error::runtime(format!("large object {id} does not exist")))?;
+                let end = at as usize + bytes.len();
+                if data.len() < end {
+                    data.resize(end, 0);
+                }
+                data[at as usize..end].copy_from_slice(&bytes);
+                Ok(())
+            })?;
+            Value::Null
+        }
+        Xpath | XpathExists => {
+            let nodes = super::xmlfuncs::xpath_nodes(&text(v(1)), &text(v(0)))?;
+            if f == XpathExists {
+                Value::Bool(!nodes.is_empty())
+            } else {
+                array(nodes.iter().map(|n| Value::text(n)).collect())
+            }
+        }
+        RestoreStats => {
+            if vals.len() % 2 != 0 {
+                return Err(Error::runtime("variadic arguments must be name/value pairs"));
+            }
+            let mut names = Vec::new();
+            for pair in vals.chunks(2) {
+                if pair[0].is_null() {
+                    return Err(Error::runtime("name at variadic position 1 is NULL"));
+                }
+                names.push(text(&pair[0]).to_ascii_lowercase());
+            }
+            if !names.iter().any(|n| n == "relname") {
+                return Err(Error::runtime("\"relname\" must be specified"));
+            }
+            Value::Bool(true)
+        }
+        ClearStats => Value::Null,
+        LoUnlink => {
+            let id = int(v(0))?;
+            if LARGE_OBJECTS.with(|m| m.borrow_mut().remove(&id)).is_none() {
+                return Err(Error::runtime(format!("large object {id} does not exist")));
+            }
+            Value::Int(1)
         }
         Null => Value::Null,
     })

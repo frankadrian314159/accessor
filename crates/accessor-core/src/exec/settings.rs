@@ -204,6 +204,21 @@ impl Database {
         self.user_vars.get(&name.to_ascii_lowercase()).cloned()
     }
 
+    /// The value of a run-time parameter as text (`current_setting`): `None` for a name that is not one.
+    pub(crate) fn setting_text(&self, name: &str) -> Option<String> {
+        let name = name.to_ascii_lowercase();
+        if name == "timezone" {
+            return Some(self.time_zone());
+        }
+        if name == "optimizer" {
+            return Some(if self.optimizer_enabled() { "on" } else { "off" }.to_string());
+        }
+        match known(&name) {
+            Some((default, _)) => Some(self.settings.get(&name).cloned().unwrap_or_else(|| default.to_string())),
+            None => self.settings.get(&name).cloned(),
+        }
+    }
+
     /// `(name, value)` of the system variables, for `SHOW VARIABLES`.
     pub(crate) fn mysql_variable_rows(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = MYSQL_VARIABLES

@@ -183,10 +183,7 @@ fn may_match(bound: &Bound, op: BinOp, v: &Value) -> bool {
             }) || vs.iter().any(Value::is_null)
         }
         Bound::Hash { modulus, remainder } if op == BinOp::Eq => {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            v.hash(&mut h);
-            *modulus == 0 || h.finish() % modulus == *remainder
+            *modulus == 0 || crate::expr::pghash::partition_hash(std::slice::from_ref(v)) % modulus == *remainder
         }
         _ => true,
     }
@@ -804,12 +801,7 @@ fn bound_hit(b: &Bound, keys: &[Value]) -> bool {
             (a, b) => a.sql_cmp(b) == Some(Ordering::Equal),
         }),
         Bound::Hash { modulus, remainder } => {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            for k in keys {
-                k.hash(&mut h);
-            }
-            *modulus != 0 && h.finish() % modulus == *remainder
+            *modulus != 0 && crate::expr::pghash::partition_hash(keys) % modulus == *remainder
         }
         Bound::Default => false,
     }

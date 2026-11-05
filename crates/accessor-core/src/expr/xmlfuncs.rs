@@ -412,6 +412,25 @@ pub fn extract_value(xml: &str, path: &str) -> Result<Option<String>> {
     Ok(Some(parts.join(" ")))
 }
 
+/// PostgreSQL's `xpath(path, xml)`: the nodes the path selects, each as XML text (an element as it is written in the source).
+pub fn xpath_nodes(xml: &str, path: &str) -> Result<Vec<String>> {
+    let doc = parse_xml(xml).ok_or_else(|| Error::runtime("invalid XML document"))?;
+    let (abs, steps) = parse_path(path.trim()).ok_or_else(|| Error::runtime(format!("invalid XPath expression: {path}")))?;
+    Ok(doc
+        .eval(abs, &steps)
+        .into_iter()
+        .map(|it| match it {
+            Item::Elem(0) => xml.trim().to_string(),
+            Item::Elem(e) => {
+                let (s, t) = doc.nodes[e].span;
+                xml[s..t].to_string()
+            }
+            Item::Attr(v) => v,
+            Item::Text(t) => t,
+        })
+        .collect())
+}
+
 /// `UPDATEXML(xml, xpath, new)`: the XML with the one element the path selects replaced; unchanged when it selects none or
 /// several.
 pub fn update_xml(xml: &str, path: &str, new: &str) -> Result<Option<String>> {

@@ -146,7 +146,11 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 
 | Statement | Notes |
 | --- | --- |
-| `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `t.col%TYPE` is a variable of no fixed type; `record` and `t%ROWTYPE` are record variables (see above); cursor variables are not |
+| `DECLARE name type [:= expr];` | `CONSTANT`, `NOT NULL` accepted; `t.col%TYPE` is a variable of no fixed type; `record` and `t%ROWTYPE` are record variables (see above); `name [SCROLL] CURSOR [(param type, ...)] FOR select` declares a cursor and `name refcursor` a cursor variable to be opened with `OPEN name FOR ...` |
+| `OPEN c [(args)];`, `OPEN c FOR select;`, `OPEN c FOR EXECUTE text [USING ...];` | opens the cursor: its rows are those of the query when it is opened (a cursor does not see later changes). The arguments of a bound cursor take the place of its parameters |
+| `FETCH [direction] [FROM \| IN] c INTO targets;`, `MOVE [direction] c;`, `CLOSE c;` | `direction` is `NEXT` (the default), `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `FORWARD [n]` or `BACKWARD [n]`; one row is fetched, into variables or a record, and `FOUND` says whether there was one (no row sets the targets to NULL). A cursor is local to the call that declared it |
+| `GET [CURRENT] DIAGNOSTICS var = ROW_COUNT [, RESULT_OID, PG_CONTEXT];` | the rows the last statement changed (or a query gave). `GET STACKED DIAGNOSTICS` is read but raises an error, as there are no `EXCEPTION` handlers |
+| `FOUND` | true when the last `SELECT INTO a record`, `UPDATE`, `INSERT`, `DELETE`, `FETCH` or `EXECUTE ... INTO` found or changed a row, or a `FOR` loop ran; false when the function starts. A plain `SELECT ... INTO a, b` does not set it |
 | `name := expr;` or `name = expr;` | assignment |
 | `IF c THEN ... ELSIF c THEN ... ELSE ... END IF;` | |
 | `CASE [expr] WHEN v [, v] THEN ... ELSE ... END CASE;` | the statement form |
@@ -159,7 +163,7 @@ Parameters are `[IN] [name] type [DEFAULT value]`; a parameter without a name is
 | `SELECT ... INTO v1 [, v2] ...;` | one row, into variables |
 | any other SQL statement | `INSERT`, `UPDATE`, `DELETE`, ... with the variables put in |
 
-Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, cursors (`OPEN`, `FETCH`), `EXECUTE`, `GET DIAGNOSTICS`, `CONTINUE`, arrays, assigning a whole record (`r := new`), `RETURN QUERY EXECUTE`, event triggers, and every language except `sql` and `plpgsql`.
+Not available, with an error that says so: `EXCEPTION ... WHEN` handlers, `CONTINUE`, arrays, assigning a whole record (`r := new`), cursors returned to the caller by name (`RETURN c` with `FETCH ALL IN "c"` afterwards), `FOR rec IN cursor LOOP`, event triggers, and every language except `sql` and `plpgsql`.
 
 ### Trigger functions
 
@@ -182,7 +186,7 @@ In the PostgreSQL dialect `CREATE AGGREGATE` checks its functions as PostgreSQL 
 
 ### Dynamic SQL, `DO` and materialized views (PostgreSQL)
 
-In a PL/pgSQL body, `EXECUTE text [INTO [STRICT] targets] [USING args]` runs a statement built at run time: `$1`, `$2`, ... in the text are replaced by the `USING` values (as literals), and `INTO` takes the first row into variables or a record. `FOR rec IN EXECUTE text [USING ...] LOOP` and `RETURN QUERY EXECUTE text [USING ...]` work too. The text cannot read the variables of the routine, as in PostgreSQL. Cursors (`OPEN`, `FETCH`, `CLOSE`) and `GET DIAGNOSTICS` are still not supported.
+In a PL/pgSQL body, `EXECUTE text [INTO [STRICT] targets] [USING args]` runs a statement built at run time: `$1`, `$2`, ... in the text are replaced by the `USING` values (as literals), and `INTO` takes the first row into variables or a record. `FOR rec IN EXECUTE text [USING ...] LOOP` and `RETURN QUERY EXECUTE text [USING ...]` work too. The text cannot read the variables of the routine, as in PostgreSQL. Cursors (`OPEN`, `FETCH`, `CLOSE`) are described in the table above.
 
 `DO [LANGUAGE plpgsql] $$ ... $$` runs an anonymous PL/pgSQL block; it is made as the function `pg_do_block()`, called, and dropped.
 

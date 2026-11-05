@@ -44,7 +44,7 @@ A partitioned table is a parent that is expected to hold no rows of its own. A p
 
 * A range bound is `FROM (a) TO (b)`, from inclusive to exclusive, with `MINVALUE` and `MAXVALUE` for the ends; a key of several columns compares column by column. A `NULL` key fits no range partition.
 * The key is a list of column names or expressions of the columns (`PARTITION BY LIST (lower(b))`, `RANGE ((a + 1))`). A row is routed by evaluating the expression; partition pruning only works on keys that are plain columns.
-* A hash partition's number comes from this engine's own hash, so rows land in different partitions than in PostgreSQL.
+* In PostgreSQL mode a hash partition's number comes from PostgreSQL's own hash (`hashtext`, `hashint8`, combined across the key columns as `satisfies_hash_partition` does), so rows land in the partitions PostgreSQL puts them in. The hash of a number or text key is exact; other types are hashed by their text, so they can land elsewhere.
 * `CREATE TABLE ... (LIKE ...)`, `ATTACH PARTITION` and `DETACH PARTITION` are not available.
 
 ## Partition pruning

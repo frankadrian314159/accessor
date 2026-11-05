@@ -7307,3 +7307,126 @@ fn postgresql_plpgsql_execute_do_blocks_and_materialized_view_refresh() {
     db.execute("REFRESH MATERIALIZED VIEW mv").unwrap();
     assert_eq!(pg_one(&mut db, "SELECT count(*) FROM mv"), "5");
 }
+
+#[test]
+fn postgresql_two_argument_statistics_aggregates() {
+    let mut db = pg();
+    db.execute("CREATE TABLE xy (y float8, x float8)").unwrap();
+    db.execute("INSERT INTO xy VALUES (1,1),(2,2),(3,4),(4,5),(NULL,6),(7,NULL)").unwrap();
+    // a pair with a NULL in it is left out
+    assert_eq!(pg_one(&mut db, "SELECT regr_count(y, x) FROM xy"), "4");
+    assert_eq!(pg_one(&mut db, "SELECT regr_avgx(y, x) FROM xy"), "3");
+    assert_eq!(pg_one(&mut db, "SELECT regr_sxy(y, x) FROM xy"), "7");
+    assert_eq!(pg_one(&mut db, "SELECT round(corr(y, x)::numeric, 6) FROM xy"), "0.989949");
+    assert_eq!(pg_one(&mut db, "SELECT round(regr_slope(y, x)::numeric, 3) FROM xy"), "0.7");
+    assert_eq!(pg_one(&mut db, "SELECT round(regr_intercept(y, x)::numeric, 3) FROM xy"), "0.4");
+    assert_eq!(pg_one(&mut db, "SELECT round(covar_samp(y, x)::numeric, 4) FROM xy"), "2.3333");
+    assert_eq!(pg_one(&mut db, "SELECT corr(y, x) IS NULL FROM xy WHERE false"), "true");
+    // grouped
+    db.execute("CREATE TABLE g (k int, y float8, x float8)").unwrap();
+    db.execute("INSERT INTO g VALUES (1,1,1),(1,2,2),(2,5,1),(2,3,2)").unwrap();
+    let r = db.execute("SELECT k, regr_slope(y, x) FROM g GROUP BY k ORDER BY k").unwrap();
+    assert_eq!(r.rows[0][1].to_string(), "1");
+    assert_eq!(r.rows[1][1].to_string(), "-2");
+    // a group with no rows counts 0, as COUNT does, but the other statistics are NULL
+    db.execute("CREATE TABLE kk (k float8)").unwrap();
+    db.execute("INSERT INTO kk VALUES (1), (99)").unwrap();
+    let r = db.execute("SELECT k, (SELECT regr_count(y, x) FROM xy WHERE xy.x = kk.k), (SELECT regr_avgx(y, x) FROM xy WHERE xy.x = kk.k) IS NULL FROM kk ORDER BY k").unwrap();
+    assert_eq!(r.rows[0][1].to_string(), "1");
+    assert_eq!(r.rows[1][1].to_string(), "0");
+    assert_eq!(r.rows[1][2].to_string(), "true");
+}
+
+#[test]
+fn postgresql_hashes_uuids_intervals_enums_and_populate_record() {
+    let mut db = pg();
+    // the numbers PostgreSQL gives
+    assert_eq!(pg_one(&mut db, "SELECT hashint4(1)"), "-1905060026");
+    assert_eq!(pg_one(&mut db, "SELECT hashint8(1)"), "-1905060026");
+    assert_eq!(pg_one(&mut db, "SELECT justify_hours(interval '27 hours')"), "1 day 03:00:00");
+    assert_eq!(pg_one(&mut db, "SELECT justify_days(interval '35 days')"), "1 month 5 days");
+    assert_eq!(pg_one(&mut db, "SELECT justify_interval(interval '1 month -1 hour')"), "29 days 23:00:00");
+    assert_eq!(pg_one(&mut db, "SELECT uuid_extract_version(uuidv7())"), "7");
+    assert_eq!(pg_one(&mut db, "SELECT uuid_extract_timestamp('019535d9-3df7-79fb-b466-fa907fa17f9e')::text LIKE '2025-02-24%'"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT to_regcollation('nosuch') IS NULL"), "true");
+    db.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT enum_range(NULL::mood)"), "{sad,ok,happy}");
+    assert_eq!(pg_one(&mut db, "SELECT enum_range('sad'::mood, 'ok'::mood)"), "{sad,ok}");
+    assert_eq!(pg_one(&mut db, "SELECT enum_first(NULL::mood)"), "sad");
+    assert_eq!(pg_one(&mut db, "SELECT enum_last(NULL::mood)"), "happy");
+    db.execute("CREATE TYPE pop AS (a text, b int, c text)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT (jsonb_populate_record(NULL::pop, '{\"a\":\"x\",\"b\":3}')).b + 1"), "4");
+    let r = db.execute("SELECT * FROM jsonb_populate_recordset(NULL::pop, '[{\"a\":\"x\",\"b\":3},{\"a\":\"y\",\"c\":\"z\"}]')").unwrap();
+    assert_eq!(r.columns, vec!["a", "b", "c"]);
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[1][2].to_string(), "z");
+    // a hash partition holds the rows PostgreSQL puts in it
+    db.execute("CREATE TABLE hp (a int) PARTITION BY HASH (a)").unwrap();
+    db.execute("CREATE TABLE hp0 PARTITION OF hp FOR VALUES WITH (MODULUS 2, REMAINDER 0)").unwrap();
+    db.execute("CREATE TABLE hp1 PARTITION OF hp FOR VALUES WITH (MODULUS 2, REMAINDER 1)").unwrap();
+    db.execute("INSERT INTO hp SELECT * FROM generate_series(1, 20)").unwrap();
+    let in0 = pg_one(&mut db, "SELECT count(*) FROM hp0");
+    let in1 = pg_one(&mut db, "SELECT count(*) FROM hp1");
+    assert_eq!(in0.parse::<i64>().unwrap() + in1.parse::<i64>().unwrap(), 20);
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM hp0 WHERE satisfies_hash_partition('hp'::regclass, 2, 0, a)"), in0);
+}
+
+#[test]
+fn postgresql_settings_row_json_and_large_objects() {
+    let mut db = pg();
+    assert_eq!(pg_one(&mut db, "SELECT current_setting('work_mem')"), "4MB");
+    db.execute("SET my.flag = 'on'").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT current_setting('my.flag')"), "on");
+    assert_eq!(pg_one(&mut db, "SELECT current_setting('my.other', true) IS NULL"), "true");
+    assert!(db.execute("SELECT current_setting('nope')").is_err());
+    db.execute("CREATE TABLE rt (id int, name text)").unwrap();
+    db.execute("INSERT INTO rt VALUES (1, 'a')").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT row_to_json(rt) FROM rt"), "{\"id\":1,\"name\":\"a\"}");
+    assert_eq!(pg_one(&mut db, "SELECT row_to_json(ROW(1, 'x'))"), "{\"f1\":1,\"f2\":\"x\"}");
+    db.execute("SELECT lo_from_bytea(7000, 'hello'::bytea)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT lo_get(7000)"), "hello");
+    assert_eq!(pg_one(&mut db, "SELECT lo_get(7000, 1, 3)"), "ell");
+    db.execute("SELECT lo_put(7000, 5, ' world'::bytea)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT lo_get(7000)"), "hello world");
+    assert_eq!(pg_one(&mut db, "SELECT lo_unlink(7000)"), "1");
+    assert!(db.execute("SELECT lo_get(7000)").is_err());
+}
+
+#[test]
+fn postgresql_plpgsql_cursors_found_and_diagnostics() {
+    let mut db = pg();
+    db.execute("CREATE TABLE t (a int, b text)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')").unwrap();
+    db.execute("CREATE FUNCTION nf() RETURNS int AS $$ DECLARE r record; BEGIN SELECT * INTO r FROM t WHERE a = 99; IF NOT FOUND THEN RETURN -1; END IF; RETURN 1; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT nf()"), "-1");
+    db.execute("CREATE FUNCTION upd() RETURNS int AS $$ DECLARE n int; BEGIN UPDATE t SET a = a + 10 WHERE a > 1; GET DIAGNOSTICS n = ROW_COUNT; RETURN n; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT upd()"), "2");
+    db.execute("CREATE FUNCTION walk() RETURNS text AS $$ DECLARE c CURSOR FOR SELECT a, b FROM t ORDER BY a; x int; y text; acc text := ''; BEGIN OPEN c; LOOP FETCH c INTO x, y; EXIT WHEN NOT FOUND; acc := acc || x::text || y || ','; END LOOP; CLOSE c; RETURN acc; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT walk()"), "1x,12y,13z,");
+    db.execute(
+        "CREATE FUNCTION nav(lim int) RETURNS text AS $$ DECLARE c CURSOR (m int) FOR SELECT a FROM t WHERE a >= m ORDER BY a; r record; x int; acc text := ''; BEGIN OPEN c(lim); FETCH c INTO r; acc := acc || r.a::text; FETCH LAST FROM c INTO x; acc := acc || '/' || x::text; FETCH PRIOR FROM c INTO x; acc := acc || '/' || x::text; MOVE FIRST IN c; FETCH NEXT FROM c INTO x; acc := acc || '/' || x::text; CLOSE c; RETURN acc; END $$ LANGUAGE plpgsql",
+    )
+    .unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT nav(12)"), "12/13/12/13");
+    db.execute("CREATE FUNCTION rc() RETURNS text AS $$ DECLARE cc refcursor; v text; BEGIN OPEN cc FOR SELECT b FROM t ORDER BY a DESC; FETCH cc INTO v; RETURN v; END $$ LANGUAGE plpgsql").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT rc()"), "z");
+    db.execute("CREATE FUNCTION nocur() RETURNS int AS $$ DECLARE c CURSOR FOR SELECT a FROM t; x int; BEGIN FETCH c INTO x; RETURN x; END $$ LANGUAGE plpgsql").unwrap();
+    assert!(db.execute("SELECT nocur()").is_err());
+}
+
+#[test]
+fn postgresql_xpath_text_search_debug_and_stats_restore() {
+    let mut db = pg();
+    assert_eq!(pg_one(&mut db, "SELECT xpath('/a/b', '<a><b>1</b><b>2</b></a>')"), "{<b>1</b>,<b>2</b>}");
+    assert_eq!(pg_one(&mut db, "SELECT xpath_exists('/a/c', '<a><b>1</b></a>')"), "false");
+    assert_eq!(pg_one(&mut db, "SELECT ts_lexize('english_stem', 'stars')"), "{star}");
+    assert_eq!(pg_one(&mut db, "SELECT ts_lexize('english_stem', 'a')"), "{}");
+    let r = db.execute("SELECT alias, token, lexemes FROM ts_debug('english', 'a fat cat')").unwrap();
+    assert_eq!(r.rows.len(), 5);
+    assert_eq!(r.rows[2][1].to_string(), "fat");
+    assert_eq!(r.rows[2][2].to_string(), "{fat}");
+    assert_eq!(r.rows[1][0].to_string(), "blank");
+    db.execute("CREATE TABLE s (a int)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 's', 'relpages', 3::integer)"), "true");
+    assert!(db.execute("SELECT pg_restore_relation_stats('relname')").is_err());
+}

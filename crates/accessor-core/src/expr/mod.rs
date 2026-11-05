@@ -15,6 +15,7 @@ pub mod xmlfuncs;
 pub mod myfuncs;
 pub mod pgfuncs;
 pub mod pgmore;
+pub(crate) mod pghash;
 
 use std::borrow::Cow;
 use std::collections::HashSet;

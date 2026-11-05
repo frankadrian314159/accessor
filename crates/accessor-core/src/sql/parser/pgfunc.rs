@@ -455,6 +455,9 @@ impl<'a> Parser<'a> {
             handlers: Vec::new(),
             conditions: Vec::new(),
         };
+        if language == "plpgsql" {
+            names.all.push("found".to_string());
+        }
         if is_trigger {
             if language != "plpgsql" {
                 return Err(Error::syntax("a trigger function is written in plpgsql"));
@@ -617,8 +620,41 @@ impl<'a> Parser<'a> {
                 }
                 let name = self.ident()?;
                 self.eat_kw("CONSTANT");
-                if self.peek_kw("CURSOR") || self.peek_kw("REFCURSOR") || self.peek_kw("SCROLL") || self.peek_kw("NO") && self.peek_kw_at(1, "SCROLL") {
-                    return Err(Error::syntax("cursor variables are not supported"));
+                if self.eat_kw("NO") {
+                    self.expect_kw("SCROLL")?;
+                } else {
+                    self.eat_kw("SCROLL");
+                }
+                if self.eat_kw("REFCURSOR") {
+                    self.expect_sym(";")?;
+                    names.all.push(name.clone());
+                    out.push(ProcStmt::DeclarePgCursor { name, params: Vec::new(), select: None });
+                    continue;
+                }
+                if self.eat_kw("CURSOR") {
+                    let mut params = Vec::new();
+                    if self.eat_sym("(") {
+                        loop {
+                            params.push(self.ident()?);
+                            self.pg_type()?;
+                            if !self.eat_sym(",") {
+                                break;
+                            }
+                        }
+                        self.expect_sym(")")?;
+                    }
+                    if !self.eat_kw("FOR") {
+                        self.expect_kw("IS")?;
+                    }
+                    for p in &params {
+                        names.all.push(p.clone());
+                    }
+                    let mut st = self.statement()?;
+                    names.statement(&mut st)?;
+                    let Statement::Select(select) = st else { return Err(Error::syntax("a cursor is declared for a SELECT")) };
+                    self.expect_sym(";")?;
+                    out.push(ProcStmt::DeclarePgCursor { name, params, select: Some(Box::new(select)) });
+                    continue;
                 }
                 if self.eat_kw("RECORD") {
                     self.expect_sym(";")?;
@@ -933,8 +969,84 @@ impl<'a> Parser<'a> {
             out.push(ProcStmt::Execute { sql, using, targets, record, strict });
             return self.end_stmt();
         }
-        if self.peek_kw("OPEN") || self.peek_kw("FETCH") || self.peek_kw("CLOSE") || self.peek_kw("GET") {
-            return Err(Error::syntax("EXECUTE, cursors and GET DIAGNOSTICS are not supported"));
+        if self.eat_kw("OPEN") {
+            let name = self.ident()?;
+            if self.eat_kw("FOR") {
+                if self.eat_kw("EXECUTE") {
+                    let sql = self.pl_expr(names)?;
+                    let using = self.pl_using(names)?;
+                    out.push(ProcStmt::OpenPg { name, args: Vec::new(), query: None, dynamic: Some((sql, using)) });
+                } else {
+                    let mut st = self.statement()?;
+                    names.statement(&mut st)?;
+                    let Statement::Select(sel) = st else { return Err(Error::syntax("OPEN ... FOR needs a SELECT")) };
+                    out.push(ProcStmt::OpenPg { name, args: Vec::new(), query: Some(Box::new(sel)), dynamic: None });
+                }
+                return self.end_stmt();
+            }
+            let mut args = Vec::new();
+            if self.eat_sym("(") {
+                loop {
+                    args.push(self.pl_expr(names)?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            }
+            out.push(ProcStmt::OpenPg { name, args, query: None, dynamic: None });
+            return self.end_stmt();
+        }
+        if self.eat_kw("CLOSE") {
+            out.push(ProcStmt::CloseCursor(self.ident()?));
+            return self.end_stmt();
+        }
+        if self.peek_kw("FETCH") || (self.peek_kw("MOVE") && !matches!(self.peek_at(1), Tok::Sym(_))) {
+            let Statement::Fetch { name, direction, move_only } = self.fetch_cursor()? else { unreachable!("FETCH gives a fetch") };
+            let mut targets = Vec::new();
+            if !move_only {
+                self.expect_kw("INTO")?;
+                loop {
+                    targets.push(self.ident()?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+            }
+            let record = targets.len() == 1 && names.records.iter().any(|r| r.eq_ignore_ascii_case(&targets[0]));
+            if !record {
+                for t in &targets {
+                    if !names.has(t) {
+                        return Err(Error::syntax(format!("'{t}' is not a declared variable or parameter")));
+                    }
+                }
+            }
+            out.push(ProcStmt::FetchPg { cursor: name, direction, move_only, targets, record });
+            return self.end_stmt();
+        }
+        if self.peek_kw("GET") && (self.peek_kw_at(1, "DIAGNOSTICS") || self.peek_kw_at(1, "CURRENT") || self.peek_kw_at(1, "STACKED")) {
+            self.advance();
+            let stacked = self.eat_kw("STACKED");
+            if !stacked {
+                self.eat_kw("CURRENT");
+            }
+            self.expect_kw("DIAGNOSTICS")?;
+            let mut items = Vec::new();
+            loop {
+                let var = self.ident()?;
+                if !names.has(&var) {
+                    return Err(Error::syntax(format!("'{var}' is not a declared variable or parameter")));
+                }
+                if !self.eat_sym(":=") {
+                    self.expect_sym("=")?;
+                }
+                items.push((var, self.ident()?.to_ascii_uppercase()));
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            out.push(ProcStmt::PgDiagnostics { stacked, items });
+            return self.end_stmt();
         }
         // NEW.col := expr (a trigger function changing the row)
         if names.trigger

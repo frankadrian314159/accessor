@@ -39,6 +39,7 @@ pub const NAMES: &[(&str, usize, usize)] = &[
     ("TSQUERY_OR", 2, 2),
     ("TSQUERY_PHRASE", 2, 3),
     ("TSQUERY_NOT", 1, 1),
+    ("TS_LEXIZE", 2, 2),
 ];
 
 /// The registered name of a function of this module.
@@ -458,6 +459,64 @@ fn tokenize(text: &str, cfg: Config) -> Vec<(Option<String>, u32)> {
         out.push((lexeme, pos));
     }
     out
+}
+
+/// The rows of `ts_debug(config, text)`: `(alias, description, token, dictionaries, dictionary, lexemes)` for each token.
+pub(crate) fn debug_rows(config: Option<&str>, text: &str) -> Vec<Vec<Value>> {
+    let cfg = config_of(config.map(Value::text).as_ref());
+    let dict = if cfg == Config::English { "english_stem" } else { "simple" };
+    let list = |items: Vec<Value>| Value::Array(std::sync::Arc::new(items));
+    let chars: Vec<char> = text.chars().collect();
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        let is_word = chars[i].is_alphanumeric();
+        while i < chars.len() {
+            let c = chars[i];
+            let joins = is_word && (c == '.' || c == '-') && i > start && chars[i - 1].is_ascii_digit() && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit());
+            if c.is_alphanumeric() == is_word || joins {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let token: String = chars[start..i].iter().collect();
+        if !is_word {
+            rows.push(vec![Value::text("blank"), Value::text("Space symbols"), Value::text(&token), list(Vec::new()), Value::Null, Value::Null]);
+            continue;
+        }
+        let (alias, desc) = if token.chars().all(|c| c.is_ascii_digit()) {
+            ("uint", "Unsigned integer")
+        } else if token.chars().any(|c| c.is_ascii_digit()) && token.chars().any(|c| c == '.' || c == '-') {
+            ("float", "Decimal notation")
+        } else if token.chars().any(|c| c.is_ascii_digit()) {
+            ("numword", "Word, letters and digits")
+        } else if token.is_ascii() {
+            ("asciiword", "Word, all ASCII")
+        } else {
+            ("word", "Word, all letters")
+        };
+        // numbers go to the simple dictionary, words to the one of the configuration
+        let (dname, lexeme) = if matches!(alias, "uint" | "float") {
+            ("simple", Some(token.to_lowercase()))
+        } else {
+            match cfg {
+                Config::Simple => ("simple", Some(token.to_lowercase())),
+                Config::English if STOP.contains(&token.to_lowercase().as_str()) => (dict, None),
+                Config::English => (dict, Some(stem(&token.to_lowercase()))),
+            }
+        };
+        rows.push(vec![
+            Value::text(alias),
+            Value::text(desc),
+            Value::text(&token),
+            list(vec![Value::text(dname)]),
+            Value::text(dname),
+            list(lexeme.map(|l| Value::text(&l)).into_iter().collect()),
+        ]);
+    }
+    rows
 }
 
 fn text_to_vector(text: &str, cfg: Config) -> Vec<Lex> {
@@ -1103,6 +1162,18 @@ pub fn call(name: &str, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 }
             }
             Value::text(&write_vector(&doc))
+        }
+        "TS_LEXIZE" => {
+            let dict = text_of(v(0)).to_ascii_lowercase();
+            let dict = dict.rsplit('.').next().unwrap_or("").trim_matches('"').to_string();
+            let word = text_of(v(1)).to_lowercase();
+            let lexemes: Vec<Value> = match dict.as_str() {
+                "simple" => vec![Value::text(&word)],
+                "english_stem" if STOP.contains(&word.as_str()) => Vec::new(),
+                "english_stem" => vec![Value::text(&stem(&word))],
+                other => return Err(Error::catalog(format!("text search dictionary \"{other}\" does not exist"))),
+            };
+            Value::Array(std::sync::Arc::new(lexemes))
         }
         "STRIP" => {
             let mut doc = vector_of(v(0))?;

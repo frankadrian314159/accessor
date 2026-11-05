@@ -456,6 +456,14 @@ pub enum ProcStmt {
     ForExecute { name: String, sql: Expr, using: Vec<Expr>, body: Vec<ProcStmt> },
     /// `RETURN QUERY EXECUTE text [USING args]`
     ReturnQueryExecute { sql: Expr, using: Vec<Expr> },
+    /// plpgsql: `name [SCROLL] CURSOR [(param type, ...)] FOR query`, or a `refcursor` variable (no query yet).
+    DeclarePgCursor { name: String, params: Vec<String>, select: Option<Box<Select>> },
+    /// plpgsql: `OPEN c [(args)]`, `OPEN c FOR query` or `OPEN c FOR EXECUTE text [USING args]`.
+    OpenPg { name: String, args: Vec<Expr>, query: Option<Box<Select>>, dynamic: Option<(Expr, Vec<Expr>)> },
+    /// plpgsql: `FETCH [direction] [FROM | IN] c INTO targets` (or `MOVE`, which has none); `record` says the one target is a record.
+    FetchPg { cursor: String, direction: FetchDirection, move_only: bool, targets: Vec<String>, record: bool },
+    /// plpgsql: `GET [CURRENT | STACKED] DIAGNOSTICS var = item, ...`
+    PgDiagnostics { stacked: bool, items: Vec<(String, String)> },
     /// `BEGIN ... END` with handlers or a label; a plain block is just its statements.
     Block { label: Option<String>, body: Vec<ProcStmt>, handlers: Vec<Handler> },
     /// `label: WHILE | LOOP | REPEAT ...`

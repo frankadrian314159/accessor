@@ -102,7 +102,7 @@ pub(crate) fn decorrelate(spec: &CorrSpec) -> Option<Decorrelated> {
                 if !matches!(kind, CorrKind::Scalar) || args.iter().any(contains_agg) {
                     return None;
                 }
-                counts = func == AggFn::Count;
+                counts = func.counts();
                 aggregate = true;
             }
             Some(expr.clone())

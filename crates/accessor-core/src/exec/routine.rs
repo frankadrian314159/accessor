@@ -249,6 +249,8 @@ struct Frame {
     rec_cols: HashMap<String, Vec<String>>,
     /// The cursors declared, with the rows of each that is open and how many were fetched.
     cursors: HashMap<String, (crate::sql::ast::Select, Option<(Vec<Vec<Value>>, usize)>)>,
+    /// plpgsql's cursors.
+    pg_cursors: HashMap<String, PgCursor>,
     /// The label of the loop about to run.
     loop_label: Option<String>,
     /// The condition a handler is dealing with (what `GET DIAGNOSTICS` and `RESIGNAL` read).
@@ -257,9 +259,22 @@ struct Frame {
     handlers: Vec<Handler>,
 }
 
+/// A plpgsql cursor: its query (none for a `refcursor` that was not opened yet), the parameters it takes, and once open
+/// the rows it gives and where it stands (0 before the first row, `rows.len() + 1` after the last).
+#[derive(Clone)]
+struct PgCursor {
+    select: Option<crate::sql::ast::Select>,
+    params: Vec<String>,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    pos: usize,
+    open: bool,
+}
+
 impl Frame {
-    fn new(vars: HashMap<String, Value>) -> Frame {
-        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), loop_label: None, diag: None, handlers: Vec::new() }
+    fn new(mut vars: HashMap<String, Value>) -> Frame {
+        vars.entry("found".to_string()).or_insert(Value::Bool(false));
+        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), pg_cursors: HashMap::new(), loop_label: None, diag: None, handlers: Vec::new() }
     }
 }
 
@@ -806,6 +821,118 @@ impl Database {
                     c.1 = Some((rows, 0));
                 }
             }
+            ProcStmt::DeclarePgCursor { name, params, select } => {
+                frame.pg_cursors.insert(
+                    name.to_ascii_lowercase(),
+                    PgCursor { select: select.as_deref().cloned(), params: params.clone(), columns: Vec::new(), rows: Vec::new(), pos: 0, open: false },
+                );
+            }
+            ProcStmt::OpenPg { name, args, query, dynamic } => {
+                let k = name.to_ascii_lowercase();
+                let cur = frame.pg_cursors.get(&k).cloned().ok_or_else(|| Error::runtime(format!("cursor \"{name}\" does not exist")))?;
+                if cur.open {
+                    return Err(Error::runtime(format!("cursor \"{name}\" already in use")));
+                }
+                let (columns, rows) = if let Some(q) = query {
+                    self.record_query(q, frame)?
+                } else if let Some((sql, using)) = dynamic {
+                    let r = self.dynamic_query(sql, using, frame)?;
+                    (r.columns, r.rows)
+                } else {
+                    let sel = cur.select.clone().ok_or_else(|| Error::runtime(format!("cursor \"{name}\" has no query")))?;
+                    if args.len() != cur.params.len() {
+                        return Err(Error::runtime(format!("cursor \"{name}\" takes {} argument(s), not {}", cur.params.len(), args.len())));
+                    }
+                    for (p, a) in cur.params.iter().zip(args) {
+                        let v = self.eval_in(a, frame)?;
+                        frame.vars.insert(p.to_ascii_lowercase(), v);
+                    }
+                    self.record_query(&sel, frame)?
+                };
+                if let Some(c) = frame.pg_cursors.get_mut(&k) {
+                    c.columns = columns;
+                    c.rows = rows;
+                    c.pos = 0;
+                    c.open = true;
+                }
+            }
+            ProcStmt::FetchPg { cursor, direction, move_only, targets, record } => {
+                use crate::sql::ast::FetchDirection as D;
+                let k = cursor.to_ascii_lowercase();
+                let Some(cur) = frame.pg_cursors.get_mut(&k).filter(|c| c.open) else {
+                    return Err(Error::runtime(format!("cursor \"{cursor}\" is not open")));
+                };
+                let (len, pos) = (cur.rows.len() as i64, cur.pos as i64);
+                let target = match direction {
+                    D::Next | D::Forward(None) => pos + 1,
+                    D::Prior | D::Backward(None) => pos - 1,
+                    D::First => 1,
+                    D::Last => len,
+                    D::Absolute(n) if *n > 0 => *n,
+                    D::Absolute(n) if *n < 0 => len + 1 + n,
+                    D::Absolute(_) => 0,
+                    D::Relative(n) | D::Forward(Some(n)) => pos + n,
+                    D::Backward(Some(n)) => pos - n,
+                };
+                cur.pos = target.clamp(0, len + 1) as usize;
+                let row = (1..=len).contains(&target).then(|| cur.rows[(target - 1) as usize].clone());
+                let columns = cur.columns.clone();
+                frame.vars.insert("found".to_string(), Value::Bool(row.is_some()));
+                if !move_only {
+                    if *record {
+                        self.set_record(frame, &targets[0], &columns, row);
+                    } else {
+                        for (i, t) in targets.iter().enumerate() {
+                            let mut v = row.as_ref().and_then(|r| r.get(i).cloned()).unwrap_or(Value::Null);
+                            let tk = t.to_ascii_lowercase();
+                            if let Some(ty) = frame.types.get(&tk) {
+                                v = v.coerce_to(*ty)?;
+                            }
+                            frame.vars.insert(tk, v);
+                        }
+                    }
+                }
+            }
+            ProcStmt::PgDiagnostics { stacked, items } => {
+                for (var, item) in items {
+                    let value = if *stacked {
+                        let Some(d) = frame.diag.as_ref() else {
+                            return Err(Error::runtime("GET STACKED DIAGNOSTICS cannot be used outside an exception handler"));
+                        };
+                        match item.as_str() {
+                            "MESSAGE_TEXT" | "RETURNED_SQLSTATE" => d.item(item).map_or(Value::Null, |t| Value::text(&t)),
+                            "PG_EXCEPTION_CONTEXT" => Value::text(""),
+                            "PG_EXCEPTION_DETAIL" => d.item("DETAIL").map_or(Value::Null, |t| Value::text(&t)),
+                            "PG_EXCEPTION_HINT" => d.item("HINT").map_or(Value::Null, |t| Value::text(&t)),
+                            "COLUMN_NAME" | "CONSTRAINT_NAME" | "PG_DATATYPE_NAME" | "TABLE_NAME" | "SCHEMA_NAME" => d.item(item).map_or(Value::Null, |t| Value::text(&t)),
+                            other => return Err(Error::syntax(format!("unrecognized GET DIAGNOSTICS item: {other}"))),
+                        }
+                    } else {
+                        match item.as_str() {
+                            "ROW_COUNT" => Value::Int(frame.last.as_ref().map_or(0, |r| if r.affected > 0 { r.affected as i64 } else { r.rows.len() as i64 })),
+                            "RESULT_OID" => Value::Int(0),
+                            "PG_CONTEXT" => Value::text(""),
+                            other => return Err(Error::syntax(format!("unrecognized GET DIAGNOSTICS item: {other}"))),
+                        }
+                    };
+                    let k = var.to_ascii_lowercase();
+                    let value = match frame.types.get(&k) {
+                        Some(t) if !value.is_null() => value.coerce_to(*t)?,
+                        _ => value,
+                    };
+                    frame.vars.insert(k, value);
+                }
+            }
+            ProcStmt::CloseCursor(name) if frame.pg_cursors.contains_key(&name.to_ascii_lowercase()) => {
+                let k = name.to_ascii_lowercase();
+                match frame.pg_cursors.get_mut(&k) {
+                    Some(c) if c.open => {
+                        c.open = false;
+                        c.rows.clear();
+                    }
+                    _ => return Err(Error::runtime(format!("cursor \"{name}\" is not open"))),
+                }
+            }
             ProcStmt::CloseCursor(name) => {
                 let k = name.to_ascii_lowercase();
                 match frame.cursors.get_mut(&k) {
@@ -847,6 +974,7 @@ impl Database {
                     return Err(Error::runtime(if rows.is_empty() { "query returned no rows" } else { "query returned more than one row" }));
                 }
                 let row = rows.into_iter().next();
+                frame.vars.insert("found".to_string(), Value::Bool(row.is_some()));
                 if targets.is_empty() {
                     self.set_record(frame, name, &columns, row);
                 } else {
@@ -862,6 +990,7 @@ impl Database {
             }
             ProcStmt::ForRecord { name, select, body } => {
                 let (columns, rows) = self.record_query(select, frame)?;
+                frame.vars.insert("found".to_string(), Value::Bool(!rows.is_empty()));
                 for row in rows {
                     frame.iterations += 1;
                     if frame.iterations > MAX_ITERATIONS {
@@ -894,6 +1023,7 @@ impl Database {
                         return Err(Error::runtime(if r.rows.is_empty() { "query returned no rows" } else { "query returned more than one row" }));
                     }
                     let row = r.rows.into_iter().next();
+                    frame.vars.insert("found".to_string(), Value::Bool(row.is_some()));
                     if *record {
                         self.set_record(frame, &targets[0], &r.columns, row);
                     } else {
@@ -1016,7 +1146,9 @@ impl Database {
                         frame.vars.insert(k, v);
                     }
                 }
-                frame.last = Some(result?);
+                let result = result?;
+                frame.vars.insert("found".to_string(), Value::Bool(result.affected > 0 || !result.rows.is_empty()));
+                frame.last = Some(result);
             }
         }
         Ok(Flow::Normal)

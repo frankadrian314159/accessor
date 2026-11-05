@@ -47,6 +47,25 @@ pub enum AggFn {
     RangeIntersect,
     /// `range_agg`: the multirange of the ranges.
     RangeAgg,
+    /// `corr`, `covar_pop`, `covar_samp` and the `regr_*` family: two arguments (y, x), fed packed in one array.
+    Bivariate(Bi),
+}
+
+/// Which of the two-argument statistics an aggregate gives.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Bi {
+    Corr,
+    CovarPop,
+    CovarSamp,
+    Count,
+    AvgX,
+    AvgY,
+    Sxx,
+    Syy,
+    Sxy,
+    Slope,
+    Intercept,
+    R2,
 }
 
 impl AggFn {
@@ -74,8 +93,25 @@ impl AggFn {
             "BIT_XOR" => AggFn::BitXor,
             "RANGE_INTERSECT_AGG" => AggFn::RangeIntersect,
             "RANGE_AGG" => AggFn::RangeAgg,
+            "CORR" => AggFn::Bivariate(Bi::Corr),
+            "COVAR_POP" => AggFn::Bivariate(Bi::CovarPop),
+            "COVAR_SAMP" => AggFn::Bivariate(Bi::CovarSamp),
+            "REGR_COUNT" => AggFn::Bivariate(Bi::Count),
+            "REGR_AVGX" => AggFn::Bivariate(Bi::AvgX),
+            "REGR_AVGY" => AggFn::Bivariate(Bi::AvgY),
+            "REGR_SXX" => AggFn::Bivariate(Bi::Sxx),
+            "REGR_SYY" => AggFn::Bivariate(Bi::Syy),
+            "REGR_SXY" => AggFn::Bivariate(Bi::Sxy),
+            "REGR_SLOPE" => AggFn::Bivariate(Bi::Slope),
+            "REGR_INTERCEPT" => AggFn::Bivariate(Bi::Intercept),
+            "REGR_R2" => AggFn::Bivariate(Bi::R2),
             _ => return None,
         })
+    }
+
+    /// Does the aggregate give 0 (not NULL) over no rows?
+    pub fn counts(self) -> bool {
+        matches!(self, AggFn::Count | AggFn::Bivariate(Bi::Count))
     }
 
     pub fn label(self) -> &'static str {
@@ -101,6 +137,7 @@ impl AggFn {
             AggFn::BitXor => "BitXor",
             AggFn::RangeIntersect => "RangeIntersect",
             AggFn::RangeAgg => "RangeAgg",
+            AggFn::Bivariate(_) => "Bivariate",
         }
     }
 }
@@ -132,6 +169,10 @@ pub struct AggState {
     sep: String,
     mean: f64,
     m2: f64,
+    /// The running mean of y, its sum of squares and the co-moment of x and y (the two-argument statistics).
+    mean_y: f64,
+    m2_y: f64,
+    cxy: f64,
     /// The bits of `BIT_AND` / `BIT_OR` / `BIT_XOR`: all ones to start with for the first, zero for the others.
     bits: u64,
 }
@@ -150,6 +191,9 @@ impl AggState {
             sep: spec.sep.clone().unwrap_or_else(|| ",".into()),
             mean: 0.0,
             m2: 0.0,
+            mean_y: 0.0,
+            m2_y: 0.0,
+            cxy: 0.0,
             bits: if spec.func == AggFn::BitAnd { u64::MAX } else { 0 },
         }
     }
@@ -243,6 +287,26 @@ impl AggState {
             AggFn::RangeAgg => self.items.push(v.clone()),
             AggFn::JsonArrayAgg => self.parts.push(crate::json::to_text(&crate::json::from_value(v))),
             AggFn::ArrayAgg => unreachable!("ARRAY_AGG is fed before the NULL check"),
+            AggFn::Bivariate(_) => {
+                // (y, x) packed by the binder; a pair with a NULL in it is skipped
+                let Value::Array(pair) = v else { return Err(Error::type_err("a two-argument aggregate needs two arguments")) };
+                let num = |p: &Value| -> Result<Option<f64>> {
+                    if p.is_null() {
+                        return Ok(None);
+                    }
+                    p.num_lenient().and_then(|n| n.to_f64()).map(Some).ok_or_else(|| Error::type_err(format!("cannot compute a statistic over '{p}'")))
+                };
+                let (Some(y), Some(x)) = (num(&pair[0])?, num(&pair[1])?) else { return Ok(()) };
+                self.count += 1;
+                let n = self.count as f64;
+                let dx = x - self.mean;
+                self.mean += dx / n;
+                let dy = y - self.mean_y;
+                self.mean_y += dy / n;
+                self.m2 += dx * (x - self.mean);
+                self.m2_y += dy * (y - self.mean_y);
+                self.cxy += dx * (y - self.mean_y);
+            }
             AggFn::StddevPop | AggFn::StddevSamp | AggFn::VarPop | AggFn::VarSamp => {
                 let x = v
                     .num_lenient()
@@ -347,6 +411,31 @@ impl AggState {
                 } else {
                     Value::Json(format!("[{}]", self.parts.join(",")).as_str().into())
                 }
+            }
+            AggFn::Bivariate(kind) => {
+                let n = self.count as f64;
+                if kind == Bi::Count {
+                    return Value::Int(self.count);
+                }
+                if self.count == 0 {
+                    return Value::Null;
+                }
+                let (sxx, syy, sxy) = (self.m2, self.m2_y, self.cxy);
+                let r = match kind {
+                    Bi::AvgX => Some(self.mean),
+                    Bi::AvgY => Some(self.mean_y),
+                    Bi::Sxx => Some(sxx),
+                    Bi::Syy => Some(syy),
+                    Bi::Sxy => Some(sxy),
+                    Bi::CovarPop => Some(sxy / n),
+                    Bi::CovarSamp => (self.count >= 2).then(|| sxy / (n - 1.0)),
+                    Bi::Corr => (sxx > 0.0 && syy > 0.0).then(|| (sxy / (sxx * syy).sqrt()).clamp(-1.0, 1.0)),
+                    Bi::Slope => (sxx > 0.0).then(|| sxy / sxx),
+                    Bi::Intercept => (sxx > 0.0).then(|| self.mean_y - sxy / sxx * self.mean),
+                    Bi::R2 => (sxx > 0.0).then(|| if syy == 0.0 { 1.0 } else { (sxy * sxy / (sxx * syy)).min(1.0) }),
+                    Bi::Count => unreachable!("handled above"),
+                };
+                r.and_then(Value::from_f64).unwrap_or(Value::Null)
             }
             AggFn::StddevPop | AggFn::StddevSamp | AggFn::VarPop | AggFn::VarSamp => {
                 let n = self.count as f64;

@@ -275,6 +275,48 @@ impl Database {
                 }
                 Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(out), alias: alias.clone(), names })
             }
+            TableFactor::Function { name, args, alias, columns }
+                if matches!(name.as_str(), "JSON_POPULATE_RECORD" | "JSONB_POPULATE_RECORD" | "JSON_POPULATE_RECORDSET" | "JSONB_POPULATE_RECORDSET")
+                    && args.len() == 2
+                    && crate::sql::parser::populate_type(args).is_some() =>
+            {
+                // the rows of a composite type filled from a JSON object (or from each object of a JSON array)
+                let type_name = crate::sql::parser::populate_type(args).expect("checked");
+                let fields = crate::expr::composite::fields_of(&type_name).ok_or_else(|| Error::catalog(format!("type \"{type_name}\" does not exist")))?;
+                let scope = Scope::default();
+                let base = Binder::new(self, &scope, depth).bind(&args[0])?.eval(&[])?.into_owned();
+                let doc = Binder::new(self, &scope, depth).bind(&args[1])?.eval(&[])?.into_owned();
+                let base = (!base.is_null()).then(|| base.to_string());
+                let mut rows: Vec<Row> = Vec::new();
+                if !doc.is_null() {
+                    let docs = match (crate::json::document(&doc)?, name.ends_with("SET")) {
+                        (serde_json::Value::Array(a), true) => a,
+                        (_, true) => return Err(Error::runtime("cannot call populate_recordset on a non-array")),
+                        (one, false) => vec![one],
+                    };
+                    for d in &docs {
+                        let items = crate::expr::pgmore::populate_fields(&type_name, base.as_deref().filter(|_| !name.ends_with("SET")), d)?;
+                        rows.push(
+                            items
+                                .into_iter()
+                                .zip(&fields)
+                                .map(|(item, (_, ty))| match item {
+                                    None => Ok(Value::Null),
+                                    Some(s) => match crate::value::DataType::from_sql_name(ty) {
+                                        Some((dt, _)) if dt != crate::value::DataType::Text => Value::text(&s).coerce_to(dt),
+                                        _ => Ok(Value::text(&s)),
+                                    },
+                                })
+                                .collect::<Result<Row>>()?,
+                        );
+                    }
+                } else if !name.ends_with("SET") {
+                    rows.push(vec![Value::Null; fields.len()]);
+                }
+                let cols: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                let names = rename_columns(cols, columns, alias)?;
+                Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias: alias.clone(), names })
+            }
             TableFactor::Function { name, args, alias, columns } => {
                 let scope = Scope::default();
                 let mut vals = Vec::with_capacity(args.len());
@@ -455,6 +497,7 @@ impl Database {
             "JSONB_EACH" | "JSON_EACH_TEXT" | "JSONB_EACH_TEXT" => vec!["key".into(), "value".into()],
             "PG_PARTITION_TREE" => vec!["relid".into(), "parentrelid".into(), "isleaf".into(), "level".into()],
             "PG_PARTITION_ANCESTORS" => vec!["relid".into()],
+            "TS_DEBUG" => ["alias", "description", "token", "dictionaries", "dictionary", "lexemes"].map(String::from).to_vec(),
             "RANGE_MINUS_MULTI" => vec!["range_minus_multi".into()],
             "MULTIRANGE_MINUS_MULTI" => vec!["multirange_minus_multi".into()],
             "PG_INPUT_ERROR_INFO" => vec!["message".into(), "detail".into(), "hint".into(), "sql_error_code".into()],
@@ -783,6 +826,13 @@ impl Database {
                     _ => return Err(Error::runtime("cannot call jsonb_each on a non-object")),
                 };
                 Ok((cols, rows))
+            }
+            "TS_DEBUG" => {
+                if args.is_empty() || args.len() > 2 || args.iter().any(Value::is_null) {
+                    return Ok((cols, Vec::new()));
+                }
+                let (config, doc) = if args.len() == 2 { (Some(args[0].to_string()), args[1].to_string()) } else { (None, args[0].to_string()) };
+                Ok((cols, crate::expr::tsearch::debug_rows(config.as_deref(), &doc)))
             }
             "PG_PARTITION_TREE" => {
                 if args.len() != 1 || args[0].is_null() {
@@ -1918,7 +1968,7 @@ impl Database {
     /// it, and the plain rewrite is used instead.
     fn crosstab_one_pass(&self, sel: &Select, ct: &Crosstab, depth: u32) -> Result<Option<QueryResult>> {
         let Expr::Function { name, args, star, .. } = &ct.agg else { return Ok(None) };
-        let missing = if AggFn::from_name(name) == Some(AggFn::Count) { Value::Int(0) } else { Value::Null };
+        let missing = if AggFn::from_name(name).is_some_and(AggFn::counts) { Value::Int(0) } else { Value::Null };
         if sel.distinct || !sel.group_sets.is_empty() || !sel.unions.is_empty() || args.len() > 1 || (*star && !args.is_empty()) {
             return Ok(None);
         }
@@ -2281,6 +2331,8 @@ pub(crate) fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, E
                 let name = match (alias, expr) {
                     (Some(a), _) => a.clone(),
                     (None, Expr::Column { name, .. }) => name.clone(),
+                    // the two-argument statistics are named as PostgreSQL names them: for the function
+                    (None, Expr::Function { name, .. }) if matches!(AggFn::from_name(name), Some(AggFn::Bivariate(_))) => name.to_ascii_lowercase(),
                     (None, Expr::Function { name, args, .. }) if AggFn::from_name(name).is_some() => {
                         match args.first() {
                             Some(Expr::Column { name: col, .. }) => {

@@ -662,6 +662,24 @@ impl<'a> Binder<'a> {
                         _ => Err(Error::runtime("pg_get_viewdef needs the name of a saved query in quotes")),
                     };
                 }
+                // current_setting('name'[, missing_ok]): a run-time parameter, known when the statement is read
+                if name.eq_ignore_ascii_case("CURRENT_SETTING") && (1..=2).contains(&args.len()) {
+                    let Some(Expr::Literal(Value::Text(n))) = args.first() else {
+                        return Err(Error::runtime("current_setting needs the name of a parameter in quotes"));
+                    };
+                    let missing_ok = matches!(args.get(1), Some(Expr::Literal(Value::Bool(true))));
+                    return match self.db.setting_text(n) {
+                        Some(v) => Ok(BExpr::Lit(Value::text(&v))),
+                        None if missing_ok => Ok(BExpr::Lit(Value::Null)),
+                        None => Err(Error::runtime(format!("unrecognized configuration parameter \"{n}\""))),
+                    };
+                }
+                // row_to_json(t), to_json(t): a row as an object of its columns
+                if matches!(name.to_ascii_uppercase().as_str(), "ROW_TO_JSON" | "TO_JSON" | "TO_JSONB") && !args.is_empty() {
+                    if let Some(object) = self.row_json(&args[0]) {
+                        return self.bind(&object);
+                    }
+                }
                 if args.iter().any(|a| matches!(a, Expr::Function { name, .. } if name == "__NAMED")) {
                     let ordered = self.positional(name, args)?;
                     return self.bind(&Expr::Function { name: name.clone(), args: ordered, distinct: false, star: false });
@@ -816,9 +834,44 @@ impl<'a> Binder<'a> {
     }
 
     /// The type name of a composite value, when it can be told from the expression.
+    /// A row (a table alias, `ROW(...)` or a value of a composite type) as a call that builds its JSON object.
+    fn row_json(&self, e: &Expr) -> Option<Expr> {
+        let call = |items: Vec<Expr>| Expr::Function { name: "JSON_BUILD_OBJECT".into(), args: items, distinct: false, star: false };
+        let key = |k: &str| Expr::Literal(Value::text(k));
+        match e {
+            Expr::Column { table: None, name } if self.scope.resolve(None, name).is_err() && self.scope.cols.iter().any(|c| c.table.eq_ignore_ascii_case(name)) => {
+                let mut items = Vec::new();
+                for c in self.scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(name) && !c.hidden) {
+                    items.push(key(&c.name));
+                    items.push(Expr::Column { table: Some(c.table.clone()), name: c.name.clone() });
+                }
+                Some(call(items))
+            }
+            Expr::Function { name, args, .. } if name == "__ROW" => {
+                Some(call(args.iter().enumerate().flat_map(|(i, a)| [key(&format!("f{}", i + 1)), a.clone()]).collect()))
+            }
+            other => {
+                let fields = crate::expr::composite::fields_of(&self.composite_type_of(other)?)?;
+                let items = fields
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, (n, t))| {
+                        let nth = Expr::Function { name: "__NTH".into(), args: vec![other.clone(), Expr::Literal(Value::Int(i as i64 + 1)), key(t)], distinct: false, star: false };
+                        [key(n), nth]
+                    })
+                    .collect();
+                Some(call(items))
+            }
+        }
+    }
+
     fn composite_type_of(&self, e: &Expr) -> Option<String> {
         match e {
             Expr::Function { name, args, .. } if name == "__ROWCAST" => match args.get(1) {
+                Some(Expr::Literal(Value::Text(t))) => Some(t.to_string()),
+                _ => None,
+            },
+            Expr::Function { name, args, .. } if name == "__POPULATE" => match args.first() {
                 Some(Expr::Literal(Value::Text(t))) => Some(t.to_string()),
                 _ => None,
             },
@@ -963,6 +1016,13 @@ impl<'a> Binder<'a> {
                 .expect("several arguments");
             let key = Expr::Function { name: "__ARRAY".into(), args: args.clone(), distinct: false, star: false };
             args = vec![Expr::Case { whens: vec![(any_null, Expr::Literal(Value::Null))], else_expr: Some(Box::new(key)) }];
+        }
+        if matches!(func, AggFn::Bivariate(_)) && !star {
+            if args.len() != 2 {
+                return Err(Error::runtime(format!("{} takes exactly two arguments", func.label())));
+            }
+            let packed = Expr::Function { name: "__ARRAY".into(), args: args.clone(), distinct: false, star: false };
+            args = vec![packed];
         }
         let args = &args[..];
         let mut order: Vec<(BExpr, bool)> = Vec::new();

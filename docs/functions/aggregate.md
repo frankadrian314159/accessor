@@ -65,6 +65,22 @@ SELECT Dept, JSON_ARRAYAGG(Name) FROM Emp GROUP BY Dept;     -- ["Ada","Grace"]
 
 They are computed in floating point and return a `DOUBLE`.
 
+## Two-argument statistics (PostgreSQL)
+
+In [PostgreSQL mode](../sql/dialects.md) the aggregates over pairs `(y, x)` are available. A pair with a NULL in it is left out; they return a `DOUBLE` (`REGR_COUNT` a whole number) and NULL over no pairs.
+
+| Function | Meaning |
+| --- | --- |
+| `CORR(y, x)` | the correlation coefficient; NULL when `x` or `y` does not vary |
+| `COVAR_POP(y, x)`, `COVAR_SAMP(y, x)` | the population and sample covariance (the latter NULL for fewer than 2 pairs) |
+| `REGR_COUNT(y, x)` | the number of pairs |
+| `REGR_AVGX(y, x)`, `REGR_AVGY(y, x)` | the average of `x`, of `y` |
+| `REGR_SXX(y, x)`, `REGR_SYY(y, x)`, `REGR_SXY(y, x)` | the sums of squares (and of products) about the means |
+| `REGR_SLOPE(y, x)`, `REGR_INTERCEPT(y, x)` | the least-squares line `y = slope * x + intercept`; NULL when `x` does not vary |
+| `REGR_R2(y, x)` | the square of the correlation (1 when `y` does not vary) |
+
+They are not available as window functions.
+
 ## EVERY, BOOL_AND and BOOL_OR
 
 `EVERY(condition)` (also `BOOL_AND`) is true when the condition is true for every row; `BOOL_OR(condition)` is true when it is true for at least one. A NULL condition counts as false. Both are NULL over no rows.

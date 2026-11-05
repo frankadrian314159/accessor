@@ -308,6 +308,11 @@ fn requalify(st: &mut Statement, alias: &str, table: &str) -> Result<()> {
 /// part of has been parsed; it never reaches the executor.
 const ROW_MARKER: &str = "__ROW";
 
+thread_local! {
+    /// The enum type named by the last `::type` cast read: `enum_range(NULL::mood)` is told the type by it.
+    static LAST_ENUM_CAST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// `e::type` for a composite type: a `ROW(..)` is written out as record text first.
 fn composite_cast(e: Expr, type_name: &str) -> Expr {
     let e = match e {
@@ -315,6 +320,17 @@ fn composite_cast(e: Expr, type_name: &str) -> Expr {
         other => other,
     };
     Expr::Function { name: "__ROWCAST".into(), args: vec![e, Expr::Literal(Value::text(type_name))], distinct: false, star: false }
+}
+
+/// The composite type the first argument of `jsonb_populate_record(NULL::type, ...)` is cast to.
+pub(crate) fn populate_type(args: &[Expr]) -> Option<String> {
+    match args.first() {
+        Some(Expr::Function { name, args: inner, .. }) if name == "__ROWCAST" => match inner.get(1) {
+            Some(Expr::Literal(Value::Text(t))) => Some(t.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn row_value(items: Vec<Expr>) -> Expr {
@@ -7314,6 +7330,9 @@ impl<'a> Parser<'a> {
             self.expect_sym(")")?;
             return Ok(first);
         }
+        if matches!(name.to_ascii_uppercase().as_str(), "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST") {
+            LAST_ENUM_CAST.with(|c| *c.borrow_mut() = None);
+        }
         let mut args = Vec::new();
         let mut distinct = false;
         let mut star = false;
@@ -7372,6 +7391,19 @@ impl<'a> Parser<'a> {
         }
         self.expect_sym(")")?;
         let up = name.to_ascii_uppercase();
+        if matches!(up.as_str(), "ENUM_RANGE" | "ENUM_FIRST" | "ENUM_LAST") {
+            // the type the argument was cast to is not in its value: it goes in front as text
+            let ty = LAST_ENUM_CAST.with(|c| c.borrow_mut().take()).map_or(Expr::Literal(Value::Null), |t| Expr::Literal(Value::text(&t)));
+            args.insert(0, ty);
+            return Ok(Expr::Function { name: format!("__{up}"), args, distinct: false, star: false });
+        }
+        if matches!(up.as_str(), "JSON_POPULATE_RECORD" | "JSONB_POPULATE_RECORD") && args.len() == 2 {
+            if let Some(t) = populate_type(&args) {
+                let base = args[0].clone();
+                let doc = args[1].clone();
+                return Ok(Expr::Function { name: "__POPULATE".into(), args: vec![Expr::Literal(Value::text(&t)), base, doc], distinct: false, star: false });
+            }
+        }
         // the range constructors take an array with VARIADIC: the array is the argument
         if up.ends_with("MULTIRANGE") {
             for a in args.iter_mut() {
@@ -7720,7 +7752,11 @@ impl<'a> Parser<'a> {
             }
             return Ok(Expr::Function { name, args: vec![e], distinct: false, star: false });
         }
-        let tn = crate::sql::usertypes::lookup(&tn).map(|u| u.base).unwrap_or(tn);
+        let user = crate::sql::usertypes::lookup(&tn);
+        if user.as_ref().is_some_and(|u| !u.labels.is_empty()) {
+            LAST_ENUM_CAST.with(|c| *c.borrow_mut() = Some(tn.clone()));
+        }
+        let tn = user.map(|u| u.base).unwrap_or(tn);
         let (ty, _) = crate::sql::usertypes::resolve(&tn).ok_or_else(|| Error::syntax(format!("unknown data type '{tn}'")))?;
         if ty == DataType::Calculated {
             return Err(Error::syntax("cannot cast to CALCULATED"));

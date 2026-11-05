@@ -28,7 +28,7 @@ SELECT O.CustID FROM Orders O WHERE O.Total > 100
 * `EXISTS` and `NOT EXISTS`;
 * `x IN (SELECT ...)` and `NOT IN`, with the correlation in the `WHERE`;
 * scalar sub-queries that return one value per key, such as `(SELECT Name FROM Customers WHERE ID = O.CustID)`;
-* scalar sub-queries that are a single aggregate, such as `(SELECT MAX(Total) FROM Orders O WHERE O.CustID = C.ID)` or `(SELECT COUNT(*) ...)`. These are run once with a `GROUP BY` on the key. A key with no rows gives `0` for `COUNT` and NULL for the other aggregates, as the one-at-a-time run would.
+* scalar sub-queries that are a single aggregate, such as `(SELECT MAX(Total) FROM Orders O WHERE O.CustID = C.ID)` or `(SELECT COUNT(*) ...)`. These are run once with a `GROUP BY` on the key. A key with no rows gives `0` for `COUNT` and `REGR_COUNT` and NULL for the other aggregates, as the one-at-a-time run would.
 
 The correlation may be several equalities (`O.A = C.A AND O.B = C.B`); the inner side of each may be any expression that reads only the sub-query's own tables. The sub-query may have other conditions, joins and sub-queries of its own.
 
