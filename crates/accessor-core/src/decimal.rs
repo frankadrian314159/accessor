@@ -6,7 +6,9 @@
 //! [`DIV_DIGITS`] significant digits.
 //!
 //! Values are kept in canonical form (no trailing zeros after the point), so
-//! equal numbers have identical representations and derive `Eq`/`Hash`.
+//! equal numbers have identical representations. In PostgreSQL mode the scale a value was
+//! written or computed with is kept (`0.0000`, `1.50`), as `numeric` does; equality, ordering
+//! and hashing go by value, so `0` and `0.0000` are equal.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -23,10 +25,31 @@ pub const DIV_DIGITS: usize = 50;
 /// power; keeps a typo such as `1e999999999` from exhausting memory.
 const MAX_EXPONENT: i64 = 100_000;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct Decimal {
     mant: BigInt,
     scale: u32,
+}
+
+impl PartialEq for Decimal {
+    fn eq(&self, o: &Decimal) -> bool {
+        self.cmp(o) == Ordering::Equal
+    }
+}
+
+impl Eq for Decimal {}
+
+impl std::hash::Hash for Decimal {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        let c = Decimal::from_parts(self.mant.clone(), self.scale as i64);
+        c.mant.hash(h);
+        c.scale.hash(h);
+    }
+}
+
+/// Does this session keep the scale of a number (PostgreSQL's `numeric` does)?
+fn keeps_scale() -> bool {
+    crate::dialect::current() == crate::dialect::Dialect::Postgresql
 }
 
 fn pow10(n: u32) -> BigInt {
@@ -75,6 +98,41 @@ impl Decimal {
         Decimal { mant, scale }
     }
 
+    /// Like [`from_parts`](Decimal::from_parts), but where the scale is kept the value keeps the scale it was given.
+    pub fn with_kept_scale(mut mant: BigInt, scale: i64) -> Decimal {
+        if !keeps_scale() {
+            return Decimal::from_parts(mant, scale);
+        }
+        let mut scale = scale;
+        if scale < 0 {
+            mant *= pow10(u32::try_from(-scale).unwrap_or(u32::MAX));
+            scale = 0;
+        }
+        Decimal { mant, scale: scale as u32 }
+    }
+
+    /// The same number without trailing zeros after the point.
+    pub fn canonical(&self) -> Decimal {
+        Decimal::from_parts(self.mant.clone(), self.scale as i64)
+    }
+
+    /// The value with exactly `scale` digits after the point: padded with zeros, or rounded (ties away from zero, as
+    /// `numeric(p, s)` does).
+    pub fn with_scale(&self, scale: u32) -> Decimal {
+        match scale.cmp(&self.scale) {
+            Ordering::Equal => self.clone(),
+            Ordering::Greater => Decimal { mant: &self.mant * pow10(scale - self.scale), scale },
+            Ordering::Less => {
+                let unit = pow10(self.scale - scale);
+                let (mut q, r) = self.mant.div_rem(&unit);
+                if r.abs() * 2u32 >= unit {
+                    q += if self.is_negative() { -1 } else { 1 };
+                }
+                Decimal { mant: q, scale }
+            }
+        }
+    }
+
     pub fn from_i64(i: i64) -> Decimal {
         Decimal { mant: BigInt::from(i), scale: 0 }
     }
@@ -118,7 +176,7 @@ impl Decimal {
         if neg {
             mant = -mant;
         }
-        Some(Decimal::from_parts(mant, frac_part.len() as i64 - exp))
+        Some(Decimal::with_kept_scale(mant, frac_part.len() as i64 - exp))
     }
 
     /// The mantissa and the number of digits after the point.
@@ -135,13 +193,15 @@ impl Decimal {
     pub fn to_i64(&self) -> Option<i64> {
         if self.scale == 0 {
             self.mant.to_i64()
+        } else if self.is_integer() {
+            Decimal::from_parts(self.mant.clone(), self.scale as i64).mant.to_i64()
         } else {
             None
         }
     }
 
     pub fn is_integer(&self) -> bool {
-        self.scale == 0
+        self.scale == 0 || (&self.mant % pow10(self.scale)).is_zero()
     }
 
     pub fn is_zero(&self) -> bool {
@@ -180,16 +240,16 @@ impl Decimal {
 
     pub fn add(&self, o: &Decimal) -> Decimal {
         let s = self.scale.max(o.scale);
-        Decimal::from_parts(self.scaled_to(s) + o.scaled_to(s), s as i64)
+        Decimal::with_kept_scale(self.scaled_to(s) + o.scaled_to(s), s as i64)
     }
 
     pub fn sub(&self, o: &Decimal) -> Decimal {
         let s = self.scale.max(o.scale);
-        Decimal::from_parts(self.scaled_to(s) - o.scaled_to(s), s as i64)
+        Decimal::with_kept_scale(self.scaled_to(s) - o.scaled_to(s), s as i64)
     }
 
     pub fn mul(&self, o: &Decimal) -> Decimal {
-        Decimal::from_parts(&self.mant * &o.mant, self.scale as i64 + o.scale as i64)
+        Decimal::with_kept_scale(&self.mant * &o.mant, self.scale as i64 + o.scale as i64)
     }
 
     /// `self / o`, rounded half-even to [`DIV_DIGITS`] significant digits when
@@ -197,6 +257,9 @@ impl Decimal {
     pub fn div(&self, o: &Decimal) -> Option<Decimal> {
         if o.is_zero() {
             return None;
+        }
+        if keeps_scale() {
+            return Some(self.div_numeric(o));
         }
         if self.is_zero() {
             return Some(Decimal::from_i64(0));
@@ -222,6 +285,39 @@ impl Decimal {
         Some(Decimal::from_parts(q, k + self.scale as i64 - o.scale as i64))
     }
 
+    /// PostgreSQL's `numeric` division: at least 16 significant digits (counted from its base-10000 digits) and at least
+    /// as many places as either operand, rounded half away from zero.
+    fn div_numeric(&self, o: &Decimal) -> Decimal {
+        // the weight (in groups of four digits) of the leading group of a number, and the value of that group
+        let lead = |x: &Decimal| -> (i64, BigInt) {
+            let len = x.mant.magnitude().to_str_radix(10).len() as i64;
+            let exp10 = len - 1 - x.scale as i64;
+            let weight = exp10.div_euclid(4);
+            let shift = weight * 4 + x.scale as i64;
+            let a = x.mant.abs();
+            (weight, if shift >= 0 { a / pow10(shift as u32) } else { a * pow10((-shift) as u32) })
+        };
+        let rscale = if self.is_zero() {
+            16
+        } else {
+            let (w1, d1) = lead(self);
+            let (w2, d2) = lead(o);
+            let mut qweight = w1 - w2;
+            if d1 < d2 {
+                qweight -= 1;
+            }
+            (16 - qweight * 4).max(0)
+        };
+        let rscale = rscale.max(self.scale as i64).max(o.scale as i64).clamp(0, 1000) as u32;
+        let num = &self.mant * pow10(o.scale + rscale);
+        let den = &o.mant * pow10(self.scale);
+        let (mut q, r) = num.div_rem(&den);
+        if r.abs() * 2u32 >= den.abs() {
+            q += if (self.mant.sign() == Sign::Minus) != (o.mant.sign() == Sign::Minus) { -1 } else { 1 };
+        }
+        Decimal { mant: q, scale: rscale }
+    }
+
     /// The integer part of `self / o` (truncated toward zero).
     pub fn div_trunc(&self, o: &Decimal) -> Option<Decimal> {
         if o.is_zero() {
@@ -237,7 +333,7 @@ impl Decimal {
             return None;
         }
         let s = self.scale.max(o.scale);
-        Some(Decimal::from_parts(self.scaled_to(s) % o.scaled_to(s), s as i64))
+        Some(Decimal::with_kept_scale(self.scaled_to(s) % o.scaled_to(s), s as i64))
     }
 
     /// Drops the fractional part.
@@ -259,7 +355,7 @@ impl Decimal {
     /// Rounds to `digits` places after the point, ties to even (away from zero when `round_half_even` is off).
     pub fn round(&self, digits: u32) -> Decimal {
         if self.scale <= digits {
-            return self.clone();
+            return if keeps_scale() { self.with_scale(digits) } else { self.clone() };
         }
         let unit = pow10(self.scale - digits);
         let (mut q, r) = self.mant.div_rem(&unit);
@@ -272,7 +368,7 @@ impl Decimal {
         if away {
             q += if self.is_negative() { -1 } else { 1 };
         }
-        Decimal::from_parts(q, digits as i64)
+        Decimal::with_kept_scale(q, digits as i64)
     }
 
     /// `self` raised to a non-negative whole power, exactly. `None` if the
@@ -340,7 +436,7 @@ impl Serialize for Decimal {
 impl<'de> Deserialize<'de> for Decimal {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
         let (mant, scale) = <(BigInt, u32)>::deserialize(d)?;
-        Ok(Decimal::from_parts(mant, scale as i64))
+        Ok(Decimal::with_kept_scale(mant, scale as i64))
     }
 }
 

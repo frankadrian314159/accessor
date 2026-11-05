@@ -247,6 +247,16 @@ fn slash_divide(x: &Value, y: &Value) -> Result<Value> {
         let big_operand = matches!(x, Value::Big(_)) || matches!(y, Value::Big(_));
         return Ok(if big_operand { Value::Big(r) } else { int_or_big(r) });
     }
+    // PostgreSQL: numeric / numeric is numeric
+    if crate::dialect::current() == crate::dialect::Dialect::Postgresql
+        && matches!((x, y), (Value::Dec(_), Value::Dec(_) | Value::Int(_) | Value::Big(_)) | (Value::Int(_) | Value::Big(_), Value::Dec(_)))
+    {
+        if let (Some(a), Some(b)) = (x.as_decimal(), y.as_decimal()) {
+            if let Some(q) = a.div(&b) {
+                return Ok(Value::Dec(q));
+            }
+        }
+    }
     let (kx, ky) = (x.kind().ok_or_else(overflow)?, y.kind().ok_or_else(overflow)?);
     Ok(match (kx, ky) {
         (Kind::Double, _) | (_, Kind::Double) => double(require_f64(x)? / require_f64(y)?)?,

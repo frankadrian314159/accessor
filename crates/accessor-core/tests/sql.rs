@@ -7319,8 +7319,8 @@ fn postgresql_two_argument_statistics_aggregates() {
     assert_eq!(pg_one(&mut db, "SELECT regr_avgx(y, x) FROM xy"), "3");
     assert_eq!(pg_one(&mut db, "SELECT regr_sxy(y, x) FROM xy"), "7");
     assert_eq!(pg_one(&mut db, "SELECT round(corr(y, x)::numeric, 6) FROM xy"), "0.989949");
-    assert_eq!(pg_one(&mut db, "SELECT round(regr_slope(y, x)::numeric, 3) FROM xy"), "0.7");
-    assert_eq!(pg_one(&mut db, "SELECT round(regr_intercept(y, x)::numeric, 3) FROM xy"), "0.4");
+    assert_eq!(pg_one(&mut db, "SELECT round(regr_slope(y, x)::numeric, 3) FROM xy"), "0.700");
+    assert_eq!(pg_one(&mut db, "SELECT round(regr_intercept(y, x)::numeric, 3) FROM xy"), "0.400");
     assert_eq!(pg_one(&mut db, "SELECT round(covar_samp(y, x)::numeric, 4) FROM xy"), "2.3333");
     assert_eq!(pg_one(&mut db, "SELECT corr(y, x) IS NULL FROM xy WHERE false"), "true");
     // grouped
@@ -7695,4 +7695,63 @@ fn postgresql_merge_current_of_operators_foreign_data_bytea_and_loose_timestamps
     assert_eq!(pg_one(&mut db, "SELECT 'February 10, 1997'::date"), "1997-02-10");
     assert_eq!(pg_one(&mut db, "SELECT '1997-Feb-10'::date"), "1997-02-10");
     assert_eq!(pg_one(&mut db, "SELECT 'tomorrow'::date - 'today'::date"), "1");
+}
+
+#[test]
+fn postgresql_numeric_scale_returning_old_new_merge_into_view_and_foreign_tables() {
+    let mut db = pg();
+    // numeric keeps the scale it was written or declared with; equality goes by value
+    db.execute("CREATE TABLE nn (v numeric(10,4))").unwrap();
+    db.execute("INSERT INTO nn VALUES (0), (1.5), ('7799461.4119'), (-83028485)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT v FROM nn WHERE v = 0"), "0.0000");
+    assert_eq!(pg_one(&mut db, "SELECT max(v) FROM nn"), "7799461.4119");
+    assert_eq!(pg_one(&mut db, "SELECT min(v) FROM nn"), "-83028485.0000");
+    assert_eq!(pg_one(&mut db, "SELECT 0 = 0.0000 AND 1.50 = 1.5"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT 1.5 * 2"), "3.0");
+    assert_eq!(pg_one(&mut db, "SELECT 2.50 + 1"), "3.50");
+    assert_eq!(pg_one(&mut db, "SELECT round(1.5, 3)"), "1.500");
+    assert_eq!(pg_one(&mut db, "SELECT count(DISTINCT x) FROM (VALUES (1.0), (1.00), (1)) v(x)"), "1");
+
+    // RETURNING old and new
+    db.execute("CREATE TABLE foo (f1 int, f2 text, f3 int)").unwrap();
+    db.execute("INSERT INTO foo VALUES (1, 'a', 10), (2, 'b', 20)").unwrap();
+    let r = db.execute("UPDATE foo SET f3 = f3 + 1 WHERE f1 = 1 RETURNING WITH (OLD AS o, NEW AS n) o.f3, n.f3").unwrap();
+    assert_eq!((r.rows[0][0].to_string(), r.rows[0][1].to_string()), ("10".to_string(), "11".to_string()));
+    let r = db.execute("INSERT INTO foo VALUES (3, 'c', 30) RETURNING old.f1, new.f1").unwrap();
+    assert_eq!((r.rows[0][0].is_null(), r.rows[0][1].to_string()), (true, "3".to_string()));
+    assert_eq!(db.execute("DELETE FROM foo WHERE f1 = 2 RETURNING old.*").unwrap().rows[0].len(), 3);
+
+    // MERGE into a simple view
+    db.execute("CREATE TABLE base (a int, b text)").unwrap();
+    db.execute("INSERT INTO base VALUES (1, 'x'), (2, 'y')").unwrap();
+    db.execute("CREATE VIEW vb AS SELECT a AS aa, b AS bb FROM base WHERE a > 0").unwrap();
+    db.execute(
+        "MERGE INTO vb t USING (VALUES (1, 'X1'), (5, 'new')) AS v(k, s) ON t.aa = v.k \
+         WHEN MATCHED THEN UPDATE SET bb = v.s WHEN NOT MATCHED THEN INSERT (aa, bb) VALUES (v.k, v.s)",
+    )
+    .unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT string_agg(a::text || b, ',' ORDER BY a) FROM base"), "1X1,2y,5new");
+
+    // foreign tables, the information_schema views, and who may use a foreign-data wrapper
+    db.execute("CREATE FOREIGN DATA WRAPPER w OPTIONS (a '1')").unwrap();
+    db.execute("CREATE SERVER s1 FOREIGN DATA WRAPPER w OPTIONS (host 'h')").unwrap();
+    db.execute("CREATE FOREIGN TABLE ft1 (c1 int, c2 text) SERVER s1 OPTIONS (table_name 't')").unwrap();
+    assert!(db.execute("CREATE FOREIGN TABLE ft2 (c1 int) SERVER nope").is_err());
+    assert_eq!(pg_one(&mut db, "SELECT foreign_server_name FROM information_schema.foreign_tables"), "s1");
+    assert_eq!(pg_one(&mut db, "SELECT option_value FROM information_schema.foreign_table_options"), "t");
+    assert_eq!(pg_one(&mut db, "SELECT foreign_data_wrapper_name FROM information_schema.foreign_servers"), "w");
+    assert!(db.execute("DROP SERVER s1").is_err());
+    db.execute("CREATE ROLE ru").unwrap();
+    db.execute("SET ROLE ru").unwrap();
+    assert!(db.execute("CREATE SERVER s2 FOREIGN DATA WRAPPER w").is_err());
+    assert!(db.execute("CREATE FOREIGN DATA WRAPPER w2").is_err());
+    db.execute("RESET ROLE").unwrap();
+    db.execute("GRANT USAGE ON FOREIGN DATA WRAPPER w TO ru").unwrap();
+    db.execute("SET ROLE ru").unwrap();
+    db.execute("CREATE SERVER s2 FOREIGN DATA WRAPPER w").unwrap();
+    assert!(db.execute("DROP SERVER s1").is_err());
+    db.execute("DROP SERVER s2").unwrap();
+    db.execute("RESET ROLE").unwrap();
+    db.execute("DROP SERVER s1 CASCADE").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM information_schema.foreign_tables"), "0");
 }

@@ -18,6 +18,15 @@ use crate::value::Value;
 
 impl Database {
     pub(crate) fn exec_merge(&mut self, m: &MergeDef) -> Result<QueryResult> {
+        for (needed, wanted) in [("update", m.whens.iter().any(|w| matches!(w.action, MergeAction::Update(_)))), ("delete", m.whens.iter().any(|w| matches!(w.action, MergeAction::Delete))), ("insert", m.whens.iter().any(|w| matches!(w.action, MergeAction::Insert { .. })))] {
+            if wanted {
+                self.require_privilege(&m.target, needed)?;
+            }
+        }
+        if self.table(&m.target).is_none() && self.view_sql(&m.target).is_some() {
+            let through = self.merge_through_view(m)?;
+            return self.exec_merge(&through);
+        }
         let own = !self.in_transaction();
         if own {
             self.begin()?;
@@ -44,6 +53,56 @@ impl Database {
             }
         };
         result.map(QueryResult::affected)
+    }
+
+    /// A MERGE whose target is a simple view, as one on the table the view reads: the view's columns are renamed to
+    /// the table's, and the view's condition joins the `ON` condition (a row outside the view matches nothing).
+    fn merge_through_view(&self, m: &MergeDef) -> Result<MergeDef> {
+        let t = self.view_target(&m.target)?;
+        let alias = m.target_alias.clone().unwrap_or_else(|| m.target.clone());
+        let rename = |e: &Expr| -> Result<Expr> {
+            let mut e = e.clone();
+            walk_expr(&mut e, &mut |x| {
+                if let Expr::Column { table, name } = x {
+                    if table.as_deref().is_none_or(|q| q.eq_ignore_ascii_case(&alias) || q.eq_ignore_ascii_case(&m.target)) {
+                        if let Some((_, b)) = t.columns.iter().find(|(v, _)| v.eq_ignore_ascii_case(name)) {
+                            *name = b.clone();
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            Ok(e)
+        };
+        let base_col = |c: &String| t.columns.iter().find(|(v, _)| v.eq_ignore_ascii_case(c)).map(|(_, b)| b.clone()).unwrap_or_else(|| c.clone());
+        let mut on = rename(&m.on)?;
+        if let Some(f) = &t.filter {
+            let mut f = f.clone();
+            walk_expr(&mut f, &mut |x| {
+                if let Expr::Column { table: table @ None, .. } = x {
+                    *table = Some(alias.clone());
+                }
+                Ok(())
+            })?;
+            on = Expr::Binary { op: BinOp::And, left: Box::new(on), right: Box::new(f) };
+        }
+        let mut whens = Vec::new();
+        for w in &m.whens {
+            let condition = w.condition.as_ref().map(&rename).transpose()?;
+            let action = match &w.action {
+                MergeAction::Update(sets) => MergeAction::Update(sets.iter().map(|(c, e)| Ok((base_col(c), rename(e)?))).collect::<Result<Vec<_>>>()?),
+                MergeAction::Insert { columns, values } => MergeAction::Insert {
+                    columns: Some(match columns {
+                        Some(c) => c.iter().map(&base_col).collect(),
+                        None => t.columns.iter().map(|(_, b)| b.clone()).collect(),
+                    }),
+                    values: values.iter().map(&rename).collect::<Result<Vec<_>>>()?,
+                },
+                other => other.clone(),
+            };
+            whens.push(MergeWhen { matched: w.matched, by_source: w.by_source, condition, action });
+        }
+        Ok(MergeDef { target: t.base.clone(), target_alias: Some(alias), source: m.source.clone(), on, whens })
     }
 
     fn merge_rows(&mut self, m: &MergeDef) -> Result<usize> {

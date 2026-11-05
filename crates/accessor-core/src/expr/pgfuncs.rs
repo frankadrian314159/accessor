@@ -18,6 +18,7 @@ pub enum PgFn {
     InputIsValid,
     TypeOf,
     Scale,
+    MinScale,
     TrimScale,
     Asinh,
     Acosh,
@@ -70,7 +71,8 @@ pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
     Some(match name {
         "PG_INPUT_IS_VALID" => (InputIsValid, 2, 2),
         "PG_TYPEOF" => (TypeOf, 1, 1),
-        "SCALE" | "MIN_SCALE" => (Scale, 1, 1),
+        "SCALE" => (Scale, 1, 1),
+        "MIN_SCALE" => (MinScale, 1, 1),
         "TRIM_SCALE" => (TrimScale, 1, 1),
         "ASINH" => (Asinh, 1, 1),
         "ACOSH" => (Acosh, 1, 1),
@@ -264,8 +266,13 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             Some(Value::Int(_)) | Some(Value::Big(_)) => Value::Int(0),
             _ => return Err(Error::type_err("a number was expected")),
         },
+        MinScale => match v(0).num_lenient().as_deref() {
+            Some(Value::Dec(d)) | Some(Value::Currency(d)) => Value::Int(i64::from(d.canonical().scale())),
+            Some(Value::Int(_)) | Some(Value::Big(_)) => Value::Int(0),
+            _ => return Err(Error::type_err("a number was expected")),
+        },
         TrimScale => match v(0).num_lenient().as_deref() {
-            Some(Value::Dec(d)) => Value::Dec(d.clone()),
+            Some(Value::Dec(d)) => Value::Dec(d.canonical()),
             Some(other) => other.clone(),
             None => return Err(Error::type_err("a number was expected")),
         },

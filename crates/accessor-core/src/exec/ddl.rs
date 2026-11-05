@@ -137,6 +137,7 @@ impl Database {
 
     pub(crate) fn exec_drop_table(&mut self, name: &str) -> Result<QueryResult> {
         let real = self.table_checked(name)?.name().to_string();
+        let _ = self.forget_foreign_table(&real);
         // the partitions of a partitioned table go with it
         if self.is_partitioned(&real) {
             for child in self.children_of(&real) {

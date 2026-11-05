@@ -115,7 +115,7 @@ WHEN MATCHED THEN UPDATE SET Qty = S.Qty + D.Qty
 WHEN NOT MATCHED THEN INSERT (ID, Qty) VALUES (D.ID, D.Qty);
 ```
 
-PostgreSQL also accepts `MERGE INTO ONLY target`, `WHEN MATCHED THEN DO NOTHING` (and the same for `NOT MATCHED`), `WHEN NOT MATCHED BY TARGET` (the same as `NOT MATCHED`), and `WHEN NOT MATCHED BY SOURCE [AND condition] THEN UPDATE | DELETE | DO NOTHING`, which acts on the target rows that no source row matched (after the source rows are done; the conditions and `SET` expressions see only the target's columns).
+The target of a `MERGE` may be a simple, updatable view: the view's columns are renamed to the table's and its condition is added to `ON`, so a row outside the view matches nothing (`RETURNING` after such a `MERGE` is not available). PostgreSQL also accepts `MERGE INTO ONLY target`, `WHEN MATCHED THEN DO NOTHING` (and the same for `NOT MATCHED`), `WHEN NOT MATCHED BY TARGET` (the same as `NOT MATCHED`), and `WHEN NOT MATCHED BY SOURCE [AND condition] THEN UPDATE | DELETE | DO NOTHING`, which acts on the target rows that no source row matched (after the source rows are done; the conditions and `SET` expressions see only the target's columns).
 
 Expressions can use the source's columns (qualified by its alias, or unqualified when the target has no column of that name) and the target's. A target row matched by more than one source row is an error. The whole statement is atomic; an error leaves the target as it was. The statement returns the number of rows inserted, updated and deleted together.
 
@@ -128,6 +128,8 @@ In PostgreSQL mode, `UPDATE t SET ... WHERE CURRENT OF cursor` and `DELETE FROM 
 In PostgreSQL mode `INSERT INTO t AS a ...` gives `t` an alias that `ON CONFLICT DO UPDATE` (its `SET` and `WHERE`) can use. `ON CONFLICT ... DO UPDATE SET (a, b) = (x, y)` sets several columns from a row of values.
 
 ## RETURNING
+
+In PostgreSQL mode `RETURNING` can name the row as it was and as it is: `old.col`, `new.col`, `old.*`, `new.*` (`old` is NULL for an insert, `new` for a delete), or other names with `RETURNING WITH (OLD AS o, NEW AS n) o.col, n.col`. An unqualified column is the row as it ended up (as it was, for a delete).
 
 `INSERT`, `UPDATE`, `DELETE` and `MERGE` can hand back the rows they changed, so the generated values need no second query:
 

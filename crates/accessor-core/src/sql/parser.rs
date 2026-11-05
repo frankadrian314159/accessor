@@ -880,12 +880,17 @@ impl<'a> Parser<'a> {
                     } else if matches!(up.as_str(), "FOREIGN" | "LARGE") {
                         self.advance();
                         // FOREIGN DATA WRAPPER, FOREIGN SERVER, LARGE OBJECT
-                        if self.eat_kw("DATA") {
+                        kind = if self.eat_kw("DATA") {
                             self.expect_kw("WRAPPER")?;
+                            "fdw"
+                        } else if up == "FOREIGN" {
+                            self.advance();
+                            "server"
                         } else {
                             self.advance();
+                            "other"
                         }
-                        kind = "other".into();
+                        .into();
                     }
                 }
                 let object_name = |p: &mut Parser| -> Result<String> {
@@ -1522,6 +1527,14 @@ impl<'a> Parser<'a> {
     /// kept (with their options) and shown in the catalogs; nothing reads through them.
     fn foreign_statement(&mut self, verb: &str) -> Result<Option<Statement>> {
         if crate::dialect::current() != crate::dialect::Dialect::Postgresql {
+            return Ok(None);
+        }
+        if self.peek_kw("FOREIGN") && self.peek_kw_at(1, "TABLE") {
+            if verb == "ALTER" {
+                return Ok(Some(self.ignore_rest("ALTER")));
+            }
+            // the rest reads as a table (with a SERVER clause for CREATE)
+            self.advance();
             return Ok(None);
         }
         let object = if self.peek_kw("FOREIGN") && self.peek_kw_at(1, "DATA") && self.peek_kw_at(2, "WRAPPER") {
@@ -2763,9 +2776,51 @@ impl<'a> Parser<'a> {
             && matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_) | Statement::Upsert { .. })
         {
             self.advance();
+            // RETURNING WITH (OLD AS o, NEW AS n) ...: the names stand for the row before and after the change
+            let mut names: Vec<(String, &'static str)> = Vec::new();
+            if self.peek_kw("WITH") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                self.advance();
+                self.advance();
+                loop {
+                    let which = if self.eat_kw("OLD") { "old" } else if self.eat_kw("NEW") { "new" } else { return Err(self.unexpected("OLD or NEW")) };
+                    self.expect_kw("AS")?;
+                    let alias = self.ident()?;
+                    if names.iter().any(|(_, w)| *w == which) {
+                        return Err(Error::syntax(format!("{} cannot be specified multiple times", which.to_ascii_uppercase())));
+                    }
+                    if names.iter().any(|(a, _)| a.eq_ignore_ascii_case(&alias)) {
+                        return Err(Error::syntax(format!("table name \"{alias}\" specified more than once")));
+                    }
+                    names.push((alias, which));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            }
             let mut items = vec![self.select_item()?];
             while self.eat_sym(",") {
                 items.push(self.select_item()?);
+            }
+            for item in items.iter_mut() {
+                match item {
+                    SelectItem::QualifiedWildcard(t) => {
+                        if let Some((_, w)) = names.iter().find(|(a, _)| a.eq_ignore_ascii_case(t)) {
+                            *t = w.to_string();
+                        }
+                    }
+                    SelectItem::Expr { expr, .. } => {
+                        let _ = crate::sql::walk::walk_expr(expr, &mut |x| {
+                            if let Expr::Column { table: Some(t), .. } = x {
+                                if let Some((_, w)) = names.iter().find(|(a, _)| a.eq_ignore_ascii_case(t)) {
+                                    *t = w.to_string();
+                                }
+                            }
+                            Ok(())
+                        });
+                    }
+                    _ => {}
+                }
             }
             return Ok(Statement::Returning { stmt: Box::new(st), items });
         }
@@ -4599,8 +4654,16 @@ impl<'a> Parser<'a> {
         let mut trailing_select: Option<Box<Select>> = None;
         let mut parents = Vec::new();
         let mut partition_by = None;
+        // CREATE FOREIGN TABLE t (...) SERVER s [OPTIONS (...)]
+        let mut foreign_server: Option<String> = None;
+        let mut foreign_options: Vec<serde_json::Value> = Vec::new();
         loop {
-            if self.eat_kw("INHERITS") {
+            if crate::dialect::current() == crate::dialect::Dialect::Postgresql && self.peek_kw("SERVER") {
+                self.advance();
+                foreign_server = Some(self.any_word()?);
+            } else if crate::dialect::current() == crate::dialect::Dialect::Postgresql && foreign_server.is_some() && self.eat_kw("OPTIONS") {
+                foreign_options.extend(self.fdw_options()?);
+            } else if self.eat_kw("INHERITS") {
                 self.expect_sym("(")?;
                 loop {
                     parents.push(self.table_ident()?);
@@ -4642,11 +4705,19 @@ impl<'a> Parser<'a> {
         } else {
             Statement::CreateTableExt(Box::new(TableExt { create: st, parents, likes, partition_by, partition_of: None }))
         };
+        let foreign = foreign_server.map(|server| {
+            let value = serde_json::json!({ "options": foreign_options }).to_string();
+            Statement::Catalog(Box::new(CatalogChange { kind: "foreign", names: vec!["CREATE".into(), "ftable".into(), table_name.clone(), server], value: Some(value), replace: false, cascade: false }))
+        });
         if indexes.is_empty() && trailing_select.is_none() {
-            return Ok(main);
+            return Ok(match foreign {
+                Some(f) => Statement::Batch(vec![main, f]),
+                None => main,
+            });
         }
         // KEY / INDEX in the table definition: indexes made after the table
         let mut all = vec![main];
+        all.extend(foreign);
         if let Some(q) = trailing_select {
             all.push(Statement::InsertSelectExtend { table: table_name.clone(), select: q });
         }
@@ -4826,8 +4897,20 @@ impl<'a> Parser<'a> {
             }
         };
         let partition_by = if self.peek_kw("PARTITION") && self.peek_kw_at(1, "BY") { Some(self.partition_by()?) } else { None };
+        // CREATE FOREIGN TABLE t PARTITION OF p ... SERVER s [OPTIONS (...)]
+        let mut foreign = None;
+        if crate::dialect::current() == crate::dialect::Dialect::Postgresql && self.eat_kw("SERVER") {
+            let server = self.any_word()?;
+            let options = if self.eat_kw("OPTIONS") { self.fdw_options()? } else { Vec::new() };
+            let value = serde_json::json!({ "options": options }).to_string();
+            foreign = Some(Statement::Catalog(Box::new(CatalogChange { kind: "foreign", names: vec!["CREATE".into(), "ftable".into(), name.clone(), server], value: Some(value), replace: false, cascade: false })));
+        }
         let create = Statement::CreateTable { name, columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new() };
-        Ok(Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: Vec::new(), partition_by, partition_of: Some((parent, bound.to_string())) })))
+        let main = Statement::CreateTableExt(Box::new(TableExt { create, parents: Vec::new(), likes: Vec::new(), partition_by, partition_of: Some((parent, bound.to_string())) }));
+        Ok(match foreign {
+            Some(f) => Statement::Batch(vec![main, f]),
+            None => main,
+        })
     }
 
     fn create_table_core(&mut self) -> Result<(Statement, Vec<String>, Vec<IndexSpec>)> {
@@ -5219,7 +5302,14 @@ impl<'a> Parser<'a> {
             expression,
             check: None,
             invisible: false,
-            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(data_type, DataType::Array(_)) && (crate::expr::ranges::cast_function_for(&type_name).is_some() || crate::expr::composite::is_composite(&type_name)) { Some(type_name.clone()) } else { None },
+            range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(data_type, DataType::Array(_)) && (crate::expr::ranges::cast_function_for(&type_name).is_some() || crate::expr::composite::is_composite(&type_name)) {
+                Some(type_name.clone())
+            } else if crate::dialect::current() == crate::dialect::Dialect::Postgresql && data_type == DataType::Decimal && matches!(size.get(1), Some(s) if *s >= 0) {
+                // numeric(p, s): the stored values have s digits after the point (marked apart from a range type)
+                Some(format!("\u{2}{}", size[1]))
+            } else {
+                None
+            },
         };
         if let Some(l) = labels {
             let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();

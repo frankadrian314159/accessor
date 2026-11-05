@@ -821,7 +821,7 @@ pub(crate) fn column_type_anywhere(column: &str) -> Option<String> {
     let col = column.to_ascii_lowercase();
     COLUMNS.with(|c| {
         let c = c.borrow();
-        let mut types = c.iter().filter(|((_, n), _)| *n == col).map(|(_, t)| t);
+        let mut types = c.iter().filter(|((_, n), t)| *n == col && !t.starts_with('\u{2}')).map(|(_, t)| t);
         let first = types.next()?;
         types.all(|t| t == first).then(|| first.clone())
     })
@@ -833,7 +833,18 @@ pub(crate) fn column_type(table: &str, column: &str) -> Option<String> {
         if c.is_empty() {
             return None;
         }
-        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase())).cloned()
+        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase())).filter(|t| !t.starts_with('\u{2}')).cloned()
+    })
+}
+
+/// The digits after the point a `numeric(p, s)` column keeps.
+pub(crate) fn column_scale(table: &str, column: &str) -> Option<u32> {
+    COLUMNS.with(|c| {
+        let c = c.borrow();
+        if c.is_empty() {
+            return None;
+        }
+        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))?.strip_prefix('\u{2}')?.parse().ok()
     })
 }
 

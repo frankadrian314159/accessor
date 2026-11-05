@@ -1043,6 +1043,7 @@ impl Value {
                     },
                     DataType::Decimal => match n {
                         Dec(_) => Ok(n.clone()),
+                        Currency(c) if crate::dialect::current() == Dialect::Postgresql => Ok(Dec(c.with_scale(2))),
                         other => other.as_decimal().map(Dec).ok_or_else(range),
                     },
                     DataType::Currency => match n {

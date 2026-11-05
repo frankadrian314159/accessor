@@ -428,6 +428,73 @@ impl Database {
                 names(&["table_catalog", "table_schema", "table_name", "partition_name", "partition_method", "partition_expression", "table_rows", "partition_description"])
             }
             "check_constraints" => names(&["constraint_catalog", "constraint_schema", "constraint_name", "check_clause"]),
+            "foreign_data_wrappers" | "foreign_data_wrapper_options" | "foreign_servers" | "foreign_server_options" | "user_mappings" | "user_mapping_options" | "foreign_tables" | "foreign_table_options" => {
+                let db = "regression";
+                let s = |d: &serde_json::Value, k: &str| d.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map_or(Value::Null, t);
+                let options = |d: &serde_json::Value| -> Vec<(String, String)> {
+                    d["options"].as_array().map(|o| o.iter().map(|p| (p[0].as_str().unwrap_or("").to_string(), p[1].as_str().unwrap_or("").to_string())).collect()).unwrap_or_default()
+                };
+                match view.to_ascii_lowercase().as_str() {
+                    "foreign_data_wrappers" => {
+                        for (_, d) in self.foreign_objects("fdw") {
+                            rows.push(vec![t(db), s(&d, "name"), s(&d, "owner"), Value::Null, t("c")]);
+                        }
+                        names(&["foreign_data_wrapper_catalog", "foreign_data_wrapper_name", "authorization_identifier", "library_name", "foreign_data_wrapper_language"])
+                    }
+                    "foreign_data_wrapper_options" => {
+                        for (_, d) in self.foreign_objects("fdw") {
+                            for (k, v) in options(&d) {
+                                rows.push(vec![t(db), s(&d, "name"), t(&k), t(&v)]);
+                            }
+                        }
+                        names(&["foreign_data_wrapper_catalog", "foreign_data_wrapper_name", "option_name", "option_value"])
+                    }
+                    "foreign_servers" => {
+                        for (_, d) in self.foreign_objects("server") {
+                            rows.push(vec![t(db), s(&d, "name"), t(db), s(&d, "fdw"), s(&d, "type"), s(&d, "version"), s(&d, "owner")]);
+                        }
+                        names(&["foreign_server_catalog", "foreign_server_name", "foreign_data_wrapper_catalog", "foreign_data_wrapper_name", "foreign_server_type", "foreign_server_version", "authorization_identifier"])
+                    }
+                    "foreign_server_options" => {
+                        for (_, d) in self.foreign_objects("server") {
+                            for (k, v) in options(&d) {
+                                rows.push(vec![t(db), s(&d, "name"), t(&k), t(&v)]);
+                            }
+                        }
+                        names(&["foreign_server_catalog", "foreign_server_name", "option_name", "option_value"])
+                    }
+                    "user_mappings" => {
+                        for (_, d) in self.foreign_objects("umapping") {
+                            rows.push(vec![s(&d, "user"), t(db), s(&d, "server")]);
+                        }
+                        names(&["authorization_identifier", "foreign_server_catalog", "foreign_server_name"])
+                    }
+                    "user_mapping_options" => {
+                        for (_, d) in self.foreign_objects("umapping") {
+                            for (k, v) in options(&d) {
+                                rows.push(vec![s(&d, "user"), t(db), s(&d, "server"), t(&k), t(&v)]);
+                            }
+                        }
+                        names(&["authorization_identifier", "foreign_server_catalog", "foreign_server_name", "option_name", "option_value"])
+                    }
+                    "foreign_tables" => {
+                        for (_, d) in self.foreign_objects("ftable") {
+                            let full = d["name"].as_str().unwrap_or("").to_string();
+                            rows.push(vec![t(db), t(if full.contains('.') { schema_of(&full) } else { "public" }), t(full.rsplit('.').next().unwrap_or("")), t(db), s(&d, "server")]);
+                        }
+                        names(&["foreign_table_catalog", "foreign_table_schema", "foreign_table_name", "foreign_server_catalog", "foreign_server_name"])
+                    }
+                    _ => {
+                        for (_, d) in self.foreign_objects("ftable") {
+                            let full = d["name"].as_str().unwrap_or("").to_string();
+                            for (k, v) in options(&d) {
+                                rows.push(vec![t(db), t(if full.contains('.') { schema_of(&full) } else { "public" }), t(full.rsplit('.').next().unwrap_or("")), t(&k), t(&v)]);
+                            }
+                        }
+                        names(&["foreign_table_catalog", "foreign_table_schema", "foreign_table_name", "option_name", "option_value"])
+                    }
+                }
+            }
             other if EMPTY_VIEWS.iter().any(|(n, _)| *n == other) => {
                 let (_, cols) = EMPTY_VIEWS.iter().find(|(n, _)| *n == other).expect("checked");
                 names(cols)

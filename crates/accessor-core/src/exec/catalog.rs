@@ -154,6 +154,14 @@ impl Database {
         Ok(QueryResult::default())
     }
 
+    /// A table that is dropped is no longer a foreign table.
+    pub(crate) fn forget_foreign_table(&mut self, name: &str) -> Result<()> {
+        if self.catalog_has("ftable", name) {
+            self.catalog_set("ftable", name, None)?;
+        }
+        Ok(())
+    }
+
     /// The foreign-data objects of a kind, as `(name, details)` in name order.
     pub(crate) fn foreign_objects(&self, kind: &str) -> Vec<(String, serde_json::Value)> {
         self.catalog
@@ -174,12 +182,41 @@ impl Database {
         let (kind, id, what) = match object.as_str() {
             "fdw" => ("fdw", key(name), format!("foreign-data wrapper \"{name}\"")),
             "server" => ("server", key(name), format!("server \"{name}\"")),
+            "ftable" => ("ftable", key(name), format!("foreign table \"{name}\"")),
             _ => {
                 let user = if name.eq_ignore_ascii_case("current_user") || name.eq_ignore_ascii_case("user") { role.clone() } else { name.clone() };
-                ("umapping", format!("{}|{}", key(&user), key(server)), format!("user mapping for \"{user}\" does not exist for server \"{server}\""))
+                ("umapping", format!("{}|{}", key(&user), key(server)), format!("user mapping for \"{user}\" for server \"{server}\""))
             }
         };
         let existing: Option<J> = self.catalog.get(&(kind.to_string(), id.clone())).and_then(|v| serde_json::from_str(v).ok());
+        let missing = if object == "mapping" {
+            format!("user mapping for \"{}\" does not exist for server \"{server}\"", id.split('|').next().unwrap_or(""))
+        } else {
+            format!("{what} does not exist")
+        };
+        // who may do what: a role that is not a superuser needs to own the object, or to have been granted USAGE
+        let acting = self.settings.get("role").filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none")).cloned();
+        let restricted = acting.as_ref().is_some_and(|r| !self.effective_roles(r).iter().any(|x| self.is_superuser(x)));
+        let owns = |d: &J| -> bool {
+            !restricted || acting.as_ref().is_some_and(|r| d["owner"].as_str().is_some_and(|o| self.effective_roles(r).contains(&key(o))))
+        };
+        let usage = |k: &str, obj: &str| -> bool {
+            !restricted
+                || acting.as_ref().is_some_and(|r| {
+                    self.effective_roles(r).iter().any(|x| {
+                        let p = self.privileges_of(x, k, obj);
+                        p.contains("usage") || p.contains("all")
+                    })
+                })
+        };
+        let lookup = |k: &str, n: &str| -> Option<J> { self.catalog.get(&(k.to_string(), key(n))).and_then(|v| serde_json::from_str(v).ok()) };
+        // the object whose owner decides: a mapping answers to its server
+        let (guard_kind, guard_name, guard_word) = match object.as_str() {
+            "fdw" => ("fdw", name.clone(), "foreign-data wrapper"),
+            "server" => ("server", name.clone(), "foreign server"),
+            "mapping" | "ftable" => ("server", server.clone(), "foreign server"),
+            _ => ("", String::new(), ""),
+        };
         let old_options = |d: &J| -> Vec<(String, String)> {
             d.get("options")
                 .and_then(|o| o.as_array())
@@ -204,6 +241,46 @@ impl Database {
         };
         let options_json = |o: Vec<(String, String)>| -> J { J::Array(o.into_iter().map(|(k, v)| json!([k, v])).collect()) };
         let save = |db: &mut Self, kind: &str, id: &str, d: J| db.catalog_set(kind, id, Some(d.to_string()));
+        if verb == "ALTER" || verb == "DROP" {
+            if let Some(d) = &existing {
+                let guard = if object == "mapping" || object == "ftable" { lookup(guard_kind, &guard_name) } else { Some(d.clone()) };
+                if let Some(g) = guard {
+                    let own_mapping = object == "mapping" && id.split('|').next() == acting.as_ref().map(|r| key(r)).as_deref();
+                    if !owns(&g) && !(own_mapping && usage("server", &guard_name)) && object != "ftable" {
+                        return Err(Error::catalog(format!("must be owner of {guard_word} {guard_name}")));
+                    }
+                    if verb == "ALTER" && object == "fdw" && restricted && (text("handler").is_some() || text("validator").is_some()) {
+                        return Err(Error::catalog(format!("permission denied to alter foreign-data wrapper \"{name}\"")));
+                    }
+                    if verb == "ALTER" && object == "fdw" && restricted && text("owner").is_some() {
+                        return Err(Error::catalog(format!("permission denied to change owner of foreign-data wrapper \"{name}\"")));
+                    }
+                }
+            }
+        }
+        if verb == "CREATE" {
+            match object.as_str() {
+                "fdw" if restricted => return Err(Error::catalog(format!("permission denied to create foreign-data wrapper \"{name}\""))),
+                "server" => {
+                    let f = text("fdw").unwrap_or_default();
+                    if let Some(p) = lookup("fdw", &f) {
+                        if !owns(&p) && !usage("fdw", &f) {
+                            return Err(Error::catalog(format!("permission denied for foreign-data wrapper {f}")));
+                        }
+                    }
+                }
+                "mapping" | "ftable" => {
+                    if let Some(p) = lookup("server", server) {
+                        let own = object == "mapping" && key(name) == "current_user" || acting.as_ref().is_some_and(|r| key(r) == key(name));
+                        let allowed = if object == "ftable" || own { owns(&p) || usage("server", server) } else { owns(&p) };
+                        if !allowed {
+                            return Err(Error::catalog(if object == "ftable" || own { format!("permission denied for foreign server {server}") } else { format!("must be owner of foreign server {server}") }));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         match verb.as_str() {
             "CREATE" => {
                 if existing.is_some() {
@@ -221,6 +298,9 @@ impl Database {
                         return Err(Error::catalog(if object == "server" { format!("foreign-data wrapper \"{parent}\" does not exist") } else { format!("server \"{server}\" does not exist") }));
                     };
                     d["fdw"] = if object == "server" { json!(p["name"]) } else { json!(parent) };
+                    if object == "ftable" {
+                        d["server"] = json!(p["name"]);
+                    }
                     if object == "mapping" {
                         d["user"] = json!(id.split('|').next().unwrap_or(""));
                         d["server"] = json!(p["name"]);
@@ -235,7 +315,7 @@ impl Database {
                 save(self, kind, &id, d)?;
             }
             "ALTER" => {
-                let Some(mut d) = existing else { return Err(Error::catalog(format!("{what} does not exist"))) };
+                let Some(mut d) = existing else { return Err(Error::catalog(missing)) };
                 d["options"] = options_json(apply(old_options(&d))?);
                 for k in ["handler", "validator", "type", "version", "owner"] {
                     if let Some(v) = text(k) {
@@ -263,7 +343,7 @@ impl Database {
                     if flag("if_exists") {
                         return Ok(QueryResult::default());
                     }
-                    return Err(Error::catalog(format!("{what} does not exist")));
+                    return Err(Error::catalog(missing));
                 }
                 let mut doomed: Vec<(&str, String)> = Vec::new();
                 match object.as_str() {
@@ -285,6 +365,11 @@ impl Database {
                                 doomed.push(("umapping", m));
                             }
                         }
+                        for (m, u) in self.foreign_objects("ftable") {
+                            if u["server"].as_str().is_some_and(|f| key(f) == id) {
+                                doomed.push(("ftable", m));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -292,6 +377,9 @@ impl Database {
                     return Err(Error::catalog(format!("cannot drop {} {} because other objects depend on it", if object == "fdw" { "foreign-data wrapper" } else { "server" }, name)));
                 }
                 for (k, n) in doomed {
+                    if k == "ftable" {
+                        let _ = self.exec_drop_table(&n);
+                    }
                     self.catalog_set(k, &n, None)?;
                 }
                 self.catalog_set(kind, &id, None)?;

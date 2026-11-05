@@ -278,6 +278,13 @@ impl TableSchema {
                     Err(e) => lenient_number(v, c.data_type).ok_or_else(|| Error::type_err(format!("column '{}': {e}", c.name)))?,
                 };
             }
+            if c.data_type == crate::value::DataType::Decimal {
+                if let Value::Dec(d) = &*v {
+                    if let Some(s) = crate::expr::ranges::column_scale(&self.name, &c.name) {
+                        *v = Value::Dec(d.with_scale(s));
+                    }
+                }
+            }
         }
         Ok(row)
     }

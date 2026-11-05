@@ -46,6 +46,10 @@ WHERE t.table_type = 'BASE TABLE'
 
 Each view is a small table computed when the query runs, and is treated like a derived table: its row count is known exactly, and it can be joined in any order. It has no indexes.
 
+## PostgreSQL's foreign-data views
+
+In PostgreSQL mode `FOREIGN_DATA_WRAPPERS`, `FOREIGN_DATA_WRAPPER_OPTIONS`, `FOREIGN_SERVERS`, `FOREIGN_SERVER_OPTIONS`, `USER_MAPPINGS`, `USER_MAPPING_OPTIONS`, `FOREIGN_TABLES` and `FOREIGN_TABLE_OPTIONS` list the [foreign-data objects](conformance.md) (catalog name `regression`; tables of the default schema are in `public`).
+
 ## MySQL's views
 
 `TABLES` and `COLUMNS` also give `TABLE_CATALOG`, `TABLE_SCHEMA`, `ENGINE` (and, for columns, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA`, `CHARACTER_SET_NAME`, `COLLATION_NAME`) after their own columns. `SCHEMATA` lists the schemas, `STATISTICS` the indexes (one row for each column of each), `CHARACTER_SETS`, `COLLATIONS` and `ENGINES` the one engine and four character sets, `PARTITIONS` one row for each table, and `PROCESSLIST`, `COLUMN_STATISTICS`, the `*_PRIVILEGES` views, `EVENTS`, `OPTIMIZER_TRACE`, `RESOURCE_GROUPS`, `FILES`, `TABLESPACES`, `PLUGINS`, `VIEW_TABLE_USAGE`, `KEYWORDS`, `CHECK_CONSTRAINTS` and some others are there with their columns and no rows. See [mysql.md](mysql.md).

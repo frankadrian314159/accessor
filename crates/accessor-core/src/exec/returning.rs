@@ -29,15 +29,14 @@ impl Database {
             return Err(Error::catalog(format!("RETURNING works on tables, and '{target}' is not one (it may be a query)")));
         };
         let real = table.name().to_string();
-        let scope = Scope {
-            invisible: Vec::new(),
-            cols: table
-                .schema()
-                .columns
-                .iter()
-                .map(|c| ScopeCol { table: real.clone(), name: c.name.clone(), hidden: false })
-                .collect(),
-        };
+        // the columns of the row as it ended up, then (out of sight of `*`) those of `old` and `new`, which RETURNING can name
+        let width = table.schema().columns.len();
+        let mut cols: Vec<ScopeCol> =
+            table.schema().columns.iter().map(|c| ScopeCol { table: real.clone(), name: c.name.clone(), hidden: false }).collect();
+        for tag in ["old", "new"] {
+            cols.extend(table.schema().columns.iter().map(|c| ScopeCol { table: tag.to_string(), name: c.name.clone(), hidden: true }));
+        }
+        let scope = Scope { invisible: Vec::new(), cols };
         // Check the expressions before anything is changed.
         let pseudo = Select { items: items.to_vec(), ..Select::default() };
         let named = expand_items(&pseudo, &scope)?;
@@ -53,7 +52,9 @@ impl Database {
 
         let mut rows = Vec::new();
         for (_, (old, new)) in captured.map(|c| c.changes).unwrap_or_default() {
-            let Some(row) = new.or(old) else { continue };
+            let Some(mut row) = new.clone().or_else(|| old.clone()) else { continue };
+            row.extend(old.unwrap_or_else(|| vec![crate::value::Value::Null; width]));
+            row.extend(new.unwrap_or_else(|| vec![crate::value::Value::Null; width]));
             rows.push(bound.iter().map(|e| e.eval(&row).map(|v| v.into_owned())).collect::<Result<Vec<_>>>()?);
         }
         Ok(QueryResult { columns: named.into_iter().map(|(n, _)| n).collect(), affected: rows.len().max(done.affected), rows })
