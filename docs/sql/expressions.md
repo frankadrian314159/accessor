@@ -82,7 +82,11 @@ Matching ignores case. `ESCAPE` names a character that takes away the special me
 
 ## Row values
 
-`(a, b)` or `ROW(a, b)` compared with another row of the same size, or used with `IN`; see [select.md](select.md#row-values).
+`(a, b)` or `ROW(a, b)` compared with another row of the same size, or used with `IN`; see [select.md](select.md#row-values). In PostgreSQL mode `ROW(t.*)` is the row of all of `t`'s columns, and `ROW(t.*) = ROW(u.*)` compares them column by column.
+
+## User-defined operators
+
+In PostgreSQL mode `CREATE OPERATOR name (LEFTARG = type, RIGHTARG = type, FUNCTION = f [, COMMUTATOR = op, ...])` makes `a name b` mean `f(a, b)`; with only `RIGHTARG` it is a prefix operator, `name b` meaning `f(b)`. The operator binds like a comparison. It is known by its spelling and whether it has a left operand (not by operand types: a later definition of the same spelling and shape replaces the earlier one, and dropping one that is not there is not an error), and the other options are read and ignored. `DROP OPERATOR name (left, right)` removes it, `NONE` standing for a missing operand. Names are read as PostgreSQL reads them: a run of the characters `+ - * / < > = ~ ! @ # % ^ & | ` ?`, without a trailing `+` or `-` unless it holds one of `~ ! @ # % ^ & | ` ?`. The lexer only treats a run as an operator once `CREATE OPERATOR` has named it.
 
 ## Time zones and intervals
 

@@ -25,6 +25,15 @@ impl Database {
         Some((c.columns.clone(), c.rows.iter().skip(c.pos).take(count).cloned().collect()))
     }
 
+    /// The row a cursor stands on (for `WHERE CURRENT OF`), with the names of its columns.
+    pub(crate) fn current_cursor_row(&self, name: &str) -> Result<(Vec<String>, Row)> {
+        let c = self.cursors.get(&name.to_ascii_lowercase()).ok_or_else(|| Error::runtime(format!("cursor \"{name}\" does not exist")))?;
+        if c.pos == 0 || c.pos > c.rows.len() {
+            return Err(Error::runtime(format!("cursor \"{name}\" is not positioned on a row")));
+        }
+        Ok((c.columns.clone(), c.rows[c.pos - 1].clone()))
+    }
+
     /// A cursor a plpgsql function opened, left in the session under `name`.
     pub(crate) fn export_cursor(&mut self, name: &str, columns: Vec<String>, rows: Vec<Row>, pos: usize) {
         self.cursors.insert(name.to_ascii_lowercase(), Cursor { columns, rows, pos, hold: true });

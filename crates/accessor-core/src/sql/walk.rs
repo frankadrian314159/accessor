@@ -232,7 +232,7 @@ pub fn walk_statement(st: &mut Statement, f: &mut Visitor) -> Result<()> {
                 match &mut w.action {
                     MergeAction::Update(sets) => sets.iter_mut().try_for_each(|(_, e)| walk_expr(e, f))?,
                     MergeAction::Insert { values, .. } => values.iter_mut().try_for_each(|e| walk_expr(e, f))?,
-                    MergeAction::Delete => {}
+                    MergeAction::Delete | MergeAction::Nothing => {}
                 }
             }
             Ok(())

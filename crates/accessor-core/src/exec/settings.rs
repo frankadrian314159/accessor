@@ -317,6 +317,9 @@ impl Database {
         if name == "optimizer" {
             self.set_optimizer(shown == "on");
         }
+        if name == "bytea_output" {
+            crate::value::set_bytea_escape(shown.trim().eq_ignore_ascii_case("escape"));
+        }
         if name == "extra_float_digits" {
             crate::value::set_extra_float_digits(shown.trim().parse().map_err(|_| Error::runtime(format!("invalid value for parameter \"{name}\": \"{value}\"")))?);
         }
@@ -346,6 +349,9 @@ impl Database {
                 }
                 if name == "extra_float_digits" {
                     crate::value::set_extra_float_digits(1);
+                }
+                if name == "bytea_output" {
+                    crate::value::set_bytea_escape(false);
                 }
                 if name == "timezone" {
                     self.set_time_zone("UTC")?;

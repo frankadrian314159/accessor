@@ -43,6 +43,7 @@ impl Zone {
             // The database is case-sensitive; accept any case by trying the usual forms.
             chrono_tz::TZ_VARIANTS.iter().find(|z| z.name().eq_ignore_ascii_case(t)).map(|z| Zone::Named(*z))
         })
+        .or_else(|| abbreviation(t).map(Zone::Fixed))
     }
 
     /// The offset from UTC (seconds east) in force at the instant `utc`.
@@ -93,6 +94,46 @@ impl Zone {
             Zone::Named(tz) => tz.name().to_string(),
         }
     }
+}
+
+/// The common zone abbreviations, as a fixed offset (seconds east of UTC).
+fn abbreviation(t: &str) -> Option<i32> {
+    let hours: f64 = match t.to_ascii_uppercase().as_str() {
+        "ZULU" => 0.0,
+        "PST" => -8.0,
+        "PDT" => -7.0,
+        "MST" => -7.0,
+        "MDT" => -6.0,
+        "CST" => -6.0,
+        "CDT" => -5.0,
+        "EST" => -5.0,
+        "EDT" => -4.0,
+        "AST" => -4.0,
+        "ADT" => -3.0,
+        "HST" => -10.0,
+        "AKST" => -9.0,
+        "AKDT" => -8.0,
+        "NST" => -3.5,
+        "NDT" => -2.5,
+        "WET" => 0.0,
+        "WEST" => 1.0,
+        "CET" => 1.0,
+        "CEST" => 2.0,
+        "EET" => 2.0,
+        "EEST" => 3.0,
+        "MSK" => 3.0,
+        "IST" => 5.5,
+        "JST" => 9.0,
+        "KST" => 9.0,
+        "AEST" => 10.0,
+        "AEDT" => 11.0,
+        "ACST" => 9.5,
+        "AWST" => 8.0,
+        "NZST" => 12.0,
+        "NZDT" => 13.0,
+        _ => return None,
+    };
+    Some((hours * 3600.0) as i32)
 }
 
 /// `+05:30` for 19 800 seconds.

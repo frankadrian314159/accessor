@@ -24,6 +24,8 @@ pub enum Tok {
     Bytes(Vec<u8>),
     Date(i64),
     Sym(&'static str),
+    /// A user-defined operator (`CREATE OPERATOR <<< (...)`), as it is spelled.
+    Op(String),
     /// `@name` — a query parameter.
     Param(String),
     Eof,
@@ -39,6 +41,34 @@ pub struct Token {
 const SYMBOLS: [&str; 38] = [
     "#", "<=>", "@?", "@@", "<<", ">>", "!~*", "~*", "!~", "~", "@", "->>", "->", "::", ":=", ":", "..", "<>", "<=", ">=", "!=", "(", ")", ",", ".", ";", "*", "+", "-", "/", "\\", "^", "&", "|", "=", "<", ">", "%",
 ];
+
+thread_local! {
+    /// The operators `CREATE OPERATOR` has named, so the later statements read them as one token.
+    static CUSTOM_OPS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn is_op_char(c: char) -> bool {
+    "+-*/<>=~!@#%^&|`?".contains(c)
+}
+
+/// The operator at the start of `rest`, as PostgreSQL reads it: the longest run of operator characters (not into a
+/// comment), without a trailing `+` or `-` unless it holds one of `~ ! @ # % ^ & | ` ?`.
+fn op_run(rest: &str) -> &str {
+    let mut n = 0;
+    for (k, c) in rest.char_indices() {
+        if !is_op_char(c) || rest[k..].starts_with("--") || rest[k..].starts_with("/*") {
+            break;
+        }
+        n = k + 1;
+    }
+    let mut run = &rest[..n];
+    if run.len() > 1 && !run.chars().any(|c| "~!@#%^&|`?".contains(c)) {
+        while run.len() > 1 && (run.ends_with('+') || run.ends_with('-')) {
+            run = &run[..run.len() - 1];
+        }
+    }
+    run
+}
 
 fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_'
@@ -68,6 +98,8 @@ fn dollar_tag(chars: &[(usize, char)], i: usize) -> Option<String> {
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     let chars: Vec<(usize, char)> = src.char_indices().collect();
     let mut out = Vec::new();
+    // inside a CREATE / DROP / ALTER OPERATOR statement every run of operator characters is an operator
+    let mut in_operator_statement = false;
     // how many array brackets are open: inside them `[` is never the start of an [identifier]
     let mut arrays = 0usize;
     let mut question = 0usize;
@@ -420,6 +452,40 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             out.push(Token { tok: Tok::Date(t), pos });
         } else {
             let rest = &src[pos..];
+            if dialect::current() == Dialect::Postgresql && is_op_char(c) {
+                let run = op_run(rest);
+                let named = matches!(
+                    out.as_slice(),
+                    [.., Token { tok: Tok::Ident(b), .. }, Token { tok: Tok::Ident(a), .. }]
+                        if a.eq_ignore_ascii_case("OPERATOR") && ["CREATE", "DROP", "ALTER"].iter().any(|w| b.eq_ignore_ascii_case(w))
+                ) || matches!(
+                    out.as_slice(),
+                    [.., Token { tok: Tok::Ident(b), .. }, Token { tok: Tok::Ident(a), .. }, Token { tok: Tok::Ident(_) | Tok::Quoted(_), .. }, Token { tok: Tok::Sym("."), .. }]
+                        if a.eq_ignore_ascii_case("OPERATOR") && ["CREATE", "DROP", "ALTER"].iter().any(|w| b.eq_ignore_ascii_case(w))
+                ) || matches!(
+                    out.as_slice(),
+                    [.., Token { tok: Tok::Ident(a), .. }, Token { tok: Tok::Ident(b), .. }, Token { tok: Tok::Ident(c2), .. }]
+                        if c2.eq_ignore_ascii_case("EXISTS") && b.eq_ignore_ascii_case("IF") && a.eq_ignore_ascii_case("OPERATOR")
+                );
+                let first = named && !in_operator_statement;
+                if first {
+                    in_operator_statement = true;
+                    // an operator that already means something (`=`, `<=`, `@>`) is never taken over
+                    let builtin = SYMBOLS.contains(&run) || ["@>", "<@", "&&", "||", "-|-", "&<", "&>", "=>", ":="].contains(&run);
+                    CUSTOM_OPS.with(|c| {
+                        let mut c = c.borrow_mut();
+                        if !builtin && !c.iter().any(|o| o == run) {
+                            c.push(run.to_string());
+                        }
+                    });
+                }
+                let custom = first || (in_operator_statement && run.len() >= 2) || CUSTOM_OPS.with(|c| c.borrow().iter().any(|o| o == run));
+                if custom {
+                    i += run.chars().count();
+                    out.push(Token { tok: Tok::Op(run.to_string()), pos });
+                    continue;
+                }
+            }
             // `||` (standard SQL) is accepted as a spelling of the concatenation operator &.
             if rest.starts_with("||") {
                 i += 2;
@@ -450,6 +516,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 .find(|s| rest.starts_with(**s))
                 .ok_or_else(|| Error::syntax(format!("unexpected character '{c}'")))?;
             i += sym.chars().count();
+            if *sym == ";" {
+                in_operator_statement = false;
+            }
             out.push(Token { tok: Tok::Sym(sym), pos });
         }
     }

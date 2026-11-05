@@ -334,6 +334,7 @@ impl ScalarFn {
 fn text_of(v: &Value) -> Cow<'_, str> {
     match v {
         Value::Text(s) => Cow::Borrowed(&**s),
+        Value::Bytes(b) => String::from_utf8_lossy(b),
         other => Cow::Owned(other.to_string()),
     }
 }

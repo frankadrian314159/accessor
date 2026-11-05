@@ -77,6 +77,8 @@ pub enum MoreFn {
     LoCreate,
     LoCreat,
     LoFromBytea,
+    ByteaIn,
+    JsonpathIn,
     LoGet,
     LoPut,
     LoUnlink,
@@ -175,6 +177,8 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "LO_CREATE" => (LoCreate, 1, 1),
         "LO_CREAT" => (LoCreat, 1, 1),
         "LO_FROM_BYTEA" => (LoFromBytea, 2, 2),
+        "BYTEA_IN" => (ByteaIn, 1, 1),
+        "JSONPATH_IN" => (JsonpathIn, 1, 1),
         "LO_GET" => (LoGet, 1, 3),
         "LO_PUT" => (LoPut, 3, 3),
         "LO_UNLINK" => (LoUnlink, 1, 1),
@@ -371,6 +375,46 @@ fn xml_content(v: &Value) -> String {
     } else {
         super::xmlfuncs::escape_content(&s)
     }
+}
+
+/// The bytes a bytea literal stands for: `\x` and hex digits, or the escape form (`\\` is a backslash, `\ooo` is a byte).
+fn parse_bytea(s: &str) -> Result<Vec<u8>> {
+    let bad = || Error::runtime("invalid input syntax for type bytea");
+    if let Some(hex) = s.strip_prefix("\\x") {
+        let digits: Vec<u8> = hex.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        if digits.len() % 2 != 0 {
+            return Err(Error::runtime("invalid hexadecimal data: odd number of digits"));
+        }
+        return digits
+            .chunks(2)
+            .map(|p| {
+                let h = |c: u8| (c as char).to_digit(16).ok_or_else(|| Error::runtime(format!("invalid hexadecimal digit: \"{}\"", c as char)));
+                Ok((h(p[0])? * 16 + h(p[1])?) as u8)
+            })
+            .collect();
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+        } else if b.get(i + 1) == Some(&b'\\') {
+            out.push(b'\\');
+            i += 2;
+        } else if i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = b[i + 1..i + 4].iter().fold(0u32, |a, c| a * 8 + (*c - b'0') as u32);
+            if v > 255 {
+                return Err(bad());
+            }
+            out.push(v as u8);
+            i += 4;
+        } else {
+            return Err(bad());
+        }
+    }
+    Ok(out)
 }
 
 fn raw(v: &Value) -> Vec<u8> {
@@ -891,6 +935,15 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         LoCreate => Value::Int(lo_new(int(v(0))?, Vec::new())?),
         LoCreat => Value::Int(lo_new(0, Vec::new())?),
         LoFromBytea => Value::Int(lo_new(int(v(0))?, raw(v(1)))?),
+        JsonpathIn => match v(0) {
+            Value::Null => Value::Null,
+            other => Value::text(&crate::jsonpath::parse(&text(other))?.to_text()),
+        },
+        ByteaIn => match v(0) {
+            Value::Null => Value::Null,
+            Value::Bytes(_) => v(0).clone(),
+            other => Value::Bytes(std::sync::Arc::new(parse_bytea(&text(other))?)),
+        },
         LoGet => {
             let id = int(v(0))?;
             let data = LARGE_OBJECTS.with(|m| m.borrow().get(&id).cloned()).ok_or_else(|| Error::runtime(format!("large object {id} does not exist")))?;

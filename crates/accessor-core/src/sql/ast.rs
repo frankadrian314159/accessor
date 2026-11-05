@@ -752,6 +752,8 @@ pub struct MergeDef {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergeWhen {
     pub matched: bool,
+    /// `WHEN NOT MATCHED BY SOURCE`: a target record no source record matched.
+    pub by_source: bool,
     pub condition: Option<Expr>,
     pub action: MergeAction,
 }
@@ -761,6 +763,7 @@ pub enum MergeAction {
     Update(Vec<(String, Expr)>),
     Delete,
     Insert { columns: Option<Vec<String>>, values: Vec<Expr> },
+    Nothing,
 }
 
 /// A schema, domain, type, extension, role or rule made or dropped.

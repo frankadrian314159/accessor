@@ -530,6 +530,31 @@ impl<'a> Binder<'a> {
             },
             Expr::Neg(a) => BExpr::Neg(self.boxed(a)?),
             Expr::Not(a) => BExpr::Not(self.boxed(a)?),
+            // t.* = u.* (what ROW(t.*) = ROW(u.*) comes to): every column of t equals the same-position column of u
+            Expr::Binary { op: op @ (crate::sql::ast::BinOp::Eq | crate::sql::ast::BinOp::Ne), left, right }
+                if matches!((&**left, &**right), (Expr::Column { table: Some(_), name: a }, Expr::Column { table: Some(_), name: b }) if a == "*" && b == "*") =>
+            {
+                let (Expr::Column { table: Some(l), .. }, Expr::Column { table: Some(r), .. }) = (&**left, &**right) else { unreachable!("checked") };
+                let cols = |t: &String| -> Vec<String> { self.scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(t) && !c.hidden).map(|c| c.name.clone()).collect() };
+                let (lc, rc) = (cols(l), cols(r));
+                if lc.is_empty() || lc.len() != rc.len() {
+                    return Err(Error::runtime("the rows compared do not have the same columns"));
+                }
+                let join = if *op == crate::sql::ast::BinOp::Eq { crate::sql::ast::BinOp::And } else { crate::sql::ast::BinOp::Or };
+                let mut all: Option<Expr> = None;
+                for (a, b) in lc.into_iter().zip(rc) {
+                    let one = Expr::Binary {
+                        op: op.clone(),
+                        left: Box::new(Expr::Column { table: Some(l.clone()), name: a }),
+                        right: Box::new(Expr::Column { table: Some(r.clone()), name: b }),
+                    };
+                    all = Some(match all {
+                        None => one,
+                        Some(prev) => Expr::Binary { op: join.clone(), left: Box::new(prev), right: Box::new(one) },
+                    });
+                }
+                return self.bind(&all.expect("columns"));
+            }
             Expr::Binary { op, left, right } => BExpr::Bin(*op, self.boxed(left)?, self.boxed(right)?),
             Expr::IsNull { expr, negated } => BExpr::IsNull(self.boxed(expr)?, *negated),
             Expr::Like { expr, pattern, negated } => {
@@ -629,6 +654,25 @@ impl<'a> Binder<'a> {
                 };
             }
             Expr::Window { func, spec } => return self.bind_window(func, spec),
+            Expr::Function { name, args, distinct, star }
+                if name == "__ROW" && args.iter().any(|a| matches!(a, Expr::Column { table: Some(_), name } if name == "*")) =>
+            {
+                let mut out = Vec::new();
+                for a in args {
+                    match a {
+                        Expr::Column { table: Some(t), name } if name == "*" => {
+                            let cols: Vec<&crate::exec::bind::ScopeCol> =
+                                self.scope.cols.iter().filter(|c| c.table.eq_ignore_ascii_case(t) && !c.hidden).collect();
+                            if cols.is_empty() {
+                                return Err(Error::catalog(format!("no table named '{t}' in this query")));
+                            }
+                            out.extend(cols.into_iter().map(|c| Expr::Column { table: Some(t.clone()), name: c.name.clone() }));
+                        }
+                        other => out.push(other.clone()),
+                    }
+                }
+                return self.bind(&Expr::Function { name: name.clone(), args: out, distinct: *distinct, star: *star });
+            }
             Expr::Function { name, args, distinct, star } if name == "__ROW" && crate::dialect::current() == crate::dialect::Dialect::Postgresql => {
                 // a row value that is not compared: PostgreSQL's record text
                 return self.bind(&Expr::Function { name: "__ROWTEXT".into(), args: args.clone(), distinct: *distinct, star: *star });
@@ -676,6 +720,37 @@ impl<'a> Binder<'a> {
                     let sha = Expr::Function { name: "SHA2".into(), args: vec![args[0].clone(), Expr::Literal(Value::Int(256))], distinct: false, star: false };
                     let cut = Expr::Function { name: "SUBSTR".into(), args: vec![sha, Expr::Literal(Value::Int(1)), Expr::Literal(Value::Int(32))], distinct: false, star: false };
                     return self.bind(&cut);
+                }
+                // a user-defined operator: the function CREATE OPERATOR named
+                if name == "__OP" {
+                    let Some(Expr::Literal(Value::Text(sym))) = args.first() else { return Err(Error::runtime("an operator needs its spelling")) };
+                    let function = self
+                        .db
+                        .operator_function(sym, args.len() - 1)
+                        .ok_or_else(|| Error::runtime(format!("operator does not exist: {sym}")))?;
+                    return self.bind(&Expr::Function { name: function, args: args[1..].to_vec(), distinct: false, star: false });
+                }
+                // WHERE CURRENT OF cursor: the table's row that equals the cursor's current row (by the columns they share)
+                if name == "__CURRENT_OF" {
+                    let Some(Expr::Literal(Value::Text(c))) = args.first() else { return Err(Error::runtime("WHERE CURRENT OF needs a cursor name")) };
+                    let (cols, row) = self.db.current_cursor_row(c)?;
+                    let mut cond: Option<Expr> = None;
+                    for (n, v) in cols.iter().zip(row) {
+                        if !self.scope.cols.iter().any(|sc| sc.name.eq_ignore_ascii_case(n)) {
+                            continue;
+                        }
+                        let col = Expr::Column { table: None, name: n.clone() };
+                        let one = if matches!(v, Value::Null) {
+                            Expr::IsNull { expr: Box::new(col), negated: false }
+                        } else {
+                            Expr::Binary { op: crate::sql::ast::BinOp::Eq, left: Box::new(col), right: Box::new(Expr::Literal(v)) }
+                        };
+                        cond = Some(match cond {
+                            None => one,
+                            Some(prev) => Expr::Binary { op: crate::sql::ast::BinOp::And, left: Box::new(prev), right: Box::new(one) },
+                        });
+                    }
+                    return self.bind(&cond.ok_or_else(|| Error::runtime(format!("cursor \"{c}\" is not a simple scan of the table")))?);
                 }
                 // current_user, session_user, current_role: the role of the session (SET ROLE changes only the current one)
                 if let Some(which) = name.strip_prefix("__PG_") {

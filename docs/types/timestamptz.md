@@ -52,6 +52,18 @@ Accepted forms, with or without an offset or zone name:
 
 and the typed literal `TIMESTAMP WITH TIME ZONE '2024-03-05 14:30:00+01:00'`. Text that is not a timestamp is an error.
 
+In PostgreSQL mode the looser forms PostgreSQL reads are accepted too, for `TIMESTAMP`, `TIMESTAMPTZ` and `DATE`:
+
+```
+now  today  tomorrow  yesterday  midnight  epoch      today and the like are read in the session zone
+Mon Feb 10 17:32:01 1997 PST                          weekday, month name, year after the time, zone abbreviation
+February 10, 1997    10 Feb 1997    1997-Feb-10       month names (day and year in either order)
+19970210 173201                                       run together
+tomorrow EST       today zulu                         a word and a zone
+```
+
+The zone abbreviations known are `ZULU`, `PST`, `PDT`, `MST`, `MDT`, `CST`, `CDT`, `EST`, `EDT`, `AST`, `ADT`, `HST`, `AKST`, `AKDT`, `NST`, `NDT`, `WET`, `WEST`, `CET`, `CEST`, `EET`, `EEST`, `MSK`, `IST`, `JST`, `KST`, `AEST`, `AEDT`, `ACST`, `AWST`, `NZST` and `NZDT`; each is a fixed offset (`PDT` is always -07:00, whatever the date). A two-digit year is 19xx from 70 and 20xx below it. Fractions of a second are dropped.
+
 ## AT TIME ZONE
 
 ```sql

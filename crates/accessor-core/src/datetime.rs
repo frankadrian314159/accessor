@@ -121,6 +121,135 @@ pub fn format(secs: i64) -> String {
 
 /// Parses `YYYY-MM-DD[ T]HH:MM[:SS]` and US-style `M/D/YYYY [h:mm[:ss] [AM|PM]]`.
 pub fn parse(input: &str) -> Option<i64> {
+    parse_iso(input).or_else(|| if crate::dialect::current() == crate::dialect::Dialect::Postgresql { parse_loose(input) } else { None })
+}
+
+const MONTHS: [&str; 12] = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const WEEKDAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+fn month_of(word: &str) -> Option<u32> {
+    let w = word.trim_end_matches('.');
+    if w.len() < 3 {
+        return None;
+    }
+    let i = MONTHS.iter().position(|m| w.starts_with(m))?;
+    let full = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"][i];
+    (w == MONTHS[i] || w == full || (i == 8 && w == "sept")).then_some(i as u32 + 1)
+}
+
+fn is_weekday(word: &str) -> bool {
+    let w = word.trim_end_matches('.');
+    WEEKDAYS.iter().any(|d| w == *d || (w.len() > 3 && w.starts_with(d) && ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "tues", "wednes", "thur", "thurs"].contains(&w)))
+}
+
+/// PostgreSQL's looser timestamp input: `now`, `today`, `tomorrow`, `yesterday`, `epoch`, and dates with month names
+/// (`Mon Feb 10 17:32:01 1997`, `February 10, 1997`, `10 Feb 1997`, `1997-Feb-10`) or run together (`19970210 173201`).
+fn parse_loose(input: &str) -> Option<i64> {
+    let lower = input.trim().to_ascii_lowercase();
+    let zone = crate::tz::session();
+    let n = now();
+    let local_now = n + zone.offset_at(n);
+    let midnight = local_now.div_euclid(86_400) * 86_400;
+    match lower.as_str() {
+        "now" => return Some(local_now),
+        "today" | "midnight" | "allballs" => return Some(midnight),
+        "tomorrow" => return Some(midnight + 86_400),
+        "yesterday" => return Some(midnight - 86_400),
+        "epoch" => return Some(0),
+        _ => {}
+    }
+    let (mut year, mut month, mut day): (Option<i64>, Option<u32>, Option<u32>) = (None, None, None);
+    let (mut h, mut mi, mut sec) = (0u32, 0u32, 0u32);
+    let (mut pm, mut bc) = (None, false);
+    let mut numbers: Vec<(i64, usize)> = Vec::new();
+    // how many numbers came before the month's name
+    let mut month_at: Option<usize> = None;
+    for t in lower.split(|c: char| c.is_whitespace() || c == ',').filter(|t| !t.is_empty()) {
+        if let Some(m) = month_of(t) {
+            month = Some(m);
+            month_at = Some(numbers.len());
+        } else if is_weekday(t) || t == "ad" || t == "at" || t == "on" {
+        } else if t == "bc" {
+            bc = true;
+        } else if t == "am" || t == "pm" {
+            pm = Some(t == "pm");
+        } else if t.contains(':') {
+            let (clock, merid) = match t.strip_suffix("pm") {
+                Some(c) => (c, Some(true)),
+                None => match t.strip_suffix("am") {
+                    Some(c) => (c, Some(false)),
+                    None => (t, None),
+                },
+            };
+            if merid.is_some() {
+                pm = merid;
+            }
+            let mut it = clock.split(':');
+            h = it.next()?.parse().ok()?;
+            mi = it.next()?.parse().ok()?;
+            sec = match it.next() {
+                Some(v) => v.split('.').next()?.parse().ok()?,
+                None => 0,
+            };
+        } else if t.contains('-') && t.split('-').any(|p| month_of(p).is_some()) {
+            // 1997-feb-10, 10-feb-1997, feb-10-1997
+            for p in t.split('-') {
+                if let Some(m) = month_of(p) {
+                    month = Some(m);
+                    month_at = Some(numbers.len());
+                } else {
+                    numbers.push((p.parse().ok()?, p.len()));
+                }
+            }
+        } else if t.chars().all(|c| c.is_ascii_digit()) {
+            let v: i64 = t.parse().ok()?;
+            if t.len() == 8 && month.is_none() {
+                year = Some(v / 10_000);
+                month = Some((v / 100 % 100) as u32);
+                day = Some((v % 100) as u32);
+            } else if t.len() == 6 && year.is_some() {
+                h = (v / 10_000) as u32;
+                mi = (v / 100 % 100) as u32;
+                sec = (v % 100) as u32;
+            } else {
+                numbers.push((v, t.len()));
+            }
+        } else {
+            return None;
+        }
+    }
+    match (month, numbers.as_slice()) {
+        (Some(_), [(_, la), (_, lb)]) if la.max(lb) < &3 || month_at == Some(2) || (month_at == Some(2) && *la >= 3) || (*la >= 3 && month_at != Some(1)) => return None,
+        (Some(_), [(a, la), (b, lb)]) => {
+            let (y, d) = if *la >= 3 || *a > 31 { (*a, *b) } else if *lb >= 3 || *b > 31 { (*b, *a) } else { (*b, *a) };
+            let y = if la.max(lb) < &3 && y < 100 { if y >= 70 { y + 1900 } else { y + 2000 } } else { y };
+            year = Some(y);
+            day = Some(u32::try_from(d).ok()?);
+        }
+        (Some(_), [(a, _)]) if year.is_none() => day = Some(u32::try_from(*a).ok()?),
+        (None, []) if year.is_some() => {}
+        _ if numbers.is_empty() => {}
+        _ => return None,
+    }
+    if year.is_none() && day.is_some() {
+        year = Some(components(local_now).0);
+    }
+    let (mut y, mo, d) = (year?, month?, day?);
+    if bc && y < 100 {
+        return None;
+    }
+    if bc {
+        y = 1 - y;
+    }
+    match pm {
+        Some(true) if h < 12 => h += 12,
+        Some(false) if h == 12 => h = 0,
+        _ => {}
+    }
+    from_components(y, mo, d, h, mi, sec)
+}
+
+fn parse_iso(input: &str) -> Option<i64> {
     let s = input.trim();
     if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
         if s.eq_ignore_ascii_case("infinity") || s.eq_ignore_ascii_case("+infinity") {

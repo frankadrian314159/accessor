@@ -7613,3 +7613,86 @@ fn postgresql_session_user_policies_ownership_select_into_and_json_spacing() {
     db.execute("RESET extra_float_digits").unwrap();
     assert_eq!(pg_one(&mut db, "SELECT sinh(1::float8)"), "1.1752011936438014");
 }
+
+#[test]
+fn postgresql_merge_current_of_operators_foreign_data_bytea_and_loose_timestamps() {
+    let mut db = pg();
+    // MERGE: DO NOTHING, ONLY, NOT MATCHED BY SOURCE
+    db.execute("CREATE TABLE tgt (a int, b text)").unwrap();
+    db.execute("INSERT INTO tgt VALUES (1, 'one'), (2, 'two'), (3, 'three')").unwrap();
+    db.execute(
+        "MERGE INTO ONLY tgt t USING (VALUES (1, 'x'), (9, 'nine')) AS v(a, b) ON t.a = v.a \
+         WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED THEN INSERT VALUES (v.a, v.b)",
+    )
+    .unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM tgt"), "4");
+    db.execute(
+        "MERGE INTO tgt t USING (VALUES (2)) AS v(a) ON t.a = v.a \
+         WHEN NOT MATCHED BY SOURCE AND t.a = 1 THEN DELETE WHEN NOT MATCHED BY SOURCE THEN UPDATE SET b = 'orphan'",
+    )
+    .unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT string_agg(a::text || b, ',' ORDER BY a) FROM tgt"), "2two,3orphan,9orphan");
+
+    // WHERE CURRENT OF
+    db.execute("CREATE TABLE uc (f1 int, f2 text)").unwrap();
+    db.execute("INSERT INTO uc VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    db.execute("BEGIN").unwrap();
+    db.execute("DECLARE c1 CURSOR FOR SELECT * FROM uc ORDER BY f1 FOR UPDATE").unwrap();
+    db.execute("FETCH 2 FROM c1").unwrap();
+    db.execute("UPDATE uc SET f2 = 'changed' WHERE CURRENT OF c1").unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT string_agg(f2, ',' ORDER BY f1) FROM uc"), "a,changed,c");
+
+    // user-defined operators
+    db.execute("CREATE FUNCTION myle(int, int) RETURNS bool AS 'select $1 <= $2' LANGUAGE sql").unwrap();
+    db.execute("CREATE OPERATOR <<< (LEFTARG = int, RIGHTARG = int, FUNCTION = myle, COMMUTATOR = >>>)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT 3 <<< 5"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM tgt WHERE a <<< 3"), "2");
+    db.execute("CREATE FUNCTION dbl(int) RETURNS int AS 'select $1 * 2' LANGUAGE sql").unwrap();
+    db.execute("CREATE OPERATOR !! (RIGHTARG = int, FUNCTION = dbl)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT !! 4"), "8");
+    db.execute("DROP OPERATOR !! (NONE, int)").unwrap();
+    assert!(db.execute("SELECT !! 4").is_err());
+
+    // foreign-data wrappers, servers and user mappings
+    db.execute("CREATE FOREIGN DATA WRAPPER foo OPTIONS (testing '1')").unwrap();
+    assert!(db.execute("CREATE FOREIGN DATA WRAPPER foo").is_err());
+    db.execute("CREATE SERVER s1 FOREIGN DATA WRAPPER foo OPTIONS (a '1')").unwrap();
+    db.execute("CREATE USER MAPPING FOR current_user SERVER s1 OPTIONS (u 'x')").unwrap();
+    assert!(db.execute("CREATE USER MAPPING FOR current_user SERVER s1").is_err());
+    assert_eq!(pg_one(&mut db, "SELECT fdwoptions FROM pg_foreign_data_wrapper"), "{testing=1}");
+    db.execute("ALTER FOREIGN DATA WRAPPER foo OPTIONS (SET testing '2', ADD b '3')").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT fdwoptions FROM pg_foreign_data_wrapper"), "{testing=2,b=3}");
+    assert!(db.execute("ALTER FOREIGN DATA WRAPPER foo OPTIONS (DROP nope)").is_err());
+    assert_eq!(pg_one(&mut db, "SELECT srvoptions FROM pg_foreign_server"), "{a=1}");
+    assert_eq!(pg_one(&mut db, "SELECT umserver FROM pg_user_mapping"), "s1");
+    assert!(db.execute("DROP FOREIGN DATA WRAPPER foo").is_err());
+    db.execute("DROP FOREIGN DATA WRAPPER foo CASCADE").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM pg_foreign_server"), "0");
+
+    // ON CONFLICT with an alias for the table, SET (a, b) = (...), and ROW(t.*)
+    db.execute("CREATE TABLE ic (key int primary key, fruit text)").unwrap();
+    db.execute("INSERT INTO ic VALUES (1, 'Apple')").unwrap();
+    assert_eq!(
+        pg_one(&mut db, "INSERT INTO ic AS i VALUES (1, 'Pear') ON CONFLICT (key) DO UPDATE SET (fruit, key) = (excluded.fruit, excluded.key) WHERE i.fruit <> 'x' RETURNING fruit"),
+        "Pear"
+    );
+    assert_eq!(pg_one(&mut db, "SELECT ROW(i.*) = ROW(i.*) FROM ic i"), "true");
+
+    // bytea input and output
+    assert_eq!(pg_one(&mut db, r"SELECT '\xDeAdBeEf'::bytea"), r"\xdeadbeef");
+    assert_eq!(pg_one(&mut db, "SELECT 'abc'::bytea"), r"\x616263");
+    assert_eq!(pg_one(&mut db, r"SELECT E'a\\134b'::bytea"), r"\x615c62");
+
+    // jsonpath values are written the way PostgreSQL writes them
+    assert_eq!(pg_one(&mut db, "SELECT 'lax $.a.v'::jsonpath"), "$.\"a\".\"v\"");
+    assert_eq!(pg_one(&mut db, "SELECT 'strict $ ? (@.a < 1)'::jsonpath"), "strict $?(@.\"a\" < 1)");
+    assert_eq!(pg_one(&mut db, "SELECT '$.a + 1 * 2'::jsonpath"), "($.\"a\" + 1 * 2)");
+
+    // timestamps in PostgreSQL's looser forms
+    db.execute("SET TIME ZONE 'PST8PDT'").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT 'Mon Feb 10 17:32:01 1997 PST'::timestamptz"), "1997-02-10 17:32:01-08:00");
+    assert_eq!(pg_one(&mut db, "SELECT 'February 10, 1997'::date"), "1997-02-10");
+    assert_eq!(pg_one(&mut db, "SELECT '1997-Feb-10'::date"), "1997-02-10");
+    assert_eq!(pg_one(&mut db, "SELECT 'tomorrow'::date - 'today'::date"), "1");
+}

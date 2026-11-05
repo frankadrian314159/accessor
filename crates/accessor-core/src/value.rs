@@ -1309,6 +1309,28 @@ fn format_currency(d: &Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 }
 
 thread_local! {
+    static BYTEA_ESCAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `SET bytea_output = escape`: bytes are shown as text with `\\` and `\ooo` for the others, not as `\x` and hex.
+pub(crate) fn set_bytea_escape(on: bool) {
+    BYTEA_ESCAPE.with(|d| d.set(on));
+}
+
+/// The bytes in PostgreSQL's escape form.
+fn bytea_escape(b: &[u8]) -> String {
+    let mut out = String::new();
+    for &x in b {
+        match x {
+            b'\\' => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(x as char),
+            _ => out.push_str(&format!("\\{x:03o}")),
+        }
+    }
+    out
+}
+
+thread_local! {
     static EXTRA_FLOAT_DIGITS: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
 }
 
@@ -1353,6 +1375,11 @@ impl fmt::Display for Value {
             Value::Json(s) if crate::dialect::current() == Dialect::Postgresql => f.write_str(&crate::json::pg_text(s)),
             Value::Json(s) => f.write_str(s),
             Value::Multirange(s) => f.write_str(s),
+            Value::Bytes(b) if crate::dialect::current() == Dialect::Postgresql && BYTEA_ESCAPE.with(|d| d.get()) => f.write_str(&bytea_escape(b)),
+            Value::Bytes(b) if crate::dialect::current() == Dialect::Postgresql => {
+                f.write_str("\\x")?;
+                b.iter().try_for_each(|x| write!(f, "{x:02x}"))
+            }
             Value::Bytes(b) => f.write_str(&String::from_utf8_lossy(b)),
             Value::Array(a) => {
                 f.write_str("{")?;

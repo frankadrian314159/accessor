@@ -1440,7 +1440,7 @@ fn plpgsql_body(body: &str, mut names: Names, value: bool) -> Result<RoutineBody
     // TG_ARGV[n] is a variable of its own
     let argv = regex::Regex::new(r"(?i)\btg_argv\s*\[\s*(\d+)\s*\]").expect("a valid pattern");
     let body = &*argv.replace_all(body, "tg_argv_$1");
-    let mut p = Parser { src: body, toks: lex(body)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: body, toks: lex(body)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let block = p.pl_block(&mut names)?;
     let value = value && !names.trigger;
     while p.eat_sym(";") {}

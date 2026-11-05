@@ -39,6 +39,8 @@ enum Step {
     Index(Vec<(Idx, Option<Idx>)>),
     Filter(Box<Expr>),
     Method(String),
+    /// A method this reads but cannot run (`datetime("..")`, `decimal(6, 2)`), with its arguments.
+    Call(String, Vec<Json>),
 }
 
 #[derive(Clone, Debug)]
@@ -271,12 +273,15 @@ impl P<'_> {
             Tok::Dollar => Root::Context,
             Tok::At => Root::Current,
             Tok::Var(n) => Root::Var(n),
-            Tok::Num(n) => return Ok(Expr::Lit(number(&n).ok_or_else(|| self.err())?)),
-            Tok::Str(s) => return Ok(Expr::Lit(Json::String(s))),
+            Tok::Num(n) => {
+                let lit = Expr::Lit(number(&n).ok_or_else(|| self.err())?);
+                return self.steps_after(lit);
+            }
+            Tok::Str(s) => return self.steps_after(Expr::Lit(Json::String(s))),
             Tok::Word(w) => match w.as_str() {
-                "true" => return Ok(Expr::Lit(Json::Bool(true))),
-                "false" => return Ok(Expr::Lit(Json::Bool(false))),
-                "null" => return Ok(Expr::Lit(Json::Null)),
+                "true" => return self.steps_after(Expr::Lit(Json::Bool(true))),
+                "false" => return self.steps_after(Expr::Lit(Json::Bool(false))),
+                "null" => return self.steps_after(Expr::Lit(Json::Null)),
                 "exists" => {
                     self.expect_sym("(")?;
                     let e = self.or()?;
@@ -313,6 +318,23 @@ impl P<'_> {
                     Some(Tok::Word(w)) => {
                         self.i += 1;
                         if self.sym("(") {
+                            if matches!(w.as_str(), "datetime" | "date" | "time" | "time_tz" | "timestamp" | "timestamp_tz" | "number" | "string" | "boolean" | "bigint" | "integer" | "decimal" | "lower" | "upper" | "ltrim" | "rtrim" | "btrim" | "initcap" | "replace" | "split_part") {
+                                let mut args = Vec::new();
+                                while !matches!(self.peek(), Some(Tok::Sym(")")) | None) {
+                                    match self.peek().cloned() {
+                                        Some(Tok::Str(s)) => args.push(Json::String(s)),
+                                        Some(Tok::Num(n)) => args.push(number(&n).ok_or_else(|| self.err())?),
+                                        _ => return Err(self.err()),
+                                    }
+                                    self.i += 1;
+                                    if !self.sym(",") {
+                                        break;
+                                    }
+                                }
+                                self.expect_sym(")")?;
+                                steps.push(Step::Call(w, args));
+                                continue;
+                            }
                             self.expect_sym(")")?;
                             if !matches!(w.as_str(), "type" | "size" | "abs" | "floor" | "ceiling" | "double" | "keyvalue") {
                                 return Err(Error::syntax(format!("the jsonpath method .{w}() is not supported")));
@@ -391,6 +413,108 @@ fn number(s: &str) -> Option<Json> {
         return Some(Json::from(i));
     }
     s.parse::<f64>().ok().and_then(|f| serde_json::Number::from_f64(f).map(Json::Number))
+}
+
+fn quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// How tightly an expression binds, as PostgreSQL's `operationPriority` has it (5 for anything that is not an operator).
+fn priority(e: &Expr) -> u8 {
+    match e {
+        Expr::Or(..) => 0,
+        Expr::And(..) => 1,
+        Expr::Cmp(..) => 2,
+        Expr::Arith('+' | '-', ..) => 3,
+        Expr::Arith(..) => 4,
+        _ => 5,
+    }
+}
+
+fn is_operator(e: &Expr) -> bool {
+    matches!(e, Expr::Or(..) | Expr::And(..) | Expr::Cmp(..) | Expr::Arith(..) | Expr::Neg(..) | Expr::Like(..) | Expr::Starts(..) | Expr::Unknown(..))
+}
+
+/// The text of an expression in PostgreSQL's canonical form; `brackets` says an operator expression is parenthesised.
+fn show(e: &Expr, brackets: bool) -> String {
+    let child = |c: &Expr, parent: &Expr| show(c, priority(c) <= priority(parent));
+    let wrap = |s: String| if brackets { format!("({s})") } else { s };
+    match e {
+        Expr::Lit(v) => match v {
+            Json::String(s) => quote(s),
+            other => other.to_string(),
+        },
+        Expr::Path(root, steps) => {
+            let mut out = match root {
+                Root::Context => "$".to_string(),
+                Root::Current => "@".to_string(),
+                Root::Var(n) => format!("${}", quote(n)),
+                Root::Sub(inner) if matches!(**inner, Expr::Lit(_)) => show(inner, false),
+                Root::Sub(inner) => format!("({})", show(inner, false)),
+            };
+            for s in steps {
+                match s {
+                    Step::Key(k) => out.push_str(&format!(".{}", quote(k))),
+                    Step::Wild => out.push_str(".*"),
+                    Step::Descend => out.push_str(".**"),
+                    Step::All => out.push_str("[*]"),
+                    Step::Index(ranges) => {
+                        let one = |i: &Idx| match i {
+                            Idx::At(n) => n.to_string(),
+                            Idx::Last(0) => "last".to_string(),
+                            Idx::Last(k) if *k < 0 => format!("last - {}", -k),
+                            Idx::Last(k) => format!("last + {k}"),
+                        };
+                        let parts: Vec<String> = ranges.iter().map(|(a, b)| match b {
+                            Some(b) => format!("{} to {}", one(a), one(b)),
+                            None => one(a),
+                        }).collect();
+                        out.push_str(&format!("[{}]", parts.join(",")));
+                    }
+                    Step::Filter(f) => out.push_str(&format!("?({})", show(f, false))),
+                    Step::Method(m) => out.push_str(&format!(".{m}()")),
+                    Step::Call(m, args) => {
+                        let shown: Vec<String> = args.iter().map(|a| match a {
+                            Json::String(s) => quote(s),
+                            other => other.to_string(),
+                        }).collect();
+                        out.push_str(&format!(".{m}({})", shown.join(",")));
+                    }
+                }
+            }
+            out
+        }
+        Expr::Neg(a) => wrap(format!("-{}", child(a, e))),
+        Expr::Arith(op, a, b) => wrap(format!("{} {op} {}", child(a, e), child(b, e))),
+        Expr::Cmp(op, a, b) => wrap(format!("{} {op} {}", child(a, e), child(b, e))),
+        Expr::And(a, b) => wrap(format!("{} && {}", child(a, e), child(b, e))),
+        Expr::Or(a, b) => wrap(format!("{} || {}", child(a, e), child(b, e))),
+        Expr::Not(a) => format!("!({})", show(a, false)),
+        Expr::Exists(a) => format!("exists ({})", show(a, false)),
+        Expr::Like(a, pat, ci) => wrap(format!("{} like_regex {}{}", child(a, e), quote(pat), if *ci { " flag \"i\"" } else { "" })),
+        Expr::Starts(a, b) => wrap(format!("{} starts with {}", child(a, e), child(b, e))),
+        Expr::Unknown(a) => format!("({}) is unknown", show(a, false)),
+    }
+}
+
+impl Path {
+    /// The path as PostgreSQL writes a `jsonpath` value: `lax` left out, keys quoted, operators spaced.
+    pub fn to_text(&self) -> String {
+        let body = show(&self.expr, is_operator(&self.expr));
+        if self.strict { format!("strict {body}") } else { body }
+    }
 }
 
 /// Reads a path.
@@ -510,6 +634,7 @@ impl Ctx<'_> {
         let mut out = Vec::new();
         for v in seq {
             match s {
+                Step::Call(name, _) => return self.fail(format!("the jsonpath method .{name}() is not supported")),
                 Step::Key(k) => match &v {
                     Json::Object(m) => match m.get(k) {
                         Some(x) => out.push(x.clone()),

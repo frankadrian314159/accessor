@@ -117,6 +117,17 @@ impl Database {
 
     /// `CREATE` / `DROP` of a schema, type, extension or role.
     pub(crate) fn exec_catalog(&mut self, c: &CatalogChange) -> Result<QueryResult> {
+        if c.kind == "foreign" {
+            return self.exec_foreign(c);
+        }
+        if c.kind == "operator" {
+            // an operator is known here by its spelling and shape, not its operand types: a second definition replaces the
+            // first and dropping one that is not there is not an error
+            for n in &c.names {
+                self.catalog_set("operator", n, c.value.clone())?;
+            }
+            return Ok(QueryResult::default());
+        }
         if c.kind == "policy_alter" {
             return self.alter_policy(&c.names[0], c.value.as_deref().unwrap_or("{}"));
         }
@@ -138,6 +149,152 @@ impl Database {
                     }
                     self.drop_catalog_object(c.kind, name, c.cascade)?;
                 }
+            }
+        }
+        Ok(QueryResult::default())
+    }
+
+    /// The foreign-data objects of a kind, as `(name, details)` in name order.
+    pub(crate) fn foreign_objects(&self, kind: &str) -> Vec<(String, serde_json::Value)> {
+        self.catalog
+            .iter()
+            .filter(|((k, _), _)| k == kind)
+            .map(|((_, n), v)| (n.clone(), serde_json::from_str(v).unwrap_or_default()))
+            .collect()
+    }
+
+    /// CREATE / ALTER / DROP of a foreign-data wrapper, a foreign server or a user mapping.
+    fn exec_foreign(&mut self, c: &CatalogChange) -> Result<QueryResult> {
+        use serde_json::{json, Value as J};
+        let [verb, object, name, server] = &c.names[..] else { return Err(Error::runtime("malformed foreign-data statement")) };
+        let a: J = serde_json::from_str(c.value.as_deref().unwrap_or("{}")).unwrap_or_default();
+        let flag = |k: &str| a.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        let text = |k: &str| a.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let role = self.settings.get("role").filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none")).cloned().unwrap_or_else(|| "postgres".to_string());
+        let (kind, id, what) = match object.as_str() {
+            "fdw" => ("fdw", key(name), format!("foreign-data wrapper \"{name}\"")),
+            "server" => ("server", key(name), format!("server \"{name}\"")),
+            _ => {
+                let user = if name.eq_ignore_ascii_case("current_user") || name.eq_ignore_ascii_case("user") { role.clone() } else { name.clone() };
+                ("umapping", format!("{}|{}", key(&user), key(server)), format!("user mapping for \"{user}\" does not exist for server \"{server}\""))
+            }
+        };
+        let existing: Option<J> = self.catalog.get(&(kind.to_string(), id.clone())).and_then(|v| serde_json::from_str(v).ok());
+        let old_options = |d: &J| -> Vec<(String, String)> {
+            d.get("options")
+                .and_then(|o| o.as_array())
+                .map(|o| o.iter().map(|p| (p[0].as_str().unwrap_or("").to_string(), p[1].as_str().unwrap_or("").to_string())).collect())
+                .unwrap_or_default()
+        };
+        let apply = |mut cur: Vec<(String, String)>| -> Result<Vec<(String, String)>> {
+            for op in a.get("options").and_then(|o| o.as_array()).cloned().unwrap_or_default() {
+                let (act, k, v) = (op[0].as_str().unwrap_or(""), op[1].as_str().unwrap_or("").to_string(), op[2].as_str().unwrap_or("").to_string());
+                let pos = cur.iter().position(|(n, _)| *n == k);
+                match (act, pos) {
+                    ("drop", Some(p)) => {
+                        cur.remove(p);
+                    }
+                    ("set", Some(p)) => cur[p].1 = v,
+                    ("drop" | "set", None) => return Err(Error::catalog(format!("option \"{k}\" not found"))),
+                    (_, Some(_)) => return Err(Error::catalog(format!("option \"{k}\" provided more than once"))),
+                    (_, None) => cur.push((k, v)),
+                }
+            }
+            Ok(cur)
+        };
+        let options_json = |o: Vec<(String, String)>| -> J { J::Array(o.into_iter().map(|(k, v)| json!([k, v])).collect()) };
+        let save = |db: &mut Self, kind: &str, id: &str, d: J| db.catalog_set(kind, id, Some(d.to_string()));
+        match verb.as_str() {
+            "CREATE" => {
+                if existing.is_some() {
+                    if flag("if_not_exists") {
+                        return Ok(QueryResult::default());
+                    }
+                    let msg = if object == "mapping" { format!("user mapping for \"{}\" already exists for server \"{server}\"", id.split('|').next().unwrap_or("")) } else { format!("{what} already exists") };
+                    return Err(Error::catalog(msg));
+                }
+                let mut d = json!({"name": name, "owner": role});
+                if object != "fdw" {
+                    let parent = if object == "server" { text("fdw").unwrap_or_default() } else { server.clone() };
+                    let parent_kind = if object == "server" { "fdw" } else { "server" };
+                    let Some(p) = self.catalog.get(&(parent_kind.to_string(), key(&parent))).and_then(|v| serde_json::from_str::<J>(v).ok()) else {
+                        return Err(Error::catalog(if object == "server" { format!("foreign-data wrapper \"{parent}\" does not exist") } else { format!("server \"{server}\" does not exist") }));
+                    };
+                    d["fdw"] = if object == "server" { json!(p["name"]) } else { json!(parent) };
+                    if object == "mapping" {
+                        d["user"] = json!(id.split('|').next().unwrap_or(""));
+                        d["server"] = json!(p["name"]);
+                    }
+                }
+                for k in ["handler", "validator", "type", "version"] {
+                    if let Some(v) = text(k) {
+                        d[k] = json!(v);
+                    }
+                }
+                d["options"] = options_json(apply(Vec::new())?);
+                save(self, kind, &id, d)?;
+            }
+            "ALTER" => {
+                let Some(mut d) = existing else { return Err(Error::catalog(format!("{what} does not exist"))) };
+                d["options"] = options_json(apply(old_options(&d))?);
+                for k in ["handler", "validator", "type", "version", "owner"] {
+                    if let Some(v) = text(k) {
+                        d[k] = json!(v);
+                    }
+                }
+                if let Some(new) = text("rename") {
+                    self.catalog_set(kind, &id, None)?;
+                    d["name"] = json!(new);
+                    if object == "fdw" {
+                        for (n, mut s) in self.foreign_objects("server") {
+                            if s["fdw"].as_str().is_some_and(|f| key(f) == id) {
+                                s["fdw"] = json!(new);
+                                save(self, "server", &n, s)?;
+                            }
+                        }
+                    }
+                    save(self, kind, &key(&new), d)?;
+                } else {
+                    save(self, kind, &id, d)?;
+                }
+            }
+            _ => {
+                if existing.is_none() {
+                    if flag("if_exists") {
+                        return Ok(QueryResult::default());
+                    }
+                    return Err(Error::catalog(format!("{what} does not exist")));
+                }
+                let mut doomed: Vec<(&str, String)> = Vec::new();
+                match object.as_str() {
+                    "fdw" => {
+                        for (n, s) in self.foreign_objects("server") {
+                            if s["fdw"].as_str().is_some_and(|f| key(f) == id) {
+                                doomed.push(("server", n.clone()));
+                                for (m, u) in self.foreign_objects("umapping") {
+                                    if u["server"].as_str().is_some_and(|f| key(f) == n) {
+                                        doomed.push(("umapping", m));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "server" => {
+                        for (m, u) in self.foreign_objects("umapping") {
+                            if u["server"].as_str().is_some_and(|f| key(f) == id) {
+                                doomed.push(("umapping", m));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if !doomed.is_empty() && !c.cascade {
+                    return Err(Error::catalog(format!("cannot drop {} {} because other objects depend on it", if object == "fdw" { "foreign-data wrapper" } else { "server" }, name)));
+                }
+                for (k, n) in doomed {
+                    self.catalog_set(k, &n, None)?;
+                }
+                self.catalog_set(kind, &id, None)?;
             }
         }
         Ok(QueryResult::default())
@@ -450,6 +607,11 @@ impl Database {
             }
         }
         Err(Error::runtime(format!("permission denied for table {table}")))
+    }
+
+    /// The function that does the work of a user-defined operator with this many operands.
+    pub(crate) fn operator_function(&self, sym: &str, operands: usize) -> Option<String> {
+        self.catalog.get(&("operator".to_string(), key(&format!("{sym}/{operands}")))).cloned()
     }
 
     /// Notes who owns a table or view just made: the current role, if one is set (none otherwise).

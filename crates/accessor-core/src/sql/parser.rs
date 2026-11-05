@@ -56,7 +56,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
 }
 
 fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -141,7 +141,7 @@ pub(crate) fn internal_function_text(name: &str, args: &[String]) -> Option<Stri
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -551,6 +551,8 @@ struct Parser<'a> {
     outfile: Option<OutfileSpec>,
     /// The table of a PostgreSQL `SELECT ... INTO [TEMP] name` just read.
     into_table: Option<String>,
+    /// `INSERT INTO t AS a`: (a, t), for the ON CONFLICT clause that follows.
+    insert_alias: Option<(String, String)>,
     /// How deep the expressions being read are nested, and how deep the sub-queries: a limit keeps a hostile text from
     /// overflowing the stack.
     depth: usize,
@@ -634,6 +636,7 @@ impl<'a> Parser<'a> {
             Tok::Float(f) => f.to_string(),
             Tok::Date(_) => "date literal".into(),
             Tok::Sym(s) => format!("'{s}'"),
+            Tok::Op(s) => format!("'{s}'"),
             Tok::Param(p) => format!("'@{p}'"),
         };
         Error::syntax(format!("expected {wanted} but found {found} (at offset {})", self.toks[self.pos].pos))
@@ -1484,6 +1487,208 @@ impl<'a> Parser<'a> {
         crate::sql::usertypes::register(&name, t.clone());
         let value = serde_json::to_string(&t).map_err(|e| Error::syntax(e.to_string()))?;
         Ok(Statement::Catalog(Box::new(CatalogChange { kind: "type", names: vec![name], value: Some(value), replace: true, cascade: false })))
+    }
+
+    /// A name, a quoted name or a string: what an option or a role may be called.
+    fn any_word(&mut self) -> Result<String> {
+        match self.advance() {
+            Tok::Ident(s) | Tok::Quoted(s) | Tok::Str(s) => Ok(s),
+            _ => Err(self.unexpected("a name")),
+        }
+    }
+
+    /// `OPTIONS ([ADD | SET | DROP] name ['value'], ...)`, as `[action, name, value]` triples.
+    fn fdw_options(&mut self) -> Result<Vec<serde_json::Value>> {
+        self.expect_sym("(")?;
+        let mut out = Vec::new();
+        loop {
+            let action = if self.peek_kw("ADD") || self.peek_kw("SET") || self.peek_kw("DROP") {
+                self.any_word()?.to_ascii_lowercase()
+            } else {
+                String::new()
+            };
+            let name = self.any_word()?;
+            let value = if action == "drop" { String::new() } else { self.any_word()? };
+            out.push(serde_json::json!([action, name, value]));
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        Ok(out)
+    }
+
+    /// CREATE / ALTER / DROP of a foreign-data wrapper, a foreign server or a user mapping (PostgreSQL). The objects are
+    /// kept (with their options) and shown in the catalogs; nothing reads through them.
+    fn foreign_statement(&mut self, verb: &str) -> Result<Option<Statement>> {
+        if crate::dialect::current() != crate::dialect::Dialect::Postgresql {
+            return Ok(None);
+        }
+        let object = if self.peek_kw("FOREIGN") && self.peek_kw_at(1, "DATA") && self.peek_kw_at(2, "WRAPPER") {
+            for _ in 0..3 {
+                self.advance();
+            }
+            "fdw"
+        } else if self.peek_kw("SERVER") {
+            self.advance();
+            "server"
+        } else if self.peek_kw("USER") && self.peek_kw_at(1, "MAPPING") {
+            self.advance();
+            self.advance();
+            "mapping"
+        } else {
+            return Ok(None);
+        };
+        let mut o = serde_json::Map::new();
+        if self.peek_kw("IF") {
+            self.advance();
+            let not = self.eat_kw("NOT");
+            self.expect_kw("EXISTS")?;
+            o.insert(if not { "if_not_exists" } else { "if_exists" }.into(), true.into());
+        }
+        let (name, server) = if object == "mapping" {
+            self.expect_kw("FOR")?;
+            let user = self.any_word()?;
+            self.expect_kw("SERVER")?;
+            (user, self.any_word()?)
+        } else {
+            (self.any_word()?, String::new())
+        };
+        let mut options = Vec::new();
+        let mut cascade = false;
+        while !self.at_eof() && !self.peek_sym(";") {
+            if self.eat_kw("HANDLER") {
+                o.insert("handler".into(), self.ident()?.into());
+            } else if self.eat_kw("VALIDATOR") {
+                o.insert("validator".into(), self.ident()?.into());
+            } else if self.eat_kw("CONNECTION") {
+                self.ident()?;
+            } else if self.peek_kw("NO") && self.peek_kw_at(1, "CONNECTION") {
+                self.advance();
+                self.advance();
+            } else if self.peek_kw("NO") && (self.peek_kw_at(1, "HANDLER") || self.peek_kw_at(1, "VALIDATOR")) {
+                self.advance();
+                let which = self.any_word()?.to_ascii_lowercase();
+                o.insert(which, "-".into());
+            } else if self.eat_kw("OPTIONS") {
+                options.extend(self.fdw_options()?);
+            } else if self.eat_kw("FOREIGN") {
+                self.expect_kw("DATA")?;
+                self.expect_kw("WRAPPER")?;
+                o.insert("fdw".into(), self.any_word()?.into());
+            } else if self.eat_kw("TYPE") {
+                o.insert("type".into(), self.any_word()?.into());
+            } else if self.eat_kw("VERSION") {
+                o.insert("version".into(), if self.eat_kw("NULL") { "".to_string() } else { self.any_word()? }.into());
+            } else if self.eat_kw("OWNER") {
+                self.expect_kw("TO")?;
+                o.insert("owner".into(), self.any_word()?.into());
+            } else if self.eat_kw("RENAME") {
+                self.expect_kw("TO")?;
+                o.insert("rename".into(), self.any_word()?.into());
+            } else if self.eat_kw("CASCADE") {
+                cascade = true;
+            } else if self.eat_kw("RESTRICT") {
+            } else {
+                return Err(self.unexpected("a foreign-data clause"));
+            }
+        }
+        o.insert("options".into(), options.into());
+        let value = serde_json::Value::Object(o).to_string();
+        Ok(Some(Statement::Catalog(Box::new(CatalogChange {
+            kind: "foreign",
+            names: vec![verb.to_string(), object.to_string(), name, server],
+            value: Some(value),
+            replace: false,
+            cascade,
+        }))))
+    }
+
+    /// The text of the operator the next token spells.
+    fn operator_name(&mut self) -> Result<String> {
+        // a schema in front: schema.+
+        if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && matches!(self.peek_at(1), Tok::Sym(".")) {
+            self.advance();
+            self.advance();
+        }
+        match self.advance() {
+            Tok::Op(s) => Ok(s),
+            Tok::Sym(s) => Ok(s.to_string()),
+            _ => Err(self.unexpected("an operator")),
+        }
+    }
+
+    /// `CREATE OPERATOR name (LEFTARG = t, RIGHTARG = t, FUNCTION = f, ...)`: the operator is kept as the function that
+    /// does its work, by its spelling and whether it has a left operand.
+    fn create_operator(&mut self) -> Result<Statement> {
+        self.advance();
+        let sym = self.operator_name()?;
+        if sym == "=>" {
+            return Err(Error::syntax("syntax error at or near \"=>\""));
+        }
+        self.expect_sym("(")?;
+        let (mut left, mut right, mut function) = (false, false, None);
+        loop {
+            let option = self.any_word()?.to_ascii_uppercase();
+            if !self.eat_sym("=") {
+                // a flag with no value (HASHES, MERGES)
+                if !self.eat_sym(",") {
+                    break;
+                }
+                continue;
+            }
+            match option.as_str() {
+                "FUNCTION" | "PROCEDURE" => {
+                    let mut f = self.ident()?;
+                    while self.eat_sym(".") {
+                        f = self.ident()?;
+                    }
+                    function = Some(f);
+                }
+                _ => {
+                    let mut depth = 0;
+                    let mut any = false;
+                    while !self.at_eof() && (depth > 0 || !(self.peek_sym(",") || self.peek_sym(")"))) {
+                        if self.peek_sym("(") {
+                            depth += 1;
+                        } else if self.peek_sym(")") {
+                            depth -= 1;
+                        }
+                        self.advance();
+                        any = true;
+                    }
+                    match option.as_str() {
+                        "LEFTARG" => left = any,
+                        "RIGHTARG" => right = any,
+                        _ => {}
+                    }
+                }
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        let function = function.ok_or_else(|| Error::syntax("CREATE OPERATOR needs FUNCTION"))?;
+        let arity = if left && right { 2 } else { 1 };
+        Ok(Statement::Catalog(Box::new(CatalogChange { kind: "operator", names: vec![format!("{sym}/{arity}")], value: Some(function), replace: false, cascade: false })))
+    }
+
+    /// `DROP OPERATOR [IF EXISTS] name (left, right)`.
+    fn drop_operator(&mut self) -> Result<Statement> {
+        self.advance();
+        if self.eat_kw("IF") {
+            self.expect_kw("EXISTS")?;
+        }
+        let sym = self.operator_name()?;
+        self.expect_sym("(")?;
+        let first_none = self.peek_kw("NONE");
+        while !self.at_eof() && !self.peek_sym(")") {
+            self.advance();
+        }
+        self.expect_sym(")")?;
+        let arity = if first_none { 1 } else { 2 };
+        Ok(Statement::Catalog(Box::new(CatalogChange { kind: "operator", names: vec![format!("{sym}/{arity}")], value: None, replace: false, cascade: false })))
     }
 
     fn ignore_rest(&mut self, what: &str) -> Statement {
@@ -2479,15 +2684,50 @@ impl<'a> Parser<'a> {
                 self.expect_kw("SET")?;
                 let mut sets = Vec::new();
                 loop {
-                    let col = self.column_name()?;
-                    self.expect_sym("=")?;
-                    sets.push((col, self.expr()?));
+                    if self.peek_sym("(") {
+                        // SET (a, b) = (x, y) or = ROW(x, y)
+                        self.advance();
+                        let cols = self.ident_list()?;
+                        self.expect_sym(")")?;
+                        self.expect_sym("=")?;
+                        let row = self.expr()?;
+                        let items = row_items(&row).map(|i| i.to_vec()).unwrap_or_else(|| vec![row.clone()]);
+                        if items.len() != cols.len() {
+                            return Err(Error::syntax("the number of columns and values in SET (...) = (...) differ"));
+                        }
+                        sets.extend(cols.into_iter().zip(items));
+                    } else {
+                        let col = self.column_name()?;
+                        self.expect_sym("=")?;
+                        sets.push((col, self.expr()?));
+                    }
                     if !self.eat_sym(",") {
                         break;
                     }
                 }
                 let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
                 ConflictAction::Update { sets, filter }
+            };
+            let action = match (action, self.insert_alias.take()) {
+                (ConflictAction::Update { mut sets, mut filter }, Some((alias, table))) => {
+                    // the alias names the table
+                    let mut rename = |e: &mut Expr| {
+                        let _ = crate::sql::walk::walk_expr(e, &mut |x| {
+                            if let Expr::Column { table: Some(t), .. } = x {
+                                if t.eq_ignore_ascii_case(&alias) {
+                                    *t = table.clone();
+                                }
+                            }
+                            Ok(())
+                        });
+                    };
+                    sets.iter_mut().for_each(|(_, e)| rename(e));
+                    if let Some(f) = filter.as_mut() {
+                        rename(f);
+                    }
+                    ConflictAction::Update { sets, filter }
+                }
+                (a, _) => a,
             };
             st = Statement::Upsert { insert: Box::new(st), conflict: Conflict { target, action } };
         }
@@ -3192,6 +3432,12 @@ impl<'a> Parser<'a> {
     fn insert(&mut self) -> Result<Statement> {
         self.eat_kw("INTO");
         let table = self.table_ident()?;
+        self.insert_alias = None;
+        if self.peek_kw("AS") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+            // INSERT INTO t AS a: a names t in ON CONFLICT DO UPDATE
+            self.advance();
+            self.insert_alias = Some((self.ident()?, table.clone()));
+        }
         if self.peek_kw("PARTITION") && matches!(self.peek_at(1), Tok::Sym("(")) {
             self.advance();
             self.skip_parens()?;
@@ -3361,6 +3607,7 @@ impl<'a> Parser<'a> {
     /// `MERGE INTO t [AS a] USING source ON cond WHEN [NOT] MATCHED [AND c] THEN action ...`.
     fn merge(&mut self) -> Result<Statement> {
         self.expect_kw("INTO")?;
+        self.eat_kw("ONLY");
         let target = self.table_ident()?;
         let target_alias = self.target_alias()?;
         self.expect_kw("USING")?;
@@ -3371,9 +3618,23 @@ impl<'a> Parser<'a> {
         while self.eat_kw("WHEN") {
             let matched = !self.eat_kw("NOT");
             self.expect_kw("MATCHED")?;
+            let mut by_source = false;
+            if self.eat_kw("BY") {
+                if self.eat_kw("SOURCE") {
+                    by_source = true;
+                } else {
+                    self.expect_kw("TARGET")?;
+                }
+            }
+            if by_source && matched {
+                return Err(Error::syntax("BY SOURCE follows NOT MATCHED"));
+            }
             let condition = if self.eat_kw("AND") { Some(self.expr()?) } else { None };
             self.expect_kw("THEN")?;
-            let action = if self.eat_kw("UPDATE") {
+            let action = if self.eat_kw("DO") {
+                self.expect_kw("NOTHING")?;
+                MergeAction::Nothing
+            } else if self.eat_kw("UPDATE") {
                 self.expect_kw("SET")?;
                 let mut sets = Vec::new();
                 loop {
@@ -3410,12 +3671,15 @@ impl<'a> Parser<'a> {
                 (MergeAction::Insert { .. }, true) => {
                     return Err(Error::syntax("WHEN MATCHED cannot INSERT; use WHEN NOT MATCHED"))
                 }
-                (MergeAction::Update(_) | MergeAction::Delete, false) => {
+                (MergeAction::Insert { .. }, false) if by_source => {
+                    return Err(Error::syntax("WHEN NOT MATCHED BY SOURCE cannot INSERT"))
+                }
+                (MergeAction::Update(_) | MergeAction::Delete, false) if !by_source => {
                     return Err(Error::syntax("WHEN NOT MATCHED can only INSERT"))
                 }
                 _ => {}
             }
-            whens.push(MergeWhen { matched, condition, action });
+            whens.push(MergeWhen { matched, by_source, condition, action });
         }
         if whens.is_empty() {
             return Err(self.unexpected("WHEN"));
@@ -4046,6 +4310,12 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+        }
+        if let Some(st) = self.foreign_statement("CREATE")? {
+            return Ok(st);
+        }
+        if self.peek_kw("OPERATOR") && !self.peek_kw_at(1, "CLASS") && !self.peek_kw_at(1, "FAMILY") {
+            return self.create_operator();
         }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("CREATE"));
@@ -5162,9 +5432,6 @@ impl<'a> Parser<'a> {
         if self.peek_kw("SCHEMA") || self.peek_kw("DATABASE") || ((self.peek_kw("USER") || self.peek_kw("ROLE")) && self.mysql_account_ahead()) {
             return Ok(self.ignore_rest("ALTER"));
         }
-        if self.peek_kw("USER") && self.peek_kw_at(1, "MAPPING") {
-            return Ok(self.ignore_rest("ALTER"));
-        }
         if self.eat_kw("POLICY") {
             return self.alter_policy();
         }
@@ -5193,6 +5460,9 @@ impl<'a> Parser<'a> {
             let options = self.sequence_options()?;
             let st = Statement::AlterSequence { name, options };
             return Ok(if guarded { Statement::Guarded { missing_ok: true, stmt: Box::new(st) } } else { st });
+        }
+        if let Some(st) = self.foreign_statement("ALTER")? {
+            return Ok(st);
         }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("ALTER"));
@@ -5452,6 +5722,12 @@ impl<'a> Parser<'a> {
             self.eat_kw("CASCADE");
             self.eat_kw("RESTRICT");
             return Ok(Statement::DropTrigger(name));
+        }
+        if let Some(st) = self.foreign_statement("DROP")? {
+            return Ok(st);
+        }
+        if self.peek_kw("OPERATOR") && !self.peek_kw_at(1, "CLASS") && !self.peek_kw_at(1, "FAMILY") {
+            return self.drop_operator();
         }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("DROP"));
@@ -6545,6 +6821,13 @@ impl<'a> Parser<'a> {
                 Tok::Sym(">=") => Some(BinOp::Ge),
                 _ => None,
             };
+            if let Tok::Op(s) = self.peek().clone() {
+                // a user-defined operator
+                self.advance();
+                let right = self.concat()?;
+                left = Expr::Function { name: "__OP".into(), args: vec![Expr::Literal(Value::text(&s)), left, right], distinct: false, star: false };
+                continue;
+            }
             if let Tok::Sym(s @ ("@?" | "@@")) = self.peek().clone() {
                 // jsonb @? path (does the path select anything?), jsonb @@ path (is the predicate true?)
                 self.advance();
@@ -6856,6 +7139,12 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Expr> {
+        if let Tok::Op(s) = self.peek().clone() {
+            // a user-defined prefix operator
+            self.advance();
+            let inner = self.unary()?;
+            return Ok(Expr::Function { name: "__OP".into(), args: vec![Expr::Literal(Value::text(&s)), inner], distinct: false, star: false });
+        }
         let cube = self.peek_sym("||") && matches!(self.peek_at(1), Tok::Sym("/"));
         if cube || (self.peek_sym("|") && matches!(self.peek_at(1), Tok::Sym("/"))) {
             // PostgreSQL's prefix square root (|/ x) and cube root (||/ x)
@@ -7116,9 +7405,20 @@ impl<'a> Parser<'a> {
                     "ROW" if matches!(self.peek_at(1), Tok::Sym("(")) => {
                         self.advance();
                         self.advance();
-                        let mut items = vec![self.expr()?];
-                        while self.eat_sym(",") {
-                            items.push(self.expr()?);
+                        let mut items = Vec::new();
+                        loop {
+                            // t.* inside ROW(...) stands for the columns of t
+                            if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && matches!(self.peek_at(1), Tok::Sym(".")) && matches!(self.peek_at(2), Tok::Sym("*")) {
+                                let table = self.ident()?;
+                                self.advance();
+                                self.advance();
+                                items.push(Expr::Column { table: Some(table), name: "*".into() });
+                            } else {
+                                items.push(self.expr()?);
+                            }
+                            if !self.eat_sym(",") {
+                                break;
+                            }
                         }
                         self.expect_sym(")")?;
                         return Ok(row_value(items));
@@ -7205,6 +7505,11 @@ impl<'a> Parser<'a> {
                         let Tok::Str(text) = self.advance() else { unreachable!("checked") };
                         return Ok(Expr::Function { name: "CDBL".into(), args: vec![Expr::Literal(Value::text(&text))], distinct: false, star: false });
                     }
+                    "BYTEA" | "JSONPATH" if matches!(self.peek_at(1), Tok::Str(_)) && crate::dialect::current() == crate::dialect::Dialect::Postgresql => {
+                        self.advance();
+                        let Tok::Str(text) = self.advance() else { unreachable!("checked") };
+                        return Ok(Expr::Function { name: if up == "BYTEA" { "BYTEA_IN" } else { "JSONPATH_IN" }.into(), args: vec![Expr::Literal(Value::text(&text))], distinct: false, star: false });
+                    }
                     n if matches!(self.peek_at(1), Tok::Str(_))
                         && DataType::from_sql_name(n).is_some_and(|(t, auto)| !auto && t != DataType::Calculated) =>
                     {
@@ -7213,6 +7518,12 @@ impl<'a> Parser<'a> {
                         let Tok::Str(text) = self.advance() else { unreachable!("checked") };
                         let name = cast_function(ty).expect("not CALCULATED");
                         return Ok(Expr::Function { name: name.into(), args: vec![Expr::Literal(Value::text(&text))], distinct: false, star: false });
+                    }
+                    "CURRENT" if self.peek_kw_at(1, "OF") => {
+                        self.advance();
+                        self.advance();
+                        let cursor = self.ident()?;
+                        return Ok(Expr::Function { name: "__CURRENT_OF".into(), args: vec![Expr::Literal(Value::text(&cursor))], distinct: false, star: false });
                     }
                     "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
                         if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(self.peek_at(1), Tok::Sym("(" | ".")) =>
@@ -8106,6 +8417,12 @@ impl<'a> Parser<'a> {
         if tn.eq_ignore_ascii_case("tsvector") || tn.eq_ignore_ascii_case("tsquery") {
             let name = if tn.eq_ignore_ascii_case("tsvector") { "TSVECTOR_IN" } else { "TSQUERY_IN" };
             return Ok(Expr::Function { name: name.into(), args: vec![e], distinct: false, star: false });
+        }
+        if tn.eq_ignore_ascii_case("jsonpath") && crate::dialect::current() == crate::dialect::Dialect::Postgresql && !self.peek_sym("[") {
+            return Ok(Expr::Function { name: "JSONPATH_IN".into(), args: vec![e], distinct: false, star: false });
+        }
+        if tn.eq_ignore_ascii_case("bytea") && crate::dialect::current() == crate::dialect::Dialect::Postgresql && !self.peek_sym("[") {
+            return Ok(Expr::Function { name: "BYTEA_IN".into(), args: vec![e], distinct: false, star: false });
         }
         if crate::expr::composite::is_composite(&tn) {
             return Ok(composite_cast(e, &tn));

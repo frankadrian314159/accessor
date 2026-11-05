@@ -96,7 +96,7 @@ impl Database {
 
             let ids = self.ids_matching(&target, &fill(&m.on)?)?;
             if ids.is_empty() {
-                for w in m.whens.iter().filter(|w| !w.matched) {
+                for w in m.whens.iter().filter(|w| !w.matched && !w.by_source) {
                     if let Some(c) = &w.condition {
                         if !self.constant_truth(&fill(c)?)? {
                             continue;
@@ -135,7 +135,47 @@ impl Database {
                             self.apply_all(vec![Op::Delete { table: target.clone(), id }])?;
                             affected += 1;
                         }
+                        MergeAction::Nothing => {}
                         MergeAction::Insert { .. } => unreachable!("rejected by the parser"),
+                    }
+                    break;
+                }
+            }
+        }
+        // WHEN NOT MATCHED BY SOURCE: the target records no source record matched.
+        if m.whens.iter().any(|w| w.by_source) {
+            let all: Vec<RowId> = self.ids_matching(&target, &Expr::Literal(Value::Bool(true)))?;
+            for id in all.into_iter().filter(|id| !touched.contains(id)) {
+                let own = |e: &Expr| -> Result<Expr> {
+                    let mut e = e.clone();
+                    walk_expr(&mut e, &mut |x| {
+                        if let Expr::Column { table, .. } = x {
+                            if table.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&target_alias)) {
+                                *table = Some(target.clone());
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(e)
+                };
+                for w in m.whens.iter().filter(|w| w.by_source) {
+                    if let Some(c) = &w.condition {
+                        if !self.row_condition(&target, id, &own(c)?)? {
+                            continue;
+                        }
+                    }
+                    match &w.action {
+                        MergeAction::Update(sets) => {
+                            let sets = sets.iter().map(|(c, e)| Ok((c.clone(), own(e)?))).collect::<Result<Vec<_>>>()?;
+                            let ops = self.plan_update_ids(&target, &sets, &[id])?;
+                            affected += ops.len();
+                            self.apply_all(ops)?;
+                        }
+                        MergeAction::Delete => {
+                            self.apply_all(vec![Op::Delete { table: target.clone(), id }])?;
+                            affected += 1;
+                        }
+                        _ => {}
                     }
                     break;
                 }

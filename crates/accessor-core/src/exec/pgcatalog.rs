@@ -263,6 +263,30 @@ impl Database {
             "pg_am" => names(&["oid", "amname", "amtype"]),
             "pg_extension" => names(&["oid", "extname", "extowner", "extnamespace", "extversion"]),
             "pg_sequence" => names(&["seqrelid", "seqtypid", "seqstart", "seqincrement", "seqmax", "seqmin", "seqcache", "seqcycle"]),
+            "pg_foreign_data_wrapper" => {
+                for (i, (_, d)) in self.foreign_objects("fdw").into_iter().enumerate() {
+                    let s = |k: &str| d.get(k).and_then(|x| x.as_str()).map_or_else(|| t("-"), t);
+                    let opts: Vec<Value> = d["options"].as_array().map(|o| o.iter().map(|p| t(&format!("{}={}", p[0].as_str().unwrap_or(""), p[1].as_str().unwrap_or("")))).collect()).unwrap_or_default();
+                    rows.push(vec![Value::Int(16384 + i as i64), s("name"), s("owner"), s("handler"), s("validator"), Value::Null, if opts.is_empty() { Value::Null } else { Value::Array(std::sync::Arc::new(opts)) }]);
+                }
+                names(&["oid", "fdwname", "fdwowner", "fdwhandler", "fdwvalidator", "fdwacl", "fdwoptions"])
+            }
+            "pg_foreign_server" => {
+                for (i, (_, d)) in self.foreign_objects("server").into_iter().enumerate() {
+                    let s = |k: &str| d.get(k).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map_or(Value::Null, t);
+                    let opts: Vec<Value> = d["options"].as_array().map(|o| o.iter().map(|p| t(&format!("{}={}", p[0].as_str().unwrap_or(""), p[1].as_str().unwrap_or("")))).collect()).unwrap_or_default();
+                    rows.push(vec![Value::Int(16384 + i as i64), s("name"), s("owner"), s("fdw"), s("type"), s("version"), Value::Null, if opts.is_empty() { Value::Null } else { Value::Array(std::sync::Arc::new(opts)) }]);
+                }
+                names(&["oid", "srvname", "srvowner", "srvfdw", "srvtype", "srvversion", "srvacl", "srvoptions"])
+            }
+            "pg_user_mapping" => {
+                for (i, (_, d)) in self.foreign_objects("umapping").into_iter().enumerate() {
+                    let s = |k: &str| d.get(k).and_then(|x| x.as_str()).map_or(Value::Null, t);
+                    let opts: Vec<Value> = d["options"].as_array().map(|o| o.iter().map(|p| t(&format!("{}={}", p[0].as_str().unwrap_or(""), p[1].as_str().unwrap_or("")))).collect()).unwrap_or_default();
+                    rows.push(vec![Value::Int(16384 + i as i64), s("user"), s("server"), if opts.is_empty() { Value::Null } else { Value::Array(std::sync::Arc::new(opts)) }]);
+                }
+                names(&["oid", "umuser", "umserver", "umoptions"])
+            }
             "pg_policies" => {
                 for ((k, n), v) in self.catalog.iter().filter(|((k, _), _)| k == "policy") {
                     let _ = k;
