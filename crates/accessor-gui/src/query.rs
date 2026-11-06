@@ -102,7 +102,9 @@ impl QueryTab {
     }
 
     /// Text boxes for the `PARAMETERS` the script declares.
-    fn parameter_inputs(&mut self, ui: &mut egui::Ui) {
+    /// Returns true when Enter (or Ctrl+Enter) was pressed in one of the boxes, which runs the query.
+    fn parameter_inputs(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut enter = false;
         if self.params_for != self.sql {
             self.params_for = self.sql.clone();
             let declared: Vec<String> = match parse_script(&self.sql).ok().and_then(|s| s.into_iter().next()) {
@@ -119,15 +121,20 @@ impl QueryTab {
                 .collect();
         }
         if self.params.is_empty() {
-            return;
+            return false;
         }
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Parameters:").strong());
             for (name, text) in &mut self.params {
                 ui.label(format!("@{name}"));
-                ui.add(TextEdit::singleline(text).desired_width(120.0));
+                let r = ui.add(TextEdit::singleline(text).desired_width(120.0));
+                // a single-line box gives up focus on Enter, so the key is seen as the box loses it
+                if (r.lost_focus() || r.has_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    enter = true;
+                }
             }
         });
+        enter
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, db: &mut Database, ev: &mut Vec<Event>) {
@@ -198,7 +205,9 @@ impl QueryTab {
                 .desired_width(f32::INFINITY)
                 .hint_text("SELECT ... FROM ..."),
         );
-        self.parameter_inputs(ui);
+        if self.parameter_inputs(ui) {
+            run = true;
+        }
         if run {
             self.run(db, ev);
         }
