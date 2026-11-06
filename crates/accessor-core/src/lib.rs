@@ -19,6 +19,7 @@
 //! assert_eq!(r.rows, vec![vec![Value::text("Grace")]]);
 //! ```
 
+pub mod collation;
 pub mod csv;
 pub mod decimal;
 pub mod rational;

@@ -1149,7 +1149,9 @@ impl Database {
         let mut hidden: Vec<BExpr> = Vec::new();
         let mut sort_keys: Vec<(usize, bool, Option<bool>)> = Vec::new();
         for o in &sel.order_by {
-            let col = match &o.expr {
+            // a key in a collation sorts by the collation's sort key
+            let keyed = binder.collated_order(&o.expr);
+            let col = match &keyed {
                 Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= n_vis => *n as usize - 1,
                 Expr::Column { table: None, name } if out_items.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) => {
                     out_items.iter().position(|(n, _)| n.eq_ignore_ascii_case(name)).expect("checked")

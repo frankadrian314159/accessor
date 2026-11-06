@@ -305,11 +305,12 @@ fn datetime_of(v: &Value) -> Option<chrono::NaiveDateTime> {
         },
         _ => return None,
     };
-    chrono::DateTime::from_timestamp(secs, 0).map(|d| d.naive_utc())
+    chrono::DateTime::from_timestamp(secs.div_euclid(1000), 0).map(|d| d.naive_utc())
 }
 
+/// A civil date and time as a timestamp value (milliseconds).
 fn to_secs(d: chrono::NaiveDateTime) -> i64 {
-    d.and_utc().timestamp()
+    d.and_utc().timestamp() * 1000
 }
 
 const DAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
@@ -926,9 +927,9 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             other => other.clone(),
         },
         CurrentRole => Value::text("NONE"),
-        CurTime => Value::text(&time_text(crate::tz::session().to_local(crate::datetime::now()).rem_euclid(86_400))),
+        CurTime => Value::text(&time_text(crate::tz::session().to_local(crate::datetime::now()).rem_euclid(86_400_000) / 1000)),
         Timestamp => match temporal(v(0)) {
-            Some((s, false)) => Value::DateTime(s + vals.get(1).and_then(|t| temporal(t)).map_or(0, |(t, _)| t)),
+            Some((s, false)) => Value::DateTime((s + vals.get(1).and_then(|t| temporal(t)).map_or(0, |(t, _)| t)) * 1000),
             _ => Value::Null,
         },
         Hex => match v(0) {
@@ -980,8 +981,8 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             None => Value::Null,
         },
         UnixTimestamp => match vals.first() {
-            None => Value::Int(crate::datetime::now()),
-            Some(x) => datetime_of(x).map_or(Value::Null, |d| Value::Int(to_secs(d))),
+            None => Value::Int(crate::datetime::now() / 1000),
+            Some(x) => datetime_of(x).map_or(Value::Null, |d| Value::Int(to_secs(d) / 1000)),
         },
         FromUnixtime => {
             let Some(secs) = int(v(0)) else { return Ok(Value::Null) };
@@ -990,7 +991,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                     Some(d) => Value::text(&format_date(d.naive_utc(), &text(fmt))),
                     None => Value::Null,
                 },
-                None => Value::DateTime(secs),
+                None => Value::DateTime(secs.saturating_mul(1000)),
             }
         }
         SecToTime => {
@@ -1121,7 +1122,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             if a_is_time {
                 Value::text(&time_text(secs))
             } else {
-                Value::DateTime(secs)
+                Value::DateTime(secs * 1000)
             }
         }
         TimeDiff => match (temporal(v(0)), temporal(v(1))) {
@@ -1132,7 +1133,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let (Some((a, _)), Some((b, _))) = (temporal(v(1)), temporal(v(2))) else { return Ok(Value::Null) };
             let d = b - a;
             let months = || -> i64 {
-                let (ca, cb) = (crate::datetime::components(a), crate::datetime::components(b));
+                let (ca, cb) = (crate::datetime::components(a * 1000), crate::datetime::components(b * 1000));
                 let m = (cb.0 - ca.0) * 12 + (cb.1 as i64 - ca.1 as i64);
                 // a whole month only when the day and time of the later one have come round
                 let (ra, rb) = ((ca.2, ca.3, ca.4, ca.5), (cb.2, cb.3, cb.4, cb.5));
@@ -1159,7 +1160,7 @@ pub fn call(f: MyFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         ConvertTz => {
             let Some((local, false)) = temporal(v(0)) else { return Ok(Value::Null) };
             let (Some(from), Some(to)) = (crate::tz::Zone::parse(&text(v(1))), crate::tz::Zone::parse(&text(v(2)))) else { return Ok(Value::Null) };
-            Value::DateTime(to.to_local(from.to_utc(local)))
+            Value::DateTime(to.to_local(from.to_utc(local * 1000)))
         }
         BitCount => Value::Int(int(v(0)).map_or(0, |n| (n as u64).count_ones() as i64)),
         BitLength => Value::Int(v(0).as_bytes().map_or_else(|| text(v(0)).len(), |b| b.len()) as i64 * 8),
@@ -1301,8 +1302,8 @@ fn time_text(secs: i64) -> String {
 /// The seconds a value stands for and whether it is a time of day (true) or a date and time (false).
 fn temporal(v: &Value) -> Option<(i64, bool)> {
     match v {
-        Value::DateTime(t) | Value::TimestampTz(t) => Some((*t, false)),
-        Value::Text(s) => time_secs(s).map(|t| (t, true)).or_else(|| crate::datetime::parse(s).map(|t| (t, false))),
+        Value::DateTime(t) | Value::TimestampTz(t) => Some((t.div_euclid(1000), false)),
+        Value::Text(s) => time_secs(s).map(|t| (t, true)).or_else(|| crate::datetime::parse(s).map(|t| (t.div_euclid(1000), false))),
         _ => None,
     }
 }

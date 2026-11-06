@@ -115,8 +115,53 @@ impl Database {
             .collect()
     }
 
+    /// Makes the collations made with `CREATE COLLATION` the ones the sort keys use.
+    pub(crate) fn sync_collations(&self) {
+        let defined: Vec<(String, String)> = self.catalog.iter().filter(|((k, _), _)| k == "collation").map(|((_, n), v)| (n.clone(), v.clone())).collect();
+        if !defined.is_empty() || crate::collation::any_defined() {
+            crate::collation::sync(&defined);
+        }
+    }
+
+    /// The collations made with `CREATE COLLATION`: (name, provider letter).
+    pub(crate) fn user_collations(&self) -> Vec<(String, char)> {
+        self.catalog
+            .iter()
+            .filter(|((k, _), _)| k == "collation")
+            .map(|((_, n), v)| (n.clone(), if serde_json::from_str::<serde_json::Value>(v).ok().and_then(|j| j.get("provider").and_then(|p| p.as_str().map(String::from))).as_deref() == Some("libc") { 'c' } else { 'i' }))
+            .collect()
+    }
+
     /// `CREATE` / `DROP` of a schema, type, extension or role.
     pub(crate) fn exec_catalog(&mut self, c: &CatalogChange) -> Result<QueryResult> {
+        if c.kind == "collation" {
+            for n in &c.names {
+                match &c.value {
+                    Some(json) => {
+                        let exists = self.catalog_has("collation", n) || crate::collation::builtins().iter().any(|(b, _)| b.eq_ignore_ascii_case(n));
+                        if exists {
+                            if c.replace {
+                                // IF NOT EXISTS
+                                continue;
+                            }
+                            return Err(Error::catalog(format!("collation \"{n}\" for encoding \"UTF8\" already exists")));
+                        }
+                        self.catalog_set("collation", n, Some(json.clone()))?;
+                    }
+                    None => {
+                        if !self.catalog_has("collation", n) {
+                            if c.replace {
+                                continue;
+                            }
+                            return Err(Error::catalog(format!("collation \"{n}\" for encoding \"UTF8\" does not exist")));
+                        }
+                        self.catalog_set("collation", n, None)?;
+                    }
+                }
+            }
+            self.sync_collations();
+            return Ok(QueryResult::default());
+        }
         if c.kind == "foreign" {
             return self.exec_foreign(c);
         }

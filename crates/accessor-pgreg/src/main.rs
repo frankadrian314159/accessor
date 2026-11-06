@@ -228,7 +228,19 @@ fn parse_expected(segment: &str) -> Expected {
                     e.table = Some(rows);
                     break;
                 }
-                rows.push(l.split('|').map(|c| c.trim().to_string()).collect::<Vec<_>>());
+                // the columns sit where the `+` marks are in the rule under the header, so a `|` inside a cell stays in it
+                let rule: Vec<char> = lines[s].chars().collect();
+                let cuts: Vec<usize> = rule.iter().enumerate().filter(|(_, c)| **c == '+').map(|(i, _)| i).collect();
+                let chars: Vec<char> = l.chars().collect();
+                let mut cells = Vec::new();
+                let mut from = 0;
+                for cut in cuts.iter().copied().chain(std::iter::once(chars.len().max(rule.len()))) {
+                    let end = cut.min(chars.len());
+                    let part: String = if from < end { chars[from..end].iter().collect() } else { String::new() };
+                    cells.push(part.trim().to_string());
+                    from = cut + 1;
+                }
+                rows.push(cells);
             }
         }
     }

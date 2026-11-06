@@ -80,6 +80,14 @@ pub struct CorrSpec {
     pub kind: CorrKind,
 }
 
+/// `e` without a `COLLATE` written on it.
+fn strip_collate(e: &Expr) -> Expr {
+    match e {
+        Expr::Function { name, args, .. } if name == "__COLLATE" => args[0].clone(),
+        other => other.clone(),
+    }
+}
+
 pub struct Binder<'a> {
     pub db: &'a Database,
     pub scope: &'a Scope,
@@ -444,7 +452,71 @@ impl<'a> Binder<'a> {
         self.db.run_select_depth(q, self.depth + 1)
     }
 
+    /// The collation an operand of a comparison or an `ORDER BY` key is read in (PostgreSQL): the one named with
+    /// `COLLATE`, or else the one its column was declared with. The flag says whether it was named in the query.
+    pub(crate) fn collation_of(&self, e: &Expr) -> Option<(String, bool)> {
+        if crate::dialect::current() != crate::dialect::Dialect::Postgresql {
+            return None;
+        }
+        match e {
+            Expr::Function { name, args, .. } if name == "__COLLATE" => match args.get(1) {
+                Some(Expr::Literal(Value::Text(n))) => Some((n.to_string(), true)),
+                _ => None,
+            },
+            Expr::Column { table, name } => {
+                let col = self.scope.cols.iter().find(|c| c.name.eq_ignore_ascii_case(name) && table.as_ref().is_none_or(|t| c.table.eq_ignore_ascii_case(t)))?;
+                crate::expr::ranges::column_collation(&col.table, &col.name).map(|n| (n, false))
+            }
+            _ => None,
+        }
+    }
+
+    /// `e` as the sort key of its collation, when it has one that orders texts by anything but the default.
+    pub(crate) fn collated_order(&self, e: &Expr) -> Expr {
+        match self.collation_of(e) {
+            Some((name, _)) if name != "default" => Expr::Function {
+                name: "__COLLKEY".into(),
+                args: vec![Expr::Literal(Value::text(&name)), strip_collate(e)],
+                distinct: false,
+                star: false,
+            },
+            _ => e.clone(),
+        }
+    }
+
     fn bind_inner(&mut self, e: &Expr) -> Result<BExpr> {
+        // timestamp - timestamp, when one is written as TIMESTAMP '..': an interval
+        if let Expr::Binary { op: crate::sql::ast::BinOp::Sub, left, right } = e {
+            let marked = |x: &Expr| matches!(x, Expr::Function { name, .. } if name == "__TS");
+            if crate::dialect::current() == crate::dialect::Dialect::Postgresql && (marked(left) || marked(right)) {
+                return self.bind(&Expr::Function { name: "__TSDIFF".into(), args: vec![(**left).clone(), (**right).clone()], distinct: false, star: false });
+            }
+        }
+        // a comparison of texts in a collation compares their sort keys
+        if let Expr::Binary { op: op @ (crate::sql::ast::BinOp::Eq | crate::sql::ast::BinOp::Ne | crate::sql::ast::BinOp::Lt | crate::sql::ast::BinOp::Le | crate::sql::ast::BinOp::Gt | crate::sql::ast::BinOp::Ge), left, right } = e {
+            let (l, r) = (self.collation_of(left), self.collation_of(right));
+            let chosen = match (&l, &r) {
+                (Some((a, true)), Some((b, true))) if !a.eq_ignore_ascii_case(b) => {
+                    return Err(Error::runtime(format!("collation mismatch between explicit collations \"{a}\" and \"{b}\"")))
+                }
+                (Some((a, true)), _) => Some(a.clone()),
+                (_, Some((b, true))) => Some(b.clone()),
+                (Some((a, false)), Some((b, false))) if !a.eq_ignore_ascii_case(b) => {
+                    return Err(Error::runtime("could not determine which collation to use for string comparison"))
+                }
+                (Some((a, false)), _) | (_, Some((a, false))) => Some(a.clone()),
+                _ => None,
+            };
+            if let Some(name) = chosen.filter(|n| n != "default") {
+                let key = |x: &Expr| Expr::Function {
+                    name: "__COLLKEY".into(),
+                    args: vec![Expr::Literal(Value::text(&name)), strip_collate(x)],
+                    distinct: false,
+                    star: false,
+                };
+                return self.bind(&Expr::Binary { op: op.clone(), left: Box::new(key(left)), right: Box::new(key(right)) });
+            }
+        }
         if self.group.is_some() {
             if let Expr::Function { name, args, distinct, star } = e {
                 if let Some(func) = AggFn::from_name(name) {

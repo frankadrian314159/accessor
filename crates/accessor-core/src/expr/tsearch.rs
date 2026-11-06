@@ -632,6 +632,9 @@ impl QParser<'_> {
                     return Err(self.err());
                 }
                 let dist = if n == "-" { 1 } else { n.parse::<u32>().map_err(|_| self.err())? };
+                if dist > 16384 {
+                    return Err(Error::type_err("distance in phrase operator must be an integer value between zero and 16384 inclusive"));
+                }
                 self.i = j + 1;
                 let r = self.unary()?;
                 l = Q::Phrase(Box::new(l), Box::new(r), dist);
@@ -844,7 +847,8 @@ fn eval(q: &Q, doc: &[Lex]) -> Option<Vec<u32>> {
                 if !hit {
                     continue;
                 }
-                if *weights == 0 {
+                if *weights == 0 || l.pos.is_empty() {
+                    // a vector without positions (strip) cannot say which weight a word had, so a weight never rules it out
                     found = true;
                     pos.extend(l.pos.iter().map(|(p, _)| u32::from(*p)));
                 } else {
@@ -887,10 +891,101 @@ fn eval(q: &Q, doc: &[Lex]) -> Option<Vec<u32>> {
                 Some(v)
             }
         },
+        Q::Phrase(..) => {
+            let r = positional(q, doc);
+            let hits: Vec<u32> = r.matches.iter().filter(|m| m.1 >= 0).map(|m| m.1 as u32).collect();
+            if r.negated {
+                // every position qualifies except the listed ones
+                Some(hits)
+            } else {
+                (!r.matches.is_empty()).then_some(hits)
+            }
+        }
+    }
+}
+
+/// The places a query holds inside a phrase: `(start, end)` positions of each match. A negated result stands for every
+/// place but those listed (`!x` inside `!x <-> y` holds wherever `x` is not).
+struct Places {
+    matches: Vec<(i64, i64)>,
+    negated: bool,
+}
+
+fn positional(q: &Q, doc: &[Lex]) -> Places {
+    let pos = |m: Vec<(i64, i64)>| Places { matches: m, negated: false };
+    match q {
+        Q::Term { .. } => pos(eval(q, doc).unwrap_or_default().into_iter().map(|p| (i64::from(p), i64::from(p))).collect()),
+        Q::Not(x) => {
+            let inner = positional(x, doc);
+            Places { negated: !inner.negated, ..inner }
+        }
+        Q::And(a, b) => {
+            let (x, y) = (positional(a, doc), positional(b, doc));
+            match (x.negated, y.negated) {
+                (false, false) => pos(x.matches.into_iter().filter(|m| y.matches.contains(m)).collect()),
+                (false, true) => pos(x.matches.into_iter().filter(|m| !y.matches.contains(m)).collect()),
+                (true, false) => pos(y.matches.into_iter().filter(|m| !x.matches.contains(m)).collect()),
+                (true, true) => Places { matches: [x.matches, y.matches].concat(), negated: true },
+            }
+        }
+        Q::Or(a, b) => {
+            let (x, y) = (positional(a, doc), positional(b, doc));
+            match (x.negated, y.negated) {
+                (false, false) => {
+                    let mut m = [x.matches, y.matches].concat();
+                    m.sort_unstable();
+                    m.dedup();
+                    pos(m)
+                }
+                (true, true) => Places { matches: x.matches.into_iter().filter(|m| y.matches.contains(m)).collect(), negated: true },
+                (true, false) => Places { matches: x.matches.into_iter().filter(|m| !y.matches.contains(m)).collect(), negated: true },
+                (false, true) => Places { matches: y.matches.into_iter().filter(|m| !x.matches.contains(m)).collect(), negated: true },
+            }
+        }
         Q::Phrase(a, b, n) => {
-            let (x, y) = (eval(a, doc)?, eval(b, doc)?);
-            let hits: Vec<u32> = y.iter().copied().filter(|p| x.iter().any(|q| q + n == *p)).collect();
-            (!hits.is_empty()).then_some(hits)
+            let n = i64::from(*n);
+            let (x, y) = (positional(a, doc), positional(b, doc));
+            let last = doc.iter().flat_map(|l| l.pos.iter().map(|p| i64::from(p.0))).max().unwrap_or(0);
+            if last == 0 {
+                // a vector without positions (strip) cannot hold a phrase
+                return pos(Vec::new());
+            }
+            let mut out = Vec::new();
+            match (x.negated, y.negated) {
+                (false, false) => {
+                    for ma in &x.matches {
+                        for mb in &y.matches {
+                            if mb.0 - ma.1 == n {
+                                out.push((ma.0, mb.1));
+                            }
+                        }
+                    }
+                }
+                (false, true) => {
+                    for ma in &x.matches {
+                        if !y.matches.iter().any(|mb| mb.0 == ma.1 + n) {
+                            out.push((ma.0, ma.1 + n));
+                        }
+                    }
+                }
+                (true, false) => {
+                    for mb in &y.matches {
+                        if !x.matches.iter().any(|ma| ma.1 == mb.0 - n) {
+                            out.push((mb.0 - n, mb.1));
+                        }
+                    }
+                }
+                (true, true) => {
+                    for p in 1..=last + 1 {
+                        if !x.matches.iter().any(|ma| ma.1 == p) && !y.matches.iter().any(|mb| mb.0 == p + n) {
+                            out.push((p, p + n));
+                        }
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            pos(out)
         }
     }
 }
@@ -1120,6 +1215,26 @@ fn json_text(v: &serde_json::Value, filter: &str, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// `a || b` for two tsvectors in their written form: the positions of `b` follow those of `a`. `None` when either side is
+/// not a tsvector as PostgreSQL writes one (quoted words), so ordinary text is still joined as text.
+pub(crate) fn concat_vectors(a: &str, b: &str) -> Option<String> {
+    let canonical = |s: &str| -> Option<Vec<Lex>> {
+        let t = s.trim();
+        if t.is_empty() || !t.starts_with('\'') {
+            return None;
+        }
+        let v = parse_vector(t).ok()?;
+        (write_vector(&v) == t).then_some(v)
+    };
+    let (x, y) = (canonical(a)?, canonical(b)?);
+    let offset = x.iter().flat_map(|l| l.pos.iter().map(|p| p.0)).max().unwrap_or(0);
+    let shifted = y.into_iter().map(|mut l| {
+        l.pos.iter_mut().for_each(|p| p.0 = (u32::from(p.0) + u32::from(offset)).min(16383) as u16);
+        l
+    });
+    Some(write_vector(&merge(x.into_iter().chain(shifted).collect())))
 }
 
 /// Evaluates the function `name` (as registered in [`NAMES`]).

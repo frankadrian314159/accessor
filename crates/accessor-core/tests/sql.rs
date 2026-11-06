@@ -7694,7 +7694,7 @@ fn postgresql_merge_current_of_operators_foreign_data_bytea_and_loose_timestamps
     assert_eq!(pg_one(&mut db, "SELECT 'Mon Feb 10 17:32:01 1997 PST'::timestamptz"), "1997-02-10 17:32:01-08:00");
     assert_eq!(pg_one(&mut db, "SELECT 'February 10, 1997'::date"), "1997-02-10");
     assert_eq!(pg_one(&mut db, "SELECT '1997-Feb-10'::date"), "1997-02-10");
-    assert_eq!(pg_one(&mut db, "SELECT 'tomorrow'::date - 'today'::date"), "1");
+    assert_eq!(pg_one(&mut db, "SELECT 'tomorrow'::timestamp - 'today'::timestamp"), "1 day");
 }
 
 #[test]
@@ -7754,4 +7754,55 @@ fn postgresql_numeric_scale_returning_old_new_merge_into_view_and_foreign_tables
     db.execute("RESET ROLE").unwrap();
     db.execute("DROP SERVER s1 CASCADE").unwrap();
     assert_eq!(pg_one(&mut db, "SELECT count(*) FROM information_schema.foreign_tables"), "0");
+}
+
+#[test]
+fn postgresql_fractional_seconds_money_phrase_search_and_collations() {
+    let mut db = pg();
+    // fractional seconds (milliseconds are kept)
+    assert_eq!(pg_one(&mut db, "SELECT timestamp '2001-02-16 20:38:40.123'"), "2001-02-16 20:38:40.123");
+    assert_eq!(pg_one(&mut db, "SELECT timestamp '2001-02-16 20:38:40.5' + interval '1.25 seconds'"), "2001-02-16 20:38:41.75");
+    assert_eq!(pg_one(&mut db, "SELECT extract(second from timestamp '2001-02-16 20:38:40.123')"), "40.123000");
+    assert_eq!(pg_one(&mut db, "SELECT extract(milliseconds from timestamp '2001-02-16 20:38:40.123')"), "40123.000");
+    assert_eq!(pg_one(&mut db, "SELECT interval '00:00:01.25'"), "00:00:01.25");
+    assert_eq!(pg_one(&mut db, "SELECT timestamp '2001-02-16 20:38:41.5' - timestamp '2001-02-16 20:38:40'"), "00:00:01.5");
+    assert_eq!(pg_one(&mut db, "SELECT to_char(timestamp '2001-02-16 20:38:40.123', 'HH24:MI:SS.MS')"), "20:38:40.123");
+    assert_eq!(pg_one(&mut db, "SELECT date_trunc('second', timestamp '2001-02-16 20:38:40.999')"), "2001-02-16 20:38:40");
+
+    // money
+    assert_eq!(pg_one(&mut db, "SELECT '1234567890'::money"), "$1,234,567,890.00");
+    assert_eq!(pg_one(&mut db, "SELECT '-12345'::money"), "-$12,345.00");
+    assert_eq!(pg_one(&mut db, "SELECT '123.455'::money"), "$123.46");
+    assert_eq!(pg_one(&mut db, "SELECT '878.08'::money / 11::int"), "$79.82");
+    assert_eq!(pg_one(&mut db, "SELECT '878.08'::money / 11::float8"), "$79.83");
+    assert_eq!(pg_one(&mut db, "SELECT '123.00'::money * 2::float8"), "$246.00");
+    assert!(db.execute("SELECT '92233720368547758.07'::money + '1'::money").is_err());
+
+    // phrase search and weights
+    assert_eq!(pg_one(&mut db, "SELECT to_tsvector('simple', '1 2 3 4') @@ '1 <-> (2 <-> 3)'"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT to_tsvector('simple', 'q x q y') @@ 'q <-> (x & y)'"), "false");
+    assert_eq!(pg_one(&mut db, "SELECT to_tsvector('simple', 'x y q y') @@ '!x <-> y'"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT strip('wa:1A'::tsvector) @@ 'w:*A'::tsquery"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT 'a:3A b:2a'::tsvector || 'ba:1234 a:1B'::tsvector"), "'a':3A,4B 'b':2A 'ba':1237");
+
+    // collations
+    db.execute("CREATE TABLE ct1 (a int, b text COLLATE \"en-x-icu\" NOT NULL)").unwrap();
+    db.execute("CREATE TABLE ct2 (a int, b text COLLATE \"C\")").unwrap();
+    db.execute("INSERT INTO ct1 VALUES (1, 'abc'), (2, 'äbc'), (3, 'bbc'), (4, 'ABC')").unwrap();
+    db.execute("INSERT INTO ct2 SELECT * FROM ct1").unwrap();
+    let ordered: Vec<String> = db.execute("SELECT b FROM ct1 ORDER BY b").unwrap().rows.iter().map(|r| r[0].to_string()).collect();
+    assert_eq!(ordered.join(","), "abc,ABC,äbc,bbc");
+    let by_bytes: Vec<String> = db.execute("SELECT b FROM ct2 ORDER BY b").unwrap().rows.iter().map(|r| r[0].to_string()).collect();
+    assert_eq!(by_bytes.join(","), "ABC,abc,bbc,äbc");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM ct1 WHERE b >= 'bbc'"), "1");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM ct2 WHERE b >= 'bbc'"), "2");
+    assert_eq!(pg_one(&mut db, "SELECT 'a' < 'B' COLLATE \"C\""), "false");
+    assert_eq!(pg_one(&mut db, "SELECT 'a' < 'B' COLLATE \"en-x-icu\""), "true");
+    assert!(db.execute("SELECT * FROM ct1, ct2 WHERE ct1.b = ct2.b").is_err());
+    db.execute("CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT 'abc' = 'ABC' COLLATE ci"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT 'abc' = 'ÄBC' COLLATE ci"), "false");
+    assert!(db.execute("CREATE COLLATION ci (locale = 'und')").is_err());
+    db.execute("DROP COLLATION ci").unwrap();
+    assert!(db.execute("SELECT 'abc' = 'ABC' COLLATE ci").is_err());
 }

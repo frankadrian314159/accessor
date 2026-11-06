@@ -1,6 +1,6 @@
 //! Time zones.
 //!
-//! A `TIMESTAMPTZ` is an instant, stored as seconds since the Unix epoch in UTC. A
+//! A `TIMESTAMPTZ` is an instant, stored as milliseconds since the Unix epoch in UTC. A
 //! zone says how that instant reads on a wall clock: its offset from UTC at that
 //! moment, which for named regions (`Europe/Paris`) follows the IANA database,
 //! daylight saving included. A plain `DATETIME` has no zone at all: it is a wall
@@ -46,11 +46,11 @@ impl Zone {
         .or_else(|| abbreviation(t).map(Zone::Fixed))
     }
 
-    /// The offset from UTC (seconds east) in force at the instant `utc`.
+    /// The offset from UTC (seconds east) in force at the instant `utc` (milliseconds).
     pub fn offset_at(self, utc: i64) -> i64 {
         match self {
             Zone::Fixed(o) => o as i64,
-            Zone::Named(tz) => match DateTime::from_timestamp(utc, 0) {
+            Zone::Named(tz) => match DateTime::from_timestamp(utc.div_euclid(datetime::MS_PER_SEC), 0) {
                 Some(dt) => tz.offset_from_utc_datetime(&dt.naive_utc()).fix().local_minus_utc() as i64,
                 None => 0,
             },
@@ -62,7 +62,7 @@ impl Zone {
         if datetime::is_infinite(utc) {
             return utc;
         }
-        utc + self.offset_at(utc)
+        utc + self.offset_at(utc) * datetime::MS_PER_SEC
     }
 
     /// The instant at which the wall clock of this zone read `local`. A reading that occurs
@@ -73,16 +73,16 @@ impl Zone {
             return local;
         }
         match self {
-            Zone::Fixed(o) => local - o as i64,
+            Zone::Fixed(o) => local - o as i64 * datetime::MS_PER_SEC,
             Zone::Named(_) => {
-                let before = self.offset_at(local - 86_400);
-                let after = self.offset_at(local + 86_400);
+                let before = self.offset_at(local - datetime::MS_PER_DAY);
+                let after = self.offset_at(local + datetime::MS_PER_DAY);
                 let valid: Vec<i64> = [before, after]
                     .into_iter()
-                    .map(|off| local - off)
-                    .filter(|utc| self.offset_at(*utc) == local - utc)
+                    .map(|off| local - off * datetime::MS_PER_SEC)
+                    .filter(|utc| self.offset_at(*utc) * datetime::MS_PER_SEC == local - utc)
                     .collect();
-                valid.into_iter().min().unwrap_or(local - before)
+                valid.into_iter().min().unwrap_or(local - before * datetime::MS_PER_SEC)
             }
         }
     }
@@ -219,8 +219,9 @@ pub fn format_in(utc: i64, zone: Zone) -> String {
         return datetime::format(utc);
     }
     let off = zone.offset_at(utc);
-    let (y, mo, d, h, mi, s) = datetime::components(utc + off);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}{}", format_offset(off))
+    let local = utc + off * datetime::MS_PER_SEC;
+    let (y, mo, d, h, mi, s) = datetime::components(local);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{}{}", datetime::seconds_text(s, datetime::millis(local)), format_offset(off))
 }
 
 #[cfg(test)]
@@ -245,10 +246,10 @@ mod tests {
         assert_eq!(ny.offset_at(winter), -5 * 3600);
         assert_eq!(ny.offset_at(summer), -4 * 3600);
         // Local noon in summer is 16:00 UTC.
-        assert_eq!(ny.to_utc(summer), summer + 4 * 3600);
+        assert_eq!(ny.to_utc(summer), summer + 4 * 3_600_000);
         // The hour that is skipped (2024-03-10 02:30) is read with the offset from before.
         let gap = datetime::parse("2024-03-10 02:30:00").unwrap();
-        assert_eq!(ny.to_local(ny.to_utc(gap)), gap + 3600);
+        assert_eq!(ny.to_local(ny.to_utc(gap)), gap + 3_600_000);
         // The hour that happens twice (2024-11-03 01:30) is the first one.
         let twice = datetime::parse("2024-11-03 01:30:00").unwrap();
         assert_eq!(ny.offset_at(ny.to_utc(twice)), -4 * 3600);

@@ -1,9 +1,11 @@
-//! Minimal proleptic-Gregorian calendar helpers. Timestamps are whole seconds
-//! since the Unix epoch (UTC); no external time crate is needed.
+//! Minimal proleptic-Gregorian calendar helpers. Timestamps are milliseconds
+//! since the Unix epoch (UTC); no external time crate is needed. Outside PostgreSQL mode
+//! a fraction of a second in text is dropped, so only that dialect sees non-zero milliseconds.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SECS_PER_DAY: i64 = 86_400;
+pub const MS_PER_SEC: i64 = 1000;
+pub const MS_PER_DAY: i64 = 86_400_000;
 /// Days between the OLE automation epoch (1899-12-30) and the Unix epoch.
 const OLE_OFFSET_DAYS: f64 = 25_569.0;
 
@@ -50,73 +52,121 @@ pub fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
-/// Splits a timestamp into `(year, month, day, hour, minute, second)`.
-pub fn components(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = secs.div_euclid(SECS_PER_DAY);
-    let rem = secs.rem_euclid(SECS_PER_DAY) as u32;
+/// Splits a timestamp into `(year, month, day, hour, minute, second)`; the milliseconds are [`millis`].
+pub fn components(t: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = t.div_euclid(MS_PER_DAY);
+    let rem = (t.rem_euclid(MS_PER_DAY) / MS_PER_SEC) as u32;
     let (y, m, d) = civil_from_days(days);
     (y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
+/// The milliseconds past the whole second (0 to 999).
+pub fn millis(t: i64) -> u32 {
+    t.rem_euclid(MS_PER_SEC) as u32
+}
+
 /// Adds `n` months to a reading, clamping the day to the end of a shorter month
 /// (31 January plus a month is 29 February in a leap year).
-pub fn add_months(secs: i64, n: i64) -> Option<i64> {
-    let (y, m, d, h, mi, s) = components(secs);
+pub fn add_months(t: i64, n: i64) -> Option<i64> {
+    let (y, m, d, h, mi, s) = components(t);
     let total = y.checked_mul(12)?.checked_add(m as i64 - 1)?.checked_add(n)?;
     let (ny, nm) = (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32);
     let day = d.min(days_in_month(ny, nm));
-    from_components(ny, nm, day, h, mi, s)
+    from_components(ny, nm, day, h, mi, s)?.checked_add(millis(t) as i64)
 }
 
 pub fn from_components(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> Option<i64> {
     if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 59 {
         return None;
     }
-    Some(days_from_civil(y, mo, d) * SECS_PER_DAY + (h * 3600 + mi * 60 + s) as i64)
+    Some(days_from_civil(y, mo, d) * MS_PER_DAY + (h * 3600 + mi * 60 + s) as i64 * MS_PER_SEC)
 }
 
+thread_local! {
+    static STATEMENT_START: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fixes `now()` for the statement that is about to run (PostgreSQL gives every `now()` of a statement the same time).
+pub(crate) fn start_statement() {
+    let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    STATEMENT_START.with(|s| s.set(Some(ms)));
+}
+
+/// The time now; whole seconds outside PostgreSQL mode, and in it the time the statement started.
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    let ms = STATEMENT_START
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
+    if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+        ms
+    } else {
+        ms - ms % MS_PER_SEC
+    }
 }
 
-pub fn ole_days(secs: i64) -> f64 {
-    secs as f64 / SECS_PER_DAY as f64 + OLE_OFFSET_DAYS
+pub fn ole_days(t: i64) -> f64 {
+    t as f64 / MS_PER_DAY as f64 + OLE_OFFSET_DAYS
 }
 
 pub fn from_ole_days(days: f64) -> i64 {
-    ((days - OLE_OFFSET_DAYS) * SECS_PER_DAY as f64).round() as i64
+    ((days - OLE_OFFSET_DAYS) * 86_400.0).round() as i64 * MS_PER_SEC
 }
 
 /// Weekday with Sunday = 1 … Saturday = 7 (Access `Weekday()` convention).
-pub fn weekday(secs: i64) -> i64 {
+pub fn weekday(t: i64) -> i64 {
     // 1970-01-01 was a Thursday (5).
-    (secs.div_euclid(SECS_PER_DAY) + 4).rem_euclid(7) + 1
+    (t.div_euclid(MS_PER_DAY) + 4).rem_euclid(7) + 1
 }
 
 /// PostgreSQL's `infinity` and `-infinity`: the largest and smallest readings, which compare with every other one.
 pub const INFINITY: i64 = i64::MAX;
 pub const NEG_INFINITY: i64 = -i64::MAX;
 
-pub fn is_infinite(secs: i64) -> bool {
-    secs >= INFINITY || secs <= NEG_INFINITY
+pub fn is_infinite(t: i64) -> bool {
+    t >= INFINITY || t <= NEG_INFINITY
 }
 
-pub fn format(secs: i64) -> String {
-    if secs >= INFINITY {
+/// `SS` and, when there are milliseconds, `SS.mmm` with the trailing zeros dropped.
+pub fn seconds_text(s: u32, ms: u32) -> String {
+    if ms == 0 {
+        format!("{s:02}")
+    } else {
+        format!("{s:02}.{}", format!("{ms:03}").trim_end_matches('0'))
+    }
+}
+
+pub fn format(t: i64) -> String {
+    if t >= INFINITY {
         return "infinity".into();
     }
-    if secs <= NEG_INFINITY {
+    if t <= NEG_INFINITY {
         return "-infinity".into();
     }
-    let (y, mo, d, h, mi, s) = components(secs);
-    if h == 0 && mi == 0 && s == 0 {
+    let (y, mo, d, h, mi, s) = components(t);
+    let ms = millis(t);
+    if h == 0 && mi == 0 && s == 0 && ms == 0 {
         format!("{y:04}-{mo:02}-{d:02}")
     } else {
-        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+        format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{}", seconds_text(s, ms))
     }
+}
+
+/// Reads the seconds of a clock (`07`, `07.5`, `07.123456`) as milliseconds. Outside PostgreSQL mode the fraction is dropped.
+fn seconds_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (whole, frac) = text.split_once('.').unwrap_or((text, ""));
+    let whole: i64 = whole.parse().ok()?;
+    if !(0..=59).contains(&whole) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let ms = if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !frac.is_empty() {
+        // rounded to the millisecond; 59.9996 carries into the next minute as it does in PostgreSQL
+        let digits: String = frac.chars().chain("0000".chars()).take(4).collect();
+        (digits.parse::<i64>().ok()? + 5) / 10
+    } else {
+        0
+    };
+    Some(whole * MS_PER_SEC + ms)
 }
 
 /// Parses `YYYY-MM-DD[ T]HH:MM[:SS]` and US-style `M/D/YYYY [h:mm[:ss] [AM|PM]]`.
@@ -148,18 +198,19 @@ fn parse_loose(input: &str) -> Option<i64> {
     let lower = input.trim().to_ascii_lowercase();
     let zone = crate::tz::session();
     let n = now();
-    let local_now = n + zone.offset_at(n);
-    let midnight = local_now.div_euclid(86_400) * 86_400;
+    let local_now = zone.to_local(n);
+    let midnight = local_now.div_euclid(MS_PER_DAY) * MS_PER_DAY;
     match lower.as_str() {
         "now" => return Some(local_now),
         "today" | "midnight" | "allballs" => return Some(midnight),
-        "tomorrow" => return Some(midnight + 86_400),
-        "yesterday" => return Some(midnight - 86_400),
+        "tomorrow" => return Some(midnight + MS_PER_DAY),
+        "yesterday" => return Some(midnight - MS_PER_DAY),
         "epoch" => return Some(0),
         _ => {}
     }
     let (mut year, mut month, mut day): (Option<i64>, Option<u32>, Option<u32>) = (None, None, None);
     let (mut h, mut mi, mut sec) = (0u32, 0u32, 0u32);
+    let mut frac_ms = 0i64;
     let (mut pm, mut bc) = (None, false);
     let mut numbers: Vec<(i64, usize)> = Vec::new();
     // how many numbers came before the month's name
@@ -187,10 +238,11 @@ fn parse_loose(input: &str) -> Option<i64> {
             let mut it = clock.split(':');
             h = it.next()?.parse().ok()?;
             mi = it.next()?.parse().ok()?;
-            sec = match it.next() {
-                Some(v) => v.split('.').next()?.parse().ok()?,
-                None => 0,
-            };
+            if let Some(v) = it.next() {
+                let total = seconds_ms(v)?;
+                sec = (total / MS_PER_SEC) as u32;
+                frac_ms = total % MS_PER_SEC;
+            }
         } else if t.contains('-') && t.split('-').any(|p| month_of(p).is_some()) {
             // 1997-feb-10, 10-feb-1997, feb-10-1997
             for p in t.split('-') {
@@ -246,7 +298,7 @@ fn parse_loose(input: &str) -> Option<i64> {
         Some(false) if h == 12 => h = 0,
         _ => {}
     }
-    from_components(y, mo, d, h, mi, sec)
+    from_components(y, mo, d, h, mi, sec)?.checked_add(frac_ms)
 }
 
 fn parse_iso(input: &str) -> Option<i64> {
@@ -280,6 +332,7 @@ fn parse_iso(input: &str) -> Option<i64> {
         (c, u32::try_from(a).ok()?, b)
     };
     let (mut h, mut mi, mut sec) = (0u32, 0u32, 0u32);
+    let mut frac_ms = 0i64;
     if !time_part.is_empty() {
         let upper = time_part.to_ascii_uppercase();
         let (clock, meridiem) = match upper.strip_suffix("PM") {
@@ -292,8 +345,12 @@ fn parse_iso(input: &str) -> Option<i64> {
         let mut it = clock.split(':');
         h = it.next()?.trim().parse().ok()?;
         mi = it.next().map_or(Some(0), |v| v.trim().parse().ok())?;
-        // a fraction of a second (MySQL's '00:00:00.567') is dropped
-        sec = it.next().map_or(Some(0), |v| v.trim().split('.').next().and_then(|w| w.parse().ok()))?;
+        // a fraction of a second (MySQL's '00:00:00.567') is dropped outside PostgreSQL mode
+        if let Some(v) = it.next() {
+            let total = seconds_ms(v)?;
+            sec = (total / MS_PER_SEC) as u32;
+            frac_ms = total % MS_PER_SEC;
+        }
         if it.next().is_some() {
             return None;
         }
@@ -305,9 +362,9 @@ fn parse_iso(input: &str) -> Option<i64> {
     }
     // MySQL's zero date, 0000-00-00, is the earliest date here
     if y == 0 && mo == 0 && d == 0 {
-        return from_components(1, 1, 1, h, mi, sec);
+        return from_components(1, 1, 1, h, mi, sec)?.checked_add(frac_ms);
     }
-    from_components(y, mo, d, h, mi, sec)
+    from_components(y, mo, d, h, mi, sec)?.checked_add(frac_ms)
 }
 
 #[cfg(test)]
@@ -331,6 +388,7 @@ mod tests {
         assert_eq!(parse("2023-02-29"), None);
         assert_eq!(parse("1/2/2020 1:05 PM"), parse("2020-01-02 13:05"));
         assert_eq!(weekday(parse("2024-02-29").unwrap()), 5); // Thursday
+        assert_eq!(parse("2024-02-29 01:02:03").unwrap() % 86_400_000, 3_723_000);
     }
 
     #[test]

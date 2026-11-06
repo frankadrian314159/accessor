@@ -1,9 +1,9 @@
-//! The `INTERVAL` type: a length of time kept as months, days and seconds.
+//! The `INTERVAL` type: a length of time kept as months, days and milliseconds.
 //!
 //! Months and days are not fixed numbers of seconds (a month is 28 to 31 days, and a day
 //! is 23 or 25 hours when the clocks change), so they are kept apart: adding "1 month" to
 //! 31 January gives the end of February, and adding "1 day" to a zoned timestamp keeps the
-//! wall-clock time across a daylight-saving change. Only the seconds are exact elapsed time.
+//! wall-clock time across a daylight-saving change. Only the milliseconds are exact elapsed time.
 //!
 //! For comparison, sorting and equality a month counts as 30 days and a day as 24 hours,
 //! so `INTERVAL '1 month' = INTERVAL '30 days'`.
@@ -21,7 +21,8 @@ use crate::decimal::Decimal;
 pub struct Interval {
     pub months: i64,
     pub days: i64,
-    pub secs: i64,
+    /// milliseconds
+    pub ms: i64,
 }
 
 /// A field of an interval literal such as `INTERVAL '5' DAY`.
@@ -51,33 +52,33 @@ impl Unit {
     const ORDER: [Unit; 6] = [Unit::Year, Unit::Month, Unit::Day, Unit::Hour, Unit::Minute, Unit::Second];
 }
 
-const DAY: i128 = 86_400;
+const DAY: i128 = 86_400_000;
 
 impl Interval {
-    pub const ZERO: Interval = Interval { months: 0, days: 0, secs: 0 };
+    pub const ZERO: Interval = Interval { months: 0, days: 0, ms: 0 };
 
-    pub fn new(months: i64, days: i64, secs: i64) -> Interval {
-        Interval { months, days, secs }
+    pub fn new(months: i64, days: i64, ms: i64) -> Interval {
+        Interval { months, days, ms }
     }
 
-    /// The length in seconds, taking a month as 30 days.
-    pub fn total_secs(&self) -> i128 {
-        self.months as i128 * 30 * DAY + self.days as i128 * DAY + self.secs as i128
+    /// The length in milliseconds, taking a month as 30 days.
+    pub fn total_ms(&self) -> i128 {
+        self.months as i128 * 30 * DAY + self.days as i128 * DAY + self.ms as i128
     }
 
     pub fn is_zero(&self) -> bool {
-        self.months == 0 && self.days == 0 && self.secs == 0
+        self.months == 0 && self.days == 0 && self.ms == 0
     }
 
     pub fn neg(&self) -> Option<Interval> {
-        Some(Interval { months: self.months.checked_neg()?, days: self.days.checked_neg()?, secs: self.secs.checked_neg()? })
+        Some(Interval { months: self.months.checked_neg()?, days: self.days.checked_neg()?, ms: self.ms.checked_neg()? })
     }
 
     pub fn add(&self, o: &Interval) -> Option<Interval> {
         Some(Interval {
             months: self.months.checked_add(o.months)?,
             days: self.days.checked_add(o.days)?,
-            secs: self.secs.checked_add(o.secs)?,
+            ms: self.ms.checked_add(o.ms)?,
         })
     }
 
@@ -95,8 +96,8 @@ impl Interval {
         };
         let (months, frac_m) = split(Decimal::from_i64(self.months).mul(k));
         let (days, frac_d) = split(Decimal::from_i64(self.days).mul(k).add(&frac_m.mul(&Decimal::from_i64(30))));
-        let secs = Decimal::from_i64(self.secs).mul(k).add(&frac_d.mul(&Decimal::from_i64(DAY as i64))).round(0);
-        Some(Interval { months: months.to_i64()?, days: days.to_i64()?, secs: secs.to_i64()? })
+        let ms = Decimal::from_i64(self.ms).mul(k).add(&frac_d.mul(&Decimal::from_i64(DAY as i64))).round(0);
+        Some(Interval { months: months.to_i64()?, days: days.to_i64()?, ms: ms.to_i64()? })
     }
 
     /// An interval from a number of days, a fraction becoming seconds.
@@ -106,14 +107,14 @@ impl Interval {
 
     /// The interval as a number of days (a month as 30), with fractions.
     pub fn to_days(&self) -> Decimal {
-        Decimal::from_i64(self.secs).div(&Decimal::from_i64(DAY as i64)).unwrap_or_else(|| Decimal::from_i64(0)).add(&Decimal::from_i64(self.days + self.months * 30))
+        Decimal::from_i64(self.ms).div(&Decimal::from_i64(DAY as i64)).unwrap_or_else(|| Decimal::from_i64(0)).add(&Decimal::from_i64(self.days + self.months * 30))
     }
 
     /// Adds `sign` times this interval to a wall-clock reading: months first (clamping to the
     /// end of a shorter month), then days, then seconds.
     pub fn add_to_local(&self, local: i64, sign: i64) -> Option<i64> {
         let moved = if self.months == 0 { local } else { datetime::add_months(local, self.months.checked_mul(sign)?)? };
-        moved.checked_add(self.days.checked_mul(sign)?.checked_mul(86_400)?)?.checked_add(self.secs.checked_mul(sign)?)
+        moved.checked_add(self.days.checked_mul(sign)?.checked_mul(datetime::MS_PER_DAY)?)?.checked_add(self.ms.checked_mul(sign)?)
     }
 
     /// The `AGE` of `a` over `b`: whole years/months/days and a time of day, as people say it.
@@ -125,9 +126,9 @@ impl Interval {
         let (yb, mb, db, ..) = datetime::components(b);
         let mut months = (ya - yb) * 12 + ma as i64 - mb as i64;
         let mut days = da as i64 - db as i64;
-        let mut tod = a.rem_euclid(86_400) - b.rem_euclid(86_400);
+        let mut tod = a.rem_euclid(datetime::MS_PER_DAY) - b.rem_euclid(datetime::MS_PER_DAY);
         if tod < 0 {
-            tod += 86_400;
+            tod += datetime::MS_PER_DAY;
             days -= 1;
         }
         if days < 0 {
@@ -136,7 +137,7 @@ impl Interval {
             let (py, pm) = if ma == 1 { (ya - 1, 12) } else { (ya, ma - 1) };
             days += datetime::days_in_month(py, pm) as i64;
         }
-        Interval { months, days, secs: tod }
+        Interval { months, days, ms: tod }
     }
 
     // ----- reading text ---------------------------------------------------------------
@@ -164,7 +165,7 @@ impl Interval {
 
 impl PartialEq for Interval {
     fn eq(&self, other: &Self) -> bool {
-        self.total_secs() == other.total_secs()
+        self.total_ms() == other.total_ms()
     }
 }
 impl Eq for Interval {}
@@ -175,12 +176,12 @@ impl PartialOrd for Interval {
 }
 impl Ord for Interval {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.total_secs().cmp(&other.total_secs())
+        self.total_ms().cmp(&other.total_ms())
     }
 }
 impl Hash for Interval {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.total_secs().hash(state);
+        self.total_ms().hash(state);
     }
 }
 
@@ -199,10 +200,11 @@ impl fmt::Display for Interval {
         if self.days != 0 {
             parts.push(plural(self.days, "day", "days"));
         }
-        if self.secs != 0 || parts.is_empty() {
-            let a = self.secs.abs();
-            let sign = if self.secs < 0 { "-" } else { "" };
-            parts.push(format!("{sign}{:02}:{:02}:{:02}", a / 3600, a % 3600 / 60, a % 60));
+        if self.ms != 0 || parts.is_empty() {
+            let a = self.ms.abs();
+            let sign = if self.ms < 0 { "-" } else { "" };
+            let whole = a / 1000;
+            parts.push(format!("{sign}{:02}:{:02}:{}", whole / 3600, whole % 3600 / 60, datetime::seconds_text((whole % 60) as u32, (a % 1000) as u32)));
         }
         f.write_str(&parts.join(" "))
     }
@@ -216,9 +218,9 @@ fn amount(unit: Unit, n: &Decimal) -> Option<Interval> {
         Unit::Year => Interval::new(12, 0, 0),
         Unit::Month => Interval::new(1, 0, 0),
         Unit::Day => Interval::new(0, 1, 0),
-        Unit::Hour => Interval::new(0, 0, 3600),
-        Unit::Minute => Interval::new(0, 0, 60),
-        Unit::Second => Interval::new(0, 0, 1),
+        Unit::Hour => Interval::new(0, 0, 3_600_000),
+        Unit::Minute => Interval::new(0, 0, 60_000),
+        Unit::Second => Interval::new(0, 0, 1000),
     };
     one.scale(n)
 }
@@ -227,7 +229,7 @@ fn num(s: &str) -> Option<Decimal> {
     Decimal::parse(s.strip_prefix('+').unwrap_or(s))
 }
 
-/// `[sign]hh:mm[:ss[.fff]]` as seconds.
+/// `[sign]hh:mm[:ss[.fff]]` as milliseconds.
 fn clock(tok: &str) -> Option<i64> {
     let (neg, body) = match tok.strip_prefix('-') {
         Some(b) => (true, b),
@@ -237,13 +239,13 @@ fn clock(tok: &str) -> Option<i64> {
     let h: i64 = it.next()?.parse().ok()?;
     let m: i64 = it.next()?.parse().ok()?;
     let s = match it.next() {
-        Some(s) => num(s)?.round(0).to_i64()?,
+        Some(s) => num(s)?.mul(&Decimal::from_i64(1000)).round(0).to_i64()?,
         None => 0,
     };
-    if it.next().is_some() || !(0..60).contains(&m) || !(0..60).contains(&s) {
+    if it.next().is_some() || !(0..60).contains(&m) || !(0..60_000).contains(&s) {
         return None;
     }
-    let total = h * 3600 + m * 60 + s;
+    let total = (h * 3600 + m * 60) * 1000 + s;
     Some(if neg { -total } else { total })
 }
 
@@ -365,23 +367,23 @@ mod tests {
         assert_eq!(p("3 days"), Interval::new(0, 3, 0));
         assert_eq!(p("2 weeks"), Interval::new(0, 14, 0));
         assert_eq!(p("90 minutes").to_string(), "01:30:00");
-        assert_eq!(p("-5 hours"), Interval::new(0, 0, -18_000));
-        assert_eq!(p("1.5 hours"), Interval::new(0, 0, 5400));
+        assert_eq!(p("-5 hours"), Interval::new(0, 0, -18_000_000));
+        assert_eq!(p("1.5 hours"), Interval::new(0, 0, 5_400_000));
         assert_eq!(p("1-6"), Interval::new(18, 0, 0));
-        assert_eq!(p("P1Y2M3DT4H5M6S"), Interval::new(14, 3, 14_706));
-        assert_eq!(p("0.5 days"), Interval::new(0, 0, 43_200));
+        assert_eq!(p("P1Y2M3DT4H5M6S"), Interval::new(14, 3, 14_706_000));
+        assert_eq!(p("0.5 days"), Interval::new(0, 0, 43_200_000));
         assert_eq!(Interval::ZERO.to_string(), "00:00:00");
         assert!(Interval::parse("soon", None).is_err());
         assert_eq!(Interval::parse("5", Some((Unit::Day, None))).unwrap(), Interval::new(0, 5, 0));
         assert_eq!(Interval::parse("1-6", Some((Unit::Year, Some(Unit::Month)))).unwrap(), Interval::new(18, 0, 0));
-        assert_eq!(Interval::parse("2 03:04:05", Some((Unit::Day, Some(Unit::Second)))).unwrap(), Interval::new(0, 2, 11_045));
+        assert_eq!(Interval::parse("2 03:04:05", Some((Unit::Day, Some(Unit::Second)))).unwrap(), Interval::new(0, 2, 11_045_000));
     }
 
     #[test]
     fn comparison_and_arithmetic() {
         assert_eq!(p("1 month"), p("30 days"));
         assert!(p("25 hours") > p("1 day"));
-        assert_eq!(p("1 day").scale(&Decimal::parse("2.5").unwrap()), Some(Interval::new(0, 2, 43_200)));
+        assert_eq!(p("1 day").scale(&Decimal::parse("2.5").unwrap()), Some(Interval::new(0, 2, 43_200_000)));
         assert_eq!(p("1 month").scale(&Decimal::parse("0.5").unwrap()), Some(Interval::new(0, 15, 0)));
     }
 
@@ -389,7 +391,7 @@ mod tests {
     fn age_in_calendar_terms() {
         let t = |s: &str| datetime::parse(s).unwrap();
         assert_eq!(Interval::age(t("2024-03-05"), t("2021-01-10")), Interval::new(37, 24, 0));
-        assert_eq!(Interval::age(t("2024-03-05 10:00:00"), t("2024-03-04 12:00:00")), Interval::new(0, 0, 79_200));
+        assert_eq!(Interval::age(t("2024-03-05 10:00:00"), t("2024-03-04 12:00:00")), Interval::new(0, 0, 79_200_000));
         assert_eq!(Interval::age(t("2021-01-10"), t("2024-03-05")), Interval::new(-37, -24, 0));
     }
 }

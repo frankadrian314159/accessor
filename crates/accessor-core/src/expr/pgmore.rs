@@ -40,6 +40,10 @@ pub enum MoreFn {
     JsonBuildArray,
     JsonExtractPath,
     JsonExtractPathText,
+    CollKey,
+    Collate,
+    TsMark,
+    TsDiff,
     JsonbExists,
     JsonbExistsAny,
     JsonbExistsAll,
@@ -140,6 +144,10 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "JSON_BUILD_ARRAY" | "JSONB_BUILD_ARRAY" => (JsonBuildArray, 0, usize::MAX),
         "JSON_EXTRACT_PATH" | "JSONB_EXTRACT_PATH" => (JsonExtractPath, 1, usize::MAX),
         "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT" => (JsonExtractPathText, 1, usize::MAX),
+        "__TS" => (TsMark, 1, 1),
+        "__TSDIFF" => (TsDiff, 2, 2),
+        "__COLLKEY" => (CollKey, 2, 2),
+        "__COLLATE" => (Collate, 2, 2),
         "JSONB_EXISTS" => (JsonbExists, 2, 2),
         "JSONB_EXISTS_ANY" => (JsonbExistsAny, 2, 2),
         "JSONB_EXISTS_ALL" => (JsonbExistsAll, 2, 2),
@@ -270,17 +278,17 @@ fn array(v: Vec<Value>) -> Value {
     Value::Array(Arc::new(v))
 }
 
-const DAY: i64 = 86_400;
+const DAY: i64 = 86_400_000;
 
 fn justify_hours(mut i: crate::interval::Interval) -> crate::interval::Interval {
-    i.days += i.secs / DAY;
-    i.secs %= DAY;
-    if i.days > 0 && i.secs < 0 {
+    i.days += i.ms / DAY;
+    i.ms %= DAY;
+    if i.days > 0 && i.ms < 0 {
         i.days -= 1;
-        i.secs += DAY;
-    } else if i.days < 0 && i.secs > 0 {
+        i.ms += DAY;
+    } else if i.days < 0 && i.ms > 0 {
         i.days += 1;
-        i.secs -= DAY;
+        i.ms -= DAY;
     }
     i
 }
@@ -837,14 +845,14 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             match (b[6] >> 4, var) {
                 (7, 2) => {
                     let ms = b[..6].iter().fold(0u64, |a, x| (a << 8) | u64::from(*x));
-                    Value::TimestampTz((ms / 1000) as i64)
+                    Value::TimestampTz(ms as i64)
                 }
                 (1, 2) => {
                     let low = u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
                     let mid = u64::from(u16::from_be_bytes([b[4], b[5]]));
                     let hi = u64::from(u16::from_be_bytes([b[6], b[7]]) & 0x0fff);
                     let ticks = (hi << 48) | (mid << 32) | low;
-                    Value::TimestampTz((ticks / 10_000_000) as i64 - 12_219_292_800)
+                    Value::TimestampTz((ticks / 10_000) as i64 - 12_219_292_800_000)
                 }
                 _ => Value::Null,
             }
@@ -853,10 +861,10 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             let mut b = random_bytes();
             if f == UuidV7 {
                 let shift = match vals.first() {
-                    Some(i) if !i.is_null() => interval_of(i)?.total_secs() as i64,
+                    Some(i) if !i.is_null() => interval_of(i)?.total_ms() as i64,
                     _ => 0,
                 };
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) + shift * 1000;
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) + shift;
                 let ms = now.max(0) as u64;
                 b[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
                 b[6] = (b[6] & 0x0f) | 0x70;
@@ -866,15 +874,31 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             b[8] = (b[8] & 0x3f) | 0x80;
             Value::text(&uuid_text(b))
         }
+        CollKey => {
+            let c = crate::collation::lookup(&text(v(0)))?;
+            match v(1) {
+                Value::Null => Value::Null,
+                Value::Text(s) => Value::Bytes(std::sync::Arc::new(c.key(s))),
+                other => Value::Bytes(std::sync::Arc::new(c.key(&other.to_string()))),
+            }
+        }
+        Collate | TsMark => v(0).clone(),
+        TsDiff => match (v(0), v(1)) {
+            (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) if !crate::datetime::is_infinite(*a) && !crate::datetime::is_infinite(*b) => {
+                let diff = a.checked_sub(*b).ok_or_else(|| Error::runtime("interval out of range"))?;
+                Value::Interval(crate::interval::Interval::new(0, diff / crate::datetime::MS_PER_DAY, diff % crate::datetime::MS_PER_DAY))
+            }
+            (x, y) => crate::numeric::arith(crate::sql::ast::BinOp::Sub, x, y)?,
+        },
         JustifyDays => Value::Interval(justify_days(interval_of(v(0))?)),
         JustifyHours => Value::Interval(justify_hours(interval_of(v(0))?)),
         JustifyInterval => {
             let mut i = justify_days(justify_hours(interval_of(v(0))?));
             // a month and a day or time of opposite signs are brought to the same sign
-            if i.months > 0 && (i.days < 0 || i.secs < 0) {
+            if i.months > 0 && (i.days < 0 || i.ms < 0) {
                 i.months -= 1;
                 i.days += 30;
-            } else if i.months < 0 && (i.days > 0 || i.secs > 0) {
+            } else if i.months < 0 && (i.days > 0 || i.ms > 0) {
                 i.months += 1;
                 i.days -= 30;
             }

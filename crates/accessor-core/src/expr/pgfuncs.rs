@@ -213,7 +213,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
             if stride.months != 0 {
                 return Err(Error::runtime("timestamps cannot be binned into intervals containing months or years"));
             }
-            let secs = stride.days.saturating_mul(86_400).saturating_add(stride.secs);
+            let secs = stride.days.saturating_mul(datetime::MS_PER_DAY).saturating_add(stride.ms);
             if secs <= 0 {
                 return Err(Error::runtime("stride must be greater than zero"));
             }
@@ -381,12 +381,14 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         }
         MakeTimestamp | MakeTimestamptz => {
             let (y, mo, d, h, mi) = (int(v(0))?, int(v(1))?, int(v(2))?, int(v(3))?, int(v(4))?);
-            let s = double(v(5))?.floor() as i64;
+            let sd = double(v(5))?;
+            let s = sd.floor() as i64;
             if !(0..=60).contains(&s) || h < 0 || mi < 0 {
                 return Err(Error::runtime("time field value out of range"));
             }
             let local = datetime::from_components(y, mo as u32, d as u32, h as u32, mi as u32, s as u32)
-                .ok_or_else(|| Error::runtime("date field value out of range"))?;
+                .ok_or_else(|| Error::runtime("date field value out of range"))?
+                + ((sd - sd.floor()) * 1000.0).round() as i64;
             if f == MakeTimestamp {
                 Value::DateTime(local)
             } else {
@@ -420,7 +422,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         ToTimestamp => {
             if vals.len() == 1 {
                 let secs = double(v(0))?;
-                Value::TimestampTz(secs.floor() as i64)
+                Value::TimestampTz((secs * 1000.0).round() as i64)
             } else {
                 let local = parse_datetime(&text(v(0)), &text(v(1)))?;
                 Value::TimestampTz(tz::session().to_utc(local))
@@ -428,7 +430,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         }
         ToDate => {
             let local = parse_datetime(&text(v(0)), &text(v(1)))?;
-            Value::DateTime(local.div_euclid(86_400) * 86_400)
+            Value::DateTime(local.div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY)
         }
         ToChar => match v(0) {
             Value::DateTime(t) => Value::text(&format_datetime(*t, &text(v(1)))),
@@ -478,14 +480,15 @@ fn trunc_date(field: &str, t: i64) -> Result<i64> {
     let (y, mo, d, h, mi, _) = datetime::components(t);
     let make = |y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32| datetime::from_components(y, mo, d, h, mi, s).ok_or_else(|| Error::runtime("timestamp out of range"));
     match field {
-        "microseconds" | "milliseconds" | "microsecond" | "millisecond" | "second" => Ok(t),
+        "microseconds" | "milliseconds" | "microsecond" | "millisecond" => Ok(t),
+        "second" => Ok(t - i64::from(datetime::millis(t))),
         "minute" => make(y, mo, d, h, mi, 0),
         "hour" => make(y, mo, d, h, 0, 0),
         "day" => make(y, mo, d, 0, 0, 0),
         "week" => {
-            let days = t.div_euclid(86_400);
+            let days = t.div_euclid(datetime::MS_PER_DAY);
             let dow = (days + 3).rem_euclid(7); // Monday = 0
-            Ok((days - dow) * 86_400)
+            Ok((days - dow) * datetime::MS_PER_DAY)
         }
         "month" => make(y, mo, 1, 0, 0, 0),
         "quarter" => make(y, ((mo - 1) / 3) * 3 + 1, 1, 0, 0, 0),
@@ -559,7 +562,7 @@ fn cased(name: &str, word: &str) -> String {
 
 fn format_datetime(t: i64, fmt: &str) -> String {
     let (y, mo, d, h, mi, s) = datetime::components(t);
-    let days = t.div_euclid(86_400);
+    let days = t.div_euclid(datetime::MS_PER_DAY);
     let dow = (days + 4).rem_euclid(7) as usize; // Sunday = 0
     let yday = days - datetime::days_from_civil(y, 1, 1) + 1;
     let mut out = String::new();
@@ -592,7 +595,8 @@ fn format_datetime(t: i64, fmt: &str) -> String {
             "MI" => out.push_str(&num(i64::from(mi), 2, fm)),
             "SS" => out.push_str(&num(i64::from(s), 2, fm)),
             "SSSS" => out.push_str(&(h * 3600 + mi * 60 + s).to_string()),
-            "MS" | "US" => out.push_str(if up == "MS" { "000" } else { "000000" }),
+            "MS" => out.push_str(&format!("{:03}", datetime::millis(t))),
+            "US" => out.push_str(&format!("{:06}", datetime::millis(t) * 1000)),
             "AM" | "PM" => out.push_str(&cased(if h < 12 { "AM" } else { "PM" }, &w)),
             "A.M." | "P.M." => out.push_str(&cased(if h < 12 { "A.M." } else { "P.M." }, &w)),
             "MONTH" => {
@@ -625,6 +629,7 @@ fn parse_datetime(input: &str, fmt: &str) -> Result<i64> {
     let s: Vec<char> = input.chars().collect();
     let mut i = 0;
     let (mut y, mut mo, mut d, mut h, mut mi, mut sec) = (1i64, 1i64, 1i64, 0i64, 0i64, 0i64);
+    let mut frac_ms = 0i64;
     let mut pm: Option<bool> = None;
     let mut hour12 = false;
     let bad = |what: &str| Error::runtime(format!("invalid value for {what}"));
@@ -685,12 +690,8 @@ fn parse_datetime(input: &str, fmt: &str) -> Result<i64> {
                         mi = v % 3600 / 60;
                         sec = v % 60;
                     }
-                    "MS" => {
-                        digits(3, &mut i)?;
-                    }
-                    "US" => {
-                        digits(6, &mut i)?;
-                    }
+                    "MS" => frac_ms = digits(3, &mut i)?,
+                    "US" => frac_ms = digits(6, &mut i)? / 1000,
                     "AM" | "PM" | "A.M." | "P.M." => {
                         let rest: String = s[i..].iter().collect::<String>().to_ascii_uppercase();
                         let len = if up.contains('.') { 4 } else { 2 };
@@ -749,7 +750,7 @@ fn parse_datetime(input: &str, fmt: &str) -> Result<i64> {
         mo = i64::from(mm);
         d = i64::from(dd);
     }
-    datetime::from_components(y, mo as u32, d as u32, h as u32, mi as u32, sec as u32).ok_or_else(|| Error::runtime("date/time field value out of range"))
+    datetime::from_components(y, mo as u32, d as u32, h as u32, mi as u32, sec as u32).map(|t| t + frac_ms).ok_or_else(|| Error::runtime("date/time field value out of range"))
 }
 
 // ----- number patterns ---------------------------------------------------------------------------------------

@@ -72,7 +72,7 @@ A `tsvector` and a `tsquery` are kept as text in the form PostgreSQL prints them
 | `to_tsvector([config,] text)` | the words of the text, lower-cased, with their positions; the `english` configuration (the default) drops stop words and stems with the Snowball English stemmer, any other configuration (`simple`) keeps the words as they are |
 | `to_tsquery([config,] text)` | the query `'fat & rats'` with its words stemmed and its stop words dropped; `&`, `\|`, `!`, `<->`, `<n>`, `( )`, `word:*` and `word:AB` are read |
 | `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery` | a query from plain text (ANDed), a phrase (`<->`, or `<n>` over a stop word), or a search box (`"a phrase"`, `or`, `-word`) |
-| `vector @@ query` | true when the query holds; phrases use the positions. Plain text on either side is read as a document or a query. (`jsonb @@ path` is still the JSON path match.) |
+| `vector @@ query` | true when the query holds; phrases use the positions: `a <-> b` and `a <n> b` need `b` exactly `n` places after the end of `a`, so a phrase can be an operand of another (`1 <-> (2 <-> 3)`), `&` inside a phrase needs both at the same place, and `!x` inside a phrase holds where `x` is not (`!x <-> y`). A weight on a word (`wd:A`, `w:*D`) is matched against the weights in the vector; a vector with no positions (`strip`) cannot rule a weight out. `v1 || v2` of two vectors in their written form puts the positions of the second after those of the first. Plain text on either side is read as a document or a query. (`jsonb @@ path` is still the JSON path match.) |
 | `setweight(vector, 'A'..'D' [, words])`, `strip(vector)`, `ts_delete`, `ts_filter`, `tsvector_to_array`, `array_to_tsvector`, `tsvector_concat`, `numnode`, `querytree` | the vector or query changed or measured |
 | `ts_rank(vector, query [, norm])`, `ts_rank_cd(...)` | PostgreSQL's rank formulas (weights 0.1, 0.2, 0.4, 1.0); `ts_rank_cd` gives the same numbers as `ts_rank`; the array of weights is not accepted |
 | `ts_headline([config,] text, query [, options])` | the text with the words of the query between `<b>` and `</b>` (`StartSel`, `StopSel`, `MaxWords`, `MinWords`, `FragmentDelimiter`, `HighlightAll`) |
@@ -86,7 +86,7 @@ The parser sees a word as letters and digits (`3.14` is one word); e-mail addres
 
 ## Not available
 
-The text search objects (`CREATE TEXT SEARCH CONFIGURATION`, dictionaries, parsers: read and ignored), `ts_stat`, `tsvector || tsvector` (the two texts are joined; use `tsvector_concat`), and the exact byte layout of the XML Schema the `*_to_xmlschema` functions write (see below). XML values are text here, so a column of type `xml` is not told from `text`.
+The text search objects (`CREATE TEXT SEARCH CONFIGURATION`, dictionaries, parsers: read and ignored), `ts_stat`, and the exact byte layout of the XML Schema the `*_to_xmlschema` functions write (see below). XML values are text here, so a column of type `xml` is not told from `text`.
 
 ## More built-in functions
 

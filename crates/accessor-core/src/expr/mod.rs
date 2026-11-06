@@ -134,6 +134,13 @@ impl BExpr {
                             _ => arrays::concat(&x, &y)?,
                         }));
                     }
+                    if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                        if let (Value::Text(p), Value::Text(q)) = (&*x, &*y) {
+                            if let Some(joined) = tsearch::concat_vectors(p, q) {
+                                return Ok(Cow::Owned(Value::text(&joined)));
+                            }
+                        }
+                    }
                     let mut s = String::new();
                     for v in [&x, &y] {
                         match &**v {

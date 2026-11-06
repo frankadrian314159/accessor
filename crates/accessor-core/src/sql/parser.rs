@@ -1633,6 +1633,79 @@ impl<'a> Parser<'a> {
 
     /// `CREATE OPERATOR name (LEFTARG = t, RIGHTARG = t, FUNCTION = f, ...)`: the operator is kept as the function that
     /// does its work, by its spelling and whether it has a left operand.
+    /// A collation's name, with the schema before it dropped: `"en-x-icu"`, `pg_catalog."C"`.
+    fn collation_name(&mut self) -> Result<String> {
+        let mut name = match self.advance() {
+            Tok::Ident(w) | Tok::Quoted(w) | Tok::Str(w) => w,
+            _ => return Err(Error::syntax("syntax error: a collation name was expected")),
+        };
+        while self.eat_sym(".") {
+            name = match self.advance() {
+                Tok::Ident(w) | Tok::Quoted(w) | Tok::Str(w) => w,
+                _ => return Err(Error::syntax("syntax error: a collation name was expected")),
+            };
+        }
+        Ok(name)
+    }
+
+    /// `CREATE COLLATION [IF NOT EXISTS] name (provider = icu, locale = 'und-u-ks-level2', deterministic = false)` or
+    /// `CREATE COLLATION name FROM other`.
+    fn create_collation(&mut self) -> Result<Statement> {
+        self.advance();
+        let if_not_exists = self.eat_kw("IF") && self.eat_kw("NOT") && self.eat_kw("EXISTS");
+        let name = self.collation_name()?;
+        let (mut locale, mut provider, mut deterministic) = (None, "icu".to_string(), true);
+        if self.eat_kw("FROM") {
+            let from = self.collation_name()?;
+            let c = crate::collation::lookup(&from)?;
+            locale = Some(c.locale);
+            provider = if c.binary { "libc".into() } else { "icu".into() };
+            deterministic = c.deterministic;
+        } else {
+            self.expect_sym("(")?;
+            loop {
+                let option = self.any_word()?.to_ascii_lowercase();
+                self.expect_sym("=")?;
+                let value = match self.advance() {
+                    Tok::Str(v) | Tok::Ident(v) | Tok::Quoted(v) => v,
+                    _ => return Err(Error::syntax("syntax error in CREATE COLLATION")),
+                };
+                match option.as_str() {
+                    "locale" => locale = Some(value),
+                    "lc_collate" | "lc_ctype" => locale = locale.or(Some(value)),
+                    "provider" => provider = value.to_ascii_lowercase(),
+                    "deterministic" => deterministic = matches!(value.to_ascii_lowercase().as_str(), "true" | "t" | "on" | "yes" | "1"),
+                    "rules" | "version" => {}
+                    other => return Err(Error::syntax(format!("collation attribute \"{other}\" not recognized"))),
+                }
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.expect_sym(")")?;
+        }
+        let locale = locale.ok_or_else(|| Error::syntax("parameter \"locale\" must be specified"))?;
+        if provider == "builtin" {
+            provider = "libc".into();
+        }
+        if provider != "icu" && provider != "libc" {
+            return Err(Error::syntax(format!("unrecognized collation provider: {provider}")));
+        }
+        if provider == "icu" && !crate::collation::known_locale(&locale) {
+            return Err(Error::runtime(format!("ICU locale \"{locale}\" has unknown language")));
+        }
+        if !deterministic && provider != "icu" {
+            return Err(Error::syntax("nondeterministic collations not supported with this provider"));
+        }
+        Ok(Statement::Catalog(Box::new(CatalogChange {
+            kind: "collation",
+            names: vec![name],
+            value: Some(crate::collation::definition(&locale, deterministic, &provider)),
+            replace: if_not_exists,
+            cascade: false,
+        })))
+    }
+
     fn create_operator(&mut self) -> Result<Statement> {
         self.advance();
         let sym = self.operator_name()?;
@@ -4372,6 +4445,9 @@ impl<'a> Parser<'a> {
         if self.peek_kw("OPERATOR") && !self.peek_kw_at(1, "CLASS") && !self.peek_kw_at(1, "FAMILY") {
             return self.create_operator();
         }
+        if self.peek_kw("COLLATION") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+            return self.create_collation();
+        }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("CREATE"));
         }
@@ -5398,6 +5474,13 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("CHARACTER") {
                 self.expect_kw("SET")?;
                 self.advance();
+            } else if crate::dialect::current() == crate::dialect::Dialect::Postgresql && self.peek_kw("COLLATE") {
+                self.advance();
+                let name = self.collation_name()?;
+                crate::collation::lookup(&name)?;
+                if def.data_type == DataType::Text && def.range.is_none() {
+                    def.range = Some(format!("\u{3}{name}"));
+                }
             } else if self.eat_kw("CHARSET") || self.eat_kw("COLLATE") || self.eat_kw("STORAGE") || self.eat_kw("COLUMN_FORMAT") {
                 self.advance();
             } else if self.eat_kw("COMMENT") {
@@ -5818,6 +5901,17 @@ impl<'a> Parser<'a> {
         }
         if self.peek_kw("OPERATOR") && !self.peek_kw_at(1, "CLASS") && !self.peek_kw_at(1, "FAMILY") {
             return self.drop_operator();
+        }
+        if self.peek_kw("COLLATION") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+            self.advance();
+            let if_exists = self.eat_kw("IF") && self.eat_kw("EXISTS");
+            let mut names = vec![self.collation_name()?];
+            while self.eat_sym(",") {
+                names.push(self.collation_name()?);
+            }
+            let cascade = self.eat_kw("CASCADE");
+            self.eat_kw("RESTRICT");
+            return Ok(Statement::Catalog(Box::new(CatalogChange { kind: "collation", names, value: None, replace: if_exists, cascade })));
         }
         if self.ignorable_object() {
             return Ok(self.ignore_rest("DROP"));
@@ -7333,7 +7427,12 @@ impl<'a> Parser<'a> {
         // `x COLLATE name`: text is compared by its characters here whatever the collation, so it is read and dropped
         while self.peek_kw("COLLATE") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_) | Tok::Str(_)) {
             self.advance();
-            self.advance();
+            if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                let name = self.collation_name()?;
+                base = Expr::Function { name: "__COLLATE".into(), args: vec![base, Expr::Literal(Value::text(&name))], distinct: false, star: false };
+            } else {
+                self.advance();
+            }
         }
         if self.eat_sym("^") {
             let exp = self.unary()?;
@@ -7565,6 +7664,10 @@ impl<'a> Parser<'a> {
                         let Tok::Str(text) = self.advance() else { unreachable!("checked") };
                         let t = crate::datetime::parse(&text)
                             .ok_or_else(|| Error::syntax(format!("'{text}' is not a valid {up} literal")))?;
+                        // TIMESTAMP '..' is marked, so that a difference of two timestamps at midnight is an interval, not days
+                        if up == "TIMESTAMP" && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                            return Ok(Expr::Function { name: "__TS".into(), args: vec![Expr::Literal(Value::DateTime(t))], distinct: false, star: false });
+                        }
                         return Ok(Expr::Literal(Value::DateTime(t)));
                     }
                     // Any other type name before a string is a cast of that string: int4 '42', bool 't', float8 '1e3',
@@ -8497,7 +8600,8 @@ impl<'a> Parser<'a> {
         }
         while self.eat_kw("ASCII") || self.eat_kw("UNICODE") || self.eat_kw("BINARY") {}
         self.expect_sym(")")?;
-        Ok(make_cast(e, ty, &hints))
+        let cast = make_cast(e, ty, &hints);
+        Ok(if is_timestamp_name(&tn) { mark_timestamp(cast) } else { cast })
     }
 
     /// The type after `::`, with an optional size, applied to `e`.
@@ -8556,8 +8660,10 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        let is_ts = is_timestamp_name(&tn) && !self.peek_sym("[");
         let ty = self.array_suffix(ty);
-        Ok(make_cast(e, ty, &hints))
+        let cast = make_cast(e, ty, &hints);
+        Ok(if is_ts { mark_timestamp(cast) } else { cast })
     }
 
     /// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` after the parenthesis.
@@ -8901,6 +9007,16 @@ mod tests {
 }
 
 /// `CAST(e AS ty)` / `e::ty` as the function that does the conversion; a decimal scale rounds.
+/// Is this the name of the type `timestamp` (PostgreSQL mode)?
+fn is_timestamp_name(tn: &str) -> bool {
+    crate::dialect::current() == crate::dialect::Dialect::Postgresql && tn.eq_ignore_ascii_case("timestamp")
+}
+
+/// Marks a value as a timestamp, so that the difference of two is an interval and not a number of days.
+fn mark_timestamp(e: Expr) -> Expr {
+    Expr::Function { name: "__TS".into(), args: vec![e], distinct: false, star: false }
+}
+
 fn make_cast(e: Expr, ty: DataType, hints: &[i64]) -> Expr {
     let name = match ty {
         // CAST drops the fraction of a float; the Access function CInt() rounds

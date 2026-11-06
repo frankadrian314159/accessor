@@ -1091,6 +1091,8 @@ impl Database {
     pub(crate) fn enter_session(&self) {
         crate::tz::set_session(self.time_zone);
         crate::dialect::set_session(self.dialect());
+        crate::datetime::start_statement();
+        self.sync_collations();
         self.sync_aggregates();
         crate::sequence::set_current(&self.seqs);
         // A connection reading for a transaction that is not the one the database has open says so.

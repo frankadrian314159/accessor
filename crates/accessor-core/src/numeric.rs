@@ -362,11 +362,11 @@ fn power(x: &Value, y: &Value) -> Result<Value> {
     }
 }
 
-/// A number of days as whole seconds.
-fn day_seconds(n: &Value) -> Result<i64> {
+/// A number of days as whole milliseconds.
+fn day_ms(n: &Value) -> Result<i64> {
     match n {
         Value::Float(_) | Value::Double(_) => {
-            let secs = (require_f64(n)? * 86_400.0).round_ties_even();
+            let secs = (require_f64(n)? * 86_400_000.0).round_ties_even();
             if secs.abs() < 9.2e18 {
                 Ok(secs as i64)
             } else {
@@ -374,7 +374,7 @@ fn day_seconds(n: &Value) -> Result<i64> {
             }
         }
         _ => {
-            let r = require_rational(n)?.mul(&Rational::from_i64(86_400));
+            let r = require_rational(n)?.mul(&Rational::from_i64(86_400_000));
             r.round().to_i64().ok_or_else(overflow)
         }
     }
@@ -385,12 +385,12 @@ fn interval_arith(op: BinOp, a: &Value, b: &Value) -> Result<Option<Value>> {
     use crate::interval::Interval;
     use crate::tz;
     let out_of_range = || Error::runtime("interval out of range");
-    // A zoned instant moved by months and days on its wall clock, and by seconds exactly.
+    // A zoned instant moved by months and days on its wall clock, and by milliseconds exactly.
     let move_tz = |t: i64, iv: &Interval, sign: i64| -> Result<i64> {
         let zone = tz::session();
         let calendar = Interval::new(iv.months, iv.days, 0);
         let local = calendar.add_to_local(zone.to_local(t), sign).ok_or_else(out_of_range)?;
-        zone.to_utc(local).checked_add(iv.secs.checked_mul(sign).ok_or_else(out_of_range)?).ok_or_else(out_of_range)
+        zone.to_utc(local).checked_add(iv.ms.checked_mul(sign).ok_or_else(out_of_range)?).ok_or_else(out_of_range)
     };
     let scale = |iv: &Interval, k: &Decimal| iv.scale(k).map(Value::Interval).ok_or_else(out_of_range);
     Ok(Some(match (op, a, b) {
@@ -418,11 +418,11 @@ fn interval_arith(op: BinOp, a: &Value, b: &Value) -> Result<Option<Value>> {
         | (BinOp::Sub, Value::DateTime(t), Value::TimestampTz(u)) => Value::Interval(Interval::new(0, 0, t.checked_sub(*u).ok_or_else(out_of_range)?)),
         (BinOp::Add, Value::TimestampTz(t), n) | (BinOp::Add, n, Value::TimestampTz(t)) if n.num().is_some() => {
             let days = n.num().ok_or_else(overflow)?.into_owned();
-            Value::TimestampTz(t + day_seconds(&days)?)
+            Value::TimestampTz(t + day_ms(&days)?)
         }
         (BinOp::Sub, Value::TimestampTz(t), n) if n.num().is_some() => {
             let days = n.num().ok_or_else(overflow)?.into_owned();
-            Value::TimestampTz(t - day_seconds(&days)?)
+            Value::TimestampTz(t - day_ms(&days)?)
         }
         _ => return Ok(None),
     }))
@@ -447,9 +447,72 @@ pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
 
 const DIVISION_BY_ZERO: &str = "Division by zero";
 
+/// PostgreSQL's `money`, in cents: a sum or difference of two, a product with a number, a quotient by a number (whole
+/// numbers truncate, floats round), and a quotient of two (a double).
+fn money_arith(op: BinOp, a: &Value, b: &Value) -> Result<Option<Value>> {
+    let range = || Error::runtime("money out of range");
+    let cents = |v: &Value| -> Option<i64> {
+        match v {
+            Value::Currency(d) => d.mul(&Decimal::from_i64(100)).round(0).to_i64(),
+            _ => None,
+        }
+    };
+    let money = |c: i128| -> Result<Value> {
+        let c = i64::try_from(c).map_err(|_| range())?;
+        Ok(Value::Currency(Decimal::with_kept_scale(BigInt::from(c), 2)))
+    };
+    let float = |c: i64, f: f64, mul: bool| -> Result<Value> {
+        let r = if mul { c as f64 * f } else { c as f64 / f };
+        if !r.is_finite() {
+            return Err(if mul { range() } else { Error::runtime(DIVISION_BY_ZERO) });
+        }
+        let r = r.round_ties_even();
+        if r.abs() >= 9.223372036854776e18 {
+            return Err(range());
+        }
+        money(r as i128)
+    };
+    Ok(Some(match (op, a, b) {
+        (BinOp::Add, Value::Currency(_), Value::Currency(_)) => money(cents(a).ok_or_else(range)? as i128 + cents(b).ok_or_else(range)? as i128)?,
+        (BinOp::Sub, Value::Currency(_), Value::Currency(_)) => money(cents(a).ok_or_else(range)? as i128 - cents(b).ok_or_else(range)? as i128)?,
+        (BinOp::Mul, Value::Currency(_), n @ (Value::Int(_) | Value::Big(_))) | (BinOp::Mul, n @ (Value::Int(_) | Value::Big(_)), Value::Currency(_)) => {
+            let c = cents(if matches!(a, Value::Currency(_)) { a } else { b }).ok_or_else(range)?;
+            let k = require_big(n)?;
+            let p = BigInt::from(c) * k;
+            money(i128::try_from(p).map_err(|_| range())?)?
+        }
+        (BinOp::Mul, Value::Currency(_), n @ (Value::Float(_) | Value::Double(_))) | (BinOp::Mul, n @ (Value::Float(_) | Value::Double(_)), Value::Currency(_)) => {
+            let c = cents(if matches!(a, Value::Currency(_)) { a } else { b }).ok_or_else(range)?;
+            float(c, require_f64(n)?, true)?
+        }
+        (BinOp::Div | BinOp::ExactDiv, Value::Currency(_), n @ (Value::Int(_) | Value::Big(_))) => {
+            let k = require_big(n)?;
+            if k == BigInt::from(0) {
+                return Err(Error::runtime(DIVISION_BY_ZERO));
+            }
+            let q = BigInt::from(cents(a).ok_or_else(range)?) / k;
+            money(i128::try_from(q).map_err(|_| range())?)?
+        }
+        (BinOp::Div | BinOp::ExactDiv, Value::Currency(_), n @ (Value::Float(_) | Value::Double(_))) => float(cents(a).ok_or_else(range)?, require_f64(n)?, false)?,
+        (BinOp::Div | BinOp::ExactDiv, Value::Currency(_), Value::Currency(_)) => {
+            let d = cents(b).ok_or_else(range)?;
+            if d == 0 {
+                return Err(Error::runtime(DIVISION_BY_ZERO));
+            }
+            Value::Double(cents(a).ok_or_else(range)? as f64 / d as f64)
+        }
+        _ => return Ok(None),
+    }))
+}
+
 fn arith_checked(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     if a.is_null() || b.is_null() {
         return Ok(Value::Null);
+    }
+    if crate::dialect::current() == crate::dialect::Dialect::Postgresql && (matches!(a, Value::Currency(_)) || matches!(b, Value::Currency(_))) {
+        if let Some(v) = money_arith(op, a, b)? {
+            return Ok(v);
+        }
     }
     // ranges: union, difference and intersection
     if let (Value::Text(_) | Value::Multirange(_), Value::Text(_) | Value::Multirange(_)) = (a, b) {
@@ -472,18 +535,28 @@ fn arith_checked(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     }
     // Date arithmetic: dates are counted in days.
     match (op, a, b) {
+        // PostgreSQL: a difference of timestamps is an interval of days and time
+        (BinOp::Sub, Value::DateTime(t), Value::DateTime(u))
+            if crate::dialect::current() == crate::dialect::Dialect::Postgresql
+                && !crate::datetime::is_infinite(*t)
+                && !crate::datetime::is_infinite(*u)
+                && (t.rem_euclid(crate::datetime::MS_PER_DAY) != 0 || u.rem_euclid(crate::datetime::MS_PER_DAY) != 0) =>
+        {
+            let diff = t.checked_sub(*u).ok_or_else(overflow)?;
+            return Ok(Value::Interval(crate::interval::Interval::new(0, diff / crate::datetime::MS_PER_DAY, diff % crate::datetime::MS_PER_DAY)));
+        }
         (BinOp::Sub, Value::DateTime(t), Value::DateTime(u)) => {
-            let days = Decimal::from_i64(t - u).div(&Decimal::from_i64(86_400)).ok_or_else(division_by_zero)?;
+            let days = Decimal::from_i64(t - u).div(&Decimal::from_i64(86_400_000)).ok_or_else(division_by_zero)?;
             return Ok(Value::from_decimal(days));
         }
         (BinOp::Add, Value::DateTime(t), n) | (BinOp::Add, n, Value::DateTime(t)) => {
             if let Some(n) = n.num() {
-                return Ok(Value::DateTime(t + day_seconds(&n)?));
+                return Ok(Value::DateTime(t + day_ms(&n)?));
             }
         }
         (BinOp::Sub, Value::DateTime(t), n) => {
             if let Some(n) = n.num() {
-                return Ok(Value::DateTime(t - day_seconds(&n)?));
+                return Ok(Value::DateTime(t - day_ms(&n)?));
             }
         }
         (BinOp::Add, Value::Text(x), Value::Text(y)) => {

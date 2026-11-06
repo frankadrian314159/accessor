@@ -33,6 +33,8 @@ Mixing with other types: a `DECIMAL` combined with an `INTEGER` or `BIGNUM` stay
 
 ### Money
 
+In **PostgreSQL mode** `money` follows PostgreSQL: two decimals (input is rounded half away from zero, `'123.455'::money` is `$123.46`), written with commas (`$1,234,567.00`, `-$12,345.00`), limited to 2^63 cents (`money out of range`). `money + money` and `money - money` are money; `money * integer` and `money * float` are money (a float product is rounded to the cent); `money / integer` truncates to the cent, `money / float` rounds, `money / money` is a `double precision`. The rest of this section describes the other dialects.
+
 `CURRENCY` follows the same rules, with these differences:
 
 | Expression | Type |

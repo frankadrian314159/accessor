@@ -412,7 +412,7 @@ fn format_date(t: i64, pattern: &str) -> Result<String> {
     let twelve = toks.iter().any(|t| matches!(t, DateTok::Meridiem(..)));
     let wd = datetime::weekday(t); // Sunday = 1
     let doy = datetime::days_from_civil(y, mo, d) - datetime::days_from_civil(y, 1, 1) + 1;
-    let jan1_wd = datetime::weekday(datetime::days_from_civil(y, 1, 1) * 86_400) - 1;
+    let jan1_wd = datetime::weekday(datetime::days_from_civil(y, 1, 1) * datetime::MS_PER_DAY) - 1;
 
     // "m" and "mm" mean minutes right after an hour or right before seconds.
     let significant = |from: usize, step: isize| -> Option<char> {

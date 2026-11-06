@@ -627,7 +627,7 @@ impl Value {
     /// How a number compares with zero (`None` for a value that is not a number).
     pub(crate) fn sign(&self) -> Option<Ordering> {
         if let Value::Interval(i) = self {
-            return Some(i.total_secs().cmp(&0));
+            return Some(i.total_ms().cmp(&0));
         }
         let n = self.num()?;
         Some(num_cmp(&n, &Value::Int(0)))
@@ -1048,6 +1048,13 @@ impl Value {
                     },
                     DataType::Currency => match n {
                         Currency(_) => Ok(n.clone()),
+                        // PostgreSQL's money has two decimals, rounded on input, and a limit of 2^63 cents
+                        other if crate::dialect::current() == Dialect::Postgresql => other
+                            .as_decimal()
+                            .map(|d| d.round(2))
+                            .filter(|d| d.mul(&Decimal::from_i64(100)).to_i64().is_some())
+                            .map(|d| Currency(d.with_scale(2)))
+                            .ok_or_else(|| Error::runtime(format!("value \"{other}\" is out of range for type money"))),
                         other => other.as_decimal().map(Currency).ok_or_else(range),
                     },
                     DataType::Rational => match n {
@@ -1300,6 +1307,19 @@ impl Hash for Value {
 
 /// `$` and at least two decimals, as money is written.
 fn format_currency(d: &Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if crate::dialect::current() == Dialect::Postgresql {
+        // two decimals and a comma between the thousands: -$1,234.56
+        let text = d.round(2).abs().with_scale(2).to_string();
+        let (whole, frac) = text.split_once('.').unwrap_or((&text, "00"));
+        let mut grouped = String::new();
+        for (i, c) in whole.chars().enumerate() {
+            if i > 0 && (whole.len() - i) % 3 == 0 {
+                grouped.push(',');
+            }
+            grouped.push(c);
+        }
+        return write!(f, "{}${grouped}.{frac}", if d.round(2).is_negative() { "-" } else { "" });
+    }
     let mut digits = d.abs().to_string();
     match digits.find('.') {
         None => digits.push_str(".00"),

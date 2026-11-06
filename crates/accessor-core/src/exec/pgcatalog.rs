@@ -323,7 +323,14 @@ impl Database {
             "pg_statistic_ext" => names(&["oid", "stxrelid", "stxname", "stxnamespace", "stxowner", "stxkeys", "stxkind"]),
             "pg_attrdef" => names(&["oid", "adrelid", "adnum", "adbin"]),
             "pg_rewrite" => names(&["oid", "rulename", "ev_class", "ev_type", "is_instead"]),
-            "pg_collation" => names(&["oid", "collname", "collnamespace", "collowner", "collprovider"]),
+            "pg_collation" => {
+                let mut all: Vec<(String, char)> = crate::collation::builtins().into_iter().map(|(n, p)| (n.to_string(), p)).collect();
+                all.extend(self.user_collations());
+                for (i, (n, p)) in all.into_iter().enumerate() {
+                    rows.push(vec![Value::Int(100 + i as i64), t(&n), Value::Int(11), Value::Int(10), t(&p.to_string())]);
+                }
+                names(&["oid", "collname", "collnamespace", "collowner", "collprovider"])
+            }
             "pg_language" => names(&["oid", "lanname", "lanowner", "lanispl"]),
             "pg_cast" => names(&["oid", "castsource", "casttarget", "castfunc", "castcontext", "castmethod"]),
             "pg_tablespace" => names(&["oid", "spcname", "spcowner"]),

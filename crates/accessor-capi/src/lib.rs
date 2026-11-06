@@ -322,8 +322,8 @@ impl Cell {
             // Money is shown with a sign; the interface gives the plain digits.
             Value::Currency(d) => Cell::text_of(ACC_TYPE_CURRENCY, &d.to_string()),
             Value::Rational(r) => Cell::text_of(ACC_TYPE_RATIONAL, &r.to_string()),
-            Value::DateTime(t) => Cell { tag: ACC_TYPE_DATETIME, int: *t, ..Cell::text_of(ACC_TYPE_DATETIME, &accessor_core::datetime::format(*t)) },
-            Value::TimestampTz(t) => Cell { tag: ACC_TYPE_TIMESTAMPTZ, int: *t, ..Cell::text_of(ACC_TYPE_TIMESTAMPTZ, &v.to_string()) },
+            Value::DateTime(t) => Cell { tag: ACC_TYPE_DATETIME, int: t.div_euclid(1000), ..Cell::text_of(ACC_TYPE_DATETIME, &accessor_core::datetime::format(*t)) },
+            Value::TimestampTz(t) => Cell { tag: ACC_TYPE_TIMESTAMPTZ, int: t.div_euclid(1000), ..Cell::text_of(ACC_TYPE_TIMESTAMPTZ, &v.to_string()) },
             Value::Interval(_) => Cell::text_of(ACC_TYPE_INTERVAL, &v.to_string()),
             Value::Json(s) => Cell::text_of(ACC_TYPE_JSON, s),
             Value::Text(s) => Cell::text_of(ACC_TYPE_TEXT, s),
@@ -852,13 +852,13 @@ pub unsafe extern "C" fn acc_bind_bignum(stmt: *mut acc_stmt, index: c_int, text
 /// Sets a parameter to a date and time with no time zone, as seconds since 1970-01-01 00:00:00.
 #[no_mangle]
 pub unsafe extern "C" fn acc_bind_datetime(stmt: *mut acc_stmt, index: c_int, seconds: i64) -> c_int {
-    bind(stmt, index, || Ok(Value::DateTime(seconds)))
+    bind(stmt, index, || Ok(Value::DateTime(seconds.saturating_mul(1000))))
 }
 
 /// Sets a parameter to a moment in time, as seconds since the Unix epoch in UTC.
 #[no_mangle]
 pub unsafe extern "C" fn acc_bind_timestamptz(stmt: *mut acc_stmt, index: c_int, seconds: i64) -> c_int {
-    bind(stmt, index, || Ok(Value::TimestampTz(seconds)))
+    bind(stmt, index, || Ok(Value::TimestampTz(seconds.saturating_mul(1000))))
 }
 
 /// Forgets every value set with `acc_bind_*`.

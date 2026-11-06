@@ -463,6 +463,18 @@ fn whole_part(v: &Value, floor: bool) -> Result<Value> {
     })
 }
 
+/// Milliseconds as a PostgreSQL `numeric` with six decimals, divided by `per_sec`/1000 (1 for seconds, 1000 for milliseconds, 1_000_000 for microseconds).
+fn fractional(ms: i64, per_sec: i64) -> Value {
+    // ms * 1000 are microseconds: as seconds that is scale 6, as milliseconds scale 3, as microseconds scale 0
+    let micro = BigInt::from(ms) * 1000;
+    let d = match per_sec {
+        1 => Decimal::with_kept_scale(micro, 6),
+        1000 => Decimal::with_kept_scale(micro, 3),
+        _ => Decimal::with_kept_scale(micro, 0),
+    };
+    Value::Dec(d)
+}
+
 fn date_of(v: &Value) -> Result<i64> {
     match v.coerce_to(DataType::DateTime)? {
         Value::DateTime(t) => Ok(t),
@@ -507,15 +519,15 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             if let Some(a) = args.first() {
                 let v = a.eval(row)?;
                 return Ok(match v.coerce_to(DataType::DateTime) {
-                    Ok(Value::DateTime(t)) => Value::DateTime(t.div_euclid(86_400) * 86_400),
+                    Ok(Value::DateTime(t)) => Value::DateTime(t.div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY),
                     _ => Value::Null,
                 });
             }
-            return Ok(Value::DateTime(datetime::now().div_euclid(86_400) * 86_400));
+            return Ok(Value::DateTime(datetime::now().div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY));
         }
         NowTz => return Ok(Value::TimestampTz(datetime::now())),
         LocalNow => return Ok(Value::DateTime(tz::session().to_local(datetime::now()))),
-        LocalDate => return Ok(Value::DateTime(tz::session().to_local(datetime::now()).div_euclid(86_400) * 86_400)),
+        LocalDate => return Ok(Value::DateTime(tz::session().to_local(datetime::now()).div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY)),
         SessionTimeZone => return Ok(Value::text(&tz::session().name())),
         _ => {}
     }
@@ -652,7 +664,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             // Normalise month overflow, then add days (Access semantics).
             let total = y * 12 + (m - 1);
             let (yy, mm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
-            Value::DateTime((datetime::days_from_civil(yy, mm as u32, 1) + d - 1) * 86_400)
+            Value::DateTime((datetime::days_from_civil(yy, mm as u32, 1) + d - 1) * datetime::MS_PER_DAY)
         }
         DateAdd => {
             let (unit, n, t) = (text_of(&vals[0]).to_ascii_lowercase(), int_of(&vals[1])?, date_of(&vals[2])?);
@@ -665,17 +677,17 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 while datetime::from_components(ny, nm, day, h, mi, s).is_none() && day > 28 {
                     day -= 1;
                 }
-                datetime::from_components(ny, nm, day, h, mi, s).ok_or_else(|| Error::runtime("DateAdd: out of range"))
+                datetime::from_components(ny, nm, day, h, mi, s).map(|v| v + datetime::millis(t) as i64).ok_or_else(|| Error::runtime("DateAdd: out of range"))
             };
             let shifted = match unit.as_str() {
                 "yyyy" | "y" => months(n * 12)?,
                 "q" => months(n * 3)?,
                 "m" => months(n)?,
-                "d" | "w" => t + n * 86_400,
-                "ww" => t + n * 7 * 86_400,
-                "h" => t + n * 3_600,
-                "n" => t + n * 60,
-                "s" => t + n,
+                "d" | "w" => t + n * datetime::MS_PER_DAY,
+                "ww" => t + n * 7 * datetime::MS_PER_DAY,
+                "h" => t + n * 3_600_000,
+                "n" => t + n * 60_000,
+                "s" => t + n * 1000,
                 u => return Err(Error::runtime(format!("DateAdd: unknown interval '{u}'"))),
             };
             // A zoned timestamp stays zoned: the shift happened on its wall clock.
@@ -695,11 +707,11 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 "yyyy" | "y" => (month_index(b) - 1).div_euclid(12) - (month_index(a) - 1).div_euclid(12),
                 "q" => (month_index(b) - 1).div_euclid(3) - (month_index(a) - 1).div_euclid(3),
                 "m" => month_index(b) - month_index(a),
-                "d" | "w" => b.div_euclid(86_400) - a.div_euclid(86_400),
-                "ww" => (b.div_euclid(86_400) - a.div_euclid(86_400)) / 7,
-                "h" => (b - a) / 3_600,
-                "n" => (b - a) / 60,
-                "s" => b - a,
+                "d" | "w" => b.div_euclid(datetime::MS_PER_DAY) - a.div_euclid(datetime::MS_PER_DAY),
+                "ww" => (b.div_euclid(datetime::MS_PER_DAY) - a.div_euclid(datetime::MS_PER_DAY)) / 7,
+                "h" => (b - a) / 3_600_000,
+                "n" => (b - a) / 60_000,
+                "s" => (b - a) / 1000,
                 u => return Err(Error::runtime(format!("DateDiff: unknown interval '{u}'"))),
             })
         }
@@ -834,16 +846,21 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
         }
         DatePart => {
             let unit = text_of(&vals[0]).to_ascii_lowercase();
+            let pg = crate::dialect::current() == crate::dialect::Dialect::Postgresql;
             if let Value::Interval(iv) = &*vals[1] {
                 // The parts of an interval as written: 14 months is 1 year 2 months.
                 return Ok(Value::Int(match unit.as_str() {
                     "yyyy" | "year" | "yy" => iv.months / 12,
                     "m" | "month" | "mon" => iv.months % 12,
                     "d" | "day" => iv.days,
-                    "h" | "hour" => iv.secs / 3600,
-                    "n" | "mi" | "minute" => iv.secs % 3600 / 60,
-                    "s" | "second" => iv.secs % 60,
-                    "epoch" => i64::try_from(iv.total_secs()).map_err(|_| Error::runtime("interval out of range"))?,
+                    "h" | "hour" => iv.ms / 3_600_000,
+                    "n" | "mi" | "minute" => iv.ms % 3_600_000 / 60_000,
+                    "s" | "second" if pg => return Ok(fractional(iv.ms % 60_000, 1)),
+                    "s" | "second" => iv.ms % 60_000 / 1000,
+                    "milliseconds" if pg => return Ok(fractional(iv.ms % 60_000, 1000)),
+                    "microseconds" if pg => return Ok(fractional(iv.ms % 60_000, 1_000_000)),
+                    "epoch" if pg => return Ok(fractional(i64::try_from(iv.total_ms()).map_err(|_| Error::runtime("interval out of range"))?, 1)),
+                    "epoch" => i64::try_from(iv.total_ms() / 1000).map_err(|_| Error::runtime("interval out of range"))?,
                     u => return Err(Error::runtime(format!("DatePart: '{u}' is not a part of an interval"))),
                 }));
             }
@@ -859,7 +876,18 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             let t = date_of(&vals[1])?;
             let (y, mo, d, h, mi, s) = datetime::components(t);
             let doy = datetime::days_from_civil(y, mo, d) - datetime::days_from_civil(y, 1, 1) + 1;
-            let jan1 = datetime::weekday(datetime::days_from_civil(y, 1, 1) * 86_400) - 1;
+            let jan1 = datetime::weekday(datetime::days_from_civil(y, 1, 1) * datetime::MS_PER_DAY) - 1;
+            if pg {
+                let ms = i64::from(datetime::millis(t)) + i64::from(s) * 1000;
+                match unit.as_str() {
+                    "s" | "second" => return Ok(fractional(ms, 1)),
+                    "milliseconds" => return Ok(fractional(ms, 1000)),
+                    "microseconds" => return Ok(fractional(ms, 1_000_000)),
+                    "epoch" if t.rem_euclid(datetime::MS_PER_DAY) == 0 => return Ok(Value::Int(t.div_euclid(1000))),
+                    "epoch" => return Ok(fractional(t, 1)),
+                    _ => {}
+                }
+            }
             Value::Int(match unit.as_str() {
                 "yyyy" | "year" | "yy" => y,
                 "q" | "quarter" => ((mo - 1) / 3 + 1) as i64,
@@ -871,14 +899,14 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                 "h" | "hour" => h as i64,
                 "n" | "mi" | "minute" => mi as i64,
                 "s" | "second" => s as i64,
-                "epoch" => t,
+                "epoch" => t.div_euclid(1000),
                 u => return Err(Error::runtime(format!("DatePart: unknown field '{u}'"))),
             })
         }
         AtTimeZone | TimeZone => {
             let (value, zone) = if f == AtTimeZone { (&vals[0], &vals[1]) } else { (&vals[1], &vals[0]) };
             let zone = match &**zone {
-                Value::Interval(iv) if iv.months == 0 => tz::Zone::Fixed(i32::try_from(iv.days * 86_400 + iv.secs).map_err(|_| Error::runtime("time zone offset out of range"))?),
+                Value::Interval(iv) if iv.months == 0 => tz::Zone::Fixed(i32::try_from(iv.days * 86_400 + iv.ms / 1000).map_err(|_| Error::runtime("time zone offset out of range"))?),
                 other => {
                     let name = text_of(other);
                     tz::Zone::parse(&name).ok_or_else(|| Error::runtime(format!("unknown time zone '{name}'")))?
@@ -912,7 +940,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             let iv = crate::interval::Interval::new(0, 1, 0)
                 .scale(&days)
                 .zip(crate::interval::Interval::new(1, 0, 0).scale(&months_total))
-                .zip(crate::interval::Interval::new(0, 0, 1).scale(&hms))
+                .zip(crate::interval::Interval::new(0, 0, 1000).scale(&hms))
                 .and_then(|((d, m), s)| d.add(&m)?.add(&s))
                 .ok_or_else(|| Error::runtime("interval out of range"))?;
             Value::Interval(iv)
