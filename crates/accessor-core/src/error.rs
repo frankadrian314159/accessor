@@ -37,6 +37,19 @@ pub enum Error {
     Signal { state: String, errno: i64, message: String, items: Vec<(String, String)> },
 }
 
+thread_local! {
+    /// The error a T-SQL `CATCH` block is dealing with (what `ERROR_MESSAGE()` and the like read).
+    static HANDLED: std::cell::RefCell<Option<Diag>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_handled(d: Option<Diag>) {
+    HANDLED.with(|h| *h.borrow_mut() = d);
+}
+
+pub(crate) fn handled() -> Option<Diag> {
+    HANDLED.with(|h| h.borrow().clone())
+}
+
 /// The diagnostics area: what `GET DIAGNOSTICS` reads of a condition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Diag {

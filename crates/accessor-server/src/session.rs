@@ -267,6 +267,14 @@ impl Session<'_> {
         self.out.flush()
     }
 
+    /// What `PRINT` said, as notices.
+    fn send_messages(&mut self) -> io::Result<()> {
+        for m in accessor_core::exec::take_messages() {
+            wire::error_fields(b'N', "NOTICE", "00000", &m).send(&mut self.out)?;
+        }
+        Ok(())
+    }
+
     fn report(&mut self, f: Failure) -> io::Result<()> {
         match f {
             Failure::Io(e) => Err(e),
@@ -324,7 +332,10 @@ impl Session<'_> {
     // ----- the simple protocol -------------------------------------------------------------------------------------
 
     fn simple_query(&mut self, text: &str) -> Done {
-        let statements = sql::split_statements(text);
+        // a T-SQL message is one batch, which has no `;` between its statements: the engine reads it as a whole
+        let tsql = self.conn.dialect() == accessor_core::dialect::Dialect::Tsql;
+        let batches: Vec<String> = if tsql { sql::split_batches(text) } else { Vec::new() };
+        let statements: Vec<&str> = if tsql { batches.iter().map(String::as_str).collect() } else { sql::split_statements(text) };
         if statements.is_empty() {
             Msg::new(b'I').send(&mut self.out)?;
             return Ok(());
@@ -333,7 +344,9 @@ impl Session<'_> {
             if self.cancel.swap(false, Ordering::SeqCst) {
                 return Err(Failure::Message("canceling statement due to user request".into(), "57014"));
             }
-            let result = self.conn.execute(stmt)?;
+            let result = self.conn.execute(stmt);
+            self.send_messages()?;
+            let result = result?;
             let formats: [i16; 0] = [];
             self.send_result(stmt, &result, &formats, true, 0, 0)?;
         }
@@ -475,7 +488,9 @@ impl Session<'_> {
         let p = self.portals.get(name).ok_or_else(|| Failure::Message(format!("portal \"{name}\" does not exist"), "34000"))?;
         if p.result.is_none() {
             let text = p.sql.clone();
-            let r = if text.trim().is_empty() { QueryResult::default() } else { self.conn.execute(&text)? };
+            let r = if text.trim().is_empty() { Ok(QueryResult::default()) } else { self.conn.execute(&text) };
+            self.send_messages()?;
+            let r = r?;
             if let Some(p) = self.portals.get_mut(name) {
                 p.result = Some(r);
             }

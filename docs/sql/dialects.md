@@ -1,6 +1,6 @@
 # SQL dialects
 
-A session speaks one of three dialects. `asql` is the default and is what the rest of this documentation describes; `postgresql` and `mysql` change how the text is read and how values are shown, so that scripts written for those servers behave as they expect.
+A session speaks one of four dialects. `asql` is the default and is what the rest of this documentation describes; `postgresql`, `mysql` and `tsql` (Microsoft SQL Server's Transact-SQL) change how the text is read and how values are shown, so that scripts written for those servers behave as they expect.
 
 | | `asql` | `postgresql` | `mysql` |
 | --- | --- | --- | --- |
@@ -33,6 +33,10 @@ A session speaks one of three dialects. `asql` is the default and is what the re
 | `CREATE FUNCTION f(.., OUT a int, OUT b text)`, `INOUT x int` | not read | several `OUT` parameters are the columns of the one row the function returns (call it with `SELECT * FROM f(..)`; `RETURNS record` or `SETOF record` is accepted beside them); `INOUT` is a parameter and an output; several functions may share a name when their parameters differ (a call takes the one that fits the number of arguments and the types that show in them: literals, casts, `ARRAY[..]`, range constructors; `DROP FUNCTION f(int)` names one), and a parameter may be `anyelement`, `anyarray`, `anyrange` and the like (it takes the argument as it comes, a result of such a type is not converted); a `VARIADIC` parameter (an array) takes the rest of the arguments of a call, or `f(VARIADIC arr)` passes the array as it is | not read |
 | `'infinity'`, `'-infinity'` (timestamp, timestamptz, date) | not read | the largest and smallest readings; they compare with every other one and print as `infinity` | not read |
 
+## T-SQL
+
+`tsql` reads Transact-SQL: batches with `DECLARE`/`SET @v`, `IF`, `WHILE`, `TRY`/`CATCH`, `PRINT`, `GO`; `dbo.`-qualified and `[bracketed]` names; `N'..'` strings; `TOP`; `IDENTITY`; storage clauses. Every T-SQL type name is accepted (`bit`, `tinyint`, `money`, `smallmoney`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset`, `date`, `time`, `nvarchar`, `varbinary`, `uniqueidentifier`, `xml`, ...), mapped onto the engine's types; `time` is its own type. Values print as SQL Server prints them: `bit` 1/0, `datetime` with milliseconds, `time` with seven digits, `money` with four decimals, binary as `0x..`. Fractional seconds are kept, decimals keep their scale, and integer ranges (`tinyint` 0-255) are checked. Division by zero is an error ("Divide by zero error encountered."). The functions are in `crates/accessor-core/src/expr/tsqlfuncs.rs`. In the server, see [../server.md](../server.md).
+
 ## Choosing one
 
 ```
@@ -40,7 +44,7 @@ accessor --postgresql mydb.adb
 accessor --mysql -f script.sql
 ```
 
-`--asql`, `--postgresql` and `--mysql` are options of the shell (the last one given counts). From SQL, `SET dialect = 'postgresql'` (`asql`, `postgresql` or `mysql`; `postgres`, `pg` and `access` are accepted too), `SHOW dialect` and `RESET dialect`; from Rust, `Database::set_dialect(Dialect::Mysql)` and `Database::dialect()`. `RESET ALL` leaves the dialect as it is.
+`--asql`, `--postgresql`, `--mysql` and `--tsql` are options of the shell (the last one given counts). From SQL, `SET dialect = 'postgresql'` (`asql`, `postgresql`, `mysql` or `tsql`; `postgres`, `pg`, `access`, `t-sql`, `sqlserver` and `mssql` are accepted too), `SHOW dialect` and `RESET dialect`; from Rust, `Database::set_dialect(Dialect::Mysql)` and `Database::dialect()`. `RESET ALL` leaves the dialect as it is.
 
 A script is read as a whole before it runs, so `SET dialect` changes how the statements of the *next* call are read, not the rest of the same script: set the dialect first (with a flag, or a call of its own).
 

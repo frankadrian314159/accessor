@@ -182,3 +182,31 @@ fn a_client_chooses_its_dialect() {
     stop.stop();
     handle.join().unwrap();
 }
+
+#[test]
+fn a_tsql_connection_reads_batches_and_shows_tsql_values() {
+    let (conn, stop, handle) = start(Config::default());
+    let mut ms = Client::connect(&format!("{conn} options='-c dialect=tsql'"), NoTls).unwrap();
+    ms.batch_execute(
+        "CREATE TABLE dbo.Emp (Id INT IDENTITY(1,1) PRIMARY KEY CLUSTERED, Name NVARCHAR(50) NOT NULL, Active BIT NOT NULL DEFAULT 1, Seen DATETIME2 NULL)\nGO\n\
+         INSERT INTO dbo.Emp (Name, Seen) VALUES (N'Ann', '2024-03-05 10:30:15.250')\nGO",
+    )
+    .unwrap();
+    let rows = |c: &mut Client, sql: &str| -> Vec<Vec<String>> {
+        c.simple_query(sql)
+            .unwrap()
+            .iter()
+            .filter_map(|m| if let SimpleQueryMessage::Row(r) = m { Some((0..r.len()).map(|i| r.get(i).unwrap_or("NULL").to_string()).collect()) } else { None })
+            .collect()
+    };
+    assert_eq!(rows(&mut ms, "SELECT Name, Active, Seen FROM dbo.Emp"), vec![vec!["Ann", "1", "2024-03-05 10:30:15.250"]]);
+    // a batch with variables and control flow returns its last result set
+    let r = rows(&mut ms, "DECLARE @n INT = 1\nWHILE @n < 5 SET @n += 2\nSELECT @n AS n, DATEADD(day, 7, CAST('2020-01-15' AS DATE)) AS d");
+    assert_eq!(r, vec![vec!["5", "2020-01-22"]]);
+    // errors are caught in the batch
+    let r = rows(&mut ms, "BEGIN TRY\nDECLARE @x INT = 1 / 0\nEND TRY\nBEGIN CATCH\nSELECT ERROR_MESSAGE() AS m\nEND CATCH");
+    assert_eq!(r, vec![vec!["Divide by zero error encountered."]]);
+    drop(ms);
+    stop.stop();
+    handle.join().unwrap();
+}

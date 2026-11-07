@@ -44,7 +44,7 @@ datasheets for working with records directly.
 - **Triggers**: row-level `BEFORE` / `AFTER` `INSERT` / `UPDATE` / `DELETE`
   triggers with `NEW` and `OLD`, an optional `WHEN`, and `RAISE` to refuse a change.
 - **A numeric tower** with exact arithmetic across the types (see below).
-- **A server**: `accessor-server` serves a database to PostgreSQL clients (`psql`, JDBC, psycopg, ...) over the network, with password
+- **A server**: `accessor-server` serves a database (in the ASQL, PostgreSQL, MySQL or T-SQL dialect, per connection) to PostgreSQL clients (`psql`, JDBC, psycopg, ...) over the network, with password
   authentication and many clients at once; the embedded library is unchanged (see [docs/server.md](docs/server.md)).
 - **Durability**: a checksummed write-ahead log plus atomic snapshots. Committed
   work survives a crash; a torn write at the end of the log is discarded.

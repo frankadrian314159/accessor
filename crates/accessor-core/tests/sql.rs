@@ -7864,3 +7864,28 @@ fn postgresql_expression_defaults_check_constraints_and_type_modifiers_in_the_ca
     assert_eq!(pg_one(&mut db, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'pos'"), "CHECK (price >= 0)");
     assert_eq!(pg_one(&mut db, "SELECT relchecks FROM pg_class WHERE relname = 't'"), "2");
 }
+
+#[test]
+fn tsql_types_batches_and_functions() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Tsql);
+    db.execute(
+        "CREATE TABLE dbo.T (Id INT IDENTITY(1,1) PRIMARY KEY CLUSTERED, N NVARCHAR(10) NOT NULL, Flag BIT, M MONEY, D DATE, T2 DATETIME2, At TIME, G UNIQUEIDENTIFIER, B TINYINT)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO dbo.T (N, Flag, M, D, T2, At, B) VALUES (N'ab', 1, 5.5, '2020-01-15', '2024-03-05 10:30:15.250', '08:30:00', 200)").unwrap();
+    let r = db.execute("SELECT Flag, M, D, T2, At FROM dbo.T").unwrap();
+    let row: Vec<String> = r.rows[0].iter().map(|v| v.to_string()).collect();
+    assert_eq!(row, vec!["1", "5.5000", "2020-01-15", "2024-03-05 10:30:15.250", "08:30:00.0000000"]);
+    // TINYINT is 0..255
+    assert!(db.execute("INSERT INTO dbo.T (N, B) VALUES ('x', 300)").is_err());
+    // a batch with variables, loops, TRY/CATCH
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "DECLARE @i INT = 0\nWHILE @i < 3 SET @i += 1\nSELECT @i"), "3");
+    assert_eq!(one(&mut db, "BEGIN TRY SELECT 1/0 END TRY BEGIN CATCH SELECT ERROR_MESSAGE() END CATCH"), "Divide by zero error encountered.");
+    assert_eq!(one(&mut db, "SELECT DATEDIFF(day, '2020-01-01', '2020-03-01')"), "60");
+    assert_eq!(one(&mut db, "SELECT CHARINDEX('c', 'abcd')"), "3");
+    assert_eq!(one(&mut db, "SELECT ISNULL(NULL, 'z')"), "z");
+    assert_eq!(one(&mut db, "SELECT CONVERT(VARCHAR(10), CAST('2024-03-05' AS DATETIME), 101)"), "03/05/2024");
+}

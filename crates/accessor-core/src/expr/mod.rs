@@ -15,6 +15,7 @@ pub mod xmlfuncs;
 pub mod myfuncs;
 pub mod pgfuncs;
 pub mod pgmore;
+pub mod tsqlfuncs;
 pub(crate) mod pghash;
 
 use std::borrow::Cow;

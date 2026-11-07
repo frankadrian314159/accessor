@@ -473,6 +473,14 @@ impl Database {
     }
 
     /// Runs a trigger function's block with `vars` as its variables; gives what it returned and the variables as they ended.
+    /// Runs a T-SQL batch: its statements, with variables of the batch, as one block. The result is that of the last
+    /// statement that gave one.
+    pub(crate) fn run_tsql_batch(&mut self, body: &[ProcStmt]) -> Result<QueryResult> {
+        let mut frame = Frame::new(HashMap::new());
+        self.run_block(body, &mut frame)?;
+        Ok(frame.last.take().unwrap_or_default())
+    }
+
     pub(crate) fn run_trigger_block(&mut self, def: &RoutineDef, vars: HashMap<String, Value>) -> Result<(Option<Value>, HashMap<String, Value>)> {
         let RoutineBody::Block(body) = &def.body else {
             return Err(Error::catalog(format!("'{}' is not a trigger function", def.name)));
@@ -747,7 +755,10 @@ impl Database {
                 Err(e) => {
                     let Some(h) = handlers.iter().find(|h| handler_matches(h, &e)) else { return Err(e) };
                     frame.diag = Some(e.diag());
-                    match self.run_block(&h.body, frame)? {
+                    crate::error::set_handled(frame.diag.clone());
+                    let ran = self.run_block(&h.body, frame);
+                    crate::error::set_handled(None);
+                    match ran? {
                         Flow::Normal => {}
                         other => return Ok(other),
                     }

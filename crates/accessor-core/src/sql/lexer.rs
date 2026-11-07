@@ -130,6 +130,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             let digits: String = chars[start..i].iter().map(|&(_, ch)| ch).collect();
+            if dialect::current() == Dialect::Tsql {
+                // 0x1F is binary data in T-SQL
+                let padded = if digits.len() % 2 == 1 { format!("0{digits}") } else { digits.clone() };
+                let bytes: Vec<u8> = (0..padded.len()).step_by(2).filter_map(|k| u8::from_str_radix(&padded[k..k + 2], 16).ok()).collect();
+                out.push(Token { tok: Tok::Bytes(bytes), pos });
+                continue;
+            }
             let tok = match i64::from_str_radix(&digits, 16) {
                 Ok(v) => Tok::Int(v),
                 Err(_) => Tok::Big(BigInt::parse_bytes(digits.as_bytes(), 16).ok_or_else(|| Error::syntax("bad hexadecimal number"))?),
@@ -232,6 +239,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             let to = chars[close].0;
             out.push(Token { tok: Tok::Str(src[if body_start >= chars.len() { src.len() } else { from }..to].to_string()), pos });
             i = close + open_len;
+        } else if matches!(c, 'N' | 'n') && at(i + 1) == Some('\'') && dialect::current() == Dialect::Tsql && !(i > 0 && is_ident_part(chars[i - 1].1)) {
+            // N'text' is text: the N says it is Unicode, which all text is here
+            i += 1;
         } else if matches!(c, 'e' | 'E' | 'b' | 'B') && at(i + 1) == Some('\'') && dialect::current() != Dialect::Mysql && !(i > 0 && is_ident_part(chars[i - 1].1)) {
             // E'..' (backslash escapes) and B'0101' (a bit string, kept as its digits)
             let escapes = matches!(c, 'e' | 'E');
@@ -302,6 +312,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             i += 1;
             out.push(Token { tok: Tok::Str(s), pos });
+        } else if c == '#' && dialect::current() == Dialect::Tsql && at(i + 1).is_some_and(|d| is_ident_start(d) || d == '#') {
+            // #temp and ##global tables
+            while at(i) == Some('#') {
+                i += 1;
+            }
+            while at(i).is_some_and(is_ident_part) {
+                i += 1;
+            }
+            let end = chars.get(i).map_or(src.len(), |&(p, _)| p);
+            out.push(Token { tok: Tok::Ident(src[pos..end].to_string()), pos });
         } else if is_ident_start(c) {
             let start = i;
             while at(i).is_some_and(is_ident_part) {

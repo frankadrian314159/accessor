@@ -44,6 +44,7 @@ pub enum MoreFn {
     CollFold,
     Collate,
     ToDateType,
+    ToTimeType,
     CatVisible,
     CatUserById,
     CatEncoding,
@@ -155,6 +156,7 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "JSON_EXTRACT_PATH" | "JSONB_EXTRACT_PATH" => (JsonExtractPath, 1, usize::MAX),
         "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT" => (JsonExtractPathText, 1, usize::MAX),
         "__TODATE" => (ToDateType, 1, 1),
+        "__TOTIME" => (ToTimeType, 1, 1),
         // the helpers psql's describe commands call
         "PG_TABLE_IS_VISIBLE" | "PG_TYPE_IS_VISIBLE" | "PG_FUNCTION_IS_VISIBLE" | "PG_OPERATOR_IS_VISIBLE" | "PG_COLLATION_IS_VISIBLE" | "PG_OPCLASS_IS_VISIBLE" | "PG_TS_CONFIG_IS_VISIBLE" => (CatVisible, 1, 1),
         "PG_GET_USERBYID" => (CatUserById, 1, 1),
@@ -931,6 +933,10 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 Some(serde_json::Value::Object(o)) => o.get(&k.to_string()).and_then(|x| x.as_str()).map_or(Value::Null, Value::text),
                 _ => Value::Null,
             },
+        },
+        ToTimeType => match v(0) {
+            Value::Null => Value::Null,
+            other => other.coerce_to(crate::value::DataType::Time)?,
         },
         ToDateType => match v(0) {
             Value::Null => Value::Null,

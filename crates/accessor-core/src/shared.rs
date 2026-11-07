@@ -201,6 +201,12 @@ impl Connection {
         self.tx.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The dialect this connection speaks (a `SET dialect` of its own, or the one the database had when it was shared).
+    pub fn dialect(&self) -> crate::dialect::Dialect {
+        let session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        session.settings.get("dialect").and_then(|d| crate::dialect::Dialect::parse(d)).unwrap_or_default()
+    }
+
     /// True while this connection has a transaction open.
     pub fn in_transaction(&self) -> bool {
         self.tx().is_some()

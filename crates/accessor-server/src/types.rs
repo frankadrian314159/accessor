@@ -17,6 +17,7 @@ pub const FLOAT8: u32 = 701;
 pub const MONEY: u32 = 790;
 pub const VARCHAR: u32 = 1043;
 pub const DATE: u32 = 1082;
+pub const TIME: u32 = 1083;
 pub const TIMESTAMP: u32 = 1114;
 pub const TIMESTAMPTZ: u32 = 1184;
 pub const INTERVAL: u32 = 1186;
@@ -36,11 +37,14 @@ pub fn oid_of(v: &Value) -> Option<u32> {
         },
         Value::Int(_) => INT8,
         Value::Big(_) | Value::Dec(_) => NUMERIC,
+        // SQL Server's money is a plain number with four decimals, which a client reads as a numeric
+        Value::Currency(_) if accessor_core::dialect::current() == accessor_core::dialect::Dialect::Tsql => NUMERIC,
         Value::Currency(_) => MONEY,
         Value::Float(_) => FLOAT4,
         Value::Double(_) => FLOAT8,
         Value::DateTime(_) => TIMESTAMP,
         Value::Date(_) => DATE,
+        Value::Time(_) => TIME,
         Value::TimestampTz(_) => TIMESTAMPTZ,
         Value::Interval(_) => INTERVAL,
         Value::Json(_) => JSONB,
@@ -60,7 +64,7 @@ pub fn type_size(oid: u32) -> i16 {
         BOOL => 1,
         INT2 => 2,
         INT4 | FLOAT4 | DATE => 4,
-        INT8 | FLOAT8 | TIMESTAMP | TIMESTAMPTZ | MONEY => 8,
+        INT8 | FLOAT8 | TIMESTAMP | TIMESTAMPTZ | MONEY | TIME => 8,
         INTERVAL => 16,
         _ => -1,
     }
@@ -128,6 +132,10 @@ pub fn binary_of(oid: u32, v: &Value) -> Vec<u8> {
             };
             micros.to_be_bytes().to_vec()
         }
+        TIME => match v {
+            Value::Time(t) => (t * 1000).to_be_bytes().to_vec(),
+            _ => vec![0; 8],
+        },
         DATE => {
             let ms = match v {
                 Value::Date(t) | Value::DateTime(t) | Value::TimestampTz(t) => *t,

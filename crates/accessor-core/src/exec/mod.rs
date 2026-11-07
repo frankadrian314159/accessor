@@ -53,6 +53,16 @@ impl QueryResult {
     }
 }
 
+thread_local! {
+    /// What `PRINT` and `RAISERROR` (severity 10 and below) said since the client last asked: messages for the client.
+    static MESSAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The messages `PRINT` has made on this thread since the last call.
+pub fn take_messages() -> Vec<String> {
+    MESSAGES.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
 /// Drops the suffix that keeps a repeated PostgreSQL column name (`?column?`) apart inside the engine.
 pub(crate) fn clean_names(mut r: QueryResult) -> QueryResult {
     for c in r.columns.iter_mut() {
@@ -438,6 +448,12 @@ impl Database {
                 self.drop_cursors(false);
                 Ok(QueryResult::default())
             }
+            Statement::Print(e) => {
+                let v = self.eval_const(e)?;
+                MESSAGES.with(|m| m.borrow_mut().push(v.to_string()));
+                Ok(QueryResult::default())
+            }
+            Statement::TsqlBatch(body) => self.run_tsql_batch(body),
             Statement::Do(exprs) => self.run_do(exprs),
             Statement::DoBlock(body) => {
                 self.execute(&format!("CREATE OR REPLACE FUNCTION pg_do_block() RETURNS void AS $do_blk$ {body} $do_blk$ LANGUAGE plpgsql"))?;

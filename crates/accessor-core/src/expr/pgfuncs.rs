@@ -51,6 +51,8 @@ pub enum PgFn {
     Composite(super::composite::CompFn),
     /// One of the functions of [`super::pgmore`].
     More(super::pgmore::MoreFn),
+    /// One of the functions of Transact-SQL ([`super::tsqlfuncs`]).
+    Tsq(super::tsqlfuncs::TsqlFn),
     /// A function that always gives the same text (`DATABASE()`, `VERSION()`, `CURRENT_USER()`).
     Text(&'static str),
     JsonPathArray,
@@ -68,6 +70,9 @@ pub enum PgFn {
 
 pub fn lookup(name: &str) -> Option<(PgFn, usize, usize)> {
     use PgFn::*;
+    if let Some((f, a, b)) = super::tsqlfuncs::lookup(name) {
+        return Some((Tsq(f), a, b));
+    }
     Some(match name {
         "PG_INPUT_IS_VALID" => (InputIsValid, 2, 2),
         "PG_TYPEOF" => (TypeOf, 1, 1),
@@ -129,6 +134,7 @@ impl PgFn {
             PgFn::Range(r) => r.handles_null(),
             PgFn::Composite(c) => c.handles_null(),
             PgFn::More(m) => m.handles_null(),
+            PgFn::Tsq(t) => t.handles_null(),
             _ => matches!(self, PgFn::ConcatWs | PgFn::TypeOf | PgFn::Nothing),
         }
     }
@@ -364,6 +370,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         Range(r) => return super::ranges::call(r, vals),
         Composite(c) => return super::composite::call(c, vals),
         More(m) => return super::pgmore::call(m, vals),
+        Tsq(t) => return super::tsqlfuncs::call(t, vals),
         Text(s) => Value::text(s),
         Zero => Value::Int(0),
         Same => v(0).clone(),

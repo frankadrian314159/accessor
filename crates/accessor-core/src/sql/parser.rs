@@ -4,6 +4,7 @@ use super::ast::*;
 use super::usertypes::UserType;
 
 mod pgfunc;
+mod tsql;
 use super::lexer::{lex, Tok, Token};
 use crate::error::{Error, Result};
 use crate::schema::RefAction;
@@ -57,6 +58,9 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
 
 fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
     let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+        return p.tsql_script();
+    }
     let mut out = Vec::new();
     loop {
         while p.eat_sym(";") {}
@@ -126,6 +130,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
         DataType::YesNo => "CBOOL",
         DataType::DateTime => "CDATE",
         DataType::Date => "__TODATE",
+        DataType::Time => "__TOTIME",
         DataType::TimestampTz => "CTIMESTAMPTZ",
         DataType::Interval => "CINTERVAL",
         DataType::Json => "JSON_PARSE",
@@ -666,7 +671,7 @@ impl<'a> Parser<'a> {
         if self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
             self.advance();
             let table = self.ident()?;
-            if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") {
+            if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") || (name.eq_ignore_ascii_case("dbo") && crate::dialect::current() == crate::dialect::Dialect::Tsql) {
                 return Ok(table);
             }
             return Ok(format!("{name}.{table}"));
@@ -2330,6 +2335,27 @@ impl<'a> Parser<'a> {
     /// `NOT VALID`, `[NOT] DEFERRABLE`, `INITIALLY DEFERRED | IMMEDIATE`, `COMPRESSION method`, `NULLS [NOT] DISTINCT`,
     /// `INCLUDE (columns)`, `MATCH FULL | SIMPLE | PARTIAL`. True if one was read.
     fn skip_constraint_option(&mut self) -> bool {
+        if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+            // CLUSTERED, NONCLUSTERED, WITH (PAD_INDEX = OFF, ...), ON [PRIMARY], NOT FOR REPLICATION: storage, not meaning
+            if self.eat_kw("CLUSTERED") || self.eat_kw("NONCLUSTERED") || self.eat_kw("ROWGUIDCOL") || self.eat_kw("SPARSE") || self.eat_kw("FILESTREAM") {
+                return true;
+            }
+            if self.peek_kw("WITH") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                self.advance();
+                return self.skip_parens().is_ok();
+            }
+            if self.peek_kw("ON") && matches!(self.peek_at(1), Tok::Quoted(_) | Tok::Ident(_)) && !(self.peek_kw_at(1, "DELETE") || self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "CONFLICT")) {
+                self.advance();
+                self.advance();
+                return true;
+            }
+            if self.peek_kw("NOT") && self.peek_kw_at(1, "FOR") && self.peek_kw_at(2, "REPLICATION") {
+                self.advance();
+                self.advance();
+                self.advance();
+                return true;
+            }
+        }
         if (self.peek_kw("NO") && self.peek_kw_at(1, "INHERIT"))
             || (self.peek_kw("NOT") && (self.peek_kw_at(1, "ENFORCED") || self.peek_kw_at(1, "VALID") || self.peek_kw_at(1, "DEFERRABLE")))
         {
@@ -2448,6 +2474,12 @@ impl<'a> Parser<'a> {
         if !self.eat_kw("KEY") {
             self.eat_kw("INDEX");
         }
+        if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+            // PRIMARY KEY CLUSTERED (id): the word is a storage choice, not the name of an index
+            while self.peek_kw("CLUSTERED") || self.peek_kw("NONCLUSTERED") {
+                self.advance();
+            }
+        }
         let name = if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && !self.peek_kw("USING") { Some(self.ident()?) } else { None };
         if self.eat_kw("USING") {
             self.ident()?;
@@ -2477,6 +2509,19 @@ impl<'a> Parser<'a> {
 
     /// One MySQL table option after `)`: `ENGINE = InnoDB`, `DEFAULT CHARSET = utf8mb4`, `AUTO_INCREMENT = 5`, ...
     fn table_option(&mut self) -> Result<bool> {
+        if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+            // ON [PRIMARY], TEXTIMAGE_ON [PRIMARY], WITH (DATA_COMPRESSION = PAGE): where the table is stored
+            if (self.peek_kw("ON") || self.peek_kw("TEXTIMAGE_ON") || self.peek_kw("FILESTREAM_ON")) && matches!(self.peek_at(1), Tok::Quoted(_) | Tok::Ident(_)) {
+                self.advance();
+                self.advance();
+                return Ok(true);
+            }
+            if self.peek_kw("WITH") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                self.advance();
+                self.skip_parens()?;
+                return Ok(true);
+            }
+        }
         let Tok::Ident(w) = self.peek().clone() else { return Ok(false) };
         let up = w.to_ascii_uppercase();
         const OPTIONS: [&str; 33] = [
@@ -2678,6 +2723,7 @@ impl<'a> Parser<'a> {
             // `FROM t FOR UPDATE`, `FROM t LOCK IN SHARE MODE`: locking clauses
             Tok::Ident(s) if s.eq_ignore_ascii_case("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) => false,
             Tok::Ident(s) if s.eq_ignore_ascii_case("LOCK") && self.peek_kw_at(1, "IN") && self.peek_kw_at(2, "SHARE") => false,
+            Tok::Ident(s) if crate::dialect::current() == crate::dialect::Dialect::Tsql && tsql::STARTERS.iter().any(|r| r.eq_ignore_ascii_case(s)) => false,
             Tok::Ident(s) => !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)),
             _ => false,
         }
@@ -5385,7 +5431,7 @@ impl<'a> Parser<'a> {
                 None
             },
         };
-        if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+        if matches!(crate::dialect::current(), crate::dialect::Dialect::Postgresql | crate::dialect::Dialect::Tsql) {
             // numeric(p, s): the stored values have s digits after the point (marked apart from a range type)
             if data_type == DataType::Decimal && matches!(size.get(1), Some(s) if *s >= 0) {
                 crate::expr::ranges::add_segment(&mut def.range, format!("\u{2}{}", size[1]));
@@ -5478,6 +5524,7 @@ impl<'a> Parser<'a> {
             } else if self.eat_kw("PRIMARY") {
                 self.expect_kw("KEY")?;
                 def.primary_key = true;
+                while crate::dialect::current() == crate::dialect::Dialect::Tsql && self.skip_constraint_option() {}
             } else if self.eat_kw("UNIQUE") {
                 self.eat_kw("KEY");
                 def.unique = true;
@@ -5512,6 +5559,10 @@ impl<'a> Parser<'a> {
                 def.references = Some(self.references_clause(None, vec![def.name.clone()])?);
             } else if self.eat_kw("AUTOINCREMENT") || self.eat_kw("IDENTITY") {
                 def.autonumber = true;
+                if self.peek_sym("(") {
+                    // IDENTITY(seed, increment): the seed and the step are not kept
+                    self.skip_parens()?;
+                }
             } else if self.eat_kw("DEFAULT") {
                 let save = self.pos;
                 let literal = self.default_value();
@@ -6926,7 +6977,7 @@ impl<'a> Parser<'a> {
             self.advance();
             let part = self.ident()?;
             default_alias = Some(part.clone());
-            name = if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") { part } else { format!("{name}.{part}") };
+            name = if name.eq_ignore_ascii_case("public") || name.eq_ignore_ascii_case("pg_catalog") || (name.eq_ignore_ascii_case("dbo") && crate::dialect::current() == crate::dialect::Dialect::Tsql) { part } else { format!("{name}.{part}") };
         }
         if self.peek_kw("PARTITION") && matches!(self.peek_at(1), Tok::Sym("(")) {
             // MySQL's `t PARTITION (p1, p2)`: the partitions are not kept apart, so every row is read
@@ -8133,6 +8184,11 @@ impl<'a> Parser<'a> {
     }
 
     fn function_call(&mut self, name: String) -> Result<Expr> {
+        if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+            if let Some(e) = self.tsql_call(&name)? {
+                return Ok(e);
+            }
+        }
         if name.eq_ignore_ascii_case("CONVERT") {
             // CONVERT(x, type) is CAST(x AS type); CONVERT(x USING charset) is x
             let first = self.expr()?;
@@ -8619,7 +8675,7 @@ impl<'a> Parser<'a> {
         let e = self.expr()?;
         self.expect_kw("AS")?;
         let tn = self.type_name()?;
-        if tn.eq_ignore_ascii_case("TIME") {
+        if tn.eq_ignore_ascii_case("TIME") && crate::dialect::current() != crate::dialect::Dialect::Tsql {
             // CAST(x AS TIME): the time of day, as hh:mm:ss text (there is no type for a time alone)
             if self.eat_sym("(") {
                 while !self.peek_sym(")") && !self.at_eof() {
@@ -9085,6 +9141,7 @@ fn strict_type_check(column: &str, type_name: &str, data_type: DataType, size: &
     let up = type_name.to_ascii_uppercase();
     match (data_type, up.as_str()) {
         (DataType::Text, _) => size.first().map(|n| format!("Len(RTrim({col})) <= {n}")),
+        (DataType::Integer, "TINYINT") if crate::dialect::current() == crate::dialect::Dialect::Tsql => Some(format!("{col} BETWEEN 0 AND 255")),
         (DataType::Integer, "SMALLINT" | "INT2") => Some(format!("{col} BETWEEN -32768 AND 32767")),
         (DataType::Integer, "INT" | "INTEGER" | "INT4") => Some(format!("{col} BETWEEN -2147483648 AND 2147483647")),
         (DataType::Decimal, "NUMERIC" | "DECIMAL" | "DEC") => {

@@ -612,6 +612,10 @@ pub enum Statement {
     Exec { name: String, args: Vec<(Option<String>, Expr)> },
     /// Aborts the statement with a message (trigger bodies).
     Raise(Expr),
+    /// T-SQL's `PRINT expr`: a message for the client.
+    Print(Expr),
+    /// A T-SQL batch with variables or control flow, run as one unit.
+    TsqlBatch(Vec<ProcStmt>),
     CreateTrigger(Box<TriggerDef>),
     DropTrigger(String),
     /// `INSERT | UPDATE | DELETE | MERGE ... RETURNING items`.

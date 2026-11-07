@@ -59,8 +59,10 @@ pub enum Value {
     Text(Arc<str>),
     /// `TIMESTAMPTZ`: an instant, as seconds since the Unix epoch in UTC.
     TimestampTz(i64),
-    /// `DATE` (PostgreSQL mode): the start of a day, in the same unit as `DateTime`.
+    /// `DATE` (PostgreSQL and T-SQL): the start of a day, in the same unit as `DateTime`.
     Date(i64),
+    /// `TIME` (T-SQL): a time of day, in milliseconds past midnight.
+    Time(i64),
     /// `INTERVAL`: months, days and seconds.
     Interval(Interval),
     /// `JSON`: a JSON document, kept as canonical text.
@@ -103,6 +105,7 @@ enum Wire {
     Bytes(Vec<u8>),
     Multirange(Arc<str>),
     Date(i64),
+    Time(i64),
 }
 
 #[derive(Serialize)]
@@ -127,6 +130,7 @@ enum WireRef<'a> {
     Bytes(&'a [u8]),
     Multirange(&'a str),
     Date(i64),
+    Time(i64),
 }
 
 impl From<Wire> for Value {
@@ -152,6 +156,7 @@ impl From<Wire> for Value {
             Wire::Bytes(b) => Value::Bytes(Arc::new(b)),
             Wire::Multirange(s) => Value::Multirange(s),
             Wire::Date(t) => Value::Date(t),
+            Wire::Time(t) => Value::Time(t),
         }
     }
 }
@@ -177,6 +182,7 @@ impl Serialize for Value {
             Value::Bytes(b) => WireRef::Bytes(b),
             Value::Multirange(t) => WireRef::Multirange(t),
             Value::Date(t) => WireRef::Date(*t),
+            Value::Time(t) => WireRef::Time(*t),
         }
         .serialize(s)
     }
@@ -204,8 +210,10 @@ pub enum DataType {
     Text,
     YesNo,
     DateTime,
-    /// A calendar day (PostgreSQL mode).
+    /// A calendar day (PostgreSQL and T-SQL).
     Date,
+    /// A time of day (T-SQL).
+    Time,
     /// An instant, read on a wall clock through a time zone.
     TimestampTz,
     /// A length of time in months, days and seconds.
@@ -256,6 +264,7 @@ impl ArrayOf {
             DataType::Text => ArrayOf::Text,
             DataType::YesNo => ArrayOf::YesNo,
             DataType::DateTime | DataType::Date => ArrayOf::DateTime,
+            DataType::Time => ArrayOf::Text,
             DataType::TimestampTz => ArrayOf::TimestampTz,
             DataType::Interval => ArrayOf::Interval,
             DataType::Json => ArrayOf::Json,
@@ -306,6 +315,7 @@ enum TypeWire {
     Array(ArrayOf),
     Multirange,
     Date,
+    Time,
 }
 
 impl From<TypeWire> for DataType {
@@ -328,6 +338,7 @@ impl From<TypeWire> for DataType {
             TypeWire::Array(a) => DataType::Array(a),
             TypeWire::Multirange => DataType::Multirange,
             TypeWire::Date => DataType::Date,
+            TypeWire::Time => DataType::Time,
         }
     }
 }
@@ -352,8 +363,31 @@ impl From<DataType> for TypeWire {
             DataType::Array(a) => TypeWire::Array(a),
             DataType::Multirange => TypeWire::Multirange,
             DataType::Date => TypeWire::Date,
+            DataType::Time => TypeWire::Time,
         }
     }
+}
+
+/// The types of SQL Server, by name. Those with no counterpart here are kept as the nearest: `binary` and `varbinary` as bytes in a
+/// text column, `uniqueidentifier`, `xml`, `sql_variant`, `hierarchyid`, `geography` and `geometry` as text.
+fn tsql_type(upper: &str) -> Option<DataType> {
+    Some(match upper {
+        "BIT" => DataType::YesNo,
+        "TINYINT" | "SMALLINT" | "INT" | "INTEGER" | "BIGINT" => DataType::Integer,
+        "DECIMAL" | "NUMERIC" | "DEC" => DataType::Decimal,
+        "MONEY" | "SMALLMONEY" => DataType::Currency,
+        "FLOAT" | "DOUBLE" => DataType::Double,
+        "REAL" => DataType::Float,
+        "DATE" => DataType::Date,
+        "TIME" => DataType::Time,
+        "DATETIME" | "DATETIME2" | "SMALLDATETIME" => DataType::DateTime,
+        "DATETIMEOFFSET" => DataType::TimestampTz,
+        "CHAR" | "VARCHAR" | "NCHAR" | "NVARCHAR" | "TEXT" | "NTEXT" | "SYSNAME" | "NAME" => DataType::Text,
+        "BINARY" | "VARBINARY" | "IMAGE" | "ROWVERSION" | "TIMESTAMP" => DataType::Text,
+        "UNIQUEIDENTIFIER" | "XML" | "SQL_VARIANT" | "HIERARCHYID" | "GEOGRAPHY" | "GEOMETRY" => DataType::Text,
+        "JSON" => DataType::Json,
+        _ => return None,
+    })
 }
 
 impl DataType {
@@ -370,6 +404,7 @@ impl DataType {
             DataType::YesNo => "YESNO",
             DataType::DateTime => "DATETIME",
             DataType::Date => "DATE",
+            DataType::Time => "TIME",
             DataType::TimestampTz => "TIMESTAMPTZ",
             DataType::Interval => "INTERVAL",
             DataType::Json => "JSON",
@@ -401,6 +436,11 @@ impl DataType {
             return DataType::from_sql_name(base).map(|(t, _)| (DataType::Array(ArrayOf::of(t)), false));
         }
         let n = name.to_ascii_uppercase();
+        if crate::dialect::current() == Dialect::Tsql {
+            if let Some(t) = tsql_type(&n) {
+                return Some((t, false));
+            }
+        }
         Some(match n.as_str() {
             "INTEGER" | "INT" | "LONG" | "SHORT" | "SMALLINT" | "BIGINT" | "BYTE" | "TINYINT" | "INT2" | "INT4" | "INT8" | "OID" => {
                 (DataType::Integer, false)
@@ -419,7 +459,7 @@ impl DataType {
                 (DataType::Text, false)
             }
             "YESNO" | "BIT" | "BOOLEAN" | "BOOL" | "LOGICAL" => (DataType::YesNo, false),
-            "DATE" if crate::dialect::current() == Dialect::Postgresql => (DataType::Date, false),
+            "DATE" if matches!(crate::dialect::current(), Dialect::Postgresql | Dialect::Tsql) => (DataType::Date, false),
             "DATETIME" | "DATE" | "TIME" | "TIMESTAMP" => (DataType::DateTime, false),
             "TIMESTAMPTZ" => (DataType::TimestampTz, false),
             "INTERVAL" => (DataType::Interval, false),
@@ -693,6 +733,7 @@ impl Value {
             Value::Rational(_) => DataType::Rational,
             Value::DateTime(_) => DataType::DateTime,
             Value::Date(_) => DataType::Date,
+            Value::Time(_) => DataType::Time,
             Value::TimestampTz(_) => DataType::TimestampTz,
             Value::Interval(_) => DataType::Interval,
             Value::Json(_) => DataType::Json,
@@ -710,7 +751,7 @@ impl Value {
         match self {
             Value::Null => 0,
             Value::Bool(_) => 1,
-            Value::DateTime(_) | Value::TimestampTz(_) | Value::Date(_) => 3,
+            Value::DateTime(_) | Value::TimestampTz(_) | Value::Date(_) | Value::Time(_) => 3,
             Value::Text(_) | Value::Bytes(_) | Value::Multirange(_) => 4,
             Value::Interval(_) => 5,
             Value::Json(_) => 6,
@@ -847,6 +888,15 @@ impl Value {
                 Some(p) => d.cmp(&p),
                 None => Ordering::Less,
             },
+            (Value::Text(t), Value::Time(d)) => match datetime::parse_time(t) {
+                Some(p) => p.cmp(d),
+                None => Ordering::Greater,
+            },
+            (Value::Time(d), Value::Text(t)) => match datetime::parse_time(t) {
+                Some(p) => d.cmp(&p),
+                None => Ordering::Less,
+            },
+            (Value::Time(a), Value::Time(b)) => a.cmp(b),
             (Value::Text(t), Value::Date(d)) => match datetime::parse(t) {
                 Some(p) => datetime::trunc_day(p).cmp(d),
                 None => Ordering::Greater,
@@ -1030,9 +1080,17 @@ impl Value {
                     None => Err(bad()),
                 },
             },
+            DataType::Time => match self {
+                Time(_) => Ok(self.clone()),
+                DateTime(t) => Ok(Time(t.rem_euclid(datetime::MS_PER_DAY))),
+                TimestampTz(t) => Ok(Time(tz::session().to_local(*t).rem_euclid(datetime::MS_PER_DAY))),
+                Text(s) => Ok(Time(datetime::parse_time(s).or_else(|| datetime::parse(s).map(|t| t.rem_euclid(datetime::MS_PER_DAY))).ok_or_else(bad)?)),
+                _ => Err(bad()),
+            },
             DataType::DateTime => match self {
                 DateTime(_) => Ok(self.clone()),
                 Date(t) => Ok(DateTime(*t)),
+                Time(t) => Ok(DateTime(*t)),
                 TimestampTz(t) => Ok(DateTime(tz::session().to_local(*t))),
                 Text(s) => Ok(DateTime(datetime::parse(s).ok_or_else(bad)?)),
                 v => match v.num().and_then(|n| n.as_f64()) {
@@ -1307,6 +1365,10 @@ impl Hash for Value {
                 1u8.hash(state);
                 b.hash(state);
             }
+            Value::Time(t) => {
+                8u8.hash(state);
+                t.hash(state);
+            }
             Value::DateTime(t) | Value::TimestampTz(t) | Value::Date(t) => {
                 3u8.hash(state);
                 t.hash(state);
@@ -1346,6 +1408,10 @@ impl Hash for Value {
 
 /// `$` and at least two decimals, as money is written.
 fn format_currency(d: &Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if crate::dialect::current() == Dialect::Tsql {
+        // SQL Server shows a money as a plain number with four decimals
+        return f.write_str(&d.round(4).with_scale(4).to_string());
+    }
     if crate::dialect::current() == Dialect::Postgresql {
         // two decimals and a comma between the thousands: -$1,234.56
         let text = d.round(2).abs().with_scale(2).to_string();
@@ -1429,8 +1495,15 @@ impl fmt::Display for Value {
             Value::Dec(d) => write!(f, "{d}"),
             Value::Currency(d) => format_currency(d, f),
             Value::Rational(r) => write!(f, "{r}"),
+            Value::DateTime(t) if crate::dialect::current() == Dialect::Tsql => f.write_str(&datetime::format_tsql(*t)),
             Value::DateTime(t) => f.write_str(&datetime::format(*t)),
             Value::Date(t) => f.write_str(&datetime::format_date(*t)),
+            Value::Time(t) => f.write_str(&datetime::format_time(*t)),
+            Value::TimestampTz(t) if crate::dialect::current() == Dialect::Tsql => {
+                let off = tz::session().offset_at(*t);
+                let local = *t + off * datetime::MS_PER_SEC;
+                write!(f, "{}.{:07} {}", &datetime::format_tsql(local)[..19], datetime::millis(local) * 10_000, tz::format_offset(off))
+            }
             Value::TimestampTz(t) => f.write_str(&tz::format_timestamptz(*t)),
             Value::Interval(i) => write!(f, "{i}"),
             Value::Json(s) if crate::dialect::current() == Dialect::Postgresql => f.write_str(&crate::json::pg_text(s)),
@@ -1440,6 +1513,10 @@ impl fmt::Display for Value {
             Value::Bytes(b) if crate::dialect::current() == Dialect::Postgresql => {
                 f.write_str("\\x")?;
                 b.iter().try_for_each(|x| write!(f, "{x:02x}"))
+            }
+            Value::Bytes(b) if crate::dialect::current() == Dialect::Tsql => {
+                f.write_str("0x")?;
+                b.iter().try_for_each(|x| write!(f, "{x:02X}"))
             }
             Value::Bytes(b) => f.write_str(&String::from_utf8_lossy(b)),
             Value::Array(a) => {

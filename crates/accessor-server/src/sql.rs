@@ -65,6 +65,21 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     out.into_iter().filter(|s| !is_blank(s)).collect()
 }
 
+/// A T-SQL message cut into its batches at the lines that say `GO` (as `sqlcmd` and SSMS do).
+pub fn split_batches(text: &str) -> Vec<String> {
+    let mut batches = vec![String::new()];
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        let go = t.len() >= 2 && t[..2].eq_ignore_ascii_case("go") && t[2..].trim().chars().all(|c| c.is_ascii_digit());
+        if go {
+            batches.push(String::new());
+        } else {
+            batches.last_mut().expect("one batch at least").push_str(line);
+        }
+    }
+    batches.into_iter().filter(|b| !is_blank(b)).collect()
+}
+
 /// `$$` or `$tag$` at the start of `s`.
 fn dollar_tag(s: &str) -> Option<&str> {
     let rest = s.strip_prefix('$')?;

@@ -97,7 +97,7 @@ pub fn now() -> i64 {
     let ms = STATEMENT_START
         .with(std::cell::Cell::get)
         .unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0));
-    if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+    if matches!(crate::dialect::current(), crate::dialect::Dialect::Postgresql | crate::dialect::Dialect::Tsql) {
         ms
     } else {
         ms - ms % MS_PER_SEC
@@ -160,6 +160,53 @@ pub fn trunc_day(t: i64) -> i64 {
     }
 }
 
+/// Reads a time of day (`10:30`, `10:30:15.25`, `10:30 PM`) as milliseconds past midnight.
+pub fn parse_time(input: &str) -> Option<i64> {
+    let upper = input.trim().to_ascii_uppercase();
+    let (clock, pm) = match upper.strip_suffix("PM") {
+        Some(c) => (c.trim(), Some(true)),
+        None => match upper.strip_suffix("AM") {
+            Some(c) => (c.trim(), Some(false)),
+            None => (upper.as_str(), None),
+        },
+    };
+    let mut it = clock.split(':');
+    let mut h: i64 = it.next()?.trim().parse().ok()?;
+    let mi: i64 = it.next().map_or(Some(0), |v| v.trim().parse().ok())?;
+    let (whole, frac) = it.next().map_or(("0", ""), |v| v.trim().split_once('.').unwrap_or((v.trim(), "")));
+    let s: i64 = whole.parse().ok()?;
+    if it.next().is_some() || !(0..60).contains(&mi) || !(0..60).contains(&s) || !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    match pm {
+        Some(true) if (1..12).contains(&h) => h += 12,
+        Some(false) if h == 12 => h = 0,
+        Some(_) if !(1..=12).contains(&h) => return None,
+        _ => {}
+    }
+    if !(0..24).contains(&h) {
+        return None;
+    }
+    let digits: String = frac.chars().chain("000".chars()).take(3).collect();
+    Some(((h * 60 + mi) * 60 + s) * 1000 + digits.parse::<i64>().ok()?)
+}
+
+/// A time of day as SQL Server shows a `time`: `10:30:15.2500000`.
+pub fn format_time(ms: i64) -> String {
+    let ms = ms.rem_euclid(MS_PER_DAY);
+    let s = ms / 1000;
+    format!("{:02}:{:02}:{:02}.{:07}", s / 3600, s % 3600 / 60, s % 60, (ms % 1000) * 10_000)
+}
+
+/// A timestamp as SQL Server shows a `datetime`: `2024-02-29 13:45:10.250`.
+pub fn format_tsql(t: i64) -> String {
+    if t >= INFINITY || t <= NEG_INFINITY {
+        return format(t);
+    }
+    let (y, mo, d, h, mi, s) = components(t);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{:03}", millis(t))
+}
+
 /// A `DATE` as text: `2024-02-29`, `infinity`.
 pub fn format_date(t: i64) -> String {
     if t >= INFINITY {
@@ -180,7 +227,7 @@ fn seconds_ms(text: &str) -> Option<i64> {
     if !(0..=59).contains(&whole) || !frac.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let ms = if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !frac.is_empty() {
+    let ms = if matches!(crate::dialect::current(), crate::dialect::Dialect::Postgresql | crate::dialect::Dialect::Tsql) && !frac.is_empty() {
         // rounded to the millisecond; 59.9996 carries into the next minute as it does in PostgreSQL
         let digits: String = frac.chars().chain("0000".chars()).take(4).collect();
         (digits.parse::<i64>().ok()? + 5) / 10

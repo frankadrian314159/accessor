@@ -58,7 +58,8 @@ impl Drop for StrictGuard {
 }
 
 pub(crate) fn strict() -> bool {
-    STRICT.with(|l| l.get())
+    // SQL Server refuses a value that does not fit its column (an `int` out of range, a string too long)
+    STRICT.with(|l| l.get()) || crate::dialect::current() == crate::dialect::Dialect::Tsql
 }
 
 /// With `SET lenient_types = on` a type name the engine does not know is kept as `TEXT` instead of being refused, and so

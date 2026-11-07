@@ -49,7 +49,7 @@ impl std::hash::Hash for Decimal {
 
 /// Does this session keep the scale of a number (PostgreSQL's `numeric` does)?
 fn keeps_scale() -> bool {
-    crate::dialect::current() == crate::dialect::Dialect::Postgresql
+    matches!(crate::dialect::current(), crate::dialect::Dialect::Postgresql | crate::dialect::Dialect::Tsql)
 }
 
 fn pow10(n: u32) -> BigInt {

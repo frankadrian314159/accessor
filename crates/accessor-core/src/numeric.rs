@@ -451,7 +451,11 @@ pub fn arith(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     match arith_checked(op, a, b) {
         Err(Error::Runtime(m)) if m == DIVISION_BY_ZERO => {
             // PostgreSQL raises the error; the other dialects give NULL
-            if crate::dialect::current() == crate::dialect::Dialect::Postgresql { Err(Error::runtime("division by zero")) } else { Ok(Value::Null) }
+            match crate::dialect::current() {
+                crate::dialect::Dialect::Postgresql => Err(Error::runtime("division by zero")),
+                crate::dialect::Dialect::Tsql => Err(Error::runtime("Divide by zero error encountered.")),
+                _ => Ok(Value::Null),
+            }
         }
         other => other,
     }

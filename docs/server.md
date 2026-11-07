@@ -3,7 +3,7 @@
 `accessor-server` serves one Accessor database to many clients over the network. It speaks PostgreSQL's wire protocol (version 3), so `psql`, JDBC, psycopg, node-postgres and the other PostgreSQL drivers connect to it unchanged. It is a separate program built on the same engine as the embedded library: the library, the command-line tool, the GUI and the C API are not touched by it, and a database file can be used embedded one day and served the next (only one process can have the file open at a time).
 
 ```
-accessor-server [FILE.adb] [--listen ADDR:PORT] [--asql|--postgresql|--mysql]
+accessor-server [FILE.adb] [--listen ADDR:PORT] [--asql|--postgresql|--mysql|--tsql]
                 [--auth trust|password|md5|scram] [--user NAME:PASSWORD]... [--users-file FILE]
                 [--max-connections N]
 ```
@@ -31,6 +31,19 @@ Each connection gets a thread and its own `Connection` on one shared database, s
 * **Settings belong to the connection.** The time zone, run-time parameters (`SET`, `set_config`), `@variables`, `PREPARE`d statements, cursors and `HANDLER`s are each connection's own, in the server and in the embedded `Connection` alike. A connection that has set nothing still reads alongside the others; one that has takes its own turn.
 * **Column names as PostgreSQL gives them** (in PostgreSQL mode): `count`, `sum`, `max`, `upper`, `coalesce`, `case`, `exists`, `extract`, and `?column?` for an operator or a literal; a cast keeps the name of the column it casts.
 * Cancel requests (taken between the statements of a message), a limit on connections (`53300`), and a graceful stop.
+
+## Dialects
+
+The mode flag sets the dialect new connections start in (`--asql`, `--postgresql` (the default), `--mysql`, `--tsql`; `--dialect NAME` also works). Each connection has its own dialect: a client can choose it when it connects, with the `dialect` startup parameter or `options='-c dialect=tsql'`, and change it later with `SET dialect = 'mysql'`. An unknown name is refused.
+
+`--tsql` is Microsoft SQL Server's **language**, spoken over the PostgreSQL wire protocol; it is not the TDS protocol, so `sqlcmd`, SSMS and SQL Server drivers cannot connect, but `psql` and PostgreSQL drivers can. In this mode:
+
+* A message is a T-SQL batch: variables (`DECLARE @n INT = 1`, `SET @n += 1`, `SELECT @x = ...`), `IF`/`ELSE`, `WHILE` with `BREAK`/`CONTINUE`, `BEGIN`/`END`, `BEGIN TRY`/`BEGIN CATCH` (with `ERROR_MESSAGE()` and friends), `THROW`, `RAISERROR`, `PRINT` (sent to the client as a notice), `EXEC('...')`. Lines that say `GO` split a message into batches. A batch returns its last result set.
+* Types: `bit`, `tinyint` (0-255), `smallint`, `int`, `bigint`, `decimal`/`numeric`, `money`, `smallmoney`, `float`, `real`, `date`, `time`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset`, `char`, `varchar`, `nchar`, `nvarchar`, `text`, `ntext`, `binary`, `varbinary`, `image`, `uniqueidentifier`, `xml`, `sql_variant`, `rowversion`, `hierarchyid`, `geography`, `geometry`, `json`. The last group is kept as text or bytes without the type's own operations.
+* Results are shown as SQL Server shows them: `bit` as 1/0, `datetime` as `2024-03-05 10:30:15.250`, `time` with seven digits, `money` with four decimals, binary as `0x...`.
+* Syntax: `dbo.` is dropped from names, `[bracketed]` names, `N'...'` strings, `TOP`, `IDENTITY(1,1)`, `CLUSTERED`/`ON [PRIMARY]` storage clauses (read and ignored), `#temp` names, `0x` literals, and the functions `ISNULL`, `GETDATE`, `DATEADD`, `DATEDIFF`, `DATEPART`, `DATENAME`, `EOMONTH`, `CONVERT` (with styles), `TRY_CAST`, `TRY_CONVERT`, `CHARINDEX`, `STUFF`, `STR`, `NEWID`, `CHOOSE`, `ISNUMERIC`, `ISDATE` and others (see [sql/dialects.md](sql/dialects.md)).
+
+Not done: several result sets per batch, table variables, cursors, `OUTPUT`, `@@ROWCOUNT`, `SCOPE_IDENTITY()` (returns NULL), IDENTITY seed and increment (the column counts from 1), `OBJECT_ID`, `FORMAT`, `STRING_SPLIT`, table hints.
 
 ## What is not (yet)
 

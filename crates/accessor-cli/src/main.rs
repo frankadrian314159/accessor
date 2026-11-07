@@ -52,12 +52,13 @@ fn main() -> ExitCode {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                println!("usage: accessor [--asql|--postgresql|--mysql] [FILE.adb] [-c SQL]... [-f SCRIPT]...\n\n{HELP}");
+                println!("usage: accessor [--asql|--postgresql|--mysql|--tsql] [FILE.adb] [-c SQL]... [-f SCRIPT]...\n\n{HELP}");
                 return ExitCode::SUCCESS;
             }
             "--asql" => dialect = Dialect::Asql,
             "--postgresql" => dialect = Dialect::Postgresql,
             "--mysql" => dialect = Dialect::Mysql,
+            "--tsql" => dialect = Dialect::Tsql,
             "-c" => match args.next() {
                 Some(c) => commands.push(c),
                 None => return usage_error("-c needs an argument"),
@@ -109,7 +110,7 @@ fn main() -> ExitCode {
 }
 
 fn usage_error(msg: &str) -> ExitCode {
-    eprintln!("{msg}\nusage: accessor [--asql|--postgresql|--mysql] [FILE.adb] [-c SQL]... [-f SCRIPT]...");
+    eprintln!("{msg}\nusage: accessor [--asql|--postgresql|--mysql|--tsql] [FILE.adb] [-c SQL]... [-f SCRIPT]...");
     ExitCode::from(2)
 }
 
