@@ -241,6 +241,14 @@ fn catalog_queries_work_through_the_extended_protocol() {
         "SELECT c.oid,c.*,d.description FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_description d ON c.oid=d.objoid AND d.objsubid=0 WHERE c.relkind not in ('i','I','c')",
         "SELECT pg_catalog.pg_encoding_to_char(encoding) FROM pg_catalog.pg_database",
         "SELECT has_database_privilege('postgres', 'CONNECT')",
+        "SELECT current_catalog",
+        "SELECT c.oid,c.*,d.description,pg_catalog.pg_get_expr(c.relpartbound, c.oid) as partition_expr, pg_catalog.pg_get_partkeydef(c.oid) as partition_key FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=c.oid AND d.objsubid=0 WHERE c.relkind='r'",
+        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS tname, a.attnotnull, pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS def, pg_catalog.col_description(a.attrelid, a.attnum) FROM pg_catalog.pg_attribute a LEFT JOIN pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum WHERE a.attnum > 0 AND NOT a.attisdropped",
+        "SELECT pg_catalog.pg_get_userbyid(c.relowner), c.relacl, c.reloptions, pg_catalog.pg_relation_size(c.oid) FROM pg_catalog.pg_class c",
+        "SELECT conname, contype, pg_catalog.pg_get_constraintdef(oid, true) FROM pg_catalog.pg_constraint",
+        "SELECT pg_catalog.pg_get_indexdef(indexrelid, 0, true), indisprimary, indisunique FROM pg_catalog.pg_index",
+        "SELECT tgname, pg_catalog.pg_get_triggerdef(oid) FROM pg_catalog.pg_trigger WHERE NOT tgisinternal",
+        "SELECT schemaname, tablename, tableowner FROM pg_catalog.pg_tables",
         "SHOW TRANSACTION ISOLATION LEVEL",
     ];
     let mut failed = Vec::new();

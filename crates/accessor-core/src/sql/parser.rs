@@ -7903,6 +7903,11 @@ impl<'a> Parser<'a> {
                         self.advance();
                         return Ok(Expr::Function { name: format!("__PG_{up}"), args: vec![], distinct: false, star: false });
                     }
+                    // current_catalog: the database, written without parentheses
+                    "CURRENT_CATALOG" if !matches!(self.peek_at(1), Tok::Sym("(" | ".")) => {
+                        self.advance();
+                        return Ok(Expr::Function { name: "CURRENT_DATABASE".into(), args: vec![], distinct: false, star: false });
+                    }
                     "CURRENT_DATE" | "CURRENT_TIMESTAMP" | "CURRENT_TIME" | "LOCALTIMESTAMP" | "LOCALTIME"
                         if !matches!(self.peek_at(1), Tok::Sym("(")) =>
                     {
