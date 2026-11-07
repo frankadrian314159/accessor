@@ -1136,6 +1136,7 @@ impl Database {
         crate::tz::set_session(self.time_zone);
         crate::dialect::set_session(self.dialect());
         crate::datetime::start_statement();
+        self.sync_column_types();
         self.sync_collations();
         self.sync_aggregates();
         crate::sequence::set_current(&self.seqs);

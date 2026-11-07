@@ -5381,13 +5381,28 @@ impl<'a> Parser<'a> {
             invisible: false,
             range: if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(data_type, DataType::Array(_)) && (crate::expr::ranges::cast_function_for(&type_name).is_some() || crate::expr::composite::is_composite(&type_name)) {
                 Some(type_name.clone())
-            } else if crate::dialect::current() == crate::dialect::Dialect::Postgresql && data_type == DataType::Decimal && matches!(size.get(1), Some(s) if *s >= 0) {
-                // numeric(p, s): the stored values have s digits after the point (marked apart from a range type)
-                Some(format!("\u{2}{}", size[1]))
             } else {
                 None
             },
         };
+        if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+            // numeric(p, s): the stored values have s digits after the point (marked apart from a range type)
+            if data_type == DataType::Decimal && matches!(size.get(1), Some(s) if *s >= 0) {
+                crate::expr::ranges::add_segment(&mut def.range, format!("\u{2}{}", size[1]));
+            }
+            // the type as written, for \d and format_type: numeric(10,2), character varying(20), character(3)
+            let upper = type_name.to_ascii_uppercase();
+            let shown = match (data_type, size.as_slice()) {
+                (DataType::Decimal, [p]) => Some(format!("numeric({p})")),
+                (DataType::Decimal, [p, s]) => Some(format!("numeric({p},{s})")),
+                (DataType::Text, [n]) if matches!(upper.as_str(), "CHAR" | "CHARACTER" | "BPCHAR" | "NCHAR") => Some(format!("character({n})")),
+                (DataType::Text, [n]) => Some(format!("character varying({n})")),
+                _ => None,
+            };
+            if let Some(shown) = shown {
+                crate::expr::ranges::add_segment(&mut def.range, format!("\u{5}{shown}"));
+            }
+        }
         if let Some(l) = labels {
             let list: Vec<String> = l.iter().map(|x| format!("'{}'", x.replace('\'', "''"))).collect();
             def.check = Some(format!("{} IN ({})", def.name, list.join(", ")));
@@ -5479,8 +5494,8 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let name = self.collation_name()?;
                 crate::collation::lookup(&name)?;
-                if def.data_type == DataType::Text && def.range.is_none() {
-                    def.range = Some(format!("\u{3}{name}"));
+                if def.data_type == DataType::Text {
+                    crate::expr::ranges::add_segment(&mut def.range, format!("\u{3}{name}"));
                 }
             } else if self.eat_kw("CHARSET") || self.eat_kw("COLLATE") || self.eat_kw("STORAGE") || self.eat_kw("COLUMN_FORMAT") {
                 self.advance();
@@ -5509,9 +5524,17 @@ impl<'a> Parser<'a> {
                         self.pos = save;
                         let now = matches!(self.peek(), Tok::Ident(w) if matches!(w.to_ascii_uppercase().as_str(), "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE"))
                             && matches!(def.data_type, DataType::DateTime | DataType::TimestampTz);
+                        let start = self.toks[self.pos].pos;
                         self.skip_default_expr()?;
+                        let end = self.toks.get(self.pos).map_or(self.src.len(), |t| t.pos);
                         if now {
                             def.default = Some(Value::text(crate::schema::NOW_DEFAULT));
+                        } else if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(def.data_type, DataType::Calculated) {
+                            // PostgreSQL: the expression is kept and worked out for each new row
+                            let source = self.src[start..end].trim();
+                            if !source.is_empty() && crate::sql::parse_expression(source).is_ok() {
+                                def.default = Some(Value::text(&format!("{}{source}", crate::schema::EXPR_DEFAULT)));
+                            }
                         }
                     }
                 }

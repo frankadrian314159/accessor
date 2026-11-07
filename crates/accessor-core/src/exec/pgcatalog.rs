@@ -94,6 +94,9 @@ impl Database {
                     for ix in sc.indexes.iter().filter(|x| x.unique && x.columns != pk && x.name.ends_with("_unique")) {
                         map.insert(ix.name.clone(), format!("UNIQUE ({})", names(sc, &ix.columns)).into());
                     }
+                    for (name, condition) in self.check_constraints(tb.name()) {
+                        map.insert(name, format!("CHECK ({condition})").into());
+                    }
                     for fk in &sc.foreign_keys {
                         let act = |a: &crate::schema::RefAction| match format!("{a:?}").as_str() {
                             "Cascade" => " CASCADE",
@@ -169,7 +172,7 @@ impl Database {
                     let fk_trigger = !sc.foreign_keys.is_empty() || self.tables.values().any(|o| o.schema().foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(tb.name())));
                     rows.push(vec![
                         t(tb.name()), t(rel), t(schema), t(""), t("postgres"), t("heap"), t(""), i(0), i(0), Value::Int(tb.len() as i64), i(0), t(""),
-                        b(!sc.indexes.is_empty()), b(false), t("p"), t("r"), i(sc.columns.len()), i(0), b(false), b(fk_trigger), b(false), b(false), b(true), t("d"), b(false), b(self.has_children(tb.name())), Value::Null, Value::Null, i(0), Value::Null,
+                        b(!sc.indexes.is_empty()), b(false), t("p"), t("r"), i(sc.columns.len()), i(self.check_constraints(tb.name()).len()), b(false), b(fk_trigger), b(false), b(false), b(true), t("d"), b(false), b(self.has_children(tb.name())), Value::Null, Value::Null, i(0), Value::Null,
                     ]);
                     for ix in sc.indexes.iter().filter(|x| !is_helper_index(sc, x)) {
                         let shown = pg_index_name(rel, &ix.name);
@@ -195,7 +198,7 @@ impl Database {
                 for tb in self.tables.values() {
                     for (n, c) in tb.schema().columns.iter().enumerate() {
                         rows.push(vec![
-                            t(tb.name()), t(&c.name), t(pg_type_name(c.data_type)), Value::Int(-1), i(n + 1), Value::Int(-1), i(0),
+                            t(tb.name()), t(&c.name), t(&crate::expr::ranges::column_typmod(tb.name(), &c.name).unwrap_or_else(|| pg_type_name(c.data_type).to_string())), Value::Int(-1), i(n + 1), Value::Int(-1), i(0),
                             b(c.not_null || c.primary_key), b(c.default.is_some() || c.autonumber), b(false), t(""), t(""), b(false), b(true), i(0), i(0), Value::Int(-1), t("p"), t(""), Value::Null, Value::Null,
                         ]);
                     }
@@ -275,6 +278,9 @@ impl Database {
                     for ix in sc.indexes.iter().filter(|x| x.unique && x.columns != pk && x.name.ends_with("_unique")) {
                         rows.push(con(&ix.name, "u", false, false, &ix.name, "", " ", " ", keys(&ix.columns), Value::Null));
                     }
+                    for (name, _) in self.check_constraints(tb.name()) {
+                        rows.push(con(&name, "c", false, false, "", "", " ", " ", Value::Null, Value::Null));
+                    }
                     for fk in &sc.foreign_keys {
                         let act = |a: &crate::schema::RefAction| match format!("{a:?}").as_str() {
                             "Cascade" => "c",
@@ -315,7 +321,7 @@ impl Database {
             }
             "pg_trigger" => {
                 for tr in self.triggers.values() {
-                    rows.push(vec![t(&tr.name), t(&tr.table), t(""), t(&tr.name), t(tr.function.as_deref().unwrap_or("")), i(if tr.each_statement { 0 } else { 1 }), t("O"), b(tr.name.starts_with("ck_")), t(""), t(""), t(""), b(false), b(false), i(0)]);
+                    rows.push(vec![t(&tr.name), t(&tr.table), t(""), t(&tr.name), t(tr.function.as_deref().unwrap_or("")), i(if tr.each_statement { 0 } else { 1 }), t("O"), b(tr.name.starts_with("ck_") || tr.sql.contains("CHECK constraint failed on")), t(""), t(""), t(""), b(false), b(false), i(0)]);
                 }
                 names(&["oid", "tgrelid", "tgparentid", "tgname", "tgfoid", "tgtype", "tgenabled", "tgisinternal", "tgconstrrelid", "tgconstrindid", "tgconstraint", "tgdeferrable", "tginitdeferred", "tgnargs"])
             }
@@ -432,7 +438,9 @@ impl Database {
             "pg_attrdef" => {
                 for tb in self.tables.values() {
                     for (n, c) in tb.schema().columns.iter().enumerate() {
-                        let shown = if c.autonumber {
+                        let shown = if let Some(src) = c.expr_default() {
+                            Some(src.to_string())
+                        } else if c.autonumber {
                             Some(format!("nextval('{}_{}_seq'::regclass)", split(tb.name()).1, c.name))
                         } else if c.now_default() {
                             Some("now()".to_string())

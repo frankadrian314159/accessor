@@ -87,6 +87,16 @@ impl Database {
         Ok(())
     }
 
+    /// Makes the registry of this thread hold the column types of this database (and only those): a connection that runs
+    /// on another thread than the one that made the table has to find them too.
+    pub(crate) fn sync_column_types(&self) {
+        let any = self.catalog.range(("coltype".to_string(), String::new())..).next().is_some_and(|((k, _), _)| k == "coltype");
+        if any || crate::expr::ranges::any_columns() {
+            crate::expr::ranges::reset_columns();
+            self.register_column_types();
+        }
+    }
+
     /// Puts the range and composite column types of the catalog in the registry of this session.
     pub(crate) fn register_column_types(&self) {
         for ((k, n), v) in &self.catalog {

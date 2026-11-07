@@ -19,6 +19,27 @@ pub struct Column {
 /// (`DEFAULT NEXT VALUE FOR s`): this prefix, then the sequence name.
 pub const SEQUENCE_DEFAULT: &str = "\u{1}nextval:";
 
+/// Text that stands in for a default that is an expression (`DEFAULT current_date`, `DEFAULT 'x'::text`): this prefix,
+/// then the source of the expression, which is worked out for each new row.
+pub const EXPR_DEFAULT: &str = "\u{1}expr:";
+
+thread_local! {
+    /// An empty database to bind expression defaults in: they read no tables.
+    static DEFAULTS_DB: std::cell::RefCell<Option<crate::database::Database>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Works out the expression of a default.
+fn eval_default(source: &str) -> Option<Value> {
+    let expr = crate::sql::parse_expression(source).ok()?;
+    DEFAULTS_DB.with(|d| {
+        let mut d = d.borrow_mut();
+        let db = d.get_or_insert_with(crate::database::Database::in_memory);
+        let scope = crate::exec::bind::Scope::default();
+        let bound = crate::exec::bind::Binder::new(db, &scope, 0).bind(&expr).ok()?;
+        bound.eval(&[]).ok().map(std::borrow::Cow::into_owned)
+    })
+}
+
 /// Text that stands in for the default `CURRENT_TIMESTAMP`: the column gets the time of the insert.
 pub const NOW_DEFAULT: &str = "\u{1}now";
 
@@ -28,8 +49,19 @@ impl Column {
         matches!(&self.default, Some(Value::Text(s)) if &**s == NOW_DEFAULT)
     }
 
-    /// The default as a value for a new row (the time, for `CURRENT_TIMESTAMP`).
+    /// The source of the expression this column's default is, if it is one.
+    pub fn expr_default(&self) -> Option<&str> {
+        match &self.default {
+            Some(Value::Text(s)) => s.strip_prefix(EXPR_DEFAULT),
+            _ => None,
+        }
+    }
+
+    /// The default as a value for a new row (the time, for `CURRENT_TIMESTAMP`; the value of an expression).
     pub fn default_now(&self) -> Option<Value> {
+        if let Some(src) = self.expr_default() {
+            return Some(eval_default(src).unwrap_or(Value::Null));
+        }
         if !self.now_default() {
             return self.default.clone();
         }

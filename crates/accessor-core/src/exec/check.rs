@@ -19,6 +19,24 @@ use crate::sql::parse_expression;
 pub(crate) const EXCLUDE_PREFIX: &str = "\u{1}exclude:";
 
 impl Database {
+    /// The `CHECK` constraints of a table, as `(name, condition)`: they are kept as the trigger pairs `add_check` makes,
+    /// whose message holds the condition as it was written.
+    pub(crate) fn check_constraints(&self, table: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for def in self.triggers.values() {
+            let marker = format!("CHECK constraint failed on ''{}'': ", def.table);
+            if !def.table.eq_ignore_ascii_case(table) || !def.name.ends_with("_ins") {
+                continue;
+            }
+            let Some(at) = def.sql.find(&marker) else { continue };
+            let rest = &def.sql[at + marker.len()..];
+            let Some(end) = rest.rfind("'; END") else { continue };
+            out.push((def.name[..def.name.len() - 4].to_string(), rest[..end].replace("''", "'")));
+        }
+        out.sort();
+        out
+    }
+
     /// An `EXCLUDE` constraint: no two rows may satisfy every `element operator element` at once. It is a pair of
     /// triggers like a check, which look for a conflicting row.
     fn add_exclusion(&mut self, table: &str, name: Option<&str>, spec: &str) -> Result<()> {

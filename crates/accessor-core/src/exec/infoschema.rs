@@ -132,9 +132,10 @@ impl Database {
                             match (&c.default, c.is_calculated()) {
                                 (_, true) | (None, _) => Value::Null,
                                 (Some(Value::Null), _) => Value::Null,
-                                (Some(v), _) => match c.sequence_default() {
-                                    Some(seq) => t(&format!("NEXT VALUE FOR {seq}")),
-                                    None => t(&v.to_string()),
+                                (Some(v), _) => match (c.sequence_default(), c.expr_default()) {
+                                    (Some(seq), _) => t(&format!("NEXT VALUE FOR {seq}")),
+                                    (None, Some(src)) => t(src),
+                                    (None, None) => t(&v.to_string()),
                                 },
                             },
                             Value::Bool(c.primary_key),

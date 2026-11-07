@@ -237,6 +237,7 @@ impl Database {
                         for &c in &fk.columns {
                             let col = &child.schema().columns[c];
                             row[c] = match &col.default {
+                                Some(_) if col.expr_default().is_some() => col.default_now().unwrap_or(Value::Null),
                                 Some(d) if col.sequence_default().is_none() => d.clone(),
                                 _ => Value::Null,
                             };

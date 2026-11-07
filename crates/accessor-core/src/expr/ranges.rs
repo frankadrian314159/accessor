@@ -810,6 +810,16 @@ pub(crate) fn register_column(table: &str, column: &str, type_name: &str) {
     COLUMNS.with(|c| c.borrow_mut().insert((table.to_ascii_lowercase(), column.to_ascii_lowercase()), type_name.to_string()));
 }
 
+/// Does this thread's registry hold any column?
+pub(crate) fn any_columns() -> bool {
+    COLUMNS.with(|c| !c.borrow().is_empty())
+}
+
+/// Empties this thread's registry of column types.
+pub(crate) fn reset_columns() {
+    COLUMNS.with(|c| c.borrow_mut().clear());
+}
+
 pub(crate) fn forget_table(table: &str) {
     let t = table.to_ascii_lowercase();
     COLUMNS.with(|c| c.borrow_mut().retain(|(tb, _), _| *tb != t));
@@ -821,7 +831,7 @@ pub(crate) fn column_type_anywhere(column: &str) -> Option<String> {
     let col = column.to_ascii_lowercase();
     COLUMNS.with(|c| {
         let c = c.borrow();
-        let mut types = c.iter().filter(|((_, n), t)| *n == col && !t.starts_with(['\u{2}', '\u{3}'])).map(|(_, t)| t);
+        let mut types = c.iter().filter(|((_, n), t)| *n == col && !t.starts_with(['\u{2}', '\u{3}', '\u{5}'])).map(|(_, t)| t);
         let first = types.next()?;
         types.all(|t| t == first).then(|| first.clone())
     })
@@ -833,7 +843,36 @@ pub(crate) fn column_type(table: &str, column: &str) -> Option<String> {
         if c.is_empty() {
             return None;
         }
-        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase())).filter(|t| !t.starts_with(['\u{2}', '\u{3}'])).cloned()
+        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase())).filter(|t| !t.starts_with(['\u{2}', '\u{3}', '\u{5}'])).cloned()
+    })
+}
+
+/// The part of a column's type string that follows `marker`, up to the next marker. A column that is not a range or
+/// composite type keeps what is known of its declaration in segments: `\u{2}` the digits after the point of a
+/// `numeric(p, s)`, `\u{3}` the collation, `\u{5}` the type as it was written (`numeric(10,2)`).
+pub(crate) fn segment(s: &str, marker: char) -> Option<&str> {
+    let start = s.find(marker)? + marker.len_utf8();
+    let rest = &s[start..];
+    Some(&rest[..rest.find(['\u{2}', '\u{3}', '\u{5}']).unwrap_or(rest.len())])
+}
+
+/// Adds a segment to a column's type string (nothing is added to the name of a range or composite type).
+pub(crate) fn add_segment(range: &mut Option<String>, segment: String) {
+    match range {
+        None => *range = Some(segment),
+        Some(r) if r.starts_with(['\u{2}', '\u{3}', '\u{5}']) => r.push_str(&segment),
+        Some(_) => {}
+    }
+}
+
+/// The type of a column as it was written, with its length or precision (`numeric(10,2)`, `character varying(20)`).
+pub(crate) fn column_typmod(table: &str, column: &str) -> Option<String> {
+    COLUMNS.with(|c| {
+        let c = c.borrow();
+        if c.is_empty() {
+            return None;
+        }
+        segment(c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))?, '\u{5}').map(String::from)
     })
 }
 
@@ -844,7 +883,7 @@ pub(crate) fn column_collation(table: &str, column: &str) -> Option<String> {
         if c.is_empty() {
             return None;
         }
-        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))?.strip_prefix('\u{3}').map(String::from)
+        segment(c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))?, '\u{3}').map(String::from)
     })
 }
 
@@ -855,7 +894,7 @@ pub(crate) fn column_scale(table: &str, column: &str) -> Option<u32> {
         if c.is_empty() {
             return None;
         }
-        c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))?.strip_prefix('\u{2}')?.parse().ok()
+        segment(c.get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))?, '\u{2}')?.parse().ok()
     })
 }
 

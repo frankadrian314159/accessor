@@ -933,7 +933,7 @@ impl Value {
             return Ok(Null);
         }
         // The stand-in for a sequence default is not a value to convert.
-        if matches!(self, Text(s) if (**s).starts_with(crate::schema::SEQUENCE_DEFAULT)) {
+        if matches!(self, Text(s) if (**s).starts_with(crate::schema::SEQUENCE_DEFAULT) || (**s).starts_with(crate::schema::EXPR_DEFAULT)) {
             return Ok(self.clone());
         }
         let bad = || Error::type_err(format!("cannot convert {} value '{}' to {}", self.type_label(), self, ty));

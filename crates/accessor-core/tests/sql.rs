@@ -7846,3 +7846,21 @@ fn postgresql_dates_are_not_timestamps_numeric_scales_and_cover_density() {
     assert_eq!(pg_one(&mut db, "SELECT 'abc' LIKE 'ABC' COLLATE ci2"), "true");
     assert_eq!(pg_one(&mut db, "SELECT 'abc' LIKE 'ÄB%' COLLATE ci2"), "false");
 }
+
+#[test]
+fn postgresql_expression_defaults_check_constraints_and_type_modifiers_in_the_catalog() {
+    let mut db = pg();
+    db.execute("CREATE TABLE t (id int, name varchar(40), price numeric(10,2) DEFAULT 1 + 1, d date DEFAULT current_date, tag text DEFAULT 'n'::text CHECK (length(tag) < 10), CONSTRAINT pos CHECK (price >= 0))").unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (1, 'a')").unwrap();
+    // an expression default is worked out for each new row
+    assert_eq!(pg_one(&mut db, "SELECT price FROM t"), "2.00");
+    assert_eq!(pg_one(&mut db, "SELECT tag FROM t"), "n");
+    assert_eq!(pg_one(&mut db, "SELECT d = current_date FROM t"), "true");
+    assert!(db.execute("INSERT INTO t (id, price) VALUES (2, -1)").is_err());
+    // and psql finds the declaration in the catalog
+    assert_eq!(pg_one(&mut db, "SELECT atttypid FROM pg_attribute WHERE attname = 'name'"), "character varying(40)");
+    assert_eq!(pg_one(&mut db, "SELECT atttypid FROM pg_attribute WHERE attname = 'price'"), "numeric(10,2)");
+    assert_eq!(pg_one(&mut db, "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adnum = 4"), "current_date");
+    assert_eq!(pg_one(&mut db, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'pos'"), "CHECK (price >= 0)");
+    assert_eq!(pg_one(&mut db, "SELECT relchecks FROM pg_class WHERE relname = 't'"), "2");
+}
