@@ -588,7 +588,7 @@ fn hash_comment(at: &dyn Fn(usize) -> Option<char>, i: usize) -> bool {
     match dialect::current() {
         Dialect::Mysql => true,
         Dialect::Asql => !closes_as_date(at, i),
-        Dialect::Postgresql => false,
+        Dialect::Postgresql | Dialect::Tsql => false,
     }
 }
 

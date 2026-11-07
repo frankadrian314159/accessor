@@ -4,7 +4,10 @@
 //!   for a boolean, which is a number (Yes is -1);
 //! * `postgresql`: PostgreSQL's reading and output: `#` is no comment, a boolean is `true`/`false` (`t`/`f` in a
 //!   result), and `false < true`;
-//! * `mysql`: MySQL's: `# ...` is a comment to the end of the line, a boolean is 1 or 0, and `false < true`.
+//! * `mysql`: MySQL's: `# ...` is a comment to the end of the line, a boolean is 1 or 0, and `false < true`;
+//! * `tsql`: Microsoft SQL Server's Transact-SQL: batches without terminators, `@variables`, `IF`/`WHILE`/`BEGIN ... END`,
+//!   `IDENTITY`, `TOP`, the T-SQL data types, and values shown as SQL Server shows them (a `bit` is 1 or 0, a `money` has
+//!   four decimals, a `datetime` has milliseconds).
 //!
 //! The dialect is the `dialect` setting of the session (`SET dialect = 'mysql'`, [`Database::set_dialect`]); the
 //! statement being run keeps it in a thread-local, as the time zone is kept, for the lexer, the parser and the
@@ -19,6 +22,7 @@ pub enum Dialect {
     Asql,
     Postgresql,
     Mysql,
+    Tsql,
 }
 
 impl Dialect {
@@ -28,6 +32,7 @@ impl Dialect {
             "asql" | "access" => Some(Dialect::Asql),
             "postgresql" | "postgres" | "pg" => Some(Dialect::Postgresql),
             "mysql" => Some(Dialect::Mysql),
+            "tsql" | "t-sql" | "transact-sql" | "sqlserver" | "mssql" => Some(Dialect::Tsql),
             _ => None,
         }
     }
@@ -37,6 +42,7 @@ impl Dialect {
             Dialect::Asql => "asql",
             Dialect::Postgresql => "postgresql",
             Dialect::Mysql => "mysql",
+            Dialect::Tsql => "tsql",
         }
     }
 }

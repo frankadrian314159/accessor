@@ -153,3 +153,32 @@ fn settings_are_per_connection_and_psql_catalog_queries_work() {
     stop.stop();
     handle.join().unwrap();
 }
+
+#[test]
+fn a_client_chooses_its_dialect() {
+    let (conn, stop, handle) = start(Config::default());
+    let value = |c: &mut Client, sql: &str| -> String {
+        c.simple_query(sql)
+            .unwrap()
+            .iter()
+            .find_map(|m| if let SimpleQueryMessage::Row(r) = m { r.get(0).map(str::to_string) } else { None })
+            .unwrap_or_default()
+    };
+    let mut pg = Client::connect(&conn, NoTls).unwrap();
+    let mut my = Client::connect(&format!("{conn} options='-c dialect=mysql'"), NoTls).unwrap();
+    let mut ms = Client::connect(&format!("{conn} options='-c dialect=tsql'"), NoTls).unwrap();
+    // a boolean is t / f in PostgreSQL's dialect, and the number 1 / 0 in MySQL's and T-SQL's
+    assert_eq!(value(&mut pg, "SELECT 1 = 1"), "t");
+    assert_eq!(value(&mut my, "SELECT 1 = 1"), "1");
+    assert_eq!(value(&mut ms, "SELECT 1 = 1"), "1");
+    // the dialect is the connection's own: the others are unchanged
+    assert_eq!(value(&mut pg, "SELECT 1 = 1"), "t");
+    // a connection can change its own later
+    my.batch_execute("SET dialect = 'postgresql'").unwrap();
+    assert_eq!(value(&mut my, "SELECT 1 = 1"), "t");
+    // an unknown dialect is refused
+    assert!(Client::connect(&format!("{conn} options='-c dialect=oracle'"), NoTls).is_err());
+    drop((pg, my, ms));
+    stop.stop();
+    handle.join().unwrap();
+}

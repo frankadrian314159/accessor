@@ -6,12 +6,14 @@ use accessor_core::dialect::Dialect;
 use accessor_core::{Database, SharedDatabase};
 use accessor_server::{AuthMethod, Config, Server};
 
-const USAGE: &str = "usage: accessor-server [FILE.adb] [--listen ADDR:PORT] [--asql|--postgresql|--mysql]
+const USAGE: &str = "usage: accessor-server [FILE.adb] [--listen ADDR:PORT] [--asql|--postgresql|--mysql|--tsql|--dialect NAME]
                        [--auth trust|password|md5|scram] [--user NAME:PASSWORD]... [--users-file FILE]
                        [--max-connections N]
 
 Serves the database in FILE.adb (or an in-memory one) to PostgreSQL clients: psql, JDBC, psycopg and the rest.
 Defaults: --listen 127.0.0.1:5432, --postgresql, --auth trust (or scram when users are given).
+The dialect is the one each connection starts in; a client may choose its own with the startup parameter dialect
+(\"options=-c dialect=mysql\" in a connection string) or later with SET dialect = 'tsql'.
 A users file has one NAME:PASSWORD per line. Stop the server with Ctrl+C; the database is checkpointed on the way out.";
 
 fn main() -> ExitCode {
@@ -39,6 +41,11 @@ fn run() -> Result<(), String> {
             "--asql" => dialect = Dialect::Asql,
             "--postgresql" => dialect = Dialect::Postgresql,
             "--mysql" => dialect = Dialect::Mysql,
+            "--tsql" => dialect = Dialect::Tsql,
+            "--dialect" => {
+                let v = value("--dialect")?;
+                dialect = Dialect::parse(&v).ok_or_else(|| format!("unknown dialect '{v}' (asql, postgresql, mysql or tsql)"))?;
+            }
             "--auth" => {
                 let v = value("--auth")?;
                 auth = Some(AuthMethod::parse(&v).ok_or_else(|| format!("unknown authentication method '{v}'"))?);

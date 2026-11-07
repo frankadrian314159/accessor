@@ -23,11 +23,17 @@ pub const INTERVAL: u32 = 1186;
 pub const NUMERIC: u32 = 1700;
 pub const JSONB: u32 = 3802;
 
-/// The OID a value is announced with.
+/// The OID a value is announced with. A boolean is a `boolean` only in PostgreSQL's dialect; in MySQL's and T-SQL's it is
+/// the number 1 or 0 (`bit`, `tinyint(1)`), and in ASQL it is shown as Yes/No text.
 pub fn oid_of(v: &Value) -> Option<u32> {
+    use accessor_core::dialect::{current, Dialect};
     Some(match v {
         Value::Null => return None,
-        Value::Bool(_) => BOOL,
+        Value::Bool(_) => match current() {
+            Dialect::Postgresql => BOOL,
+            Dialect::Mysql | Dialect::Tsql => INT2,
+            Dialect::Asql => TEXT,
+        },
         Value::Int(_) => INT8,
         Value::Big(_) | Value::Dec(_) => NUMERIC,
         Value::Currency(_) => MONEY,
@@ -62,8 +68,13 @@ pub fn type_size(oid: u32) -> i16 {
 
 /// A value in PostgreSQL's text format.
 pub fn text_of(v: &Value) -> String {
+    use accessor_core::dialect::{current, Dialect};
     match v {
-        Value::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+        Value::Bool(b) => match current() {
+            Dialect::Postgresql => (if *b { "t" } else { "f" }).to_string(),
+            Dialect::Mysql | Dialect::Tsql => (if *b { "1" } else { "0" }).to_string(),
+            Dialect::Asql => v.to_string(),
+        },
         Value::Text(s) => s.to_string(),
         other => other.to_string(),
     }
@@ -88,6 +99,7 @@ pub fn binary_of(oid: u32, v: &Value) -> Vec<u8> {
     let as_f64 = |v: &Value| v.to_f64().unwrap_or(f64::NAN);
     match oid {
         BOOL => vec![u8::from(matches!(v, Value::Bool(true)))],
+        INT2 if matches!(v, Value::Bool(_)) => i16::from(matches!(v, Value::Bool(true))).to_be_bytes().to_vec(),
         INT8 => as_i64(v).to_be_bytes().to_vec(),
         INT4 => (as_i64(v) as i32).to_be_bytes().to_vec(),
         INT2 => (as_i64(v) as i16).to_be_bytes().to_vec(),

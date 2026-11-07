@@ -104,6 +104,13 @@ pub fn serve(stream: TcpStream, shared: &Shared, pid: i32) -> io::Result<()> {
             }
         }
     };
+    // a client may choose its dialect when it connects: a `dialect` parameter, or `options=-c dialect=mysql`
+    let requested = params.get("dialect").cloned().or_else(|| dialect_in_options(params.get("options").map(String::as_str).unwrap_or("")));
+    let dialect = match requested.as_deref().map(|d| (d, accessor_core::dialect::Dialect::parse(d))) {
+        Some((d, None)) => return fatal(&mut out, "22023", &format!("invalid value for parameter \"dialect\": \"{d}\" (asql, postgresql, mysql or tsql)")),
+        Some((_, Some(d))) => Some(d),
+        None => None,
+    };
     let user = params.get("user").cloned().unwrap_or_default();
     if user.is_empty() {
         return fatal(&mut out, "28000", "no PostgreSQL user name specified in startup packet");
@@ -137,10 +144,31 @@ pub fn serve(stream: TcpStream, shared: &Shared, pid: i32) -> io::Result<()> {
     Msg::new(b'K').i32(pid).i32(secret).send(&mut out)?;
 
     let mut session = Session { conn: shared.db.connect(), out, shared, cancel, statements: HashMap::new(), portals: HashMap::new() };
+    if let Some(d) = dialect {
+        if let Err(e) = session.conn.execute(&format!("SET dialect = '{}'", d.name())) {
+            return fatal(&mut session.out, "XX000", &e.to_string());
+        }
+    }
     session.ready()?;
     let result = session.run(&mut reader);
     shared.cancels.lock().unwrap_or_else(|e| e.into_inner()).remove(&(pid, secret));
     result
+}
+
+/// The `dialect=name` in a `-c dialect=name` / `--dialect=name` list of startup options.
+fn dialect_in_options(options: &str) -> Option<String> {
+    let mut words = options.split_whitespace().peekable();
+    while let Some(w) = words.next() {
+        let setting = match w {
+            "-c" | "--set" => words.next()?,
+            other => other.strip_prefix("-c").or_else(|| other.strip_prefix("--"))?,
+        };
+        let (name, value) = setting.split_once('=')?;
+        if name.eq_ignore_ascii_case("dialect") || name.eq_ignore_ascii_case("accessor.dialect") {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn authenticate(reader: &mut impl Read, out: &mut impl Write, shared: &Shared, user: &str) -> io::Result<bool> {
