@@ -264,6 +264,10 @@ fn catalog_queries_work_through_the_extended_protocol() {
     // the navigator: the schema's number, then its tables, columns and indexes by that number
     let mut c = Client::connect(&conn, NoTls).unwrap();
     c.batch_execute("CREATE TABLE emp (id int PRIMARY KEY, name varchar(20) NOT NULL); CREATE INDEX emp_name ON emp(name)").unwrap();
+    // double-quoted names are identifiers (DBeaver quotes every name that has capitals)
+    c.batch_execute("CREATE TABLE \"Album\" (\"AlbumId\" int PRIMARY KEY, \"Title\" text); INSERT INTO \"Album\" VALUES (1, 'x')").unwrap();
+    let rows = c.simple_query("SELECT a.* FROM \"Album\" AS a").unwrap();
+    assert!(rows.iter().any(|m| matches!(m, SimpleQueryMessage::Row(r) if r.get(1) == Some("x") && r.columns()[0].name() == "AlbumId")));
     let schema: i64 = c.query_one("SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'public'", &[]).unwrap().get::<_, i64>(0);
     assert_eq!(schema, 2200);
     // JDBC declares its parameters (setLong is int8) when it prepares
@@ -273,8 +277,8 @@ fn catalog_queries_work_through_the_extended_protocol() {
         c.query(&st, &[&v]).unwrap()
     };
     let tables = q(&mut c, "SELECT c.oid, c.relname, c.relkind FROM pg_catalog.pg_class c WHERE c.relnamespace = $1 AND c.relkind NOT IN ('i','I','c')", schema);
-    assert_eq!(tables.len(), 1);
-    let table: i64 = tables[0].get::<_, &str>(0).parse().unwrap();
+    assert_eq!(tables.len(), 2);
+    let table: i64 = tables.iter().find(|r| r.get::<_, &str>(1) == "emp").unwrap().get::<_, &str>(0).parse().unwrap();
     let cols = q(&mut c, "SELECT a.attname, a.atttypid, a.atttypmod, a.attnum FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum", table);
     assert_eq!(cols.len(), 2);
     assert_eq!(cols[1].get::<_, &str>(1), "1043");

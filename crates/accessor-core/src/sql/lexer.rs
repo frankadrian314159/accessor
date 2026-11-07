@@ -409,6 +409,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             }
             i += 1;
             out.push(Token { tok: Tok::Quoted(name), pos });
+        } else if c == '"' && matches!(dialect::current(), Dialect::Postgresql | Dialect::Tsql) {
+            // PostgreSQL and SQL Server: "name" is an identifier, case kept; "" inside stands for one quote
+            let mut name = String::new();
+            i += 1;
+            loop {
+                match at(i) {
+                    None => return Err(Error::syntax("unterminated quoted identifier")),
+                    Some('"') if at(i + 1) == Some('"') => {
+                        name.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    Some('"') => break,
+                    Some(ch) => name.push(ch),
+                }
+                i += 1;
+            }
+            i += 1;
+            out.push(Token { tok: Tok::Quoted(name), pos });
         } else if c == '\'' || c == '"' {
             let quote = c;
             let mut s = String::new();
