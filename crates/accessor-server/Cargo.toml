@@ -1,0 +1,28 @@
+[package]
+name = "accessor-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "A PostgreSQL-protocol server for Accessor"
+
+[dependencies]
+accessor-core = { path = "../accessor-core" }
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+base64 = "0.22"
+getrandom = "0.3"
+ctrlc = "3"
+
+[dev-dependencies]
+postgres = "0.19"
+tempfile = { workspace = true }
+
+[lib]
+name = "accessor_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "accessor-server"
+path = "src/main.rs"
