@@ -285,9 +285,10 @@ only as precise as a `DOUBLE`; everything else is exact.
 
 ## Dates and times
 
-A `DATETIME` field holds a moment as a whole number of seconds since 1970-01-01 00:00:00,
+A `DATETIME` field holds a moment as a number of milliseconds since 1970-01-01 00:00:00,
 in UTC, so dates before 1970 work and there are no time zones or daylight-saving
-rules to think about. Fractions of a second are not kept. `DATE`, `TIME` and `TIMESTAMP`
+rules to think about. Fractions of a second are kept only in PostgreSQL mode
+(to the millisecond); in ASQL and MySQL mode they are dropped. `DATE`, `TIME` and `TIMESTAMP`
 are accepted as other names for the type. The calendar is the proleptic Gregorian one.
 
 ```sql
