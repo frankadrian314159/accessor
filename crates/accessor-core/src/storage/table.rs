@@ -786,6 +786,7 @@ impl Table {
             fill = match column.data_type {
                 DataType::Text => Value::text(""),
                 DataType::DateTime => Value::DateTime(0),
+                DataType::Date => Value::Date(0),
 
                 _ => Value::Int(0).coerce_to(column.data_type).unwrap_or(Value::Null),
             };

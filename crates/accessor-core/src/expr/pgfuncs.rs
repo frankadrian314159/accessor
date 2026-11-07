@@ -170,6 +170,7 @@ fn type_label(v: &Value) -> &'static str {
         "TEXT" => "text",
         "YESNO" => "boolean",
         "DATETIME" => "timestamp without time zone",
+        "DATE" => "date",
         "TIMESTAMPTZ" => "timestamp with time zone",
         "INTERVAL" => "interval",
         "JSON" => "jsonb",
@@ -377,7 +378,7 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         MakeDate => {
             let (y, m, d) = (int(v(0))?, int(v(1))?, int(v(2))?);
             let t = datetime::from_components(y, m as u32, d as u32, 0, 0, 0).ok_or_else(|| Error::runtime("date field value out of range"))?;
-            Value::DateTime(t)
+            Value::Date(t)
         }
         MakeTimestamp | MakeTimestamptz => {
             let (y, mo, d, h, mi) = (int(v(0))?, int(v(1))?, int(v(2))?, int(v(3))?, int(v(4))?);
@@ -430,10 +431,10 @@ pub fn call(f: PgFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         }
         ToDate => {
             let local = parse_datetime(&text(v(0)), &text(v(1)))?;
-            Value::DateTime(local.div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY)
+            Value::Date(local.div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY)
         }
         ToChar => match v(0) {
-            Value::DateTime(t) => Value::text(&format_datetime(*t, &text(v(1)))),
+            Value::DateTime(t) | Value::Date(t) => Value::text(&format_datetime(*t, &text(v(1)))),
             Value::TimestampTz(t) => Value::text(&format_datetime(tz::session().to_local(*t), &text(v(1)))),
             other => match other.num_lenient().as_deref() {
                 Some(n) => {

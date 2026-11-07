@@ -485,13 +485,6 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_inner(&mut self, e: &Expr) -> Result<BExpr> {
-        // timestamp - timestamp, when one is written as TIMESTAMP '..': an interval
-        if let Expr::Binary { op: crate::sql::ast::BinOp::Sub, left, right } = e {
-            let marked = |x: &Expr| matches!(x, Expr::Function { name, .. } if name == "__TS");
-            if crate::dialect::current() == crate::dialect::Dialect::Postgresql && (marked(left) || marked(right)) {
-                return self.bind(&Expr::Function { name: "__TSDIFF".into(), args: vec![(**left).clone(), (**right).clone()], distinct: false, star: false });
-            }
-        }
         // a comparison of texts in a collation compares their sort keys
         if let Expr::Binary { op: op @ (crate::sql::ast::BinOp::Eq | crate::sql::ast::BinOp::Ne | crate::sql::ast::BinOp::Lt | crate::sql::ast::BinOp::Le | crate::sql::ast::BinOp::Gt | crate::sql::ast::BinOp::Ge), left, right } = e {
             let (l, r) = (self.collation_of(left), self.collation_of(right));
@@ -630,6 +623,20 @@ impl<'a> Binder<'a> {
             Expr::Binary { op, left, right } => BExpr::Bin(*op, self.boxed(left)?, self.boxed(right)?),
             Expr::IsNull { expr, negated } => BExpr::IsNull(self.boxed(expr)?, *negated),
             Expr::Like { expr, pattern, negated } => {
+                // under a collation that calls different texts equal (case-insensitive, accent-insensitive), both sides are
+                // folded to what the collation tells apart before they are matched
+                let chosen = self.collation_of(pattern).filter(|c| c.1).or_else(|| self.collation_of(expr));
+                if let Some((name, _)) = chosen {
+                    if !crate::collation::lookup(&name)?.deterministic {
+                        let fold = |x: &Expr, is_pattern: bool| Expr::Function {
+                            name: "__COLLFOLD".into(),
+                            args: vec![Expr::Literal(Value::text(&name)), strip_collate(x), Expr::Literal(Value::Bool(is_pattern))],
+                            distinct: false,
+                            star: false,
+                        };
+                        return self.bind(&Expr::Like { expr: Box::new(fold(expr, false)), pattern: Box::new(fold(pattern, true)), negated: *negated });
+                    }
+                }
                 let pattern = self.boxed(pattern)?;
                 let compiled = match &*pattern {
                     BExpr::Lit(Value::Text(s)) => Some(LikePattern::new(s)),

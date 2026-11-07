@@ -125,6 +125,7 @@ pub(crate) fn cast_function(ty: DataType) -> Option<&'static str> {
         DataType::Text => "CSTR",
         DataType::YesNo => "CBOOL",
         DataType::DateTime => "CDATE",
+        DataType::Date => "__TODATE",
         DataType::TimestampTz => "CTIMESTAMPTZ",
         DataType::Interval => "CINTERVAL",
         DataType::Json => "JSON_PARSE",
@@ -7664,9 +7665,8 @@ impl<'a> Parser<'a> {
                         let Tok::Str(text) = self.advance() else { unreachable!("checked") };
                         let t = crate::datetime::parse(&text)
                             .ok_or_else(|| Error::syntax(format!("'{text}' is not a valid {up} literal")))?;
-                        // TIMESTAMP '..' is marked, so that a difference of two timestamps at midnight is an interval, not days
-                        if up == "TIMESTAMP" && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
-                            return Ok(Expr::Function { name: "__TS".into(), args: vec![Expr::Literal(Value::DateTime(t))], distinct: false, star: false });
+                        if up == "DATE" && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                            return Ok(Expr::Literal(Value::Date(crate::datetime::trunc_day(t))));
                         }
                         return Ok(Expr::Literal(Value::DateTime(t)));
                     }
@@ -8600,8 +8600,7 @@ impl<'a> Parser<'a> {
         }
         while self.eat_kw("ASCII") || self.eat_kw("UNICODE") || self.eat_kw("BINARY") {}
         self.expect_sym(")")?;
-        let cast = make_cast(e, ty, &hints);
-        Ok(if is_timestamp_name(&tn) { mark_timestamp(cast) } else { cast })
+        Ok(make_cast(e, ty, &hints))
     }
 
     /// The type after `::`, with an optional size, applied to `e`.
@@ -8660,10 +8659,8 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let is_ts = is_timestamp_name(&tn) && !self.peek_sym("[");
         let ty = self.array_suffix(ty);
-        let cast = make_cast(e, ty, &hints);
-        Ok(if is_ts { mark_timestamp(cast) } else { cast })
+        Ok(make_cast(e, ty, &hints))
     }
 
     /// `TRIM([LEADING|TRAILING|BOTH] [chars FROM] x)` after the parenthesis.
@@ -9007,16 +9004,6 @@ mod tests {
 }
 
 /// `CAST(e AS ty)` / `e::ty` as the function that does the conversion; a decimal scale rounds.
-/// Is this the name of the type `timestamp` (PostgreSQL mode)?
-fn is_timestamp_name(tn: &str) -> bool {
-    crate::dialect::current() == crate::dialect::Dialect::Postgresql && tn.eq_ignore_ascii_case("timestamp")
-}
-
-/// Marks a value as a timestamp, so that the difference of two is an interval and not a number of days.
-fn mark_timestamp(e: Expr) -> Expr {
-    Expr::Function { name: "__TS".into(), args: vec![e], distinct: false, star: false }
-}
-
 fn make_cast(e: Expr, ty: DataType, hints: &[i64]) -> Expr {
     let name = match ty {
         // CAST drops the fraction of a float; the Access function CInt() rounds

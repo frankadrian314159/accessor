@@ -42,6 +42,7 @@ fn pg_type_name(d: DataType) -> &'static str {
         DataType::Text => "text",
         DataType::YesNo => "boolean",
         DataType::DateTime => "timestamp without time zone",
+        DataType::Date => "date",
         DataType::TimestampTz => "timestamp with time zone",
         DataType::Interval => "interval",
         DataType::Json => "jsonb",

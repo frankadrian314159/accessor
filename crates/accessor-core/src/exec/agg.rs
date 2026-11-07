@@ -154,6 +154,32 @@ pub struct AggSpec {
     pub order: Vec<(BExpr, bool)>,
 }
 
+/// The variance (or its square root) of numerics, exactly as PostgreSQL computes it: the numerator and denominator are
+/// exact and the quotient has the scale the division rules give; a square root keeps that scale.
+fn exact_variance(func: AggFn, n: i64, sum: &crate::decimal::Decimal, sum2: &crate::decimal::Decimal) -> Option<Value> {
+    use crate::decimal::Decimal;
+    let n_d = Decimal::from_i64(n);
+    let numerator = n_d.mul(sum2).sub(&sum.mul(sum));
+    let denominator = match func {
+        AggFn::VarPop | AggFn::StddevPop => n_d.mul(&n_d),
+        _ => n_d.mul(&Decimal::from_i64(n - 1)),
+    };
+    // no spread at all is a plain zero
+    let var = if numerator.is_zero() { Decimal::from_i64(0) } else { numerator.div(&denominator)? };
+    if matches!(func, AggFn::VarPop | AggFn::VarSamp) {
+        return Some(Value::Dec(var));
+    }
+    // the square root, to the scale of the variance
+    let (mant, scale) = var.parts();
+    let wanted = scale;
+    let shifted = mant * num_bigint::BigInt::from(10).pow(wanted);
+    let root = num_bigint::BigInt::sqrt(&shifted);
+    // round to nearest: root + 1 is closer when (2 root + 1)^2 <= 4 * shifted
+    let next = &root * 2 + 1;
+    let root = if &next * &next <= shifted.clone() * 4 { root + 1 } else { root };
+    Some(Value::Dec(Decimal::with_kept_scale(root, i64::from(wanted))))
+}
+
 #[derive(Clone)]
 pub struct AggState {
     func: AggFn,
@@ -175,6 +201,9 @@ pub struct AggState {
     cxy: f64,
     /// The bits of `BIT_AND` / `BIT_OR` / `BIT_XOR`: all ones to start with for the first, zero for the others.
     bits: u64,
+    /// PostgreSQL's variance of numerics is computed exactly: n, the sum, the sum of squares, and whether all were exact.
+    exact: Option<(crate::decimal::Decimal, crate::decimal::Decimal)>,
+    inexact: bool,
 }
 
 impl AggState {
@@ -195,6 +224,8 @@ impl AggState {
             m2_y: 0.0,
             cxy: 0.0,
             bits: if spec.func == AggFn::BitAnd { u64::MAX } else { 0 },
+            exact: None,
+            inexact: false,
         }
     }
 
@@ -235,7 +266,7 @@ impl AggState {
             AggFn::Count => self.count += 1,
             AggFn::Sum => {
                 let v = match v {
-                    Value::Text(_) | Value::DateTime(_) => v
+                    Value::Text(_) | Value::DateTime(_) | Value::Date(_) => v
                         .num_lenient()
                         .ok_or_else(|| Error::type_err(format!("cannot sum '{v}'")))?
                         .into_owned(),
@@ -312,6 +343,20 @@ impl AggState {
                     .num_lenient()
                     .and_then(|n| n.to_f64())
                     .ok_or_else(|| Error::type_err(format!("cannot compute a variance over '{v}'")))?;
+                if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+                    match v {
+                        Value::Dec(d) => {
+                            let (s, s2) = self.exact.take().unwrap_or_else(|| (crate::decimal::Decimal::from_i64(0), crate::decimal::Decimal::from_i64(0)));
+                            self.exact = Some((s.add(d), s2.add(&d.mul(d))));
+                        }
+                        Value::Int(i) => {
+                            let d = crate::decimal::Decimal::from_i64(*i);
+                            let (s, s2) = self.exact.take().unwrap_or_else(|| (crate::decimal::Decimal::from_i64(0), crate::decimal::Decimal::from_i64(0)));
+                            self.exact = Some((s.add(&d), s2.add(&d.mul(&d))));
+                        }
+                        _ => self.inexact = true,
+                    }
+                }
                 self.count += 1;
                 let delta = x - self.mean;
                 self.mean += delta / self.count as f64;
@@ -445,6 +490,11 @@ impl AggState {
                 };
                 if !enough {
                     return Value::Null;
+                }
+                if let (Some((sum, sum2)), false) = (&self.exact, self.inexact) {
+                    if let Some(v) = exact_variance(self.func, self.count, sum, sum2) {
+                        return v;
+                    }
                 }
                 let r = if matches!(self.func, AggFn::StddevPop | AggFn::StddevSamp) { var.sqrt() } else { var };
                 Value::from_f64(r).unwrap_or(Value::Null)

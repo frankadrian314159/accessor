@@ -323,6 +323,7 @@ impl Cell {
             Value::Currency(d) => Cell::text_of(ACC_TYPE_CURRENCY, &d.to_string()),
             Value::Rational(r) => Cell::text_of(ACC_TYPE_RATIONAL, &r.to_string()),
             Value::DateTime(t) => Cell { tag: ACC_TYPE_DATETIME, int: t.div_euclid(1000), ..Cell::text_of(ACC_TYPE_DATETIME, &accessor_core::datetime::format(*t)) },
+            Value::Date(t) => Cell { tag: ACC_TYPE_DATETIME, int: t.div_euclid(1000), ..Cell::text_of(ACC_TYPE_DATETIME, &accessor_core::datetime::format_date(*t)) },
             Value::TimestampTz(t) => Cell { tag: ACC_TYPE_TIMESTAMPTZ, int: t.div_euclid(1000), ..Cell::text_of(ACC_TYPE_TIMESTAMPTZ, &v.to_string()) },
             Value::Interval(_) => Cell::text_of(ACC_TYPE_INTERVAL, &v.to_string()),
             Value::Json(s) => Cell::text_of(ACC_TYPE_JSON, s),

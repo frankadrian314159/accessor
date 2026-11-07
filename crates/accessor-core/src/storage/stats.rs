@@ -48,7 +48,7 @@ fn same_kind(a: &Value, b: &Value) -> bool {
     let numeric = |v: &Value| v.is_numeric();
     (numeric(a) && numeric(b))
         || matches!((a, b), (Text(_), Text(_)) | (Bool(_), Bool(_)) | (Interval(_), Interval(_)) | (Json(_), Json(_)))
-        || matches!((a, b), (DateTime(_), DateTime(_)) | (TimestampTz(_), TimestampTz(_)))
+        || matches!((a, b), (DateTime(_) | Date(_), DateTime(_) | Date(_)) | (TimestampTz(_), TimestampTz(_)))
 }
 
 impl ColumnStats {

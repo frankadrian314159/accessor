@@ -41,9 +41,9 @@ pub enum MoreFn {
     JsonExtractPath,
     JsonExtractPathText,
     CollKey,
+    CollFold,
     Collate,
-    TsMark,
-    TsDiff,
+    ToDateType,
     JsonbExists,
     JsonbExistsAny,
     JsonbExistsAll,
@@ -144,10 +144,10 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "JSON_BUILD_ARRAY" | "JSONB_BUILD_ARRAY" => (JsonBuildArray, 0, usize::MAX),
         "JSON_EXTRACT_PATH" | "JSONB_EXTRACT_PATH" => (JsonExtractPath, 1, usize::MAX),
         "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT" => (JsonExtractPathText, 1, usize::MAX),
-        "__TS" => (TsMark, 1, 1),
-        "__TSDIFF" => (TsDiff, 2, 2),
+        "__TODATE" => (ToDateType, 1, 1),
         "__COLLKEY" => (CollKey, 2, 2),
         "__COLLATE" => (Collate, 2, 2),
+        "__COLLFOLD" => (CollFold, 3, 3),
         "JSONB_EXISTS" => (JsonbExists, 2, 2),
         "JSONB_EXISTS_ANY" => (JsonbExistsAny, 2, 2),
         "JSONB_EXISTS_ALL" => (JsonbExistsAll, 2, 2),
@@ -882,13 +882,14 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 other => Value::Bytes(std::sync::Arc::new(c.key(&other.to_string()))),
             }
         }
-        Collate | TsMark => v(0).clone(),
-        TsDiff => match (v(0), v(1)) {
-            (Value::DateTime(a) | Value::TimestampTz(a), Value::DateTime(b) | Value::TimestampTz(b)) if !crate::datetime::is_infinite(*a) && !crate::datetime::is_infinite(*b) => {
-                let diff = a.checked_sub(*b).ok_or_else(|| Error::runtime("interval out of range"))?;
-                Value::Interval(crate::interval::Interval::new(0, diff / crate::datetime::MS_PER_DAY, diff % crate::datetime::MS_PER_DAY))
-            }
-            (x, y) => crate::numeric::arith(crate::sql::ast::BinOp::Sub, x, y)?,
+        CollFold => match v(1) {
+            Value::Null => Value::Null,
+            other => Value::text(&crate::collation::lookup(&text(v(0)))?.fold(&other.to_string(), matches!(v(2), Value::Bool(true)))),
+        },
+        Collate => v(0).clone(),
+        ToDateType => match v(0) {
+            Value::Null => Value::Null,
+            other => other.coerce_to(crate::value::DataType::Date)?,
         },
         JustifyDays => Value::Interval(justify_days(interval_of(v(0))?)),
         JustifyHours => Value::Interval(justify_hours(interval_of(v(0))?)),

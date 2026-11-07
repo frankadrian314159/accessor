@@ -206,6 +206,27 @@ fn tailored(lang: &str, c: char) -> Option<u32> {
 }
 
 impl Collation {
+    /// The text reduced to what this collation tells apart, for `LIKE` under a non-deterministic collation: the case
+    /// (strength 2 and below) and the accents (strength 1) are dropped. In a pattern the wildcards stay as they are.
+    pub fn fold(&self, text: &str, pattern: bool) -> String {
+        if self.binary || self.strength >= 3 {
+            return text.to_string();
+        }
+        text.chars()
+            .map(|c| {
+                if pattern && matches!(c, '%' | '_' | '\\') {
+                    return c;
+                }
+                let lower = c.to_lowercase().next().unwrap_or(c);
+                if self.strength == 1 {
+                    decompose(lower).0
+                } else {
+                    lower
+                }
+            })
+            .collect()
+    }
+
     /// The bytes that stand for `text` in this collation; texts the collation puts in the same place get the same bytes.
     pub fn key(&self, text: &str) -> Vec<u8> {
         if self.binary {

@@ -7806,3 +7806,43 @@ fn postgresql_fractional_seconds_money_phrase_search_and_collations() {
     db.execute("DROP COLLATION ci").unwrap();
     assert!(db.execute("SELECT 'abc' = 'ABC' COLLATE ci").is_err());
 }
+
+#[test]
+fn postgresql_dates_are_not_timestamps_numeric_scales_and_cover_density() {
+    let mut db = pg();
+    // date and timestamp are different types
+    assert_eq!(pg_one(&mut db, "SELECT pg_typeof(date '2001-02-17')"), "date");
+    assert_eq!(pg_one(&mut db, "SELECT pg_typeof(timestamp '2001-02-17')"), "timestamp without time zone");
+    assert_eq!(pg_one(&mut db, "SELECT timestamp '2001-02-17'"), "2001-02-17 00:00:00");
+    assert_eq!(pg_one(&mut db, "SELECT date '2001-02-17' - date '2001-02-16'"), "1");
+    assert_eq!(pg_one(&mut db, "SELECT timestamp '2001-02-17' - timestamp '2001-02-16'"), "1 day");
+    assert_eq!(pg_one(&mut db, "SELECT date '2001-02-17' + 1"), "2001-02-18");
+    assert_eq!(pg_one(&mut db, "SELECT date '2001-02-17' + interval '1 hour'"), "2001-02-17 01:00:00");
+    assert_eq!(pg_one(&mut db, "SELECT '2001-02-17 10:00'::date"), "2001-02-17");
+    assert_eq!(pg_one(&mut db, "SELECT extract(epoch from date '2020-08-11')"), "1597104000");
+    assert_eq!(pg_one(&mut db, "SELECT make_date(2020, 1, 2) = date '2020-01-02'"), "true");
+    db.execute("CREATE TABLE dt (d date, t timestamp)").unwrap();
+    db.execute("INSERT INTO dt VALUES ('2020-01-02 03:04:05', '2020-01-02 03:04:05')").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT d::text || ' ' || t::text FROM dt"), "2020-01-02 2020-01-02 03:04:05");
+    assert_eq!(pg_one(&mut db, "SELECT d < t FROM dt"), "true");
+
+    // numeric scales
+    assert_eq!(pg_one(&mut db, "SELECT power('-2'::numeric, '3')"), "-8.0000000000000000");
+    assert_eq!(pg_one(&mut db, "SELECT power(2, 3)"), "8");
+    db.execute("CREATE TABLE nd (id int, val numeric(210,10))").unwrap();
+    db.execute("INSERT INTO nd VALUES (1, '-34338492.215397047'), (2, '4.31'), (3, '7799461.4119'), (4, '16397.038491028')").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT variance(val) FROM nd"), "354700482167867.45718931408708663425");
+    assert_eq!(pg_one(&mut db, "SELECT stddev(val) FROM nd"), "18833493.62619340090208276165");
+    db.execute("CREATE TABLE zr (a numeric)").unwrap();
+    db.execute("INSERT INTO zr VALUES ('0.0')").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT a FROM zr"), "0.0");
+
+    // cover density
+    assert_eq!(pg_one(&mut db, "SELECT ts_rank_cd(' a:1 s:2C d g'::tsvector, 'a | s')"), "0.3");
+    assert_eq!(pg_one(&mut db, "SELECT ts_rank_cd(' a:1 s:2,3A d:2A g'::tsvector, 'a <2> s:A')"), "0.09090909");
+
+    // LIKE and a collation that calls different texts equal
+    db.execute("CREATE COLLATION ci2 (provider = icu, locale = 'und-u-ks-level2', deterministic = false)").unwrap();
+    assert_eq!(pg_one(&mut db, "SELECT 'abc' LIKE 'ABC' COLLATE ci2"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT 'abc' LIKE 'ÄB%' COLLATE ci2"), "false");
+}

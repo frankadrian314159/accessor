@@ -202,7 +202,7 @@ fn family(v: &Value) -> u8 {
     match v {
         Value::Bool(_) => 1,
         Value::Text(_) => 4,
-        Value::DateTime(_) => 3,
+        Value::DateTime(_) | Value::Date(_) => 3,
         Value::TimestampTz(_) => 7,
         Value::Interval(_) => 5,
         Value::Json(_) => 6,

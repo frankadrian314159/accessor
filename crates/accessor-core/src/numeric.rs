@@ -301,8 +301,20 @@ fn int_div_mod(op: BinOp, x: &Value, y: &Value) -> Result<Value> {
     Ok(if big_operand { Value::Big(r) } else { int_or_big(r) })
 }
 
-/// `x ^ y`.
+/// `x ^ y`. With a `numeric` in PostgreSQL mode the result has 16 significant digits at least, and the scale of either operand.
 fn power(x: &Value, y: &Value) -> Result<Value> {
+    let r = power_exact(x, y)?;
+    if crate::dialect::current() != crate::dialect::Dialect::Postgresql || !(matches!(x, Value::Dec(_)) || matches!(y, Value::Dec(_))) {
+        return Ok(r);
+    }
+    let (Some(d), Value::Dec(_) | Value::Int(_) | Value::Big(_)) = (r.as_decimal(), &r) else { return Ok(r) };
+    let weight = Some(d.to_f64()).filter(|f| *f != 0.0 && f.is_finite()).map_or(0, |f| f.abs().log10() as i64);
+    let own = |v: &Value| if let Value::Dec(d) = v { i64::from(d.scale()) } else { 0 };
+    let rscale = (16 - weight).max(own(x)).max(own(y)).clamp(0, 1000);
+    Ok(Value::Dec(d.with_scale(rscale as u32)))
+}
+
+fn power_exact(x: &Value, y: &Value) -> Result<Value> {
     let (kx, ky) = (x.kind().ok_or_else(overflow)?, y.kind().ok_or_else(overflow)?);
     let inexact = |k: Kind| matches!(k, Kind::Float | Kind::Double);
     if inexact(kx) || inexact(ky) {
@@ -347,7 +359,7 @@ fn power(x: &Value, y: &Value) -> Result<Value> {
         }
         // A negative whole exponent divides one by the positive power: a decimal.
         Value::Dec(_) | Value::Currency(_) | Value::Int(_) | Value::Big(_) => {
-            let positive = power(x, &Value::Int(-e))?;
+            let positive = power_exact(x, &Value::Int(-e))?;
             if positive.is_zero() {
                 return Err(division_by_zero());
             }
@@ -404,10 +416,10 @@ fn interval_arith(op: BinOp, a: &Value, b: &Value) -> Result<Option<Value>> {
             let inverse = Decimal::from_i64(1).div(&d).ok_or_else(division_by_zero)?;
             scale(x, &inverse)?
         }
-        (BinOp::Add, Value::DateTime(t), Value::Interval(i)) | (BinOp::Add, Value::Interval(i), Value::DateTime(t)) => {
+        (BinOp::Add, Value::DateTime(t) | Value::Date(t), Value::Interval(i)) | (BinOp::Add, Value::Interval(i), Value::DateTime(t) | Value::Date(t)) => {
             Value::DateTime(i.add_to_local(*t, 1).ok_or_else(out_of_range)?)
         }
-        (BinOp::Sub, Value::DateTime(t), Value::Interval(i)) => Value::DateTime(i.add_to_local(*t, -1).ok_or_else(out_of_range)?),
+        (BinOp::Sub, Value::DateTime(t) | Value::Date(t), Value::Interval(i)) => Value::DateTime(i.add_to_local(*t, -1).ok_or_else(out_of_range)?),
         (BinOp::Add, Value::TimestampTz(t), Value::Interval(i)) | (BinOp::Add, Value::Interval(i), Value::TimestampTz(t)) => {
             Value::TimestampTz(move_tz(*t, i, 1)?)
         }
@@ -535,15 +547,26 @@ fn arith_checked(op: BinOp, a: &Value, b: &Value) -> Result<Value> {
     }
     // Date arithmetic: dates are counted in days.
     match (op, a, b) {
-        // PostgreSQL: a difference of timestamps is an interval of days and time
-        (BinOp::Sub, Value::DateTime(t), Value::DateTime(u))
+        // PostgreSQL: the difference of two dates is a number of days; of a timestamp and a date or another timestamp, an interval
+        (BinOp::Sub, Value::Date(t), Value::Date(u)) if !crate::datetime::is_infinite(*t) && !crate::datetime::is_infinite(*u) => {
+            return Ok(Value::Int((t - u) / crate::datetime::MS_PER_DAY));
+        }
+        (BinOp::Sub, Value::DateTime(t) | Value::Date(t), Value::DateTime(u) | Value::Date(u))
             if crate::dialect::current() == crate::dialect::Dialect::Postgresql
                 && !crate::datetime::is_infinite(*t)
-                && !crate::datetime::is_infinite(*u)
-                && (t.rem_euclid(crate::datetime::MS_PER_DAY) != 0 || u.rem_euclid(crate::datetime::MS_PER_DAY) != 0) =>
+                && !crate::datetime::is_infinite(*u) =>
         {
             let diff = t.checked_sub(*u).ok_or_else(overflow)?;
             return Ok(Value::Interval(crate::interval::Interval::new(0, diff / crate::datetime::MS_PER_DAY, diff % crate::datetime::MS_PER_DAY)));
+        }
+        // a date plus or minus whole days is a date
+        (BinOp::Add, Value::Date(t), n) | (BinOp::Add, n, Value::Date(t)) if n.num().is_some() => {
+            let n = n.num().ok_or_else(overflow)?;
+            return Ok(Value::Date(t + day_ms(&n)?));
+        }
+        (BinOp::Sub, Value::Date(t), n) if n.num().is_some() => {
+            let n = n.num().ok_or_else(overflow)?;
+            return Ok(Value::Date(t - day_ms(&n)?));
         }
         (BinOp::Sub, Value::DateTime(t), Value::DateTime(u)) => {
             let days = Decimal::from_i64(t - u).div(&Decimal::from_i64(86_400_000)).ok_or_else(division_by_zero)?;

@@ -506,7 +506,7 @@ fn print_result(res: &QueryResult) {
 fn sql_literal(v: &Value) -> String {
     match v {
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
-        Value::DateTime(_) => format!("#{v}#"),
+        Value::DateTime(_) | Value::Date(_) => format!("#{v}#"),
         // Money prints with a `$`, which SQL numbers do not have.
         Value::Currency(_) => v.to_string().replace('$', ""),
         other => other.to_string(),

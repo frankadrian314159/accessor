@@ -518,16 +518,22 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
             // `DATE()` is today; `DATE(x)` is the date part of x
             if let Some(a) = args.first() {
                 let v = a.eval(row)?;
+                let pg = crate::dialect::current() == crate::dialect::Dialect::Postgresql;
                 return Ok(match v.coerce_to(DataType::DateTime) {
+                    Ok(Value::DateTime(t)) if pg => Value::Date(t.div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY),
                     Ok(Value::DateTime(t)) => Value::DateTime(t.div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY),
                     _ => Value::Null,
                 });
             }
-            return Ok(Value::DateTime(datetime::now().div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY));
+            let today = datetime::now().div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY;
+            return Ok(if crate::dialect::current() == crate::dialect::Dialect::Postgresql { Value::Date(today) } else { Value::DateTime(today) });
         }
         NowTz => return Ok(Value::TimestampTz(datetime::now())),
         LocalNow => return Ok(Value::DateTime(tz::session().to_local(datetime::now()))),
-        LocalDate => return Ok(Value::DateTime(tz::session().to_local(datetime::now()).div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY)),
+        LocalDate => {
+            let today = tz::session().to_local(datetime::now()).div_euclid(datetime::MS_PER_DAY) * datetime::MS_PER_DAY;
+            return Ok(if crate::dialect::current() == crate::dialect::Dialect::Postgresql { Value::Date(today) } else { Value::DateTime(today) });
+        }
         SessionTimeZone => return Ok(Value::text(&tz::session().name())),
         _ => {}
     }
@@ -883,7 +889,7 @@ pub fn call(f: ScalarFn, args: &[BExpr], row: &[Value]) -> Result<Value> {
                     "s" | "second" => return Ok(fractional(ms, 1)),
                     "milliseconds" => return Ok(fractional(ms, 1000)),
                     "microseconds" => return Ok(fractional(ms, 1_000_000)),
-                    "epoch" if t.rem_euclid(datetime::MS_PER_DAY) == 0 => return Ok(Value::Int(t.div_euclid(1000))),
+                    "epoch" if matches!(&*vals[1], Value::Date(_)) => return Ok(Value::Int(t.div_euclid(1000))),
                     "epoch" => return Ok(fractional(t, 1)),
                     _ => {}
                 }

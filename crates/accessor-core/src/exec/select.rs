@@ -2406,7 +2406,7 @@ fn compatible(dt: DataType, v: &Value) -> bool {
         || matches!(
             (dt, v),
             (DataType::Text, Value::Text(_))
-                | (DataType::DateTime | DataType::TimestampTz, Value::DateTime(_) | Value::TimestampTz(_))
+                | (DataType::DateTime | DataType::TimestampTz | DataType::Date, Value::DateTime(_) | Value::TimestampTz(_) | Value::Date(_))
                 | (DataType::Interval, Value::Interval(_))
                 | (DataType::YesNo, Value::Bool(_))
         )

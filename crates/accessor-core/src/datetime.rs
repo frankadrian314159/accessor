@@ -144,11 +144,32 @@ pub fn format(t: i64) -> String {
     }
     let (y, mo, d, h, mi, s) = components(t);
     let ms = millis(t);
-    if h == 0 && mi == 0 && s == 0 && ms == 0 {
+    if h == 0 && mi == 0 && s == 0 && ms == 0 && crate::dialect::current() != crate::dialect::Dialect::Postgresql {
         format!("{y:04}-{mo:02}-{d:02}")
     } else {
         format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{}", seconds_text(s, ms))
     }
+}
+
+/// The start of the day a timestamp falls in (an infinite reading stays as it is).
+pub fn trunc_day(t: i64) -> i64 {
+    if is_infinite(t) {
+        t
+    } else {
+        t.div_euclid(MS_PER_DAY) * MS_PER_DAY
+    }
+}
+
+/// A `DATE` as text: `2024-02-29`, `infinity`.
+pub fn format_date(t: i64) -> String {
+    if t >= INFINITY {
+        return "infinity".into();
+    }
+    if t <= NEG_INFINITY {
+        return "-infinity".into();
+    }
+    let (y, mo, d, ..) = components(t);
+    format!("{y:04}-{mo:02}-{d:02}")
 }
 
 /// Reads the seconds of a clock (`07`, `07.5`, `07.123456`) as milliseconds. Outside PostgreSQL mode the fraction is dropped.

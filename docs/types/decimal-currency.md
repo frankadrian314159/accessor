@@ -20,7 +20,7 @@ A number with a decimal point and no exponent is a `DECIMAL`: `19.99`, `.5`, `10
 
 A decimal is stored by value, not by the way it was written. `1.10` and `1.1` are the same number and both display as `1.1`; `10.00` displays as `10`. If you want two decimal places on output, use `Format(x, '0.00')` or `Format(x, 'Fixed')`.
 
-In **PostgreSQL mode** a number keeps its scale, as `numeric` does: `0.0000` and `1.50` display as written, `1.5 * 2` is `3.0`, `2.50 + 1` is `3.50` (the larger scale for a sum, the sum of the scales for a product), `round(x, 3)` pads to three places, and a `numeric(p, s)` column pads or rounds (ties away from zero) every value it stores to `s` places. Comparison, `DISTINCT`, grouping and indexes go by value, so `0 = 0.0000` and `1.0`, `1.00` and `1` are one value. Division and averages still give the shortest exact (or 50-digit) result rather than PostgreSQL's scale rules.
+In **PostgreSQL mode** a number keeps its scale, as `numeric` does: `0.0000` and `1.50` display as written, `1.5 * 2` is `3.0`, `2.50 + 1` is `3.50` (the larger scale for a sum, the sum of the scales for a product), `round(x, 3)` pads to three places, and a `numeric(p, s)` column pads or rounds (ties away from zero) every value it stores to `s` places. Comparison, `DISTINCT`, grouping and indexes go by value, so `0 = 0.0000` and `1.0`, `1.00` and `1` are one value. Division, averages, `round`, `power` (16 significant digits at least) and `variance`/`stddev` (exact, then scaled as PostgreSQL does) follow PostgreSQL's scale rules, and text stored into a `numeric` column keeps its written scale (`'0.0'` stays `0.0`).
 
 ## Arithmetic
 

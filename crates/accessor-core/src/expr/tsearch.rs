@@ -20,8 +20,8 @@ pub const NAMES: &[(&str, usize, usize)] = &[
     ("WEBSEARCH_TO_TSQUERY", 1, 2),
     ("SETWEIGHT", 2, 3),
     ("STRIP", 1, 1),
-    ("TS_RANK", 2, 3),
-    ("TS_RANK_CD", 2, 3),
+    ("TS_RANK", 2, 4),
+    ("TS_RANK_CD", 2, 4),
     ("TS_HEADLINE", 2, 4),
     ("NUMNODE", 1, 1),
     ("QUERYTREE", 1, 1),
@@ -1085,6 +1085,81 @@ fn rank(doc: &[Lex], q: &Q, norm: i64) -> f64 {
     res
 }
 
+/// `ts_rank_cd`: cover density. A *cover* is a shortest run of the words of the document that holds the query; each adds
+/// its length over the sum of the inverse weights of its words, divided by one more than the words in it that the query
+/// does not use.
+fn rank_cd(doc: &[Lex], q: &Q, norm: i64, weights: [f64; 4]) -> f64 {
+    let mut terms = Vec::new();
+    operands(q, &mut terms);
+    // every position of a word the query names, with the weight it carries
+    let mut entries: Vec<(u16, u8, usize)> = Vec::new();
+    for (li, l) in doc.iter().enumerate() {
+        for (p, w) in &l.pos {
+            let bit = [1u8, 2, 4, 8][(*w).min(3) as usize];
+            let used = terms.iter().any(|t| {
+                let Q::Term { word, prefix, weights } = t else { return false };
+                (if *prefix { l.word.starts_with(word.as_str()) } else { l.word == *word }) && (*weights == 0 || weights & bit != 0)
+            });
+            if used {
+                entries.push((*p, *w, li));
+            }
+        }
+    }
+    entries.sort_unstable();
+    let holds = |from: usize, to: usize| -> bool {
+        let mut mini: Vec<Lex> = Vec::new();
+        for (p, w, li) in &entries[from..=to] {
+            match mini.iter_mut().find(|m| m.word == doc[*li].word) {
+                Some(m) => m.pos.push((*p, *w)),
+                None => mini.push(Lex { word: doc[*li].word.clone(), pos: vec![(*p, *w)] }),
+            }
+        }
+        eval(q, &mini).is_some()
+    };
+    let (mut wdoc, mut extents, mut sum_dist, mut prev_ext) = (0.0f64, 0usize, 0.0f64, 0.0f64);
+    let mut start = 0usize;
+    while start < entries.len() {
+        // the first end at which a cover exists, then the latest start that still holds the query
+        let Some(end) = (start..entries.len()).find(|&j| holds(start, j)) else { break };
+        let begin = (start..=end).rev().find(|&i| holds(i, end)).unwrap_or(start);
+        let inv_sum: f64 = entries[begin..=end].iter().map(|(_, w, _)| 1.0 / weights[(*w).min(3) as usize]).sum();
+        let cpos = (end - begin + 1) as f64 / inv_sum;
+        let (p, qpos) = (i64::from(entries[begin].0), i64::from(entries[end].0));
+        let mut noise = (qpos - p) - (end - begin) as i64;
+        if noise < 0 {
+            noise = (end - begin) as i64 / 2;
+        }
+        wdoc += cpos / (1 + noise) as f64;
+        let cur = (qpos + p) as f64 / 2.0;
+        if extents > 0 && cur > prev_ext {
+            sum_dist += 1.0 / (cur - prev_ext);
+        }
+        prev_ext = cur;
+        extents += 1;
+        start = begin + 1;
+    }
+    let len: f64 = doc.iter().map(|l| l.pos.len().max(1) as f64).sum();
+    if norm & 1 != 0 && !doc.is_empty() {
+        wdoc /= (len + 1.0).ln();
+    }
+    if norm & 2 != 0 && len > 0.0 {
+        wdoc /= len;
+    }
+    if norm & 4 != 0 && extents > 0 && sum_dist > 0.0 {
+        wdoc /= extents as f64 / sum_dist;
+    }
+    if norm & 8 != 0 && !doc.is_empty() {
+        wdoc /= doc.len() as f64;
+    }
+    if norm & 16 != 0 && !doc.is_empty() {
+        wdoc /= (doc.len() as f64 + 1.0).log2();
+    }
+    if norm & 32 != 0 {
+        wdoc /= wdoc + 1.0;
+    }
+    wdoc
+}
+
 fn fn_is_and(q: &Q) -> bool {
     match q {
         Q::Term { .. } => true,
@@ -1314,9 +1389,21 @@ pub fn call(name: &str, vals: &[Cow<'_, Value>]) -> Result<Value> {
             }
         }
         "TS_RANK" | "TS_RANK_CD" => {
-            let doc = vector_of(v(0))?;
-            let norm = vals.get(2).and_then(|n| n.to_f64()).unwrap_or(0.0) as i64;
-            match query_of(v(1))? {
+            // the weights ({D, C, B, A}) may come first
+            let (weights, args) = match v(0) {
+                Value::Array(w) if vals.len() >= 3 => {
+                    let mut ws = [0.1, 0.2, 0.4, 1.0];
+                    for (i, x) in w.iter().take(4).enumerate() {
+                        ws[i] = x.to_f64().unwrap_or(ws[i]);
+                    }
+                    (ws, &vals[1..])
+                }
+                _ => ([0.1, 0.2, 0.4, 1.0], vals),
+            };
+            let doc = vector_of(args[0].as_ref())?;
+            let norm = args.get(2).and_then(|n| n.to_f64()).unwrap_or(0.0) as i64;
+            match query_of(args[1].as_ref())? {
+                Some(q) if name == "TS_RANK_CD" => Value::Float(rank_cd(&doc, &q, norm, weights) as f32),
                 Some(q) => Value::Float(rank(&doc, &q, norm) as f32),
                 None => Value::Float(0.0),
             }
