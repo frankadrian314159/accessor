@@ -947,7 +947,9 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                         Value::Int(n) => crate::oid::name_of(*n).unwrap_or_else(|| n.to_string()),
                         other => other.to_string(),
                     };
-                    o.get(&key).and_then(|x| x.as_str()).map_or(Value::Null, Value::text)
+                    // a name as regclass writes it: "Quoted", or public.name
+                    let bare = key.strip_prefix("public.").unwrap_or(&key).trim_matches('"');
+                    o.get(&key).or_else(|| o.get(bare)).and_then(|x| x.as_str()).map_or(Value::Null, Value::text)
                 }
                 _ => Value::Null,
             },
