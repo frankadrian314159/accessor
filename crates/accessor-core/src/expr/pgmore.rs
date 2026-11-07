@@ -49,6 +49,7 @@ pub enum MoreFn {
     CatUserById,
     CatEncoding,
     CatFormatType,
+    RegName,
     CatGetExpr,
     CatNull,
     CatFalse,
@@ -162,6 +163,7 @@ pub fn lookup(name: &str) -> Option<(MoreFn, usize, usize)> {
         "PG_GET_USERBYID" => (CatUserById, 1, 1),
         "PG_ENCODING_TO_CHAR" => (CatEncoding, 1, 1),
         "FORMAT_TYPE" => (CatFormatType, 2, 2),
+        "__REGNAME" => (RegName, 1, 1),
         "PG_GET_EXPR" => (CatGetExpr, 2, 3),
         "OBJ_DESCRIPTION" | "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => (CatNull, 1, 3),
         "PG_RELATION_IS_PUBLISHABLE" => (CatFalse, 1, 1),
@@ -918,11 +920,21 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         // the catalog names owners and types by text already
         CatUserById => match v(0) {
             Value::Text(t) if !t.is_empty() => v(0).clone(),
+            Value::Int(n) => Value::text(&crate::oid::name_of(*n).unwrap_or_else(|| "postgres".into())),
             _ => Value::text("postgres"),
         },
         CatEncoding => Value::text("UTF8"),
         CatFormatType => match v(0) {
             Value::Null => Value::Null,
+            Value::Int(n) => Value::text(&crate::oid::format_type(*n, match v(1) { Value::Int(m) => *m, _ => -1 })),
+            other => Value::text(&other.to_string()),
+        },
+        // x::regclass, ::regtype ...: the name an oid stands for (a name stays as it is)
+        RegName => match v(0) {
+            Value::Null => Value::Null,
+            Value::Int(n) => Value::text(&crate::oid::name_of(*n).unwrap_or_else(|| n.to_string())),
+            // '16386'::regclass is the oid written as text
+            Value::Text(t) if t.trim().parse::<i64>().is_ok_and(|n| crate::oid::name_of(n).is_some()) => Value::text(&crate::oid::name_of(t.trim().parse().unwrap_or(0)).unwrap_or_default()),
             other => Value::text(&other.to_string()),
         },
         CatGetExpr => v(0).clone(),
@@ -930,7 +942,13 @@ pub fn call(f: MoreFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
         CatMapGet => match (v(0), v(1)) {
             (_, Value::Null) => Value::Null,
             (m, k) => match crate::json::parse(&m.to_string()).ok() {
-                Some(serde_json::Value::Object(o)) => o.get(&k.to_string()).and_then(|x| x.as_str()).map_or(Value::Null, Value::text),
+                Some(serde_json::Value::Object(o)) => {
+                    let key = match k {
+                        Value::Int(n) => crate::oid::name_of(*n).unwrap_or_else(|| n.to_string()),
+                        other => other.to_string(),
+                    };
+                    o.get(&key).and_then(|x| x.as_str()).map_or(Value::Null, Value::text)
+                }
                 _ => Value::Null,
             },
         },

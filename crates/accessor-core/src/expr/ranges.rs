@@ -1009,6 +1009,10 @@ pub fn call(f: RangeFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
 /// The function that casts to the range or multirange type called `tn`, if it is one.
 pub(crate) fn cast_function_for(tn: &str) -> Option<String> {
     let up = tn.to_ascii_uppercase();
+    // regclass, regtype ...: an oid shows as the name of its object
+    if matches!(up.as_str(), "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGNAMESPACE" | "REGROLE" | "REGOPER" | "REGOPERATOR") {
+        return Some("__REGNAME".into());
+    }
     let known = KINDS.iter().any(|(n, _)| *n == up) || MULTI.iter().any(|(n, _)| *n == up);
     let custom = crate::sql::usertypes::lookup(tn).is_some_and(|t| t.range.is_some()) || crate::sql::usertypes::is_multirange_name(tn);
     (known || custom).then(|| format!("__RANGE_CAST_{up}"))

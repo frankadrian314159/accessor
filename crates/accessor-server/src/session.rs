@@ -20,6 +20,8 @@ struct Statement {
     sql: String,
     declared: Vec<u32>,
     count: usize,
+    /// The column types the client was told when it described the statement: the rows are sent in those.
+    described: Option<Vec<u32>>,
 }
 
 /// A statement with its parameters filled in. It runs when its rows are first needed, and the result is kept.
@@ -28,6 +30,7 @@ struct Portal {
     result_formats: Vec<i16>,
     result: Option<QueryResult>,
     sent: usize,
+    described: Option<Vec<u32>>,
 }
 
 struct Session<'a> {
@@ -351,18 +354,21 @@ impl Session<'_> {
             let formats: [i16; 0] = [];
             // a T-SQL batch that selected several times: its earlier result sets come first
             for r in &earlier {
-                self.send_result("SELECT", r, &formats, true, 0, 0)?;
+                self.send_result("SELECT", r, &formats, true, 0, 0, None)?;
             }
-            self.send_result(stmt, &result, &formats, true, 0, 0)?;
+            self.send_result(stmt, &result, &formats, true, 0, 0, None)?;
         }
         Ok(())
     }
 
     /// Sends a result: the row description (if asked), the rows `from..` (up to `max` of them, 0 for all) and the completion.
     /// Gives the number of the next row.
-    fn send_result(&mut self, sql_text: &str, r: &QueryResult, formats: &[i16], describe: bool, from: usize, max: usize) -> Result<usize, Failure> {
+    fn send_result(&mut self, sql_text: &str, r: &QueryResult, formats: &[i16], describe: bool, from: usize, max: usize, forced: Option<&[u32]>) -> Result<usize, Failure> {
         let has_columns = !r.columns.is_empty();
-        let oids = types::column_oids(r.columns.len(), &r.rows);
+        let oids = match forced {
+            Some(f) if f.len() == r.columns.len() => f.to_vec(),
+            _ => types::column_oids(r.columns.len(), &r.rows),
+        };
         if has_columns && describe {
             self.row_description(r, &oids, formats)?;
         }
@@ -429,7 +435,7 @@ impl Session<'_> {
         if !text.is_empty() {
             accessor_core::sql::parse_script(&sql::substitute_parameters(&text, |_| "NULL".into()))?;
         }
-        self.statements.insert(name, Statement { sql: text, declared, count });
+        self.statements.insert(name, Statement { sql: text, declared, count, described: None });
         Msg::new(b'1').send(&mut self.out)?;
         Ok(())
     }
@@ -483,7 +489,8 @@ impl Session<'_> {
             result_formats.push(b.i16()?);
         }
         let text = sql::substitute_parameters(&stmt.sql, |n| literals.get(n.wrapping_sub(1)).cloned().unwrap_or_else(|| "NULL".into()));
-        self.portals.insert(portal, Portal { sql: text, result_formats, result: None, sent: 0 });
+        let described = stmt.described.clone();
+        self.portals.insert(portal, Portal { sql: text, result_formats, result: None, sent: 0, described });
         Msg::new(b'2').send(&mut self.out)?;
         Ok(())
     }
@@ -524,6 +531,9 @@ impl Session<'_> {
                     if !r.columns.is_empty() {
                         let oids = types::column_oids(r.columns.len(), &r.rows);
                         self.row_description(&r, &oids, &[])?;
+                        if let Some(s) = self.statements.get_mut(&name) {
+                            s.described = Some(oids);
+                        }
                         return Ok(());
                     }
                 }
@@ -533,11 +543,14 @@ impl Session<'_> {
         }
         self.run_portal(&name)?;
         let p = &self.portals[&name];
-        let (r, formats) = (p.result.clone().unwrap_or_default(), p.result_formats.clone());
+        let (r, formats, forced) = (p.result.clone().unwrap_or_default(), p.result_formats.clone(), p.described.clone());
         if r.columns.is_empty() {
             Msg::new(b'n').send(&mut self.out)?;
         } else {
-            let oids = types::column_oids(r.columns.len(), &r.rows);
+            let oids = match forced {
+                Some(f) if f.len() == r.columns.len() => f,
+                _ => types::column_oids(r.columns.len(), &r.rows),
+            };
             self.row_description(&r, &oids, &formats)?;
         }
         Ok(())
@@ -555,8 +568,8 @@ impl Session<'_> {
         }
         self.run_portal(&name)?;
         let p = self.portals.get_mut(&name).ok_or_else(|| Failure::Message(format!("portal \"{name}\" does not exist"), "34000"))?;
-        let (r, formats, from, text) = (p.result.take().unwrap_or_default(), p.result_formats.clone(), p.sent, p.sql.clone());
-        let sent = self.send_result(&text, &r, &formats, false, from, max);
+        let (r, formats, from, text, forced) = (p.result.take().unwrap_or_default(), p.result_formats.clone(), p.sent, p.sql.clone(), p.described.clone());
+        let sent = self.send_result(&text, &r, &formats, false, from, max, forced.as_deref());
         if let Some(p) = self.portals.get_mut(&name) {
             p.result = Some(r);
             if let Ok(n) = &sent {

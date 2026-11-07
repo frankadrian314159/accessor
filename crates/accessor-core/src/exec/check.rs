@@ -107,7 +107,7 @@ impl Database {
         let expr = &default_calls(expr, &schema);
         // PostgreSQL: tableoid is the table the row is in, which a condition on the table knows
         let expr = &if schema.column_index("tableoid").is_none() {
-            let literal = format!("'{}'", real.replace('\'', "''"));
+            let literal = crate::oid::oid(crate::oid::RELATION, &real).to_string();
             regex::Regex::new(r"(?i)\btableoid\b").expect("a valid pattern").replace_all(expr, regex::NoExpand(&literal)).into_owned()
         } else {
             expr.to_string()

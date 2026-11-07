@@ -27,6 +27,7 @@ pub mod database;
 pub mod datetime;
 pub mod dialect;
 pub mod interval;
+pub(crate) mod oid;
 pub mod tz;
 pub mod error;
 pub mod exec;

@@ -176,7 +176,7 @@ impl Database {
                             .iter()
                             .map(|(_, row)| {
                                 let mut r = row.clone();
-                                r.push(Value::text(t.name()));
+                                r.push(crate::oid::value(crate::oid::RELATION, t.name()));
                                 r
                             })
                             .collect();

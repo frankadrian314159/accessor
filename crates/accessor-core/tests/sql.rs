@@ -7858,8 +7858,16 @@ fn postgresql_expression_defaults_check_constraints_and_type_modifiers_in_the_ca
     assert_eq!(pg_one(&mut db, "SELECT d = current_date FROM t"), "true");
     assert!(db.execute("INSERT INTO t (id, price) VALUES (2, -1)").is_err());
     // and psql finds the declaration in the catalog
-    assert_eq!(pg_one(&mut db, "SELECT atttypid FROM pg_attribute WHERE attname = 'name'"), "character varying(40)");
-    assert_eq!(pg_one(&mut db, "SELECT atttypid FROM pg_attribute WHERE attname = 'price'"), "numeric(10,2)");
+    assert_eq!(pg_one(&mut db, "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attname = 'name'"), "character varying(40)");
+    assert_eq!(pg_one(&mut db, "SELECT format_type(atttypid, atttypmod) FROM pg_attribute WHERE attname = 'price'"), "numeric(10,2)"
+    );
+    // object ids are numbers, a name stands for its number, and a number cast to regclass is the name
+    assert_eq!(pg_one(&mut db, "SELECT atttypid FROM pg_attribute WHERE attname = 'id'"), "23");
+    assert_eq!(pg_one(&mut db, "SELECT relnamespace FROM pg_class WHERE relname = 't'"), "2200");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.oid = 't'::regclass"), "5");
+    assert_eq!(pg_one(&mut db, "SELECT oid::regclass FROM pg_class WHERE relname = 't'"), "t");
+    assert_eq!(pg_one(&mut db, "SELECT 't'::regclass::oid = (SELECT oid FROM pg_class WHERE relname = 't')"), "true");
+    assert_eq!(pg_one(&mut db, "SELECT count(*) FROM pg_attribute WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 't')::text::int"), "5");
     assert_eq!(pg_one(&mut db, "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adnum = 4"), "current_date");
     assert_eq!(pg_one(&mut db, "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'pos'"), "CHECK (price >= 0)");
     assert_eq!(pg_one(&mut db, "SELECT relchecks FROM pg_class WHERE relname = 't'"), "2");

@@ -598,7 +598,7 @@ impl Database {
             for (_, row) in t.iter() {
                 let mut r: Row = map.iter().map(|i| i.map_or(Value::Null, |i| row[i].clone())).collect();
                 if tableoid {
-                    r.push(Value::text(t.name()));
+                    r.push(crate::oid::value(crate::oid::RELATION, t.name()));
                 }
                 rows.push(r);
             }

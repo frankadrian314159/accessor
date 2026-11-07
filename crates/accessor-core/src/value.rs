@@ -946,6 +946,9 @@ impl Value {
                 Some(c) => c.as_str().cmp(&**b),
                 None => (**t).cmp(&**b),
             },
+            // oid = 'tbl': the name of an object stands for its oid
+            (Value::Text(t), Value::Int(i)) if parse_num(t).is_none() && crate::oid::named(t, *i) => Ordering::Equal,
+            (Value::Int(i), Value::Text(t)) if parse_num(t).is_none() && crate::oid::named(t, *i) => Ordering::Equal,
             (Value::Text(t), n) => match (parse_num(t), n.num()) {
                 (Some(x), Some(y)) => num_cmp(&as_real_for(x, n), &y),
                 _ => Ordering::Greater,
@@ -985,6 +988,14 @@ impl Value {
         // The stand-in for a sequence default is not a value to convert.
         if matches!(self, Text(s) if (**s).starts_with(crate::schema::SEQUENCE_DEFAULT) || (**s).starts_with(crate::schema::EXPR_DEFAULT)) {
             return Ok(self.clone());
+        }
+        // 'tbl'::oid: the oid of the object of that name
+        if let (DataType::Integer, Text(s)) = (ty, self) {
+            if parse_num(s).is_none() {
+                if let Some(o) = crate::oid::find(s) {
+                    return Ok(Int(o));
+                }
+            }
         }
         let bad = || Error::type_err(format!("cannot convert {} value '{}' to {}", self.type_label(), self, ty));
         let range = || Error::type_err(format!("'{}' is out of range for {}", self, ty));

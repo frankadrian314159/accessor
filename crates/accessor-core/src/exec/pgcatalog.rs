@@ -1,13 +1,28 @@
 //! PostgreSQL's system catalogs (`pg_class`, `pg_attribute`, `pg_type`, `pg_proc`, `pg_constraint`, `pg_index`, ...),
 //! built from the tables, views, routines, triggers, roles and types the database holds.
 //!
-//! There are no object identifiers here. The `oid` of a table, a type or a function is its name, which is also what
-//! `'name'::regclass` and `::regtype` give, so `oid = 'tbl'::regclass`, a join of `pg_attribute.attrelid` to
-//! `pg_class.oid` and `attrelid::regclass` all work, while arithmetic on an `oid` does not.
+//! Every object has a numeric `oid` (see [`crate::oid`]): the registry gives a number to each name the first time the
+//! catalog lists it, and `'name'::regclass`, `oid::regclass`, `oid = 'tbl'` and the `pg_get_...def(oid)` functions
+//! translate between the two.
 
 use super::Row;
 use crate::database::Database;
+use crate::oid::{self, ACCESS_METHOD, CONSTRAINT, DEFAULT, NAMESPACE, PROC, RELATION, ROLE, TRIGGER, TYPE};
 use crate::value::{DataType, Value};
+
+/// The oid of an object, as a catalog value.
+fn o(kind: oid::Kind, name: &str) -> Value {
+    oid::value(kind, name)
+}
+
+/// The oid of an object, or 0 when there is no name.
+fn o0(kind: oid::Kind, name: &str) -> Value {
+    if name.is_empty() {
+        Value::Int(0)
+    } else {
+        oid::value(kind, name)
+    }
+}
 
 fn t(s: &str) -> Value {
     Value::text(s)
@@ -161,7 +176,7 @@ impl Database {
                 schemas.extend(self.catalog.keys().filter(|(k, _)| k == "schema").map(|(_, n)| n.clone()));
                 schemas.dedup();
                 for s in schemas {
-                    rows.push(vec![t(&s), t(&s), t("postgres")]);
+                    rows.push(vec![o(NAMESPACE, &s), t(&s), o(ROLE, "postgres")]);
                 }
                 names(&["oid", "nspname", "nspowner"])
             }
@@ -171,13 +186,13 @@ impl Database {
                     let sc = tb.schema();
                     let fk_trigger = !sc.foreign_keys.is_empty() || self.tables.values().any(|o| o.schema().foreign_keys.iter().any(|f| f.ref_table.eq_ignore_ascii_case(tb.name())));
                     rows.push(vec![
-                        t(tb.name()), t(rel), t(schema), t(""), t("postgres"), t("heap"), t(""), i(0), i(0), Value::Int(tb.len() as i64), i(0), t(""),
+                        o(RELATION, tb.name()), t(rel), o(NAMESPACE, schema), i(0), o(ROLE, "postgres"), o(ACCESS_METHOD, "heap"), i(0), i(0), i(0), Value::Int(tb.len() as i64), i(0), i(0),
                         b(!sc.indexes.is_empty()), b(false), t("p"), t("r"), i(sc.columns.len()), i(self.check_constraints(tb.name()).len()), b(false), b(fk_trigger), b(false), b(false), b(true), t("d"), b(false), b(self.has_children(tb.name())), Value::Null, Value::Null, i(0), Value::Null,
                     ]);
                     for ix in sc.indexes.iter().filter(|x| !is_helper_index(sc, x)) {
                         let shown = pg_index_name(rel, &ix.name);
                         rows.push(vec![
-                            t(&shown), t(&shown), t(schema), t(""), t("postgres"), t("btree"), t(""), i(0), i(0), i(0), i(0), t(""),
+                            o(RELATION, &shown), t(&shown), o(NAMESPACE, schema), i(0), o(ROLE, "postgres"), o(ACCESS_METHOD, "btree"), i(0), i(0), i(0), i(0), i(0), i(0),
                             b(false), b(false), t("p"), t("i"), i(ix.columns.len()), i(0), b(false), b(false), b(false), b(false), b(true), t("n"), b(false), b(false), Value::Null, Value::Null, i(0), Value::Null,
                         ]);
                     }
@@ -185,7 +200,7 @@ impl Database {
                 for (display, _) in self.views.values() {
                     let (schema, rel) = split(display);
                     rows.push(vec![
-                        t(display), t(rel), t(schema), t(""), t("postgres"), i(0), t(""), i(0), i(0), i(0), i(0), t(""),
+                        o(RELATION, display), t(rel), o(NAMESPACE, schema), i(0), o(ROLE, "postgres"), i(0), i(0), i(0), i(0), i(0), i(0), i(0),
                         b(false), b(false), t("p"), t("v"), i(0), i(0), b(true), b(false), b(false), b(false), b(true), t("n"), b(false), b(false), Value::Null, Value::Null, i(0), Value::Null,
                     ]);
                 }
@@ -197,8 +212,10 @@ impl Database {
             "pg_attribute" => {
                 for tb in self.tables.values() {
                     for (n, c) in tb.schema().columns.iter().enumerate() {
+                        let declared = crate::expr::ranges::column_typmod(tb.name(), &c.name).unwrap_or_else(|| pg_type_name(c.data_type).to_string());
+                        let (type_oid, typmod) = oid::type_of_declared(&declared);
                         rows.push(vec![
-                            t(tb.name()), t(&c.name), t(&crate::expr::ranges::column_typmod(tb.name(), &c.name).unwrap_or_else(|| pg_type_name(c.data_type).to_string())), Value::Int(-1), i(n + 1), Value::Int(-1), i(0),
+                            o(RELATION, tb.name()), t(&c.name), Value::Int(type_oid), Value::Int(-1), i(n + 1), Value::Int(typmod as i64), i(0),
                             b(c.not_null || c.primary_key), b(c.default.is_some() || c.autonumber), b(false), t(""), t(""), b(false), b(true), i(0), i(0), Value::Int(-1), t("p"), t(""), Value::Null, Value::Null,
                         ]);
                     }
@@ -218,7 +235,7 @@ impl Database {
                     ("record", -1, 'p', 'P'), ("void", 4, 'p', 'P'), ("trigger", 4, 'p', 'P'), ("unknown", -2, 'p', 'X'),
                 ];
                 let mut push = |n: &str, len: i64, ty: char, cat: char, base: &str, not_null: bool| {
-                    rows.push(vec![t(n), t(n), t("pg_catalog"), t("postgres"), Value::Int(len), b(len > 0 && len <= 8), t(&ty.to_string()), t(&cat.to_string()), b(false), b(true), t(","), t(""), t(""), t(""), b(not_null), t(base), Value::Int(-1), t(""), i(0)]);
+                    rows.push(vec![o(TYPE, n), t(n), o(NAMESPACE, "pg_catalog"), o(ROLE, "postgres"), Value::Int(len), b(len > 0 && len <= 8), t(&ty.to_string()), t(&cat.to_string()), b(false), b(true), t(","), i(0), i(0), t(""), b(not_null), o0(TYPE, base), Value::Int(-1), i(0), i(0)]);
                 };
                 for (n, len, ty, cat) in builtin {
                     push(n, len, ty, cat, "", false);
@@ -239,8 +256,9 @@ impl Database {
                     let args: Vec<String> = r.params.iter().map(|p| if p.poly.is_empty() { p.data_type.map_or("text", pg_type_name).to_string() } else { p.poly.clone() }).collect();
                     let pnames: Vec<Value> = r.params.iter().map(|p| t(&p.name)).collect();
                     rows.push(vec![
-                        t(&r.name), t(&r.name), t("public"), t("postgres"), t("sql"), Value::Int(100), Value::Int(0), i(0), t(kind), b(false), b(false), b(false),
-                        b(!r.set_columns.is_empty()), t("v"), i(r.params.len()), i(r.params.iter().filter(|p| p.default.is_some()).count()), t(&ret), t(&args.join(" ")),
+                        o(PROC, &r.name), t(&r.name), o(NAMESPACE, "public"), o(ROLE, "postgres"), i(14), Value::Int(100), Value::Int(0), i(0), t(kind), b(false), b(false), b(false),
+                        b(!r.set_columns.is_empty()), t("v"), i(r.params.len()), i(r.params.iter().filter(|p| p.default.is_some()).count()), o(TYPE, &ret),
+                        t(&args.iter().map(|a| oid::oid(TYPE, a).to_string()).collect::<Vec<_>>().join(" ")),
                         Value::Array(std::sync::Arc::new(pnames)), t(&r.sql),
                     ]);
                 }
@@ -253,7 +271,7 @@ impl Database {
                 for r in self.routines.values() {
                     if let Some(a) = &r.aggregate {
                         rows.push(vec![
-                            t(&r.name), t("n"), i(0), t(&a.sfunc), a.finalfunc.as_deref().map_or(t(""), t), a.stype.map_or(t("anyelement"), |d| t(pg_type_name(d))), a.initcond.as_deref().map_or(Value::Null, t),
+                            o(PROC, &r.name), t("n"), i(0), t(&a.sfunc), a.finalfunc.as_deref().map_or(t(""), t), a.stype.map_or(o(TYPE, "anyelement"), |d| o(TYPE, pg_type_name(d))), a.initcond.as_deref().map_or(Value::Null, t),
                         ]);
                     }
                 }
@@ -267,7 +285,7 @@ impl Database {
                     let pk: Vec<usize> = sc.columns.iter().enumerate().filter(|(_, c)| c.primary_key).map(|(n, _)| n).collect();
                     let con = |name: &str, ty: &str, deferrable: bool, deferred: bool, index: &str, referenced: &str, upd: &str, del: &str, key: Value, fkey: Value| {
                         vec![
-                            t(name), t(name), t(schema), t(ty), b(deferrable), b(deferred), b(true), t(tb.name()), t(""), t(index), t(referenced), t(upd), t(del),
+                            o(CONSTRAINT, name), t(name), o(NAMESPACE, schema), t(ty), b(deferrable), b(deferred), b(true), o(RELATION, tb.name()), i(0), o0(RELATION, index), o0(RELATION, referenced), t(upd), t(del),
                             t(if ty == "f" { "s" } else { " " }), b(true), i(0), b(true), key, fkey, i(0), b(true),
                         ]
                     };
@@ -303,7 +321,7 @@ impl Database {
                     let pk: Vec<usize> = sc.columns.iter().enumerate().filter(|(_, c)| c.primary_key).map(|(n, _)| n).collect();
                     for ix in sc.indexes.iter().filter(|x| !is_helper_index(sc, x)) {
                         let key: Vec<String> = ix.columns.iter().map(|c| (c + 1).to_string()).collect();
-                        rows.push(vec![t(&pg_index_name(split(tb.name()).1, &ix.name)), t(tb.name()), i(ix.columns.len()), i(ix.columns.len()), b(ix.unique), b(!pk.is_empty() && ix.columns == pk), b(false), b(true), b(false), b(true), b(true), b(true), t(&key.join(" ")), b(false), b(false), Value::Null, Value::Null]);
+                        rows.push(vec![o(RELATION, &pg_index_name(split(tb.name()).1, &ix.name)), o(RELATION, tb.name()), i(ix.columns.len()), i(ix.columns.len()), b(ix.unique), b(!pk.is_empty() && ix.columns == pk), b(false), b(true), b(false), b(true), b(true), b(true), t(&key.join(" ")), b(false), b(false), Value::Null, Value::Null]);
                     }
                 }
                 names(&["indexrelid", "indrelid", "indnatts", "indnkeyatts", "indisunique", "indisprimary", "indisexclusion", "indimmediate", "indisclustered", "indisvalid", "indisready", "indislive", "indkey", "indisreplident", "indnullsnotdistinct", "indpred", "indexprs"])
@@ -315,18 +333,18 @@ impl Database {
                     roles.push((n.clone(), self.is_superuser(n)));
                 }
                 for (r, sup) in roles {
-                    rows.push(vec![t(&r), t(&r), b(sup), b(true), b(sup), b(sup), b(true), b(sup), b(sup), Value::Int(-1), Value::Null, if name.eq_ignore_ascii_case("pg_roles") { t("********") } else { Value::Null }]);
+                    rows.push(vec![o(ROLE, &r), t(&r), b(sup), b(true), b(sup), b(sup), b(true), b(sup), b(sup), Value::Int(-1), Value::Null, if name.eq_ignore_ascii_case("pg_roles") { t("********") } else { Value::Null }]);
                 }
                 names(&["oid", "rolname", "rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb", "rolcanlogin", "rolreplication", "rolbypassrls", "rolconnlimit", "rolvaliduntil", "rolpassword"])
             }
             "pg_trigger" => {
                 for tr in self.triggers.values() {
-                    rows.push(vec![t(&tr.name), t(&tr.table), t(""), t(&tr.name), t(tr.function.as_deref().unwrap_or("")), i(if tr.each_statement { 0 } else { 1 }), t("O"), b(tr.name.starts_with("ck_") || tr.sql.contains("CHECK constraint failed on")), t(""), t(""), t(""), b(false), b(false), i(0)]);
+                    rows.push(vec![o(TRIGGER, &tr.name), o(RELATION, &tr.table), i(0), t(&tr.name), o0(PROC, tr.function.as_deref().unwrap_or("")), i(if tr.each_statement { 0 } else { 1 }), t("O"), b(tr.name.starts_with("ck_") || tr.sql.contains("CHECK constraint failed on")), i(0), i(0), i(0), b(false), b(false), i(0)]);
                 }
                 names(&["oid", "tgrelid", "tgparentid", "tgname", "tgfoid", "tgtype", "tgenabled", "tgisinternal", "tgconstrrelid", "tgconstrindid", "tgconstraint", "tgdeferrable", "tginitdeferred", "tgnargs"])
             }
             "pg_database" => {
-                rows.push(vec![i(5), t("postgres"), t("postgres"), i(6), t("C"), t("C"), b(false), b(true), Value::Int(-1), t("c"), Value::Null, Value::Null, Value::Null]);
+                rows.push(vec![i(5), t("postgres"), o(ROLE, "postgres"), i(6), t("C"), t("C"), b(false), b(true), Value::Int(-1), t("c"), Value::Null, Value::Null, Value::Null]);
                 names(&["oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datistemplate", "datallowconn", "datconnlimit", "datlocprovider", "daticulocale", "daticurules", "datacl"])
             }
             "pg_tables" => {
@@ -368,8 +386,8 @@ impl Database {
             "pg_description" => names(&["objoid", "classoid", "objsubid", "description"]),
             "pg_inherits" => names(&["inhrelid", "inhparent", "inhseqno", "inhdetachpending"]),
             "pg_am" => {
-                rows.push(vec![t("heap"), t("heap"), t("t")]);
-                rows.push(vec![t("btree"), t("btree"), t("i")]);
+                rows.push(vec![o(ACCESS_METHOD, "heap"), t("heap"), t("t")]);
+                rows.push(vec![o(ACCESS_METHOD, "btree"), t("btree"), t("i")]);
                 names(&["oid", "amname", "amtype"])
             }
             "pg_extension" => names(&["oid", "extname", "extowner", "extnamespace", "extversion"]),
@@ -454,7 +472,7 @@ impl Database {
                             })
                         };
                         if let Some(text) = shown {
-                            rows.push(vec![t(&format!("{}.{}", tb.name(), c.name)), t(tb.name()), i(n + 1), t(&text)]);
+                            rows.push(vec![o(DEFAULT, &format!("{}.{}", tb.name(), c.name)), o(RELATION, tb.name()), i(n + 1), t(&text)]);
                         }
                     }
                 }

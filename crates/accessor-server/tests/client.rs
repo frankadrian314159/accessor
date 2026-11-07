@@ -142,7 +142,14 @@ fn settings_are_per_connection_and_psql_catalog_queries_work() {
 
     // the queries psql sends for \d emp
     let oid = show(&mut b, "SELECT c.oid FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relname OPERATOR(pg_catalog.~) '^(emp)$' COLLATE pg_catalog.default AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 2, 3");
-    assert_eq!(oid, "emp");
+    // object ids are numbers, and psql sends them back as quoted numbers
+    assert!(oid.parse::<i64>().is_ok_and(|n| n >= 16384), "{oid}");
+    assert_eq!(show(&mut b, &format!("SELECT c.relname FROM pg_catalog.pg_class c WHERE c.oid = '{oid}'")), "emp");
+    assert_eq!(show(&mut b, &format!("SELECT '{oid}'::regclass")), "emp");
+    assert_eq!(show(&mut b, &format!("SELECT count(*) FROM pg_catalog.pg_attribute a WHERE a.attrelid = '{oid}' AND a.attnum > 0")), "3");
+    assert_eq!(show(&mut b, &format!("SELECT a.attname || ' ' || pg_catalog.format_type(a.atttypid, a.atttypmod) FROM pg_catalog.pg_attribute a WHERE a.attrelid = '{oid}' AND a.attname = 'salary'")), "salary numeric(10,2)");
+    let ix = show(&mut b, &format!("SELECT i.indexrelid FROM pg_catalog.pg_index i WHERE i.indrelid = '{oid}' AND NOT i.indisprimary"));
+    assert_eq!(show(&mut b, &format!("SELECT pg_catalog.pg_get_indexdef('{ix}'::oid, 0, true)")), "CREATE INDEX emp_name ON emp USING btree (name)");
     let def = show(&mut b, "SELECT pg_catalog.pg_get_indexdef(i.indexrelid, 0, true) FROM pg_catalog.pg_index i WHERE i.indexrelid = 'emp_name'");
     assert_eq!(def, "CREATE INDEX emp_name ON emp USING btree (name)");
     let fk = show(&mut b, "SELECT pg_catalog.pg_get_constraintdef(r.oid, true) FROM pg_catalog.pg_constraint r WHERE r.conrelid = 'dept' AND r.contype = 'f'");
@@ -246,6 +253,27 @@ fn catalog_queries_work_through_the_extended_protocol() {
             }
         }
     }
+    // the navigator: the schema's number, then its tables, columns and indexes by that number
+    let mut c = Client::connect(&conn, NoTls).unwrap();
+    c.batch_execute("CREATE TABLE emp (id int PRIMARY KEY, name varchar(20) NOT NULL); CREATE INDEX emp_name ON emp(name)").unwrap();
+    let schema: i64 = c.query_one("SELECT n.oid FROM pg_catalog.pg_namespace n WHERE n.nspname = 'public'", &[]).unwrap().get::<_, i64>(0);
+    assert_eq!(schema, 2200);
+    // JDBC declares its parameters (setLong is int8) when it prepares
+    let int8 = [postgres::types::Type::INT8];
+    let q = |c: &mut Client, sql: &str, v: i64| {
+        let st = c.prepare_typed(sql, &int8).unwrap();
+        c.query(&st, &[&v]).unwrap()
+    };
+    let tables = q(&mut c, "SELECT c.oid, c.relname, c.relkind FROM pg_catalog.pg_class c WHERE c.relnamespace = $1 AND c.relkind NOT IN ('i','I','c')", schema);
+    assert_eq!(tables.len(), 1);
+    let table: i64 = tables[0].get::<_, &str>(0).parse().unwrap();
+    let cols = q(&mut c, "SELECT a.attname, a.atttypid, a.atttypmod, a.attnum FROM pg_catalog.pg_attribute a WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum", table);
+    assert_eq!(cols.len(), 2);
+    assert_eq!(cols[1].get::<_, &str>(1), "1043");
+    let types = q(&mut c, "SELECT t.oid, t.typname FROM pg_catalog.pg_type t WHERE t.oid = $1", 1043);
+    assert_eq!(types.len(), 1);
+    let ixs = q(&mut c, "SELECT i.indexrelid FROM pg_catalog.pg_index i WHERE i.indrelid = $1", table);
+    assert_eq!(ixs.len(), 2);
     stop.stop();
     handle.join().unwrap();
     assert!(failed.is_empty(), "{}", failed.join("

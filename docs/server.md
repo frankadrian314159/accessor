@@ -47,7 +47,7 @@ Not done: IDENTITY seed and increment (the column counts from 1 by 1), cursor va
 
 ## GUI clients (DBeaver and others)
 
-Choose the PostgreSQL driver: host and port of the server, any database name, the user and password. The catalog tables a client reads on connecting (`pg_database`, `pg_namespace`, `pg_class`, `pg_type`, `pg_roles`, ...) and `version()`, `current_database()`, `current_schema()`, `session_user` and `SHOW TRANSACTION ISOLATION LEVEL` answer in every mode of the server, so a client works with a server started with `--mysql` or `--tsql` too; `version()` reads as PostgreSQL's in the default mode. Clients that browse objects with many catalog queries may still find a column or function the engine lacks; the error text says which.
+Choose the PostgreSQL driver: host and port of the server, any database name, the user and password. The catalog tables a client reads on connecting (`pg_database`, `pg_namespace`, `pg_class`, `pg_type`, `pg_roles`, ...) and `version()`, `current_database()`, `current_schema()`, `session_user` and `SHOW TRANSACTION ISOLATION LEVEL` answer in every mode of the server, so a client works with a server started with `--mysql` or `--tsql` too; `version()` reads as PostgreSQL's in the default mode. Objects have numeric oids (see [sql/schemas-and-types.md](sql/schemas-and-types.md)), so a client that reads a schema's number and asks for its tables, columns and indexes by that number (DBeaver) finds them. Rows of an extended-protocol query are sent in the column types the client was told when it described the statement. Clients that browse objects with many catalog queries may still find a column or function the engine lacks; the error text says which.
 
 ## What is not (yet)
 
