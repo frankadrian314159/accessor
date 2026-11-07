@@ -216,3 +216,38 @@ SELECT 3 AS c").unwrap();
     stop.stop();
     handle.join().unwrap();
 }
+
+#[test]
+fn catalog_queries_work_through_the_extended_protocol() {
+    let (conn, stop, handle) = start(Config::default());
+    // what DBeaver asks when it connects, in the dialect of the server and in another one
+    let queries = [
+        "SELECT db.oid,db.* FROM pg_catalog.pg_database db WHERE datname = $1",
+        "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 ORDER BY nspname",
+        "SELECT current_schema(),session_user",
+        "SELECT current_database()",
+        "SELECT version()",
+        "SELECT * FROM pg_catalog.pg_tablespace",
+        "SELECT a.oid,a.* FROM pg_catalog.pg_roles a",
+        "SELECT * FROM pg_catalog.pg_extension",
+        "SELECT t.oid,t.*,c.relkind,format_type(nullif(t.typbasetype, 0), t.typtypmod) as base_type_name, d.description FROM pg_catalog.pg_type t LEFT OUTER JOIN pg_catalog.pg_type et ON et.oid=t.typelem LEFT OUTER JOIN pg_catalog.pg_class c ON c.oid=t.typrelid LEFT OUTER JOIN pg_catalog.pg_description d ON t.oid=d.objoid WHERE t.typname IS NOT NULL AND (c.relkind IS NULL OR c.relkind = 'c') AND (et.typcategory IS NULL OR et.typcategory <> 'C')",
+        "SELECT c.oid,c.*,d.description FROM pg_catalog.pg_class c LEFT OUTER JOIN pg_catalog.pg_description d ON c.oid=d.objoid AND d.objsubid=0 WHERE c.relkind not in ('i','I','c')",
+        "SELECT pg_catalog.pg_encoding_to_char(encoding) FROM pg_catalog.pg_database",
+        "SELECT has_database_privilege('postgres', 'CONNECT')",
+        "SHOW TRANSACTION ISOLATION LEVEL",
+    ];
+    let mut failed = Vec::new();
+    for options in ["", " options='-c dialect=mysql'", " options='-c dialect=tsql'"] {
+        let mut c = Client::connect(&format!("{conn}{options}"), NoTls).unwrap();
+        for sql in queries {
+            let params: Vec<&(dyn postgres::types::ToSql + Sync)> = if sql.contains("$1") { vec![&"postgres"] } else { vec![] };
+            if let Err(e) = c.query(sql, &params) {
+                failed.push(format!("[{options}] {sql}: {}", e.as_db_error().map_or(e.to_string(), |d| d.message().to_string())));
+            }
+        }
+    }
+    stop.stop();
+    handle.join().unwrap();
+    assert!(failed.is_empty(), "{}", failed.join("
+"));
+}

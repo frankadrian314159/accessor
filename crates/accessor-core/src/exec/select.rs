@@ -196,10 +196,10 @@ impl Database {
                     let res = self.without_privileges(|| self.run_select_depth(&q, depth + 1))?;
                     return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(res.rows), alias, names: res.columns });
                 }
-                if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
-                    if let Some((names, rows)) = self.pg_catalog(name) {
-                        return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
-                    }
+                // the PostgreSQL catalog is there in every dialect: PostgreSQL clients (DBeaver, psql) of a server in
+                // another mode ask for it too, and a user's own table of that name was found before this point
+                if let Some((names, rows)) = self.pg_catalog(name) {
+                    return Ok(Source { keep: None, intrinsic: Vec::new(), hidden: Vec::new(), data: SourceData::Rows(rows), alias, names });
                 }
                 Err(Error::catalog(format!("the table or query '{name}' does not exist")))
             }

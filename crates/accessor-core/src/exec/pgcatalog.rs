@@ -326,7 +326,7 @@ impl Database {
                 names(&["oid", "tgrelid", "tgparentid", "tgname", "tgfoid", "tgtype", "tgenabled", "tgisinternal", "tgconstrrelid", "tgconstrindid", "tgconstraint", "tgdeferrable", "tginitdeferred", "tgnargs"])
             }
             "pg_database" => {
-                rows.push(vec![t("postgres"), t("postgres"), t("postgres"), i(6), t("C"), t("C"), b(false), b(true), Value::Int(-1), t("c"), Value::Null, Value::Null, Value::Null]);
+                rows.push(vec![i(5), t("postgres"), t("postgres"), i(6), t("C"), t("C"), b(false), b(true), Value::Int(-1), t("c"), Value::Null, Value::Null, Value::Null]);
                 names(&["oid", "datname", "datdba", "encoding", "datcollate", "datctype", "datistemplate", "datallowconn", "datconnlimit", "datlocprovider", "daticulocale", "daticurules", "datacl"])
             }
             "pg_tables" => {

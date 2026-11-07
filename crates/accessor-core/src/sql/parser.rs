@@ -2197,6 +2197,12 @@ impl<'a> Parser<'a> {
     /// MySQL's `SHOW ...`; `None` (nothing consumed) for the PostgreSQL forms `SHOW name`, `SHOW ALL`.
     fn show_statement(&mut self) -> Result<Option<Statement>> {
         let save = self.pos;
+        // SHOW TRANSACTION ISOLATION LEVEL is SHOW transaction_isolation
+        if self.peek_kw_at(1, "TRANSACTION") && self.peek_kw_at(2, "ISOLATION") && self.peek_kw_at(3, "LEVEL") {
+            let p = self.pos;
+            self.toks[p + 1].tok = Tok::Ident("transaction_isolation".into());
+            self.toks.drain(p + 2..p + 4);
+        }
         self.advance();
         // GLOBAL / SESSION before VARIABLES and STATUS
         if self.peek_kw("GLOBAL") || self.peek_kw("SESSION") || self.peek_kw("LOCAL") {
@@ -7891,7 +7897,8 @@ impl<'a> Parser<'a> {
                         return Ok(Expr::Function { name: "__CURRENT_OF".into(), args: vec![Expr::Literal(Value::text(&cursor))], distinct: false, star: false });
                     }
                     "CURRENT_USER" | "SESSION_USER" | "CURRENT_ROLE" | "USER"
-                        if crate::dialect::current() == crate::dialect::Dialect::Postgresql && !matches!(self.peek_at(1), Tok::Sym("(" | ".")) =>
+                        if (crate::dialect::current() == crate::dialect::Dialect::Postgresql || up == "SESSION_USER")
+                            && !matches!(self.peek_at(1), Tok::Sym("(" | ".")) =>
                     {
                         self.advance();
                         return Ok(Expr::Function { name: format!("__PG_{up}"), args: vec![], distinct: false, star: false });

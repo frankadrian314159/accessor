@@ -45,6 +45,10 @@ The mode flag sets the dialect new connections start in (`--asql`, `--postgresql
 
 Not done: IDENTITY seed and increment (the column counts from 1 by 1), cursor variables (`DECLARE @c CURSOR`), `TOP ... PERCENT` and `WITH TIES`, `OUTPUT` on `UPDATE ... FROM`, an error in one batch stops the batches after it in the same message, and the storage limits of some types (see the type table in [sql/dialects.md](sql/dialects.md)).
 
+## GUI clients (DBeaver and others)
+
+Choose the PostgreSQL driver: host and port of the server, any database name, the user and password. The catalog tables a client reads on connecting (`pg_database`, `pg_namespace`, `pg_class`, `pg_type`, `pg_roles`, ...) and `version()`, `current_database()`, `current_schema()`, `session_user` and `SHOW TRANSACTION ISOLATION LEVEL` answer in every mode of the server, so a client works with a server started with `--mysql` or `--tsql` too; `version()` reads as PostgreSQL's in the default mode. Clients that browse objects with many catalog queries may still find a column or function the engine lacks; the error text says which.
+
 ## What is not (yet)
 
 * **TLS.** Connections are in the clear; run it on a trusted network or behind a tunnel or proxy.
