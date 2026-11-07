@@ -193,7 +193,7 @@ impl Database {
         };
         let mut sel = sel.clone();
         crate::sql::walk::bind_params_select(&mut sel, &values)?;
-        self.run_select(&sel)
+        self.run_select(&sel).map(super::clean_names)
     }
 
     // ----- PREPARE / EXEC / DEALLOCATE ---------------------------------------------

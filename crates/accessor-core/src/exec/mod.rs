@@ -53,6 +53,16 @@ impl QueryResult {
     }
 }
 
+/// Drops the suffix that keeps a repeated PostgreSQL column name (`?column?`) apart inside the engine.
+pub(crate) fn clean_names(mut r: QueryResult) -> QueryResult {
+    for c in r.columns.iter_mut() {
+        if let Some(cut) = c.find('\u{1}') {
+            c.truncate(cut);
+        }
+    }
+    r
+}
+
 impl Database {
     /// Runs every statement in `sql`, returning the result of the last one.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
@@ -109,7 +119,7 @@ impl Database {
         self.admit()?;
         match parsed {
             [] => Err(Error::syntax("empty statement")),
-            [Statement::Select(s)] => self.run_select(s),
+            [Statement::Select(s)] => self.run_select(s).map(clean_names),
             [Statement::Explain(s)] => self.run_explain(s, false),
             [Statement::ExplainAnalyze(s)] => self.run_explain(s, true),
             [_] => Err(Error::runtime("query() only accepts SELECT statements")),
@@ -159,7 +169,7 @@ impl Database {
         };
         // Numbers handed out are logged even if the statement failed or its transaction is rolled back.
         self.flush_sequences()?;
-        result
+        result.map(clean_names)
     }
 
     fn run_statement(&mut self, st: &Statement) -> Result<QueryResult> {

@@ -2307,9 +2307,58 @@ fn narrow_sources(sel: &Select, sources: &mut [Source<'_>]) -> bool {
     any
 }
 
+/// The name PostgreSQL gives a select item that has no alias: the name of the column, function or construct it is, and
+/// `?column?` for anything else (a literal, an operator, a comparison).
+fn postgres_column_name(e: &Expr) -> String {
+    match e {
+        Expr::Column { name, .. } => name.clone(),
+        Expr::Case { .. } => "case".into(),
+        Expr::Exists { .. } => "exists".into(),
+        Expr::Window { func, .. } => postgres_column_name(func),
+        Expr::Function { name, args, .. } => {
+            let n = name.to_ascii_lowercase();
+            match n.as_str() {
+                // casts are named after the column they cast, or the type
+                "cint" | "cbig" | "cstr" | "cdbl" | "csng" | "cdec" | "cbool" | "cdate" | "__todate" | "ctimestamptz" | "cinterval" | "ccur" | "json_parse" => match args.first() {
+                    Some(Expr::Column { name, .. }) => name.clone(),
+                    _ => match n.as_str() {
+                        "cint" => "int4",
+                        "cbig" => "int8",
+                        "cstr" => "text",
+                        "cdbl" => "float8",
+                        "csng" => "float4",
+                        "cdec" => "numeric",
+                        "cbool" => "bool",
+                        "cdate" | "__todate" => "date",
+                        "ctimestamptz" => "timestamptz",
+                        "cinterval" => "interval",
+                        "ccur" => "money",
+                        _ => "json",
+                    }
+                    .to_string(),
+                },
+                "trimof" => match args.first() {
+                    Some(Expr::Literal(Value::Text(m))) if &**m == "leading" => "ltrim",
+                    Some(Expr::Literal(Value::Text(m))) if &**m == "trailing" => "rtrim",
+                    _ => "btrim",
+                }
+                .to_string(),
+                "datepart" => "extract".into(),
+                "__collate" | "__ts" | "__todate_marker" => args.first().map_or_else(|| "?column?".into(), postgres_column_name),
+                other if other.starts_with("__") => "?column?".into(),
+                other => other.to_string(),
+            }
+        }
+        _ => "?column?".into(),
+    }
+}
+
 pub(crate) fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, Expr)>> {
     let mut out = Vec::new();
     let mut anon = 1000;
+    // PostgreSQL's names for unnamed items can repeat (`SELECT 1, 2` has two `?column?`); inside the engine a repeat gets
+    // a suffix after a \u{1}, which the result of the statement drops (see `clean_names`)
+    let mut auto_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for item in &sel.items {
         match item {
             SelectItem::Wildcard => {
@@ -2330,9 +2379,16 @@ pub(crate) fn expand_items(sel: &Select, scope: &Scope) -> Result<Vec<(String, E
                 }
             }
             SelectItem::Expr { expr, alias } => {
+                let postgres = crate::dialect::current() == crate::dialect::Dialect::Postgresql;
                 let name = match (alias, expr) {
                     (Some(a), _) => a.clone(),
                     (None, Expr::Column { name, .. }) => name.clone(),
+                    (None, e) if postgres => {
+                        let base = postgres_column_name(e);
+                        let n = auto_seen.entry(base.to_ascii_lowercase()).or_insert(0);
+                        *n += 1;
+                        if *n == 1 { base } else { format!("{base}\u{1}{}", *n - 1) }
+                    }
                     // the two-argument statistics are named as PostgreSQL names them: for the function
                     (None, Expr::Function { name, .. }) if matches!(AggFn::from_name(name), Some(AggFn::Bivariate(_))) => name.to_ascii_lowercase(),
                     (None, Expr::Function { name, args, .. }) if AggFn::from_name(name).is_some() => {

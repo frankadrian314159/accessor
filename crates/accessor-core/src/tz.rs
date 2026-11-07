@@ -26,6 +26,12 @@ pub enum Zone {
     Named(chrono_tz::Tz),
 }
 
+impl Default for Zone {
+    fn default() -> Zone {
+        Zone::UTC
+    }
+}
+
 impl Zone {
     pub const UTC: Zone = Zone::Fixed(0);
 

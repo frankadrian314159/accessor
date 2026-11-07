@@ -84,6 +84,8 @@ Matching ignores case. `ESCAPE` names a character that takes away the special me
 
 `(a, b)` or `ROW(a, b)` compared with another row of the same size, or used with `IN`; see [select.md](select.md#row-values). In PostgreSQL mode `ROW(t.*)` is the row of all of `t`'s columns, and `ROW(t.*) = ROW(u.*)` compares them column by column.
 
+In PostgreSQL mode `||` gives NULL when either side is NULL (the other dialects treat NULL as an empty text), and a select item with no alias is named as PostgreSQL names it (`count`, `sum`, `?column?`, ...) rather than `Expr1000` or `SumOfx`. `a OPERATOR(pg_catalog.~) b` is `a ~ b`.
+
 ## User-defined operators
 
 In PostgreSQL mode `CREATE OPERATOR name (LEFTARG = type, RIGHTARG = type, FUNCTION = f [, COMMUTATOR = op, ...])` makes `a name b` mean `f(a, b)`; with only `RIGHTARG` it is a prefix operator, `name b` meaning `f(b)`. The operator binds like a comparison. It is known by its spelling and whether it has a left operand (not by operand types: a later definition of the same spelling and shape replaces the earlier one, and dropping one that is not there is not an error), and the other options are read and ignored. `DROP OPERATOR name (left, right)` removes it, `NONE` standing for a missing operand. Names are read as PostgreSQL reads them: a run of the characters `+ - * / < > = ~ ! @ # % ^ & | ` ?`, without a trailing `+` or `-` unless it holds one of `~ ! @ # % ^ & | ` ?`. The lexer only treats a run as an operator once `CREATE OPERATOR` has named it.

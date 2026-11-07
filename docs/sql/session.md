@@ -2,6 +2,8 @@
 
 A few settings belong to the open database, not to the file. They last until changed or until the database is closed, and are not undone by `ROLLBACK`.
 
+When a database is shared (several `Connection`s, or the [server](../server.md)), each connection has its own: the time zone, the parameters set with `SET` or `set_config`, `@variables`, `PREPARE`d statements, cursors and `HANDLER`s. A new connection starts with the values the database had when it was shared.
+
 ## Run-time parameters
 
 `SET name TO value` (or `SET name = value`), `RESET name` and `SHOW name` read and write named settings, as in PostgreSQL, so that scripts written for it run:

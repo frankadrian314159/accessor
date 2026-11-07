@@ -485,6 +485,25 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_inner(&mut self, e: &Expr) -> Result<BExpr> {
+        // pg_get_indexdef(oid), pg_get_constraintdef(oid), pg_get_viewdef(oid): the definition kept under that name
+        if let Expr::Function { name, args, .. } = e {
+            let kind = match name.to_ascii_uppercase().as_str() {
+                "PG_GET_INDEXDEF" => Some("index"),
+                "PG_GET_CONSTRAINTDEF" => Some("constraint"),
+                "PG_GET_VIEWDEF" => Some("view"),
+                "PG_GET_TRIGGERDEF" => Some("trigger"),
+                _ => None,
+            };
+            if let (Some(kind), Some(first)) = (kind, args.first()) {
+                let map = self.db.definitions(kind);
+                return self.bind(&Expr::Function {
+                    name: "__MAPGET".into(),
+                    args: vec![Expr::Literal(Value::text(&map)), first.clone()],
+                    distinct: false,
+                    star: false,
+                });
+            }
+        }
         // a comparison of texts in a collation compares their sort keys
         if let Expr::Binary { op: op @ (crate::sql::ast::BinOp::Eq | crate::sql::ast::BinOp::Ne | crate::sql::ast::BinOp::Lt | crate::sql::ast::BinOp::Le | crate::sql::ast::BinOp::Gt | crate::sql::ast::BinOp::Ge), left, right } = e {
             let (l, r) = (self.collation_of(left), self.collation_of(right));

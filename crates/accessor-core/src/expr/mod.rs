@@ -134,6 +134,10 @@ impl BExpr {
                             _ => arrays::concat(&x, &y)?,
                         }));
                     }
+                    // PostgreSQL's || gives NULL when either side is NULL
+                    if crate::dialect::current() == crate::dialect::Dialect::Postgresql && (x.is_null() || y.is_null()) {
+                        return Ok(Cow::Owned(Value::Null));
+                    }
                     if crate::dialect::current() == crate::dialect::Dialect::Postgresql {
                         if let (Value::Text(p), Value::Text(q)) = (&*x, &*y) {
                             if let Some(joined) = tsearch::concat_vectors(p, q) {

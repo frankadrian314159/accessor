@@ -64,6 +64,20 @@ pub(crate) struct CatalogUndo {
     catalog: Option<BTreeMap<(String, String), String>>,
 }
 
+/// What belongs to one session rather than to the database: the time zone, the run-time parameters, `@variables`,
+/// `PREPARE`d statements, cursors, `HANDLER`s and the last condition. A [`Connection`](crate::Connection) has its own,
+/// which are put in the database for the length of each statement, so that one client's `SET` is not another's.
+#[derive(Default)]
+pub(crate) struct SessionState {
+    pub time_zone: crate::tz::Zone,
+    pub settings: BTreeMap<String, String>,
+    pub user_vars: BTreeMap<String, crate::value::Value>,
+    pub prepared: BTreeMap<String, crate::exec::Prepared>,
+    pub cursors: BTreeMap<String, crate::exec::Cursor>,
+    pub handlers: BTreeMap<String, (String, usize)>,
+    pub last_diag: Option<crate::error::Diag>,
+}
+
 pub struct Database {
     pub(crate) tables: BTreeMap<String, Table>,
     /// Saved queries: lowercase name → (display name, SQL text).
@@ -1027,6 +1041,36 @@ impl Database {
 
     /// Runs the open transaction `tx` (if any) in place of the database's own, for a connection that
     /// keeps its transaction between calls.
+    /// A new session as the database starts it: its time zone and parameters, nothing else.
+    pub(crate) fn new_session(&self) -> SessionState {
+        SessionState { time_zone: self.time_zone, settings: self.settings.clone(), ..SessionState::default() }
+    }
+
+    /// Puts a session in the database and takes the database's own out (call again to put them back).
+    pub(crate) fn swap_session(&mut self, s: &mut SessionState) {
+        std::mem::swap(&mut self.time_zone, &mut s.time_zone);
+        std::mem::swap(&mut self.settings, &mut s.settings);
+        std::mem::swap(&mut self.user_vars, &mut s.user_vars);
+        std::mem::swap(&mut self.prepared, &mut s.prepared);
+        std::mem::swap(&mut self.cursors, &mut s.cursors);
+        std::mem::swap(&mut self.handlers, &mut s.handlers);
+        std::mem::swap(&mut self.last_diag, &mut s.last_diag);
+    }
+
+    /// Is the session the one the database is in, so that a statement can run on it as it is (alongside others)?
+    pub(crate) fn session_matches(&self, s: &SessionState) -> bool {
+        self.time_zone == s.time_zone
+            && self.settings == s.settings
+            && s.user_vars.is_empty()
+            && s.prepared.is_empty()
+            && s.cursors.is_empty()
+            && s.handlers.is_empty()
+            && self.user_vars.is_empty()
+            && self.prepared.is_empty()
+            && self.cursors.is_empty()
+            && self.handlers.is_empty()
+    }
+
     pub(crate) fn swap_tx(&mut self, other: &mut Option<Tx>) {
         std::mem::swap(&mut self.tx, other);
         mvcc::set_view(self.view_of());

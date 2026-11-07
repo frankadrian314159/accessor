@@ -6017,6 +6017,7 @@ impl<'a> Parser<'a> {
                     "GENERATE_SERIES" | "JSONB_PATH_QUERY" | "JSONB_PATH_QUERY_TZ" | "UNNEST" | "RANGE_MINUS_MULTI" | "MULTIRANGE_MINUS_MULTI"
                         | "STRING_TO_TABLE" | "REGEXP_SPLIT_TO_TABLE" | "REGEXP_MATCHES" | "GENERATE_SUBSCRIPTS" | "JSON_OBJECT_KEYS" | "JSONB_OBJECT_KEYS"
                         | "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT"
+                        | "PG_PARTITION_ANCESTORS"
                 ) {
                     let col = match up.as_str() {
                         "STRING_TO_TABLE" => "string_to_table",
@@ -6027,6 +6028,7 @@ impl<'a> Parser<'a> {
                         "JSONB_OBJECT_KEYS" => "jsonb_object_keys",
                         "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT" => "value",
                         "GENERATE_SERIES" => "generate_series",
+                        "PG_PARTITION_ANCESTORS" => "relid",
                         "UNNEST" => "unnest",
                         "RANGE_MINUS_MULTI" => "range_minus_multi",
                         "MULTIRANGE_MINUS_MULTI" => "multirange_minus_multi",
@@ -6827,6 +6829,15 @@ impl<'a> Parser<'a> {
             let name = format!("__ROWS_FROM:{}{spec}", if ordinality { "ord;" } else { ";" });
             return Ok(TableFactor::Function { name, args, alias, columns });
         }
+        // pg_catalog.generate_series(..): the schema of a function is left off
+        if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("pg_catalog") || s.eq_ignore_ascii_case("public"))
+            && matches!(self.peek_at(1), Tok::Sym("."))
+            && matches!(self.peek_at(2), Tok::Ident(_))
+            && matches!(self.peek_at(3), Tok::Sym("("))
+        {
+            self.advance();
+            self.advance();
+        }
         // A table function: name(arguments) [AS] alias [(columns)].
         if matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Sym("(")) {
             let name = self.ident()?.to_ascii_uppercase();
@@ -6997,6 +7008,18 @@ impl<'a> Parser<'a> {
     fn comparison(&mut self) -> Result<Expr> {
         let mut left = self.concat()?;
         loop {
+            // `a OPERATOR(pg_catalog.~) b` is `a ~ b`: the schema and the wrapper are dropped
+            if self.peek_kw("OPERATOR") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                let mut k = 2;
+                while matches!(self.peek_at(k), Tok::Ident(_) | Tok::Quoted(_)) && matches!(self.peek_at(k + 1), Tok::Sym(".")) {
+                    k += 2;
+                }
+                if matches!(self.peek_at(k), Tok::Sym(_) | Tok::Op(_)) && matches!(self.peek_at(k + 1), Tok::Sym(")")) {
+                    let sym = self.toks[self.pos + k].clone();
+                    self.toks.drain(self.pos + 1..self.pos + k + 2);
+                    self.toks[self.pos] = sym;
+                }
+            }
             let op = match self.peek() {
                 Tok::Sym("=") => Some(BinOp::Eq),
                 Tok::Sym("<>") | Tok::Sym("!=") => Some(BinOp::Ne),
@@ -8252,6 +8275,14 @@ impl<'a> Parser<'a> {
 
     /// The name of a data type, including the multi-word standard spellings.
     fn type_name(&mut self) -> Result<String> {
+        // a type named with its schema (`pg_catalog.regtype`, `public.mytype`) is the type
+        if matches!(self.peek(), Tok::Ident(s) if matches!(s.to_ascii_lowercase().as_str(), "pg_catalog" | "public" | "information_schema"))
+            && matches!(self.peek_at(1), Tok::Sym("."))
+            && matches!(self.peek_at(2), Tok::Ident(_))
+        {
+            self.advance();
+            self.advance();
+        }
         let first = match self.advance() {
             Tok::Ident(s) => s,
             _ => {

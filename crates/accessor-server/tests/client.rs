@@ -112,3 +112,44 @@ fn passwords_are_checked() {
         handle.join().unwrap();
     }
 }
+
+#[test]
+fn settings_are_per_connection_and_psql_catalog_queries_work() {
+    let (conn, stop, handle) = start(Config::default());
+    let mut a = Client::connect(&conn, NoTls).unwrap();
+    let mut b = Client::connect(&conn, NoTls).unwrap();
+    let show = |c: &mut Client, sql: &str| -> String {
+        c.simple_query(sql)
+            .unwrap()
+            .iter()
+            .find_map(|m| if let SimpleQueryMessage::Row(r) = m { r.get(0).map(str::to_string) } else { None })
+            .unwrap_or_default()
+    };
+    a.batch_execute("SET TIME ZONE 'Europe/Paris'").unwrap();
+    assert_eq!(show(&mut a, "SHOW TIME ZONE"), "Europe/Paris");
+    assert_eq!(show(&mut b, "SHOW TIME ZONE"), "UTC");
+
+    // column names as PostgreSQL gives them
+    a.batch_execute("CREATE TABLE emp (id int PRIMARY KEY, name text NOT NULL, salary numeric(10,2) DEFAULT 0)").unwrap();
+    a.batch_execute("CREATE TABLE dept (id int PRIMARY KEY, emp_id int REFERENCES emp(id)); CREATE INDEX emp_name ON emp(name)").unwrap();
+    let r = a.simple_query("SELECT count(*), max(id), id + 1, upper(name) FROM emp GROUP BY id, name").unwrap();
+    let names: Vec<String> = r.iter().find_map(|m| if let SimpleQueryMessage::Row(r) = m { Some(r.columns().iter().map(|c| c.name().to_string()).collect()) } else { None }).unwrap_or_else(|| {
+        // no rows: ask for the columns another way
+        let s = a.prepare("SELECT count(*), max(id), id + 1, upper(name) FROM emp GROUP BY id, name").unwrap();
+        s.columns().iter().map(|c| c.name().to_string()).collect()
+    });
+    assert_eq!(names, ["count", "max", "?column?", "upper"]);
+
+    // the queries psql sends for \d emp
+    let oid = show(&mut b, "SELECT c.oid FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE c.relname OPERATOR(pg_catalog.~) '^(emp)$' COLLATE pg_catalog.default AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 2, 3");
+    assert_eq!(oid, "emp");
+    let def = show(&mut b, "SELECT pg_catalog.pg_get_indexdef(i.indexrelid, 0, true) FROM pg_catalog.pg_index i WHERE i.indexrelid = 'emp_name'");
+    assert_eq!(def, "CREATE INDEX emp_name ON emp USING btree (name)");
+    let fk = show(&mut b, "SELECT pg_catalog.pg_get_constraintdef(r.oid, true) FROM pg_catalog.pg_constraint r WHERE r.conrelid = 'dept' AND r.contype = 'f'");
+    assert_eq!(fk, "FOREIGN KEY (emp_id) REFERENCES emp(id)");
+    assert_eq!(show(&mut b, "SELECT pg_catalog.pg_get_expr(adbin, adrelid, true) FROM pg_catalog.pg_attrdef WHERE adrelid = 'emp'"), "0");
+
+    drop((a, b));
+    stop.stop();
+    handle.join().unwrap();
+}

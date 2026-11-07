@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::database::{Database, Tx};
+use crate::database::{Database, SessionState, Tx};
 use crate::error::{Error, Result};
 use crate::exec::{Prepared, QueryResult};
 use crate::storage::mvcc::{self, View};
@@ -145,7 +145,8 @@ impl SharedDatabase {
 
     /// A new connection. Each has its own transaction; open as many as you like.
     pub fn connect(&self) -> Connection {
-        Connection { shared: self.clone(), tx: Mutex::new(None) }
+        let session = self.inner.db.read().unwrap_or_else(|e| e.into_inner()).new_session();
+        Connection { shared: self.clone(), tx: Mutex::new(None), session: Mutex::new(session) }
     }
 
     /// Runs `f` on the database, for tests and tools: it sees the newest state of every table.
@@ -181,6 +182,10 @@ pub struct Connection {
     shared: SharedDatabase,
     /// This connection's open transaction, between statements.
     tx: Mutex<Option<Tx>>,
+    /// This connection's time zone, parameters, variables, prepared statements and cursors (see [`SessionState`]).
+    /// A statement that changes none of them and meets a connection that has changed none runs alongside other
+    /// readers; otherwise the session is put in the database and the statement takes the write turn.
+    session: Mutex<SessionState>,
 }
 
 fn unavailable() -> Error {
@@ -233,9 +238,12 @@ impl Connection {
         let _turn = WriteTurn(inner);
         let mut db = inner.db.write().map_err(|_| unavailable())?;
         let mut mine = self.tx();
+        let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
         db.swap_tx(&mut mine);
+        db.swap_session(&mut session);
         db.enter_session();
         let result = f(&mut db);
+        db.swap_session(&mut session);
         db.swap_tx(&mut mine);
         result
     }
@@ -286,6 +294,10 @@ impl Connection {
     pub fn execute(&self, sql: &str) -> Result<QueryResult> {
         self.retrying(|| {
             let read = self.read(|db| {
+                // a connection with settings of its own runs on its own turn
+                if !db.session_matches(&self.session.lock().unwrap_or_else(|e| e.into_inner())) {
+                    return Ok(None);
+                }
                 let parsed = db.parse_cached(sql)?;
                 if db.is_pure_read(&parsed) {
                     db.run_read(&parsed).map(Some)
@@ -309,6 +321,9 @@ impl Connection {
     pub fn execute_prepared(&self, prepared: &Prepared, params: &[(&str, Value)]) -> Result<QueryResult> {
         self.retrying(|| {
             let read = self.read(|db| {
+                if !db.session_matches(&self.session.lock().unwrap_or_else(|e| e.into_inner())) {
+                    return Ok(None);
+                }
                 if db.is_pure_read(prepared.statements()) {
                     db.query_prepared(prepared, params).map(Some)
                 } else {

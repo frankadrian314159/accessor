@@ -184,3 +184,30 @@ fn a_shared_file_is_locked_once_and_kept() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn settings_belong_to_the_connection_that_set_them() {
+    let mut base = Database::in_memory();
+    base.set_dialect(accessor_core::dialect::Dialect::Postgresql);
+    let db = SharedDatabase::new(base);
+    let (a, b) = (db.connect(), db.connect());
+    let shown = |c: &Connection, sql: &str| c.execute(sql).unwrap().rows[0][0].to_string();
+
+    a.execute("SET TIME ZONE 'America/New_York'").unwrap();
+    a.execute("SET myapp.mode = 'strict'").unwrap();
+    assert_eq!(shown(&a, "SHOW TIME ZONE"), "America/New_York");
+    assert_eq!(shown(&a, "SELECT current_setting('myapp.mode')"), "strict");
+    // the other connection, and one made later, see none of it
+    assert_eq!(shown(&b, "SHOW TIME ZONE"), "UTC");
+    assert!(b.execute("SELECT current_setting('myapp.mode')").is_err());
+    assert_eq!(shown(&db.connect(), "SHOW TIME ZONE"), "UTC");
+    // a timestamp is read and shown in the zone of the connection
+    assert_eq!(shown(&a, "SELECT '2024-07-01 12:00:00'::timestamptz"), "2024-07-01 12:00:00-04:00");
+    assert_eq!(shown(&b, "SELECT '2024-07-01 12:00:00'::timestamptz"), "2024-07-01 12:00:00+00:00");
+    // prepared statements and cursors are the connection's too
+    a.execute("PREPARE p AS SELECT 1").unwrap();
+    assert!(b.execute("EXECUTE p").is_err());
+    assert_eq!(shown(&a, "EXECUTE p"), "1");
+    // and a connection that has set nothing still reads alongside the others
+    assert_eq!(shown(&b, "SELECT 2"), "2");
+}
