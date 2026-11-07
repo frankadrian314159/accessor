@@ -53,6 +53,9 @@ pub enum TsqlFn {
     Style,
     IdentityOf,
     ObjectId,
+    ObjectName,
+    ObjectIdOf,
+    Format,
     Version,
 }
 
@@ -105,6 +108,9 @@ pub fn lookup(name: &str) -> Option<(TsqlFn, usize, usize)> {
         "__TSQL_STYLE" => (Style, 2, 2),
         "SCOPE_IDENTITY" | "IDENT_CURRENT" => (IdentityOf, 0, 1),
         "OBJECT_ID" => (ObjectId, 1, 2),
+        "__TSQL_OBJNAME" => (ObjectName, 1, 1),
+        "__TSQL_OBJID" => (ObjectIdOf, 1, 1),
+        "FORMAT" => (Format, 2, 3),
         "__TSQL_VERSION" => (Version, 0, 0),
         _ => return None,
     })
@@ -494,11 +500,243 @@ pub fn call(f: TsqlFn, vals: &[Cow<'_, Value>]) -> Result<Value> {
                 other => Value::text(&other.to_string()),
             }
         }
-        // the last identity value is not tracked per connection yet
-        IdentityOf => Value::Null,
+        IdentityOf => match super::myfuncs::last_insert_id() {
+            0 => Value::Null,
+            n => Value::Int(n),
+        },
         ObjectId => Value::Null,
+        ObjectName => {
+            // [dbo].[Emp], dbo.Emp, "Emp", tempdb..#t: the name of the object, with no schema or quotes
+            let t = text(v(0)).to_string();
+            let last = t.rsplit('.').next().unwrap_or(&t);
+            Value::text(last.trim_matches(|c| c == '[' || c == ']' || c == '"'))
+        }
+        ObjectIdOf => {
+            // a number for a table that does not change while it exists: a hash of its name
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in text(v(0)).to_lowercase().bytes() {
+                h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+            }
+            Value::Int(((h >> 33) as i64) + 100_000_000)
+        }
+        Format => match v(0) {
+            Value::Null => Value::Null,
+            val @ (Value::Date(_) | Value::DateTime(_) | Value::TimestampTz(_) | Value::Time(_)) => {
+                let (ms, kind) = instant(val)?;
+                Value::text(&format_date(ms, kind, &text(v(1)))?)
+            }
+            Value::Text(s) => Value::Text(s.clone()),
+            val => match val.to_f64() {
+                Some(x) => Value::text(&format_number(x, &text(v(1)))?),
+                None => Value::text(&val.to_string()),
+            },
+        },
         Version => Value::text("Microsoft SQL Server 2022 (Accessor) - 16.0.1000.6"),
     })
+}
+
+// ----- FORMAT -------------------------------------------------------------------------------------------------------
+
+fn group_thousands(digits: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `FORMAT(date, pattern)`: the standard letters and custom patterns of .NET, in the culture en-US.
+fn format_date(ms: i64, kind: Kind, pattern: &str) -> Result<String> {
+    let expanded = match pattern {
+        "d" => "M/d/yyyy",
+        "D" => "dddd, MMMM d, yyyy",
+        "f" => "dddd, MMMM d, yyyy h:mm tt",
+        "F" => "dddd, MMMM d, yyyy h:mm:ss tt",
+        "g" => "M/d/yyyy h:mm tt",
+        "G" => "M/d/yyyy h:mm:ss tt",
+        "m" | "M" => "MMMM d",
+        "y" | "Y" => "MMMM yyyy",
+        "t" => "h:mm tt",
+        "T" => "h:mm:ss tt",
+        "s" => "yyyy'-'MM'-'dd'T'HH':'mm':'ss",
+        "o" | "O" => "yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffff",
+        "u" => "yyyy'-'MM'-'dd HH':'mm':'ss'Z'",
+        "r" | "R" => "ddd, dd MMM yyyy HH':'mm':'ss 'GMT'",
+        p => p,
+    };
+    let _ = kind;
+    let (y, mo, d, h, mi, s) = datetime::components(ms);
+    let frac = datetime::millis(ms);
+    let weekday = (datetime::trunc_day(ms).div_euclid(MS_PER_DAY) + 4).rem_euclid(7) as usize;
+    let chars: Vec<char> = expanded.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let run = chars[i..].iter().take_while(|&&x| x == c).count();
+        match c {
+            '\'' | '"' => {
+                let end = chars[i + 1..].iter().position(|&x| x == c).map_or(chars.len(), |p| i + 1 + p);
+                out.extend(&chars[i + 1..end]);
+                i = end + 1;
+                continue;
+            }
+            '\\' => {
+                if let Some(&n) = chars.get(i + 1) {
+                    out.push(n);
+                }
+                i += 2;
+                continue;
+            }
+            'y' => match run {
+                1 => out.push_str(&(y % 100).to_string()),
+                2 => out.push_str(&format!("{:02}", y % 100)),
+                n => out.push_str(&format!("{y:0width$}", width = n.max(4))),
+            },
+            'M' => match run {
+                1 => out.push_str(&mo.to_string()),
+                2 => out.push_str(&format!("{mo:02}")),
+                3 => out.push_str(&MONTH_NAMES[(mo - 1) as usize][..3]),
+                _ => out.push_str(MONTH_NAMES[(mo - 1) as usize]),
+            },
+            'd' => match run {
+                1 => out.push_str(&d.to_string()),
+                2 => out.push_str(&format!("{d:02}")),
+                3 => out.push_str(&DAY_NAMES[weekday][..3]),
+                _ => out.push_str(DAY_NAMES[weekday]),
+            },
+            'H' => out.push_str(&if run == 1 { h.to_string() } else { format!("{h:02}") }),
+            'h' => {
+                let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+                out.push_str(&if run == 1 { h12.to_string() } else { format!("{h12:02}") });
+            }
+            'm' => out.push_str(&if run == 1 { mi.to_string() } else { format!("{mi:02}") }),
+            's' => out.push_str(&if run == 1 { s.to_string() } else { format!("{s:02}") }),
+            'f' | 'F' => {
+                let digits = format!("{frac:03}0000");
+                let n = run.min(7);
+                let mut part = digits[..n].to_string();
+                if c == 'F' {
+                    part = part.trim_end_matches('0').to_string();
+                }
+                out.push_str(&part);
+            }
+            't' => {
+                let m = if h < 12 { "AM" } else { "PM" };
+                out.push_str(if run == 1 { &m[..1] } else { m });
+            }
+            '/' => out.push('/'),
+            other => out.extend(std::iter::repeat(other).take(run)),
+        }
+        i += run;
+    }
+    Ok(out)
+}
+
+/// `FORMAT(number, pattern)`: the standard letters (`N2`, `C`, `P1`, `D4`, `X`, `F3`, `E2`, `G`) and custom patterns
+/// (`#,##0.00`, `000`, `0.0%`).
+fn format_number(x: f64, pattern: &str) -> Result<String> {
+    let mut letters = pattern.chars();
+    let first = letters.next().unwrap_or('G');
+    let rest: String = letters.collect();
+    let precision = if rest.is_empty() { None } else { rest.parse::<usize>().ok() };
+    if first.is_ascii_alphabetic() && (rest.is_empty() || precision.is_some()) {
+        let neg = x < 0.0;
+        let a = x.abs();
+        let fixed = |n: usize| format!("{a:.n$}");
+        let grouped = |n: usize| {
+            let s = fixed(n);
+            match s.split_once('.') {
+                Some((i, f)) => format!("{}.{f}", group_thousands(i)),
+                None => group_thousands(&s),
+            }
+        };
+        let sign = if neg { "-" } else { "" };
+        return Ok(match first.to_ascii_uppercase() {
+            'N' => format!("{sign}{}", grouped(precision.unwrap_or(2))),
+            'F' => format!("{sign}{}", fixed(precision.unwrap_or(2))),
+            'C' => format!("{sign}${}", grouped(precision.unwrap_or(2))),
+            'P' => format!("{sign}{}%", {
+                let p = a * 100.0;
+                let s = format!("{p:.*}", precision.unwrap_or(2));
+                match s.split_once('.') {
+                    Some((i, f)) => format!("{}.{f}", group_thousands(i)),
+                    None => group_thousands(&s),
+                }
+            }),
+            'D' => {
+                let digits = format!("{}", a.trunc() as i64);
+                format!("{sign}{digits:0>width$}", width = precision.unwrap_or(1))
+            }
+            'X' => {
+                let s = format!("{:X}", x as i64);
+                let s = if first == 'x' { s.to_lowercase() } else { s };
+                format!("{s:0>width$}", width = precision.unwrap_or(1))
+            }
+            'E' => {
+                let s = format!("{a:.*e}", precision.unwrap_or(6));
+                let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+                let e: i32 = e.parse().unwrap_or(0);
+                format!("{sign}{m}{}{}{:03}", if first == 'e' { 'e' } else { 'E' }, if e < 0 { '-' } else { '+' }, e.abs())
+            }
+            'G' | 'R' => {
+                let s = if a == a.trunc() && a.abs() < 1e15 { format!("{}", a as i64) } else { format!("{a}") };
+                format!("{sign}{s}")
+            }
+            _ => return Err(Error::runtime(format!("The format specifier '{first}' is not valid"))),
+        });
+    }
+    // a custom pattern: 0 and # are digits, `,` groups, `.` is the decimal point, `%` multiplies by 100
+    let percent = pattern.contains('%');
+    let x = if percent { x * 100.0 } else { x };
+    let (int_pat, frac_pat) = match pattern.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (pattern, ""),
+    };
+    let min_frac = frac_pat.chars().filter(|&c| c == '0').count();
+    let max_frac = frac_pat.chars().filter(|&c| c == '0' || c == '#').count();
+    let group = int_pat.contains(',');
+    let min_int = int_pat.chars().filter(|&c| c == '0').count();
+    let a = x.abs();
+    let text = format!("{a:.max_frac$}");
+    let (int_text, frac_text) = text.split_once('.').unwrap_or((&text, ""));
+    let mut frac_text = frac_text.to_string();
+    while frac_text.len() > min_frac && frac_text.ends_with('0') {
+        frac_text.pop();
+    }
+    let mut int_digits = int_text.trim_start_matches('0').to_string();
+    while int_digits.len() < min_int {
+        int_digits.insert(0, '0');
+    }
+    if group {
+        int_digits = group_thousands(&int_digits);
+    }
+    let nonzero = int_text.chars().any(|c| c != '0') || frac_text.chars().any(|c| c != '0');
+    // the literal text around the digits
+    let prefix: String = int_pat.chars().take_while(|c| !matches!(c, '0' | '#' | ',')).collect();
+    let suffix_int: String = int_pat.chars().rev().take_while(|c| !matches!(c, '0' | '#' | ',')).collect::<Vec<_>>().into_iter().rev().collect();
+    let suffix_frac: String = frac_pat.chars().rev().take_while(|c| !matches!(c, '0' | '#')).collect::<Vec<_>>().into_iter().rev().collect();
+    let mut out = String::new();
+    if x < 0.0 && nonzero {
+        out.push('-');
+    }
+    out.push_str(&prefix.replace('%', ""));
+    out.push_str(&int_digits);
+    if !frac_text.is_empty() {
+        out.push('.');
+        out.push_str(&frac_text);
+    }
+    out.push_str(&suffix_frac.replace('%', ""));
+    if frac_pat.is_empty() {
+        out.push_str(&suffix_int.replace('%', ""));
+    }
+    if percent {
+        out.push('%');
+    }
+    Ok(out)
 }
 
 /// Sixteen random bytes (for `NEWID` and `RAND`).

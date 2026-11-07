@@ -58,6 +58,20 @@ thread_local! {
     static MESSAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// The result sets a T-SQL batch produced before its last one (a batch may `SELECT` several times).
+    static EXTRA_SETS: std::cell::RefCell<Vec<QueryResult>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The result sets a T-SQL batch made before the one `execute` returned, in order (empty for other statements).
+pub fn take_result_sets() -> Vec<QueryResult> {
+    EXTRA_SETS.with(|m| std::mem::take(&mut *m.borrow_mut()))
+}
+
+pub(crate) fn put_result_sets(sets: Vec<QueryResult>) {
+    EXTRA_SETS.with(|m| *m.borrow_mut() = sets);
+}
+
 /// The messages `PRINT` has made on this thread since the last call.
 pub fn take_messages() -> Vec<String> {
     MESSAGES.with(|m| std::mem::take(&mut *m.borrow_mut()))
@@ -78,9 +92,19 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let mut last = QueryResult::default();
         let _hint = budget::hinted_time(sql).map(budget::limit);
+        // T-SQL: a batch of several statements returns all of the result sets, in order (the last is the result)
+        let tsql = self.dialect() == crate::dialect::Dialect::Tsql;
+        let mut sets: Vec<QueryResult> = Vec::new();
+        put_result_sets(Vec::new());
         for st in self.parse_cached(sql)?.iter() {
             match self.execute_statement(st) {
                 Ok(r) => {
+                    if tsql {
+                        if !last.columns.is_empty() {
+                            sets.push(std::mem::take(&mut last));
+                        }
+                        sets.extend(take_result_sets());
+                    }
                     if !matches!(st, Statement::GetDiagnostics { .. }) {
                         self.last_diag = None;
                     }
@@ -93,9 +117,13 @@ impl Database {
                 }
                 Err(e) => {
                     self.last_diag = Some(e.diag());
+                    take_result_sets();
                     return Err(e);
                 }
             }
+        }
+        if tsql {
+            put_result_sets(sets);
         }
         Ok(last)
     }
@@ -164,6 +192,18 @@ impl Database {
 
     pub fn execute_statement(&mut self, st: &Statement) -> Result<QueryResult> {
         let result = self.run_statement(st);
+        if crate::dialect::current() == crate::dialect::Dialect::Tsql && !matches!(st, Statement::TsqlBatch(_) | Statement::Print(_)) {
+            // @@ROWCOUNT and @@ERROR describe the statement that ran last
+            match &result {
+                Ok(r) => {
+                    self.user_vars.insert("@@rowcount".into(), crate::value::Value::Int(if r.affected > 0 { r.affected as i64 } else { r.rows.len() as i64 }));
+                    self.user_vars.insert("@@error".into(), crate::value::Value::Int(0));
+                }
+                Err(e) => {
+                    self.user_vars.insert("@@error".into(), crate::value::Value::Int(e.errno() as i64));
+                }
+            }
+        }
         if result.is_ok() {
             if let Statement::CreateTable { name, .. } | Statement::CreateTableAs { name, .. } | Statement::CreateView { name, .. } = st {
                 self.record_owner(name);

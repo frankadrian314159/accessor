@@ -189,6 +189,11 @@ impl Database {
     pub(crate) fn session_value(&self, name: &str) -> Option<Value> {
         if let Some(sys) = name.strip_prefix("@@") {
             let sys = sys.to_ascii_lowercase();
+            if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+                if let Some(v) = self.tsql_system_variable(&sys) {
+                    return Some(v);
+                }
+            }
             let (default, _) = known(&sys)?;
             let text = if sys == "timezone" { self.time_zone() } else { self.settings.get(&sys).cloned().unwrap_or_else(|| default.to_string()) };
             // numbers and switches are numbers, as MySQL gives them
@@ -202,6 +207,29 @@ impl Database {
             });
         }
         self.user_vars.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// T-SQL's `@@name` variables: the ones the engine keeps (`@@ROWCOUNT`, `@@ERROR`, `@@FETCH_STATUS`) and the fixed ones.
+    fn tsql_system_variable(&self, name: &str) -> Option<Value> {
+        let kept = |key: &str, default: i64| self.user_vars.get(key).cloned().unwrap_or(Value::Int(default));
+        Some(match name {
+            "rowcount" => kept("@@rowcount", 0),
+            "error" => kept("@@error", 0),
+            "fetch_status" => kept("@@fetch_status", -1),
+            "identity" => match crate::expr::myfuncs::last_insert_id() {
+                0 => Value::Null,
+                n => Value::Int(n),
+            },
+            "trancount" => Value::Int(i64::from(self.in_transaction())),
+            "version" => Value::text("Microsoft SQL Server 2022 (Accessor) - 16.0.1000.6"),
+            "servername" | "servicename" => Value::text("ACCESSOR"),
+            "spid" => Value::Int(1),
+            "language" => Value::text("us_english"),
+            "datefirst" => Value::Int(7),
+            "max_connections" => Value::Int(32767),
+            "nestlevel" => Value::Int(0),
+            _ => return None,
+        })
     }
 
     /// Remembers a `set_config` call for the end of the statement (the binder cannot change the settings itself).

@@ -12,6 +12,8 @@
 //! (`DECLARE @t TABLE`), cursors, `GOTO` and labels.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{Parser, Tok};
 use crate::error::{Error, Result};
@@ -22,11 +24,24 @@ thread_local! {
     /// The labels of the `WHILE` loops being read, innermost last (`CONTINUE` goes to the innermost).
     static LOOPS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static NEXT_LOOP: Cell<u32> = const { Cell::new(0) };
+    /// The table variables of the batch being read: `@t` (lowercase, without the `@`) and the table that stands for it.
+    static TABLE_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
+
+static NEXT_TABLE_VAR: AtomicU64 = AtomicU64::new(1);
+
+/// What `OUTPUT` asked for: the list, and the table of `INTO`.
+pub(super) struct TsqlOutput {
+    items: Vec<SelectItem>,
+    into: Option<(String, Option<Vec<String>>)>,
+}
+
+/// The prefix of the tables that stand for table variables (they are dropped when the batch ends).
+pub(crate) const TABLE_VAR_PREFIX: &str = "__tv";
 
 /// The words that begin a statement: the end of one without a terminator.
 pub(super) const STARTERS: &[&str] = &[
-    "DECLARE", "IF", "WHILE", "PRINT", "EXEC", "EXECUTE", "RETURN", "BREAK", "CONTINUE", "GO", "USE", "BEGIN", "THROW", "RAISERROR", "COMMIT",
+    "DECLARE", "IF", "WHILE", "PRINT", "OPEN", "CLOSE", "DEALLOCATE", "EXEC", "EXECUTE", "RETURN", "BREAK", "CONTINUE", "GO", "USE", "BEGIN", "THROW", "RAISERROR", "COMMIT",
     "ROLLBACK", "SAVE", "TRUNCATE", "ALTER", "MERGE", "GRANT", "REVOKE", "DENY", "WAITFOR",
 ];
 
@@ -44,7 +59,10 @@ fn empty() -> ProcStmt {
 
 /// A batch becomes its statements when they are all plain SQL, and one block when it has variables or control flow.
 fn flush(out: &mut Vec<Statement>, batch: Vec<ProcStmt>) {
-    let plain = |s: &ProcStmt| matches!(s, ProcStmt::Sql(st) if !matches!(st, Statement::Raise(_) | Statement::Print(_)));
+    let plain = |s: &ProcStmt| {
+        matches!(s, ProcStmt::Sql(st) if !matches!(st, Statement::Raise(_) | Statement::Print(_))
+            && !matches!(st, Statement::CreateTable { name, .. } if name.starts_with(TABLE_VAR_PREFIX)))
+    };
     if batch.is_empty() {
         return;
     }
@@ -70,6 +88,7 @@ impl Parser<'_> {
 
     /// The whole text: batches split at `GO`.
     pub(super) fn tsql_script(&mut self) -> Result<Vec<Statement>> {
+        TABLE_VARS.with(|t| t.borrow_mut().clear());
         let mut out = Vec::new();
         let mut batch: Vec<ProcStmt> = Vec::new();
         loop {
@@ -83,6 +102,7 @@ impl Parser<'_> {
                     self.advance();
                 }
                 flush(&mut out, std::mem::take(&mut batch));
+                TABLE_VARS.with(|t| t.borrow_mut().clear());
                 continue;
             }
             batch.push(self.tsql_stmt()?);
@@ -119,12 +139,46 @@ impl Parser<'_> {
     fn tsql_stmt(&mut self) -> Result<ProcStmt> {
         // DECLARE @a INT = 1, @b NVARCHAR(20)
         if self.eat_kw("DECLARE") {
+            // DECLARE c CURSOR [options] FOR select
+            if matches!(self.peek(), Tok::Ident(_) | Tok::Quoted(_)) && self.peek_kw_at(1, "CURSOR") {
+                let name = self.ident()?;
+                self.advance();
+                const OPTIONS: [&str; 12] =
+                    ["LOCAL", "GLOBAL", "FORWARD_ONLY", "SCROLL", "STATIC", "KEYSET", "DYNAMIC", "FAST_FORWARD", "READ_ONLY", "SCROLL_LOCKS", "OPTIMISTIC", "TYPE_WARNING"];
+                while OPTIONS.iter().any(|o| self.peek_kw(o)) {
+                    self.advance();
+                }
+                self.expect_kw("FOR")?;
+                let select = self.select()?;
+                if self.eat_kw("FOR") {
+                    if self.eat_kw("READ") {
+                        self.expect_kw("ONLY")?;
+                    } else {
+                        self.expect_kw("UPDATE")?;
+                        if self.eat_kw("OF") {
+                            self.ident_list()?;
+                        }
+                    }
+                }
+                return Ok(ProcStmt::DeclarePgCursor { name, params: Vec::new(), select: Some(Box::new(select)) });
+            }
             let mut body = Vec::new();
             loop {
                 let name = self.tsql_variable()?;
                 self.eat_kw("AS");
-                if self.peek_kw("TABLE") || self.peek_kw("CURSOR") {
-                    return Err(Error::syntax("table variables and cursors are not supported in a T-SQL batch"));
+                if self.peek_kw("CURSOR") {
+                    return Err(Error::syntax("a cursor variable is not supported; DECLARE name CURSOR FOR ... is"));
+                }
+                if self.eat_kw("TABLE") {
+                    // a table variable is a table of its own, named for this declaration and dropped with the batch
+                    let table = format!("{TABLE_VAR_PREFIX}{}_{}", NEXT_TABLE_VAR.fetch_add(1, Ordering::Relaxed), name.to_ascii_lowercase());
+                    let (create, _, _) = self.create_table_core_named(table.clone())?;
+                    TABLE_VARS.with(|t| t.borrow_mut().insert(name.to_ascii_lowercase(), table));
+                    body.push(ProcStmt::Sql(create));
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                    continue;
                 }
                 let data_type = Some(self.data_type_name()?);
                 let init = if self.eat_sym("=") { Some(self.expr()?) } else { None };
@@ -253,6 +307,52 @@ impl Parser<'_> {
         if self.eat_kw("PRINT") {
             return Ok(ProcStmt::Sql(Statement::Print(self.expr()?)));
         }
+        if self.eat_kw("OPEN") {
+            self.eat_kw("GLOBAL");
+            let name = self.ident()?;
+            return Ok(ProcStmt::OpenPg { name, args: Vec::new(), query: None, dynamic: None });
+        }
+        if self.eat_kw("CLOSE") {
+            self.eat_kw("GLOBAL");
+            return Ok(ProcStmt::CloseCursor(self.ident()?));
+        }
+        if self.eat_kw("DEALLOCATE") {
+            self.eat_kw("GLOBAL");
+            self.ident()?;
+            return Ok(empty());
+        }
+        if self.peek_kw("FETCH") {
+            use crate::sql::ast::FetchDirection as D;
+            self.advance();
+            let direction = if self.eat_kw("NEXT") {
+                D::Next
+            } else if self.eat_kw("PRIOR") {
+                D::Prior
+            } else if self.eat_kw("FIRST") {
+                D::First
+            } else if self.eat_kw("LAST") {
+                D::Last
+            } else if self.eat_kw("ABSOLUTE") {
+                D::Absolute(self.signed_int()?)
+            } else if self.eat_kw("RELATIVE") {
+                D::Relative(self.signed_int()?)
+            } else {
+                D::Next
+            };
+            self.eat_kw("FROM");
+            self.eat_kw("GLOBAL");
+            let cursor = self.ident()?;
+            let mut targets = Vec::new();
+            if self.eat_kw("INTO") {
+                loop {
+                    targets.push(self.tsql_variable()?);
+                    if !self.eat_sym(",") {
+                        break;
+                    }
+                }
+            }
+            return Ok(ProcStmt::FetchPg { cursor, direction, move_only: false, targets, record: false });
+        }
         if self.eat_kw("USE") {
             self.ident()?;
             return Ok(empty());
@@ -324,7 +424,89 @@ impl Parser<'_> {
             let st = self.statement()?;
             return tsql_assignment(st);
         }
-        Ok(ProcStmt::Sql(self.statement()?))
+        let st = self.statement()?;
+        if let Some((table, columns)) = self.output_into.take() {
+            return Ok(ProcStmt::OutputInto { stmt: Box::new(st), table, columns });
+        }
+        Ok(ProcStmt::Sql(st))
+    }
+
+    /// `@t` where a table is expected: the table that stands for the table variable.
+    pub(super) fn tsql_table_variable(&mut self) -> Option<String> {
+        if crate::dialect::current() != crate::dialect::Dialect::Tsql {
+            return None;
+        }
+        let Tok::Param(n) = self.peek().clone() else { return None };
+        let table = TABLE_VARS.with(|t| t.borrow().get(&n.to_ascii_lowercase()).cloned())?;
+        self.advance();
+        Some(table)
+    }
+
+    /// Is a `FETCH NEXT FROM cursor` here, rather than the `FETCH NEXT n ROWS ONLY` of a query?
+    pub(super) fn tsql_cursor_fetch_ahead(&self) -> bool {
+        crate::dialect::current() == crate::dialect::Dialect::Tsql
+            && self.peek_kw("FETCH")
+            && (self.peek_kw_at(1, "FROM")
+                || self.peek_kw_at(2, "FROM")
+                || self.peek_kw_at(1, "PRIOR")
+                || self.peek_kw_at(1, "LAST")
+                || self.peek_kw_at(1, "ABSOLUTE")
+                || self.peek_kw_at(1, "RELATIVE"))
+    }
+
+    /// `OUTPUT inserted.a, deleted.b [INTO table [(columns)]]`, kept until the statement is finished.
+    pub(super) fn tsql_output(&mut self) -> Result<()> {
+        if crate::dialect::current() != crate::dialect::Dialect::Tsql || !self.eat_kw("OUTPUT") {
+            return Ok(());
+        }
+        let mut items = vec![self.select_item()?];
+        while self.eat_sym(",") {
+            items.push(self.select_item()?);
+        }
+        let into = if self.eat_kw("INTO") {
+            let table = self.table_ident()?;
+            let columns = if self.peek_sym("(") {
+                self.advance();
+                let c = self.ident_list()?;
+                self.expect_sym(")")?;
+                Some(c)
+            } else {
+                None
+            };
+            Some((table, columns))
+        } else {
+            None
+        };
+        self.output = Some(TsqlOutput { items, into });
+        Ok(())
+    }
+
+    /// The statement with its `OUTPUT` as a `RETURNING`: `inserted` is the row after, `deleted` the row before.
+    pub(super) fn tsql_finish_output(&mut self, st: Statement, out: TsqlOutput) -> Statement {
+        let rename = |t: &mut String| {
+            if t.eq_ignore_ascii_case("inserted") {
+                *t = "new".into();
+            } else if t.eq_ignore_ascii_case("deleted") {
+                *t = "old".into();
+            }
+        };
+        let mut items = out.items;
+        for item in items.iter_mut() {
+            match item {
+                SelectItem::QualifiedWildcard(t) => rename(t),
+                SelectItem::Expr { expr, .. } => {
+                    let _ = crate::sql::walk::walk_expr(expr, &mut |x| {
+                        if let Expr::Column { table: Some(t), .. } = x {
+                            rename(t);
+                        }
+                        Ok(())
+                    });
+                }
+                _ => {}
+            }
+        }
+        self.output_into = out.into;
+        Statement::Returning { stmt: Box::new(st), items }
     }
 
     /// T-SQL's calls that are not written like the others: `DATEADD(day, 1, d)` (a bare part name first), and
@@ -350,6 +532,27 @@ impl Parser<'_> {
                 }
                 self.expect_sym(")")?;
                 Ok(Some(call(&up, args)))
+            }
+            "OBJECT_ID" | "IDENT_CURRENT" => {
+                // a lookup in the catalog: OBJECT_ID gives the object's number, IDENT_CURRENT its last identity value
+                let arg = self.expr()?;
+                while self.eat_sym(",") {
+                    self.expr()?;
+                }
+                self.expect_sym(")")?;
+                let sql = if up == "OBJECT_ID" {
+                    "(SELECT __tsql_objid(table_name) FROM information_schema.tables WHERE lower(table_name) = lower(__tsql_objname(@__arg)))"
+                } else {
+                    "(SELECT auto_increment - 1 FROM information_schema.tables WHERE lower(table_name) = lower(__tsql_objname(@__arg)))"
+                };
+                let mut e = crate::sql::parse_expression(sql)?;
+                crate::sql::walk::walk_expr(&mut e, &mut |x| {
+                    if matches!(x, Expr::Param(n) if n == "__arg") {
+                        *x = arg.clone();
+                    }
+                    Ok(())
+                })?;
+                Ok(Some(e))
             }
             "CONVERT" | "TRY_CONVERT" => {
                 let (tn, hints) = self.tsql_type_with_size()?;

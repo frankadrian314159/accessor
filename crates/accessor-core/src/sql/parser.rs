@@ -5,6 +5,7 @@ use super::usertypes::UserType;
 
 mod pgfunc;
 mod tsql;
+pub(crate) use tsql::TABLE_VAR_PREFIX;
 use super::lexer::{lex, Tok, Token};
 use crate::error::{Error, Result};
 use crate::schema::RefAction;
@@ -57,7 +58,7 @@ pub fn parse_script(sql: &str) -> Result<Vec<Statement>> {
 }
 
 fn parse_tokens(sql: &str, toks: Vec<Token>) -> Result<Vec<Statement>> {
-    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: sql, toks, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, output: None, output_into: None, depth: 0, selects: 0, prefixed: Vec::new() };
     if crate::dialect::current() == crate::dialect::Dialect::Tsql {
         return p.tsql_script();
     }
@@ -147,7 +148,7 @@ pub(crate) fn internal_function_text(name: &str, args: &[String]) -> Option<Stri
 
 /// Parses a stand-alone expression (the stored form of a calculated field).
 pub fn parse_expression(sql: &str) -> Result<Expr> {
-    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, depth: 0, selects: 0, prefixed: Vec::new() };
+    let mut p = Parser { src: sql, toks: lex(sql)?, pos: 0, into_vars: Vec::new(), outfile: None, into_table: None, insert_alias: None, output: None, output_into: None, depth: 0, selects: 0, prefixed: Vec::new() };
     let e = p.expr()?;
     if !p.at_eof() {
         return Err(p.unexpected("the end of the expression"));
@@ -559,6 +560,9 @@ struct Parser<'a> {
     into_table: Option<String>,
     /// `INSERT INTO t AS a`: (a, t), for the ON CONFLICT clause that follows.
     insert_alias: Option<(String, String)>,
+    /// T-SQL: the `OUTPUT` list just read, and the table of its `INTO`.
+    output: Option<tsql::TsqlOutput>,
+    output_into: Option<(String, Option<Vec<String>>)>,
     /// How deep the expressions being read are nested, and how deep the sub-queries: a limit keeps a hostile text from
     /// overflowing the stack.
     depth: usize,
@@ -667,6 +671,9 @@ impl<'a> Parser<'a> {
     /// are dropped; any other schema stays part of the name (`s.t` is a table of its own, which `CREATE SCHEMA s`
     /// must have announced).
     fn table_ident(&mut self) -> Result<String> {
+        if let Some(t) = self.tsql_table_variable() {
+            return Ok(t);
+        }
         let name = self.ident()?;
         if self.peek_sym(".") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) {
             self.advance();
@@ -2724,6 +2731,9 @@ impl<'a> Parser<'a> {
             Tok::Ident(s) if s.eq_ignore_ascii_case("FOR") && (self.peek_kw_at(1, "UPDATE") || self.peek_kw_at(1, "SHARE") || self.peek_kw_at(1, "NO") || self.peek_kw_at(1, "KEY")) => false,
             Tok::Ident(s) if s.eq_ignore_ascii_case("LOCK") && self.peek_kw_at(1, "IN") && self.peek_kw_at(2, "SHARE") => false,
             Tok::Ident(s) if crate::dialect::current() == crate::dialect::Dialect::Tsql && tsql::STARTERS.iter().any(|r| r.eq_ignore_ascii_case(s)) => false,
+            // `t WITH (NOLOCK)`, `... OPTION (RECOMPILE)`, `UPDATE t SET .. OUTPUT inserted.x`
+            Tok::Ident(s) if crate::dialect::current() == crate::dialect::Dialect::Tsql && (s.eq_ignore_ascii_case("WITH") || s.eq_ignore_ascii_case("OPTION")) && matches!(self.peek_at(1), Tok::Sym("(")) => false,
+            Tok::Ident(s) if crate::dialect::current() == crate::dialect::Dialect::Tsql && s.eq_ignore_ascii_case("OUTPUT") => false,
             Tok::Ident(s) => !RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)),
             _ => false,
         }
@@ -2891,6 +2901,12 @@ impl<'a> Parser<'a> {
                 }
             }
             st = Statement::Upsert { insert: Box::new(st), conflict: Conflict { target: Vec::new(), action: ConflictAction::Update { sets, filter: None } } };
+        }
+        if let Some(out) = self.output.take() {
+            if !matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_) | Statement::Upsert { .. }) {
+                return Err(Error::syntax("OUTPUT is not supported with this form of statement"));
+            }
+            return Ok(self.tsql_finish_output(st, out));
         }
         if self.peek_kw("RETURNING")
             && matches!(st, Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. } | Statement::Merge(_) | Statement::Upsert { .. })
@@ -3607,6 +3623,7 @@ impl<'a> Parser<'a> {
     fn insert(&mut self) -> Result<Statement> {
         self.eat_kw("INTO");
         let table = self.table_ident()?;
+        self.skip_index_hints()?;
         self.insert_alias = None;
         if self.peek_kw("AS") && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
             // INSERT INTO t AS a: a names t in ON CONFLICT DO UPDATE
@@ -3640,6 +3657,7 @@ impl<'a> Parser<'a> {
             columns = Some(self.ident_list()?);
             self.expect_sym(")")?;
         }
+        self.tsql_output()?;
         let mut empty_rows = 0;
         let source = if self.peek_kw("DEFAULT") && self.peek_kw_at(1, "VALUES") {
             self.advance();
@@ -3708,6 +3726,7 @@ impl<'a> Parser<'a> {
             self.pos = save;
         }
         let table = self.table_ident()?;
+        self.skip_index_hints()?;
         let alias = self.target_alias()?;
         self.expect_kw("SET")?;
         let mut assignments = Vec::new();
@@ -3748,6 +3767,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
+        self.tsql_output()?;
         // PostgreSQL: UPDATE t SET .. FROM u, v WHERE ..
         if self.peek_kw("FROM") {
             self.advance();
@@ -3921,7 +3941,9 @@ impl<'a> Parser<'a> {
 
     fn delete_inner(&mut self) -> Result<Statement> {
         let table = self.table_ident()?;
+        self.skip_index_hints()?;
         let alias = self.target_alias()?;
+        self.tsql_output()?;
         let filter = if self.eat_kw("WHERE") { Some(self.expr()?) } else { None };
         let mut tail = Select::default();
         self.select_tail(&mut tail)?;
@@ -5038,6 +5060,11 @@ impl<'a> Parser<'a> {
 
     fn create_table_core(&mut self) -> Result<(Statement, Vec<String>, Vec<IndexSpec>)> {
         let name = self.table_ident()?;
+        self.create_table_core_named(name)
+    }
+
+    /// The column list and constraints of a table whose name has been read.
+    fn create_table_core_named(&mut self, name: String) -> Result<(Statement, Vec<String>, Vec<IndexSpec>)> {
         self.expect_sym("(")?;
         if self.eat_sym(")") {
             // a table with no columns of its own (all of them inherited)
@@ -6265,7 +6292,26 @@ impl<'a> Parser<'a> {
                 sel.distinct = true;
             } else if self.eat_kw("ALL") {
             } else if sel.top.is_none() && self.eat_kw("TOP") {
-                sel.top = Some(self.usize_literal()?);
+                if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+                    // TOP n, TOP (n), TOP (@n): a variable is bound when the batch runs
+                    let paren = self.eat_sym("(");
+                    if matches!(self.peek(), Tok::Param(_)) {
+                        self.limit_value(&mut sel, true)?;
+                    } else {
+                        sel.top = Some(self.usize_literal()?);
+                    }
+                    if paren {
+                        self.expect_sym(")")?;
+                    }
+                    if self.peek_kw("PERCENT") {
+                        return Err(Error::syntax("TOP ... PERCENT is not supported"));
+                    }
+                    if self.peek_kw("WITH") && self.peek_kw_at(1, "TIES") {
+                        return Err(Error::syntax("TOP ... WITH TIES is not supported"));
+                    }
+                } else {
+                    sel.top = Some(self.usize_literal()?);
+                }
             } else if ["STRAIGHT_JOIN", "HIGH_PRIORITY", "SQL_SMALL_RESULT", "SQL_BIG_RESULT", "SQL_BUFFER_RESULT", "SQL_NO_CACHE", "SQL_CACHE", "SQL_CALC_FOUND_ROWS"]
                 .iter()
                 .any(|w| self.eat_kw(w))
@@ -6372,7 +6418,10 @@ impl<'a> Parser<'a> {
                 if !self.eat_kw("ROWS") {
                     self.eat_kw("ROW");
                 }
-            } else if self.eat_kw("FETCH") {
+            } else if crate::dialect::current() == crate::dialect::Dialect::Tsql && self.peek_kw("OPTION") && matches!(self.peek_at(1), Tok::Sym("(")) {
+                self.advance();
+                self.skip_parens()?;
+            } else if !self.tsql_cursor_fetch_ahead() && self.eat_kw("FETCH") {
                 if !self.eat_kw("FIRST") {
                     self.expect_kw("NEXT")?;
                 }
@@ -6930,12 +6979,27 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_sym(")")?;
+            // T-SQL's STRING_SPLIT(text, separator [, enable_ordinal]) gives `value`, and `ordinal` when asked
+            let mut name = name;
+            let mut only_value = false;
+            if name == "STRING_SPLIT" && crate::dialect::current() == crate::dialect::Dialect::Tsql {
+                name = "SPLIT_STRING".into();
+                only_value = !(args.len() == 3 && matches!(args.pop(), Some(Expr::Literal(Value::Int(1)))));
+            }
             let ordinality = self.peek_kw("WITH") && self.peek_kw_at(1, "ORDINALITY");
             if ordinality {
                 self.advance();
                 self.advance();
             }
             let alias = if self.eat_kw("AS") || self.peek_is_alias() { self.ident()? } else { name.to_ascii_lowercase() };
+            if only_value {
+                let query = Select {
+                    items: vec![SelectItem::Expr { expr: Expr::Column { table: None, name: "value".into() }, alias: None }],
+                    from: Some(From { first: TableFactor::Function { name, args, alias: alias.clone(), columns: Vec::new() }, joins: Vec::new() }),
+                    ..Select::default()
+                };
+                return Ok(TableFactor::Derived { query: Box::new(query), alias, columns: Vec::new(), lateral: true });
+            }
             let columns = if self.eat_sym("(") {
                 let c = self.ident_list()?;
                 self.expect_sym(")")?;
@@ -6962,7 +7026,11 @@ impl<'a> Parser<'a> {
             return Err(self.unexpected("a sub-query or function after LATERAL"));
         }
         let only = self.peek_kw("ONLY") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Quoted(_)) && self.eat_kw("ONLY");
-        let mut name = self.ident()?;
+        let variable = self.tsql_table_variable();
+        let mut name = match &variable {
+            Some(t) => t.clone(),
+            None => self.ident()?,
+        };
         let mut default_alias = None;
         if name.eq_ignore_ascii_case("information_schema") && self.eat_sym(".") {
             // The catalog, as tables: INFORMATION_SCHEMA.COLUMNS and so on.
@@ -6995,12 +7063,19 @@ impl<'a> Parser<'a> {
     }
 
     fn at_index_hint(&self) -> bool {
-        (self.peek_kw("USE") || self.peek_kw("IGNORE") || self.peek_kw("FORCE")) && (self.peek_kw_at(1, "INDEX") || self.peek_kw_at(1, "KEY"))
+        (crate::dialect::current() == crate::dialect::Dialect::Tsql && self.peek_kw("WITH") && matches!(self.peek_at(1), Tok::Sym("(")))
+            || (self.peek_kw("USE") || self.peek_kw("IGNORE") || self.peek_kw("FORCE")) && (self.peek_kw_at(1, "INDEX") || self.peek_kw_at(1, "KEY"))
     }
 
     /// MySQL's `USE | IGNORE | FORCE INDEX | KEY [FOR JOIN | ORDER BY | GROUP BY] (names)`: read and ignored.
     fn skip_index_hints(&mut self) -> Result<()> {
         while self.at_index_hint() {
+            if self.peek_kw("WITH") {
+                // T-SQL's table hints: WITH (NOLOCK, INDEX(ix), ...)
+                self.advance();
+                self.skip_parens()?;
+                continue;
+            }
             self.advance();
             self.advance();
             if self.eat_kw("FOR") {

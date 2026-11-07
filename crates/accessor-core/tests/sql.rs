@@ -7889,3 +7889,43 @@ fn tsql_types_batches_and_functions() {
     assert_eq!(one(&mut db, "SELECT ISNULL(NULL, 'z')"), "z");
     assert_eq!(one(&mut db, "SELECT CONVERT(VARCHAR(10), CAST('2024-03-05' AS DATETIME), 101)"), "03/05/2024");
 }
+
+#[test]
+fn tsql_batches_return_every_result_set_and_support_cursors_table_variables_and_output() {
+    use accessor_core::dialect::Dialect;
+    let mut db = Database::in_memory();
+    db.set_dialect(Dialect::Tsql);
+    db.execute("CREATE TABLE dbo.E (Id INT IDENTITY(1,1) PRIMARY KEY, N NVARCHAR(20), S DECIMAL(10,2))").unwrap();
+    // several result sets: the earlier ones come from take_result_sets, the last is the result
+    let last = db.execute("INSERT INTO dbo.E (N, S) VALUES ('a', 1), ('b', 2), ('c', 3)\nSELECT @@ROWCOUNT AS rc, SCOPE_IDENTITY() AS id\nSELECT N FROM dbo.E WITH (NOLOCK) ORDER BY Id OPTION (RECOMPILE)").unwrap();
+    let earlier = accessor_core::exec::take_result_sets();
+    assert_eq!(earlier.len(), 1);
+    assert_eq!(earlier[0].rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), vec!["3", "3"]);
+    assert_eq!(col(&last, 0), vec!["a", "b", "c"]);
+    // a table variable, and TOP (n)
+    let r = db.execute("DECLARE @t TABLE (Id INT, N NVARCHAR(20))\nINSERT INTO @t SELECT Id, N FROM dbo.E\nDELETE FROM @t WHERE Id = 1\nSELECT TOP (1) N FROM @t ORDER BY Id").unwrap();
+    assert_eq!(col(&r, 0), vec!["b"]);
+    // the table variable is gone with its batch
+    assert!(db.execute("SELECT * FROM @t").is_err());
+    // a cursor and @@FETCH_STATUS
+    let r = db
+        .execute(
+            "DECLARE @n NVARCHAR(20), @tot DECIMAL(10,2) = 0\nDECLARE c CURSOR FOR SELECT N, S FROM dbo.E ORDER BY Id\nOPEN c\nFETCH NEXT FROM c INTO @n, @tot\n\
+             DECLARE @s DECIMAL(10,2)\nSET @s = @tot\nWHILE @@FETCH_STATUS = 0\nBEGIN\n  FETCH NEXT FROM c INTO @n, @tot\n  IF @@FETCH_STATUS = 0 SET @s += @tot\nEND\nCLOSE c\nDEALLOCATE c\nSELECT @s",
+        )
+        .unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "6.00");
+    // OUTPUT, alone and INTO a table variable
+    let r = db.execute("UPDATE dbo.E SET S = S + 1 OUTPUT inserted.N, deleted.S AS Old, inserted.S AS New WHERE Id = 1").unwrap();
+    assert_eq!(r.rows[0].iter().map(|v| v.to_string()).collect::<Vec<_>>(), vec!["a", "1.00", "2.00"]);
+    let r = db.execute("DECLARE @log TABLE (Id INT, N NVARCHAR(20))\nDELETE FROM dbo.E OUTPUT deleted.Id, deleted.N INTO @log WHERE Id > 1\nSELECT COUNT(*) FROM @log").unwrap();
+    assert_eq!(r.rows[0][0].to_string(), "2");
+    // STRING_SPLIT, FORMAT, OBJECT_ID
+    let r = db.execute("SELECT value FROM STRING_SPLIT('x,y', ',')").unwrap();
+    assert_eq!(col(&r, 0), vec!["x", "y"]);
+    let one = |db: &mut Database, sql: &str| db.execute(sql).unwrap().rows[0][0].to_string();
+    assert_eq!(one(&mut db, "SELECT FORMAT(1234567.891, 'N2')"), "1,234,567.89");
+    assert_eq!(one(&mut db, "SELECT FORMAT(0.256, 'P1')"), "25.6%");
+    assert_eq!(one(&mut db, "SELECT FORMAT(CAST('2024-03-05 14:07:09' AS DATETIME), 'dddd, MMMM d, yyyy hh:mm tt')"), "Tuesday, March 5, 2024 02:07 PM");
+    assert_eq!(one(&mut db, "SELECT CASE WHEN OBJECT_ID('dbo.E') IS NOT NULL AND OBJECT_ID('nope') IS NULL THEN 'ok' END"), "ok");
+}

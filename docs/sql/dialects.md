@@ -37,6 +37,8 @@ A session speaks one of four dialects. `asql` is the default and is what the res
 
 `tsql` reads Transact-SQL: batches with `DECLARE`/`SET @v`, `IF`, `WHILE`, `TRY`/`CATCH`, `PRINT`, `GO`; `dbo.`-qualified and `[bracketed]` names; `N'..'` strings; `TOP`; `IDENTITY`; storage clauses. Every T-SQL type name is accepted (`bit`, `tinyint`, `money`, `smallmoney`, `datetime`, `datetime2`, `smalldatetime`, `datetimeoffset`, `date`, `time`, `nvarchar`, `varbinary`, `uniqueidentifier`, `xml`, ...), mapped onto the engine's types; `time` is its own type. Values print as SQL Server prints them: `bit` 1/0, `datetime` with milliseconds, `time` with seven digits, `money` with four decimals, binary as `0x..`. Fractional seconds are kept, decimals keep their scale, and integer ranges (`tinyint` 0-255) are checked. Division by zero is an error ("Divide by zero error encountered."). The functions are in `crates/accessor-core/src/expr/tsqlfuncs.rs`. In the server, see [../server.md](../server.md).
 
+How each T-SQL type is stored: `bit`, `tinyint` (0-255), `smallint`, `int`, `bigint`, `decimal`/`numeric`, `money`/`smallmoney`, `float`/`real`, `date`, `varchar`/`nvarchar` (length checked) keep their meaning. Approximations: `time`, `datetime2` and `datetimeoffset` keep milliseconds, not seven digits; `datetime` is not rounded to 1/300 s and `smalldatetime` not to the minute; `datetimeoffset` is stored as UTC and its offset is not kept; `char`/`nchar` are not blank-padded; `binary`/`varbinary`/`image` hold bytes without padding; `uniqueidentifier`, `xml`, `sql_variant`, `hierarchyid`, `geometry`, `geography` are text with no validation or operations; `rowversion`/`timestamp` is a column that is never filled.
+
 ## Choosing one
 
 ```

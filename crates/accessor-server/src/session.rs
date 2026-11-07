@@ -346,8 +346,13 @@ impl Session<'_> {
             }
             let result = self.conn.execute(stmt);
             self.send_messages()?;
+            let earlier = accessor_core::exec::take_result_sets();
             let result = result?;
             let formats: [i16; 0] = [];
+            // a T-SQL batch that selected several times: its earlier result sets come first
+            for r in &earlier {
+                self.send_result("SELECT", r, &formats, true, 0, 0)?;
+            }
             self.send_result(stmt, &result, &formats, true, 0, 0)?;
         }
         Ok(())
@@ -490,6 +495,8 @@ impl Session<'_> {
             let text = p.sql.clone();
             let r = if text.trim().is_empty() { Ok(QueryResult::default()) } else { self.conn.execute(&text) };
             self.send_messages()?;
+            // the extended protocol answers with one result set: a batch's earlier ones are not sent
+            accessor_core::exec::take_result_sets();
             let r = r?;
             if let Some(p) = self.portals.get_mut(name) {
                 p.result = Some(r);

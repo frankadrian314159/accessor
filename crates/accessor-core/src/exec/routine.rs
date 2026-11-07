@@ -245,6 +245,10 @@ struct Frame {
     vars: HashMap<String, Value>,
     types: HashMap<String, DataType>,
     last: Option<QueryResult>,
+    /// T-SQL: every result set the batch has made so far.
+    sets: Vec<QueryResult>,
+    /// T-SQL: the tables that stand for table variables, dropped when the batch ends.
+    temps: Vec<String>,
     returned: Option<Value>,
     iterations: u64,
     /// A function that returns a set: the names of its output columns, and the rows `RETURN NEXT` / `RETURN QUERY` made.
@@ -281,7 +285,7 @@ struct PgCursor {
 impl Frame {
     fn new(mut vars: HashMap<String, Value>) -> Frame {
         vars.entry("found".to_string()).or_insert(Value::Bool(false));
-        Frame { vars, types: HashMap::new(), last: None, returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), pg_cursors: HashMap::new(), loop_label: None, diag: None, handlers: Vec::new() }
+        Frame { vars, types: HashMap::new(), last: None, sets: Vec::new(), temps: Vec::new(), returned: None, iterations: 0, set_names: Vec::new(), rows: Vec::new(), rec_cols: HashMap::new(), cursors: HashMap::new(), pg_cursors: HashMap::new(), loop_label: None, diag: None, handlers: Vec::new() }
     }
 }
 
@@ -477,8 +481,20 @@ impl Database {
     /// statement that gave one.
     pub(crate) fn run_tsql_batch(&mut self, body: &[ProcStmt]) -> Result<QueryResult> {
         let mut frame = Frame::new(HashMap::new());
-        self.run_block(body, &mut frame)?;
-        Ok(frame.last.take().unwrap_or_default())
+        crate::exec::put_result_sets(Vec::new());
+        let ran = self.run_block(body, &mut frame);
+        for table in std::mem::take(&mut frame.temps) {
+            let _ = self.execute_statement(&Statement::DropTable(table));
+        }
+        ran?;
+        // every result set but the last goes to `take_result_sets`; the last is the result
+        let last = frame.last.take();
+        let mut sets = std::mem::take(&mut frame.sets);
+        if last.as_ref().is_some_and(|l| !l.columns.is_empty()) {
+            sets.pop();
+        }
+        crate::exec::put_result_sets(sets);
+        Ok(last.unwrap_or_default())
     }
 
     pub(crate) fn run_trigger_block(&mut self, def: &RoutineDef, vars: HashMap<String, Value>) -> Result<(Option<Value>, HashMap<String, Value>)> {
@@ -885,6 +901,18 @@ impl Database {
             ProcStmt::DeclareCursor { name, select } => {
                 frame.cursors.insert(name.to_ascii_lowercase(), ((**select).clone(), None));
             }
+            ProcStmt::OutputInto { stmt, table, columns } => {
+                let mut st = (**stmt).clone();
+                bind_params(&mut st, &frame.vars)?;
+                let r = self.execute_statement(&st)?;
+                let n = r.rows.len();
+                if n > 0 {
+                    let rows = r.rows.into_iter().map(|row| row.into_iter().map(Expr::Literal).collect()).collect();
+                    let insert = Statement::Insert { table: table.clone(), columns: columns.clone(), source: crate::sql::ast::InsertSource::Values(rows) };
+                    self.execute_statement(&insert)?;
+                }
+                frame.last = Some(QueryResult { affected: n as _, ..Default::default() });
+            }
             ProcStmt::OpenCursor(name) => {
                 let k = name.to_ascii_lowercase();
                 let select = frame.cursors.get(&k).map(|c| c.0.clone()).ok_or_else(|| Error::runtime(format!("the cursor '{name}' is not declared")))?;
@@ -962,6 +990,9 @@ impl Database {
                 let row = (1..=len).contains(&target).then(|| cur.rows[(target - 1) as usize].clone());
                 let columns = cur.columns.clone();
                 frame.vars.insert("found".to_string(), Value::Bool(row.is_some()));
+                if crate::dialect::current() == crate::dialect::Dialect::Tsql {
+                    self.user_vars.insert("@@fetch_status".into(), Value::Int(if row.is_some() { 0 } else { -1 }));
+                }
                 if !move_only {
                     if *record {
                         self.set_record(frame, &targets[0], &columns, row);
@@ -1221,6 +1252,11 @@ impl Database {
                 }
                 bind_params(&mut stmt, &frame.vars)?;
                 let result = self.execute_statement(&stmt);
+                if let (Ok(_), Statement::CreateTable { name, .. }) = (&result, &stmt) {
+                    if name.starts_with(crate::sql::parser::TABLE_VAR_PREFIX) {
+                        frame.temps.push(name.clone());
+                    }
+                }
                 for (k, tmp) in outs {
                     if let Some(v) = self.user_vars.remove(&tmp) {
                         let v = match frame.types.get(&k) {
@@ -1232,6 +1268,9 @@ impl Database {
                 }
                 let result = result?;
                 frame.vars.insert("found".to_string(), Value::Bool(result.affected > 0 || !result.rows.is_empty()));
+                if !result.columns.is_empty() && crate::dialect::current() == crate::dialect::Dialect::Tsql {
+                    frame.sets.push(result.clone());
+                }
                 frame.last = Some(result);
             }
         }

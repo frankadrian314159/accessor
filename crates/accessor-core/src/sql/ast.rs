@@ -479,6 +479,9 @@ pub enum ProcStmt {
     /// `ITERATE label`
     Iterate(String),
     DeclareCursor { name: String, select: Box<Select> },
+    /// T-SQL `INSERT/UPDATE/DELETE ... OUTPUT ... INTO table [(columns)]`: the statement (a `RETURNING` one) runs and the
+    /// rows it returns are inserted into the table.
+    OutputInto { stmt: Box<Statement>, table: String, columns: Option<Vec<String>> },
     OpenCursor(String),
     CloseCursor(String),
     /// `FETCH c INTO a, b`

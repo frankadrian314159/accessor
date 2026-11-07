@@ -1455,6 +1455,11 @@ pub(crate) fn set_row_count(n: i64) {
     ROW_COUNT.with(|c| c.set(n));
 }
 
+/// The last number an AutoNumber column was given (`LAST_INSERT_ID()`, T-SQL's `SCOPE_IDENTITY()` and `@@IDENTITY`).
+pub(crate) fn last_insert_id() -> i64 {
+    LAST_INSERT_ID.with(|c| c.get())
+}
+
 /// Remembers the last number an AutoNumber column was given, for `LAST_INSERT_ID()`.
 pub(crate) fn set_last_insert_id(n: i64) {
     LAST_INSERT_ID.with(|c| c.set(n));

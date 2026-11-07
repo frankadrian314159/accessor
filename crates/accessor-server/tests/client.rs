@@ -206,6 +206,12 @@ fn a_tsql_connection_reads_batches_and_shows_tsql_values() {
     // errors are caught in the batch
     let r = rows(&mut ms, "BEGIN TRY\nDECLARE @x INT = 1 / 0\nEND TRY\nBEGIN CATCH\nSELECT ERROR_MESSAGE() AS m\nEND CATCH");
     assert_eq!(r, vec![vec!["Divide by zero error encountered."]]);
+    // a batch that selects several times sends every result set, in order
+    let msgs = ms.simple_query("SELECT 1 AS a
+SELECT 2 AS b
+SELECT 3 AS c").unwrap();
+    let firsts: Vec<String> = msgs.iter().filter_map(|m| if let SimpleQueryMessage::Row(r) = m { r.get(0).map(str::to_string) } else { None }).collect();
+    assert_eq!(firsts, vec!["1", "2", "3"]);
     drop(ms);
     stop.stop();
     handle.join().unwrap();
