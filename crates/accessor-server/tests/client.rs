@@ -291,3 +291,20 @@ fn catalog_queries_work_through_the_extended_protocol() {
     assert!(failed.is_empty(), "{}", failed.join("
 "));
 }
+
+#[test]
+fn a_trigger_body_with_semicolons_is_one_statement() {
+    let (conn, stop, handle) = start(Config::default());
+    let mut c = Client::connect(&conn, NoTls).unwrap();
+    c.batch_execute("CREATE TABLE ar (id INTEGER PRIMARY KEY); CREATE TABLE al (id INTEGER PRIMARY KEY, ids INTEGER[])").unwrap();
+    let trigger = "CREATE TRIGGER al_ids BEFORE INSERT OR UPDATE ON al FOR EACH ROW\nWHEN (EXISTS (SELECT 1 FROM unnest(NEW.ids) AS x WHERE x NOT IN (SELECT id FROM ar)))\nBEGIN\n  RAISE 'no such artist';\nEND;";
+    // a driver sends it as one statement (extended protocol), a script as part of a message
+    c.execute(trigger, &[]).unwrap();
+    assert!(c.batch_execute("INSERT INTO al VALUES (1, ARRAY[9])").is_err());
+    c.batch_execute("DROP TRIGGER al_ids").unwrap();
+    c.batch_execute(trigger).unwrap();
+    assert!(c.batch_execute("INSERT INTO al VALUES (1, ARRAY[9])").is_err());
+    drop(c);
+    stop.stop();
+    handle.join().unwrap();
+}

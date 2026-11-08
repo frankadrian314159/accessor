@@ -53,6 +53,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 }
                 None => i += 1,
             },
+            b';' if inside_block(&sql[start..i]) => i += 1,
             b';' => {
                 out.push(&sql[start..i]);
                 i += 1;
@@ -63,6 +64,54 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     }
     out.push(&sql[start..]);
     out.into_iter().filter(|s| !is_blank(s)).collect()
+}
+
+/// Is `seg` (a statement so far) a `CREATE TRIGGER`, `PROCEDURE` or `FUNCTION` with a `BEGIN ... END` body that is not yet
+/// closed? A `;` inside such a body does not end the statement. `BEGIN`/`CASE` open a block, `END` (and `END CASE`) close it;
+/// `END IF`, `END LOOP` and `END WHILE` close what `IF`, `LOOP` and `WHILE` opened, which are not counted.
+fn inside_block(seg: &str) -> bool {
+    let b = seg.as_bytes();
+    let (mut i, mut depth, mut words) = (0usize, 0i32, Vec::<String>::new());
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let from = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                words.push(seg[from..i].to_ascii_uppercase());
+            }
+            _ => i += 1,
+        }
+    }
+    let head: Vec<&str> = words.iter().take(8).map(String::as_str).collect();
+    let routine = head.first() == Some(&"CREATE") && head.iter().any(|w| matches!(*w, "TRIGGER" | "PROCEDURE" | "FUNCTION" | "PROC"));
+    if !routine {
+        return false;
+    }
+    for (k, w) in words.iter().enumerate() {
+        match w.as_str() {
+            "BEGIN" | "CASE" => depth += 1,
+            "END" => match words.get(k + 1).map(String::as_str) {
+                Some("IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR") => {}
+                _ => depth -= 1,
+            },
+            _ => {}
+        }
+    }
+    depth > 0
 }
 
 /// A T-SQL message cut into its batches at the lines that say `GO` (as `sqlcmd` and SSMS do).
@@ -308,6 +357,14 @@ pub fn sqlstate(e: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trigger_body_keeps_its_semicolons() {
+        let t = "CREATE TRIGGER t BEFORE INSERT ON a BEGIN RAISE 'x'; RAISE 'y'; END";
+        assert_eq!(split_statements(&format!("{t}; select 1")), [t, " select 1"]);
+        assert_eq!(split_statements(t), [t]);
+        assert_eq!(split_statements("BEGIN; select 1; COMMIT"), ["BEGIN", " select 1", " COMMIT"]);
+    }
 
     #[test]
     fn statements_split_outside_strings_and_bodies() {
