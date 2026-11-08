@@ -186,7 +186,7 @@ fn authenticate(reader: &mut impl Read, out: &mut impl Write, shared: &Shared, u
         Ok(false)
     };
     // the next 'p' message
-    let mut password_message = |reader: &mut dyn Read| -> io::Result<Option<Vec<u8>>> {
+    let password_message = |reader: &mut dyn Read| -> io::Result<Option<Vec<u8>>> {
         match wire::read_message(reader)? {
             Some((b'p', body)) => Ok(Some(body)),
             _ => Ok(None),
