@@ -183,6 +183,19 @@ pub enum QueryDef {
 
 /// Parses the text of a saved query.
 pub fn parse_query_def(sql: &str) -> Result<QueryDef> {
+    // a query with parameters (`PARAMETERS @a ...`) is Accessor's own; `@` is an operator to PostgreSQL's reading
+    let own = sql.trim_start().get(..10).is_some_and(|h| h.eq_ignore_ascii_case("PARAMETERS"));
+    if own && crate::dialect::current() == crate::dialect::Dialect::Postgresql {
+        let saved = crate::dialect::current();
+        crate::dialect::set_session(crate::dialect::Dialect::Asql);
+        let r = parse_query_def_in(sql);
+        crate::dialect::set_session(saved);
+        return r;
+    }
+    parse_query_def_in(sql)
+}
+
+fn parse_query_def_in(sql: &str) -> Result<QueryDef> {
     let mut stmts = parse_script(sql)?;
     if let [Statement::Exec { .. }] = stmts.as_slice() {
         if let Some(Statement::Exec { name, args }) = stmts.pop() {

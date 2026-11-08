@@ -7937,3 +7937,14 @@ fn tsql_batches_return_every_result_set_and_support_cursors_table_variables_and_
     assert_eq!(one(&mut db, "SELECT FORMAT(CAST('2024-03-05 14:07:09' AS DATETIME), 'dddd, MMMM d, yyyy hh:mm tt')"), "Tuesday, March 5, 2024 02:07 PM");
     assert_eq!(one(&mut db, "SELECT CASE WHEN OBJECT_ID('dbo.E') IS NOT NULL AND OBJECT_ID('nope') IS NULL THEN 'ok' END"), "ok");
 }
+
+#[test]
+fn a_query_with_parameters_is_read_in_postgresql_mode() {
+    let mut db = Database::in_memory();
+    db.execute("CREATE TABLE t (id INTEGER, n TEXT)").unwrap();
+    db.execute("CREATE QUERY q AS PARAMETERS @id Integer; SELECT n FROM t WHERE id = @id").unwrap();
+    db.execute("SET dialect = 'postgresql'").unwrap();
+    // the parameters are understood; the query then asks to be run with EXEC rather than failing to parse
+    let e = db.execute("SELECT q.* FROM q AS q").unwrap_err().to_string();
+    assert!(e.contains("needs parameters"), "{e}");
+}
